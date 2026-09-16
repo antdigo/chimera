@@ -4,6 +4,7 @@ pub mod config;
 pub mod daemon;
 pub mod docker;
 pub mod github;
+pub mod import;
 pub mod job;
 pub mod node;
 pub mod runner;

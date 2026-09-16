@@ -1,0 +1,12 @@
+{
+  "agentId": 42,
+  "agentName": "official-runner",
+  "poolId": 1,
+  "poolName": "Default",
+  "disableUpdate": true,
+  "serverUrl": "https://pipelines.actions.githubusercontent.com/tenant-id",
+  "gitHubUrl": "https://github.com/example/repository",
+  "workFolder": "_work",
+  "useV2Flow": true,
+  "serverUrlV2": "https://broker.actions.githubusercontent.com"
+}
