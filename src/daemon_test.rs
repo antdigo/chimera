@@ -5,6 +5,40 @@ use chrono::Utc;
 use tempfile::TempDir;
 
 use super::*;
+use crate::storage::{RootLock, RootLockError};
+
+#[test]
+fn daemon_load_refuses_busy_root_before_reading_config() {
+    let root = TempDir::new().unwrap();
+    let paths = ChimeraPaths::new(root.path().to_path_buf());
+    let config_path = paths.config_file();
+    let _held = RootLock::acquire(root.path()).unwrap();
+
+    let error = match Daemon::load(paths) {
+        Ok(_) => panic!("daemon unexpectedly acquired a busy root"),
+        Err(error) => error,
+    };
+
+    assert!(error.to_string().contains("root storage is busy"));
+    assert!(
+        !config_path.exists(),
+        "config was read/created before locking"
+    );
+}
+
+#[test]
+fn daemon_holds_root_lock_for_its_lifetime() {
+    let root = TempDir::new().unwrap();
+    let paths = ChimeraPaths::new(root.path().to_path_buf());
+    let daemon = Daemon::load(paths).unwrap();
+
+    assert!(matches!(
+        RootLock::acquire(root.path()).unwrap_err(),
+        RootLockError::Busy
+    ));
+    drop(daemon);
+    RootLock::acquire(root.path()).unwrap();
+}
 
 // --- PID lock tests ---
 

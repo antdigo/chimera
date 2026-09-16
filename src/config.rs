@@ -140,6 +140,10 @@ impl ChimeraPaths {
         self.root.join("chimera.pid")
     }
 
+    pub fn root_lock_file(&self) -> PathBuf {
+        self.root.join(".chimera.lock")
+    }
+
     pub fn state_file(&self) -> PathBuf {
         self.root.join("state.json")
     }

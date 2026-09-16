@@ -1,5 +1,6 @@
 use super::*;
 use crate::config::{ChimeraConfig, load_config, save_config};
+use crate::storage::RootLock;
 use tempfile::TempDir;
 use wiremock::matchers::method;
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -120,4 +121,36 @@ async fn unregister_removes_files() {
 
     let updated_config = load_config(&root.join("config.toml")).unwrap();
     assert_eq!(updated_config.runners, vec!["other-runner"]);
+}
+
+#[tokio::test]
+async fn unregister_refuses_busy_root() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    let _held = RootLock::acquire(root).unwrap();
+    let runner_dir = root.join("runners").join("test-runner");
+    std::fs::create_dir_all(&runner_dir).unwrap();
+    std::fs::write(runner_dir.join("runner.json"), b"runner data").unwrap();
+
+    let config = ChimeraConfig {
+        runners: vec!["test-runner".into(), "other-runner".into()],
+        ..Default::default()
+    };
+    let config_path = root.join("config.toml");
+    save_config(&config_path, &config).unwrap();
+    let original_config = std::fs::read(&config_path).unwrap();
+
+    let error = unregister("test-runner", root).await.unwrap_err();
+
+    assert!(error.to_string().contains("root storage is busy"));
+    assert_eq!(
+        std::fs::read(runner_dir.join("runner.json")).unwrap(),
+        b"runner data"
+    );
+    assert_eq!(std::fs::read(&config_path).unwrap(), original_config);
+    let unchanged_config = load_config(&config_path).unwrap();
+    assert_eq!(
+        unchanged_config.runners,
+        vec!["test-runner", "other-runner"]
+    );
 }

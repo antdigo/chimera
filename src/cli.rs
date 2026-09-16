@@ -1,11 +1,11 @@
 use std::path::PathBuf;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
 use tokio::sync::watch;
 use tracing::{info, warn};
 
-use crate::config::{ChimeraConfig, ChimeraPaths, DaemonConfig, default_root, load_config};
+use crate::config::{ChimeraPaths, DaemonConfig, default_root};
 use crate::daemon::{Daemon, format_status_display, is_process_alive, read_state_file};
 
 #[derive(Parser)]
@@ -89,18 +89,17 @@ pub async fn run(cli: Cli) -> Result<()> {
         }
 
         Command::Start { root } => {
-            let paths = ChimeraPaths::new(root);
-            let config = load_config(&paths.config_file()).context("loading config")?;
-            init_tracing(&config.daemon);
-            run_start(paths, config).await
+            let daemon = Daemon::load(ChimeraPaths::new(root))?;
+            init_tracing(&daemon.config().daemon);
+            run_start(daemon).await
         }
 
         Command::Status { root } => run_status(root),
     }
 }
 
-async fn run_start(paths: ChimeraPaths, config: ChimeraConfig) -> Result<()> {
-    if config.runners.is_empty() {
+async fn run_start(daemon: Daemon) -> Result<()> {
+    if daemon.config().runners.is_empty() {
         bail!("no runners registered. Use 'chimera register' first.");
     }
 
@@ -124,7 +123,6 @@ async fn run_start(paths: ChimeraPaths, config: ChimeraConfig) -> Result<()> {
         let _ = shutdown_tx.send(true);
     });
 
-    let daemon = Daemon::new(paths, config);
     daemon.run(shutdown_rx).await
 }
 
@@ -149,7 +147,7 @@ fn run_status(root: PathBuf) -> Result<()> {
         return Ok(());
     }
 
-    let config = load_config(&config_path)?;
+    let config = crate::config::load_config(&config_path)?;
     if config.runners.is_empty() {
         println!("No runners registered.");
         return Ok(());

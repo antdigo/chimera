@@ -10,6 +10,7 @@ use crate::config::{
     ChimeraConfig, OAuthCredentials, RunnerCredentials, RunnerInfo, load_config,
     private_key_to_rsa_params, public_key_to_xml, save_config, save_runner_credentials,
 };
+use crate::storage::RootLock;
 use crate::utils::{arch_label, os_label};
 
 // ---------------------------------------------------------------------------
@@ -198,6 +199,10 @@ pub async fn register(
     labels: &[String],
     root: &Path,
 ) -> Result<()> {
+    let _root_lock = RootLock::acquire(root).map_err(|error| {
+        let context = format!("acquiring root storage lock: {error}");
+        anyhow::Error::new(error).context(context)
+    })?;
     let target = GitHubTarget::parse(url)?;
     let client = reqwest::Client::builder()
         .user_agent(format!("chimera/{RUNNER_VERSION}"))
@@ -247,7 +252,7 @@ pub async fn register(
 
     let config_path = root.join("config.toml");
     let mut config = if config_path.exists() {
-        load_config(&config_path).unwrap_or_default()
+        load_config(&config_path)?
     } else {
         ChimeraConfig::default()
     };
@@ -267,6 +272,10 @@ pub async fn register(
 }
 
 pub async fn unregister(name: &str, root: &Path) -> Result<()> {
+    let _root_lock = RootLock::acquire(root).map_err(|error| {
+        let context = format!("acquiring root storage lock: {error}");
+        anyhow::Error::new(error).context(context)
+    })?;
     let runners_dir = root.join("runners");
     let runner_dir = runners_dir.join(name);
 
@@ -279,8 +288,8 @@ pub async fn unregister(name: &str, root: &Path) -> Result<()> {
 
     let config_path = root.join("config.toml");
     if config_path.exists() {
-        let mut config = load_config(&config_path).unwrap_or_default();
-        config.runners.retain(|r| r != name);
+        let mut config = load_config(&config_path)?;
+        config.runners.retain(|runner| runner != name);
         save_config(&config_path, &config)?;
     }
 
