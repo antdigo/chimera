@@ -39,6 +39,92 @@ fn rejects_symlink_and_group_or_world_writable_root() {
 
 #[cfg(unix)]
 #[test]
+fn rejects_group_or_world_writable_non_sticky_ancestor() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let parent = tempfile::tempdir().unwrap();
+    let writable_ancestor = parent.path().join("writable");
+    let root = writable_ancestor.join("root");
+    std::fs::create_dir(&writable_ancestor).unwrap();
+    std::fs::create_dir(&root).unwrap();
+    std::fs::set_permissions(&writable_ancestor, std::fs::Permissions::from_mode(0o777)).unwrap();
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    assert!(matches!(
+        RootLock::acquire(&root).unwrap_err(),
+        RootLockError::UnsafeRoot(_)
+    ));
+
+    std::fs::set_permissions(&writable_ancestor, std::fs::Permissions::from_mode(0o700)).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn rejects_symlink_root_with_trailing_separator() {
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    use std::os::unix::fs::symlink;
+
+    let parent = tempfile::tempdir().unwrap();
+    let real_root = parent.path().join("real-root");
+    std::fs::create_dir(&real_root).unwrap();
+    let linked_root = parent.path().join("linked-root");
+    symlink(&real_root, &linked_root).unwrap();
+    let mut spelling = linked_root.as_os_str().as_bytes().to_vec();
+    spelling.push(b'/');
+    let linked_root_with_separator =
+        std::path::PathBuf::from(std::ffi::OsString::from_vec(spelling));
+
+    assert!(matches!(
+        RootLock::acquire(&linked_root_with_separator).unwrap_err(),
+        RootLockError::UnsafeRoot(_)
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn rejects_symlink_root_with_terminal_dot() {
+    use std::os::unix::fs::symlink;
+
+    let parent = tempfile::tempdir().unwrap();
+    let real_root = parent.path().join("real-root");
+    std::fs::create_dir(&real_root).unwrap();
+    let linked_root = parent.path().join("linked-root");
+    symlink(&real_root, &linked_root).unwrap();
+
+    assert!(matches!(
+        RootLock::acquire(&linked_root.join(".")).unwrap_err(),
+        RootLockError::UnsafeRoot(_)
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn creates_missing_multi_component_relative_root() {
+    let current = std::env::current_dir().unwrap();
+    let reservation = tempfile::Builder::new()
+        .prefix(".chimera-relative-root-")
+        .tempdir_in(&current)
+        .unwrap();
+    let top_level_name = reservation.path().file_name().unwrap().to_owned();
+    drop(reservation);
+    let relative_root = std::path::PathBuf::from(&top_level_name)
+        .join("nested")
+        .join("root");
+    let absolute_top_level = current.join(&top_level_name);
+
+    let lock = RootLock::acquire(&relative_root).unwrap();
+
+    assert!(
+        absolute_top_level
+            .join("nested/root/.chimera.lock")
+            .is_file()
+    );
+    drop(lock);
+    std::fs::remove_dir_all(absolute_top_level).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
 fn rejects_symlinked_lock_file_without_touching_target() {
     use std::os::unix::fs::symlink;
 
@@ -53,10 +139,33 @@ fn rejects_symlinked_lock_file_without_touching_target() {
 
 #[cfg(unix)]
 #[test]
+fn opens_lock_file_relative_to_pinned_root_directory() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let parent = tempfile::tempdir().unwrap();
+    let root = parent.path().join("root");
+    let moved_root = parent.path().join("moved-root");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let pinned_root = open_root(&root, false).unwrap();
+    std::fs::rename(&root, &moved_root).unwrap();
+    std::fs::create_dir(&root).unwrap();
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    let lock_file = open_lock_file(&pinned_root).unwrap();
+
+    assert!(moved_root.join(".chimera.lock").is_file());
+    assert!(!root.join(".chimera.lock").exists());
+    drop(lock_file);
+}
+
+#[cfg(unix)]
+#[test]
 fn creates_new_root_and_lock_with_private_modes() {
     use std::os::unix::fs::PermissionsExt;
 
     let parent = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(parent.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let root = parent.path().join("new-root");
 
     let lock = RootLock::acquire(&root).unwrap();
