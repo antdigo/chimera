@@ -45,7 +45,7 @@ fn default_log_format() -> String {
     "text".into()
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RunnerInfo {
     pub agent_id: u64,
@@ -63,7 +63,7 @@ fn default_true() -> bool {
     true
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OAuthCredentials {
     pub scheme: String,
@@ -72,7 +72,7 @@ pub struct OAuthCredentials {
 }
 
 /// RSA private key parameters in .NET-compatible base64 format.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RsaParameters {
     pub d: String,
@@ -87,7 +87,7 @@ pub struct RsaParameters {
 }
 
 /// All credential data for a single runner, loaded from three JSON files.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunnerCredentials {
     pub info: RunnerInfo,
     pub oauth: OAuthCredentials,
@@ -238,12 +238,29 @@ pub fn rsa_params_to_private_key(params: &RsaParameters) -> Result<RsaPrivateKey
     let d = decode_biguint(&params.d, "d")?;
     let p = decode_biguint(&params.p, "p")?;
     let q = decode_biguint(&params.q, "q")?;
+    let dp = decode_biguint(&params.dp, "dp")?;
+    let dq = decode_biguint(&params.dq, "dq")?;
+    let inverse_q = decode_biguint(&params.inverse_q, "inverseQ")?;
 
-    let primes = vec![p, q];
-    let key = RsaPrivateKey::from_components(n, e, d, primes)
+    let key = RsaPrivateKey::from_components(n, e, d, vec![p, q])
         .context("constructing RSA private key from parameters")?;
-
     key.validate().context("validating RSA private key")?;
+
+    let expected_dp = key.dp().context("RSA key missing dp component")?;
+    let expected_dq = key.dq().context("RSA key missing dq component")?;
+    let expected_inverse_q = key
+        .qinv()
+        .context("RSA key missing inverseQ component")?
+        .to_biguint()
+        .context("RSA inverseQ is negative")?;
+
+    anyhow::ensure!(&dp == expected_dp, "RSA parameter 'dp' is inconsistent");
+    anyhow::ensure!(&dq == expected_dq, "RSA parameter 'dq' is inconsistent");
+    anyhow::ensure!(
+        inverse_q == expected_inverse_q,
+        "RSA parameter 'inverseQ' is inconsistent"
+    );
+
     Ok(key)
 }
 

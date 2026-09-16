@@ -1,27 +1,11 @@
 use super::*;
 use tempfile::TempDir;
 
-#[test]
-fn rsa_key_roundtrip() {
+fn test_credentials() -> RunnerCredentials {
     let key = RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).unwrap();
+    let rsa_params = private_key_to_rsa_params(&key).unwrap();
 
-    let params = private_key_to_rsa_params(&key).unwrap();
-    let reconstructed = rsa_params_to_private_key(&params).unwrap();
-
-    assert_eq!(key.n(), reconstructed.n());
-    assert_eq!(key.e(), reconstructed.e());
-    assert_eq!(key.d(), reconstructed.d());
-}
-
-#[test]
-fn credentials_save_load_roundtrip() {
-    let tmp = TempDir::new().unwrap();
-    let runners_dir = tmp.path().join("runners");
-
-    let key = RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).unwrap();
-    let params = private_key_to_rsa_params(&key).unwrap();
-
-    let creds = RunnerCredentials {
+    RunnerCredentials {
         info: RunnerInfo {
             agent_id: 42,
             agent_name: "test-runner".into(),
@@ -37,8 +21,59 @@ fn credentials_save_load_roundtrip() {
             client_id: "client-id-123".into(),
             authorization_url: "https://vstoken.actions.githubusercontent.com/abc".into(),
         },
-        rsa_params: params,
-    };
+        rsa_params,
+    }
+}
+
+#[test]
+fn rsa_key_roundtrip() {
+    let key = RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).unwrap();
+
+    let params = private_key_to_rsa_params(&key).unwrap();
+    let reconstructed = rsa_params_to_private_key(&params).unwrap();
+
+    assert_eq!(key.n(), reconstructed.n());
+    assert_eq!(key.e(), reconstructed.e());
+    assert_eq!(key.d(), reconstructed.d());
+}
+
+#[test]
+fn rsa_validation_rejects_inconsistent_derived_parameters() {
+    type FieldSelector = fn(&mut RsaParameters) -> &mut String;
+
+    let key = RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).unwrap();
+    let params = private_key_to_rsa_params(&key).unwrap();
+
+    let corruptions: [(&str, FieldSelector); 3] = [
+        ("dp", |value| &mut value.dp),
+        ("dq", |value| &mut value.dq),
+        ("inverseQ", |value| &mut value.inverse_q),
+    ];
+
+    for (field, select) in corruptions {
+        let mut invalid = params.clone();
+        *select(&mut invalid) = BASE64.encode([1_u8]);
+
+        let error = rsa_params_to_private_key(&invalid).unwrap_err();
+
+        assert!(error.to_string().contains(field), "got: {error:#}");
+    }
+}
+
+#[test]
+fn runner_credentials_have_structural_equality() {
+    let credentials = test_credentials();
+
+    assert_eq!(credentials.clone(), credentials);
+}
+
+#[test]
+fn credentials_save_load_roundtrip() {
+    let tmp = TempDir::new().unwrap();
+    let runners_dir = tmp.path().join("runners");
+
+    let creds = test_credentials();
+    let original_key = rsa_params_to_private_key(&creds.rsa_params).unwrap();
 
     save_runner_credentials(&runners_dir, "test-runner", &creds).unwrap();
     let loaded = load_runner_credentials(&runners_dir, "test-runner").unwrap();
@@ -49,7 +84,7 @@ fn credentials_save_load_roundtrip() {
 
     // Verify RSA key survives roundtrip through files
     let loaded_key = rsa_params_to_private_key(&loaded.rsa_params).unwrap();
-    assert_eq!(key.n(), loaded_key.n());
+    assert_eq!(original_key.n(), loaded_key.n());
 }
 
 #[test]
