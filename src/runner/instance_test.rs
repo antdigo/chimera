@@ -254,11 +254,13 @@ async fn poll_loop_refreshes_token_on_401() {
     assert!(result.is_none());
 }
 
-fn finish_manifest(server_url: &str) -> JobManifest {
-    serde_json::from_value(serde_json::json!({
+fn finish_manifest_value(server_url: &str) -> serde_json::Value {
+    serde_json::json!({
         "plan": { "planId": "plan", "jobId": "job", "timelineId": "timeline" },
         "steps": [],
-        "variables": {},
+        "variables": {
+            "system.github.results_endpoint": { "value": server_url, "isSecret": false }
+        },
         "resources": {
             "endpoints": [{
                 "name": "SystemVssConnection",
@@ -273,8 +275,11 @@ fn finish_manifest(server_url: &str) -> JobManifest {
         "contextData": {},
         "jobContainer": null,
         "serviceContainers": null
-    }))
-    .unwrap()
+    })
+}
+
+fn finish_manifest(server_url: &str) -> JobManifest {
+    serde_json::from_value(finish_manifest_value(server_url)).unwrap()
 }
 
 async fn finish_client(server: &MockServer) -> Arc<JobClient> {
@@ -366,5 +371,104 @@ async fn execution_and_cleanup_errors_are_both_returned_without_early_completion
         requests
             .iter()
             .all(|request| request.url.path() != "/completejob")
+    );
+}
+
+fn cache_node_runtimes(runner: &Runner) {
+    let node_os = match std::env::consts::OS {
+        "macos" => "darwin",
+        other => other,
+    };
+    let node_arch = match std::env::consts::ARCH {
+        "x86_64" | "x86" => "x64",
+        "aarch64" => "arm64",
+        other => other,
+    };
+
+    for major in ["20", "24"] {
+        let node = runner
+            .paths
+            .externals_dir()
+            .join(format!("node{major}-{node_os}-{node_arch}/bin/node"));
+        std::fs::create_dir_all(node.parent().unwrap()).unwrap();
+        std::fs::write(node, "synthetic node").unwrap();
+    }
+}
+
+#[tokio::test]
+async fn completion_failure_is_not_reported_as_a_setup_failure() {
+    use wiremock::matchers::body_json;
+
+    let (server, token_manager, _shutdown_tx) = setup().await;
+    let (_temp, runner) = make_runner();
+    cache_node_runtimes(&runner);
+
+    Mock::given(method("POST"))
+        .and(path("/acquirejob"))
+        .and(body_json(serde_json::json!({
+            "jobMessageId": "request",
+            "runnerOS": "Linux"
+        })))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(finish_manifest_value(&server.uri())),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/completejob"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("completion unavailable"))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(
+            "/twirp/github.actions.results.api.v1.WorkflowStepUpdateService/WorkflowStepsUpdate",
+        ))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(
+            "/twirp/results.services.receiver.Receiver/GetStepLogsSignedBlobURL",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "logs_url": format!("{}/step-log?signature=synthetic", server.uri()),
+            "blob_storage_type": ""
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/step-log"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(
+            "/twirp/results.services.receiver.Receiver/CreateStepLogsMetadata",
+        ))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+
+    assert!(
+        runner
+            .execute_job(
+                &reqwest::Client::new(),
+                token_manager,
+                "request",
+                &server.uri(),
+                CancellationToken::new(),
+            )
+            .await
+            .is_err()
+    );
+
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.url.path() == "/completejob")
+            .count(),
+        1
     );
 }

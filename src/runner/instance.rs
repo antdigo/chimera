@@ -34,6 +34,23 @@ struct JobExecutionOutcome {
     outputs: HashMap<String, String>,
 }
 
+#[derive(Debug)]
+struct CompletionPublicationError {
+    source: anyhow::Error,
+}
+
+impl std::fmt::Display for CompletionPublicationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}", self.source)
+    }
+}
+
+impl std::error::Error for CompletionPublicationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
 fn conclusion_after_cleanup_failure(conclusion: JobConclusion) -> JobConclusion {
     match conclusion {
         JobConclusion::Succeeded => JobConclusion::Failed,
@@ -73,6 +90,7 @@ async fn finish_job(
         )
         .await
         .context("completing job")
+        .map_err(|source| anyhow::Error::new(CompletionPublicationError { source }))
 }
 
 pub struct Runner {
@@ -304,22 +322,27 @@ impl Runner {
 
         self.report_running(&repo, &manifest.plan.job_id).await;
 
-        // From this point, any failure must report back to GitHub via complete_job.
-        // Otherwise GitHub hangs waiting for a completion that never comes.
         let job_client = Arc::new(job_client);
         let result = self
             .run_job(&manifest, &job_client, client, cancel_token, &repo)
             .await;
 
-        if let Err(ref e) = result {
-            error!(error = %e, cause = ?e, "job failed, reporting failure to GitHub");
-
-            if let Err(report_err) = report_setup_failure(&job_client, &manifest, e).await {
-                error!(error = %report_err, "failed to report setup failure to GitHub");
+        match result {
+            Ok(()) => Ok(()),
+            Err(error) if error.downcast_ref::<CompletionPublicationError>().is_some() => {
+                error!(error = %error, cause = ?error, "job completion request failed; not retrying completion");
+                Err(error)
+            }
+            Err(error) => {
+                error!(error = %error, cause = ?error, "job failed before completion, reporting failure to GitHub");
+                if let Err(report_error) =
+                    report_setup_failure(&job_client, &manifest, &error).await
+                {
+                    error!(error = %report_error, "failed to report setup failure to GitHub");
+                }
+                Err(error)
             }
         }
-
-        result
     }
 
     async fn run_job(
