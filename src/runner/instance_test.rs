@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -9,6 +10,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 use crate::config::ChimeraPaths;
 use crate::github::auth::TokenManager;
 use crate::github::broker::{BrokerClient, MessageType};
+use crate::job::docker_config::JobDockerConfigError;
 
 use super::*;
 
@@ -250,4 +252,119 @@ async fn poll_loop_refreshes_token_on_401() {
     let mut rx = shutdown_tx.subscribe();
     let result = runner.poll_loop(&broker, &mut rx).await.unwrap();
     assert!(result.is_none());
+}
+
+fn finish_manifest(server_url: &str) -> JobManifest {
+    serde_json::from_value(serde_json::json!({
+        "plan": { "planId": "plan", "jobId": "job", "timelineId": "timeline" },
+        "steps": [],
+        "variables": {},
+        "resources": {
+            "endpoints": [{
+                "name": "SystemVssConnection",
+                "url": server_url,
+                "authorization": {
+                    "scheme": "OAuth",
+                    "parameters": { "AccessToken": "synthetic" }
+                },
+                "data": { "PipelinesServiceUrl": server_url }
+            }]
+        },
+        "contextData": {},
+        "jobContainer": null,
+        "serviceContainers": null
+    }))
+    .unwrap()
+}
+
+async fn finish_client(server: &MockServer) -> Arc<JobClient> {
+    let private_key = rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).unwrap();
+    let token_manager = Arc::new(TokenManager::new(
+        reqwest::Client::new(),
+        format!("{}/oauth2/token", server.uri()),
+        private_key,
+        "test-client".into(),
+    ));
+    let mut client = JobClient::new(
+        reqwest::Client::new(),
+        token_manager,
+        server.uri(),
+        server.uri(),
+    );
+    client.set_job_access_token("synthetic-job-token".into());
+    Arc::new(client)
+}
+
+#[test]
+fn cleanup_failure_only_downgrades_success() {
+    assert_eq!(
+        conclusion_after_cleanup_failure(JobConclusion::Succeeded),
+        JobConclusion::Failed
+    );
+    assert_eq!(
+        conclusion_after_cleanup_failure(JobConclusion::Failed),
+        JobConclusion::Failed
+    );
+    assert_eq!(
+        conclusion_after_cleanup_failure(JobConclusion::Cancelled),
+        JobConclusion::Cancelled
+    );
+}
+
+#[tokio::test]
+async fn successful_job_reports_failed_when_docker_config_cleanup_fails() {
+    use wiremock::matchers::body_json;
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/completejob"))
+        .and(body_json(serde_json::json!({
+            "planId": "plan",
+            "jobId": "job",
+            "conclusion": "failed",
+            "outputs": {},
+            "stepResults": []
+        })))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let client = finish_client(&server).await;
+    let manifest = finish_manifest(&server.uri());
+    let execution = Ok(JobExecutionOutcome {
+        conclusion: JobConclusion::Succeeded,
+        outputs: HashMap::new(),
+    });
+    let cleanup = Err(JobDockerConfigError::UnsafeEntry {
+        path: "/synthetic/job-resource/entry".into(),
+    });
+
+    finish_job(&client, &manifest, execution, cleanup)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn execution_and_cleanup_errors_are_both_returned_without_early_completion() {
+    let server = MockServer::start().await;
+    let client = finish_client(&server).await;
+    let manifest = finish_manifest(&server.uri());
+    let execution = Err(anyhow::anyhow!("job-execution-category"));
+    let cleanup = Err(JobDockerConfigError::UnsafeEntry {
+        path: "/synthetic/job-resource/entry".into(),
+    });
+
+    let error = finish_job(&client, &manifest, execution, cleanup)
+        .await
+        .unwrap_err();
+
+    let chain = format!("{error:#}");
+    assert!(chain.contains("job-execution-category"));
+    assert!(chain.contains("unsafe-job-resource-path"));
+    let requests = server.received_requests().await.unwrap();
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.url.path() != "/completejob")
+    );
 }

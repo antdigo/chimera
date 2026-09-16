@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -16,7 +17,7 @@ use crate::github::broker::{BrokerClient, BrokerError, BrokerMessage, MessageTyp
 use crate::job::JobClient;
 use crate::job::action::ActionCache;
 use crate::job::client::JobConclusion;
-use crate::job::docker_config::{JobDockerConfig, JobResourceRoot};
+use crate::job::docker_config::{JobDockerConfig, JobDockerConfigError, JobResourceRoot};
 use crate::job::execute::{JobExecutionContext, run_all_steps};
 use crate::job::live_feed::LiveFeed;
 use crate::job::schema::JobManifest;
@@ -27,6 +28,52 @@ use super::env::{build_base_env, build_container_env};
 use super::report::{outputs_to_variable_values, report_setup_failure};
 
 const CONTROL_MSG_DELAY: Duration = Duration::from_millis(2000);
+
+struct JobExecutionOutcome {
+    conclusion: JobConclusion,
+    outputs: HashMap<String, String>,
+}
+
+fn conclusion_after_cleanup_failure(conclusion: JobConclusion) -> JobConclusion {
+    match conclusion {
+        JobConclusion::Succeeded => JobConclusion::Failed,
+        JobConclusion::Failed => JobConclusion::Failed,
+        JobConclusion::Cancelled => JobConclusion::Cancelled,
+    }
+}
+
+async fn finish_job(
+    job_client: &Arc<JobClient>,
+    manifest: &JobManifest,
+    execution_result: Result<JobExecutionOutcome>,
+    cleanup_result: std::result::Result<(), JobDockerConfigError>,
+) -> Result<()> {
+    let mut outcome = match execution_result {
+        Ok(outcome) => outcome,
+        Err(execution_error) => {
+            return match cleanup_result {
+                Ok(()) => Err(execution_error),
+                Err(cleanup_error) => Err(execution_error.context(cleanup_error.to_string())),
+            };
+        }
+    };
+
+    if cleanup_result.is_err() {
+        outcome.conclusion = conclusion_after_cleanup_failure(outcome.conclusion);
+    }
+
+    let outputs = outputs_to_variable_values(&outcome.outputs);
+    job_client
+        .complete_job(
+            &manifest.plan.plan_id,
+            &manifest.plan.job_id,
+            outcome.conclusion,
+            &outputs,
+            &[],
+        )
+        .await
+        .context("completing job")
+}
 
 pub struct Runner {
     pub(super) name: String,
@@ -283,6 +330,47 @@ impl Runner {
         cancel_token: CancellationToken,
         repo: &str,
     ) -> Result<()> {
+        let mut docker_config = self
+            .job_resources
+            .create_docker_config()
+            .context("creating per-job Docker config")?;
+        let attempt_id = docker_config.attempt_id();
+        info!(%attempt_id, "created job Docker config");
+
+        let execution_result = self
+            .run_job_body(
+                manifest,
+                job_client,
+                client,
+                cancel_token,
+                repo,
+                &docker_config,
+            )
+            .await;
+
+        let cleanup_result = docker_config.cleanup();
+        match &cleanup_result {
+            Ok(()) => info!(%attempt_id, "cleaned job Docker config"),
+            Err(cleanup_error) => error!(
+                category = "job-resource-cleanup",
+                %attempt_id,
+                error = %cleanup_error,
+                "job Docker config cleanup failed"
+            ),
+        }
+
+        finish_job(job_client, manifest, execution_result, cleanup_result).await
+    }
+
+    async fn run_job_body(
+        &self,
+        manifest: &JobManifest,
+        job_client: &Arc<JobClient>,
+        client: &reqwest::Client,
+        cancel_token: CancellationToken,
+        repo: &str,
+        docker_config: &JobDockerConfig,
+    ) -> Result<JobExecutionOutcome> {
         let workspace = Workspace::create(
             &self.paths.work_dir(),
             &self.paths.tmp_dir(),
@@ -291,68 +379,55 @@ impl Runner {
             repo,
         )
         .context("creating workspace")?;
+        let mut docker_resources = None;
 
-        // Write the event payload so actions can read it via GITHUB_EVENT_PATH
-        let event_data = manifest
-            .context_data
-            .get("github")
-            .and_then(|g| g.get("event"))
-            .cloned()
-            .unwrap_or_default();
-        workspace
-            .write_event_file(&event_data)
-            .context("writing event payload")?;
+        let execution_result = async {
+            let event_data = manifest
+                .context_data
+                .get("github")
+                .and_then(|github| github.get("event"))
+                .cloned()
+                .unwrap_or_default();
+            workspace
+                .write_event_file(&event_data)
+                .context("writing event payload")?;
 
-        // Ensure the node binaries are available for the host platform.
-        // Used by node actions in host mode; container mode downloads its own Linux set.
-        let node_runtimes = crate::node::ensure_node(&self.paths.externals_dir())
-            .await
-            .context("ensuring node binaries")?;
-
-        // Set up Docker resources if the job needs containers or services
-        let mut docker_resources = if manifest.has_container() || manifest.has_services() {
-            let docker = crate::docker::client::connect(None)?;
-            crate::docker::client::ping(&docker).await?;
-            let mut resources = JobDockerResources::new(docker);
-
-            let services = manifest.service_containers.as_deref().unwrap_or_default();
-
-            let workflow_files_path = workspace
-                .workspace_dir()
-                .parent()
-                .context("workspace has no parent")?;
-
-            if let Err(e) = resources
-                .setup(&SetupParams {
-                    runner_name: &self.name,
-                    job_id: &manifest.plan.job_id,
-                    job_container: manifest.job_container.as_ref(),
-                    services,
-                    workspace_host_path: workspace.workspace_dir(),
-                    workflow_files_host_path: workflow_files_path,
-                    runner_temp_host_path: workspace.runner_temp(),
-                    actions_host_path: &self.paths.actions_dir(),
-                    tool_cache_host_path: workspace.tool_cache(),
-                    externals_dir: &self.paths.externals_dir(),
-                })
+            let node_runtimes = crate::node::ensure_node(&self.paths.externals_dir())
                 .await
-            {
-                resources.cleanup().await;
-                return Err(e.context("setting up Docker resources"));
+                .context("ensuring node binaries")?;
+
+            if manifest.has_container() || manifest.has_services() {
+                let docker = crate::docker::client::connect(None)?;
+                crate::docker::client::ping(&docker).await?;
+                let mut resources = JobDockerResources::new(docker);
+                let services = manifest.service_containers.as_deref().unwrap_or_default();
+                let workflow_files_path = workspace
+                    .workspace_dir()
+                    .parent()
+                    .context("workspace has no parent")?;
+
+                if let Err(setup_error) = resources
+                    .setup(&SetupParams {
+                        runner_name: &self.name,
+                        job_id: &manifest.plan.job_id,
+                        job_container: manifest.job_container.as_ref(),
+                        services,
+                        workspace_host_path: workspace.workspace_dir(),
+                        workflow_files_host_path: workflow_files_path,
+                        runner_temp_host_path: workspace.runner_temp(),
+                        actions_host_path: &self.paths.actions_dir(),
+                        tool_cache_host_path: workspace.tool_cache(),
+                        externals_dir: &self.paths.externals_dir(),
+                    })
+                    .await
+                {
+                    resources.cleanup().await;
+                    return Err(setup_error.context("setting up Docker resources"));
+                }
+                docker_resources = Some(resources);
             }
-            Some(resources)
-        } else {
-            None
-        };
 
-        let mut docker_config = self
-            .job_resources
-            .create_docker_config()
-            .context("creating per-job Docker config")?;
-
-        // Run the job body — cleanup is guaranteed to run regardless of outcome
-        let result = self
-            .run_job_body(
+            self.run_job_steps(
                 manifest,
                 job_client,
                 client,
@@ -361,35 +436,24 @@ impl Runner {
                 &workspace,
                 &node_runtimes,
                 &mut docker_resources,
-                &docker_config,
+                docker_config,
             )
-            .await;
+            .await
+        }
+        .await;
 
-        if let Some(ref mut resources) = docker_resources {
+        if let Some(resources) = docker_resources.as_mut() {
             resources.cleanup().await;
         }
-
-        let docker_config_cleanup = docker_config
-            .cleanup()
-            .context("cleaning up per-job Docker config");
-
-        if let Err(e) = workspace.cleanup() {
-            warn!(error = %e, "workspace cleanup failed");
+        if let Err(cleanup_error) = workspace.cleanup() {
+            warn!(error = %cleanup_error, "workspace cleanup failed");
         }
 
-        match (result, docker_config_cleanup) {
-            (Err(job_error), Err(cleanup_error)) => {
-                warn!(error = %cleanup_error, "per-job Docker config cleanup failed");
-                Err(job_error)
-            }
-            (Err(job_error), Ok(())) => Err(job_error),
-            (Ok(()), Err(cleanup_error)) => Err(cleanup_error),
-            (Ok(()), Ok(())) => Ok(()),
-        }
+        execution_result
     }
 
     #[allow(clippy::too_many_arguments)]
-    async fn run_job_body(
+    async fn run_job_steps(
         &self,
         manifest: &JobManifest,
         job_client: &Arc<JobClient>,
@@ -400,7 +464,7 @@ impl Runner {
         node_runtimes: &crate::node::NodeRuntimes,
         docker_resources: &mut Option<JobDockerResources>,
         docker_config: &JobDockerConfig,
-    ) -> Result<()> {
+    ) -> Result<JobExecutionOutcome> {
         // Choose env builder based on execution mode
         let mut base_env = if manifest.has_container() {
             build_container_env(manifest, workspace, &self.name)
@@ -508,38 +572,32 @@ impl Runner {
         )
         .await;
 
-        // Close the live feed so remaining lines are flushed over WebSocket
+        // Close the live feed so remaining lines are flushed over WebSocket.
         if let Some(feed) = live_feed {
             feed.close().await;
         }
 
-        let (mut conclusion, job_outputs) = job_result.context("running job steps")?;
+        heartbeat_cancel.cancel();
+        let heartbeat_result = heartbeat_handle.await.context("heartbeat task panicked");
+        let job_result = job_result.context("running job steps");
+        let (mut conclusion, outputs) = match (job_result, heartbeat_result) {
+            (Ok(outcome), Ok(())) => outcome,
+            (Err(job_error), Ok(())) => return Err(job_error),
+            (Ok(_), Err(heartbeat_error)) => return Err(heartbeat_error),
+            (Err(job_error), Err(heartbeat_error)) => {
+                return Err(job_error.context(heartbeat_error.to_string()));
+            }
+        };
 
         if cancel_token.is_cancelled() && conclusion != JobConclusion::Cancelled {
             conclusion = JobConclusion::Cancelled;
         }
 
         info!(conclusion = %conclusion, "job steps completed");
-
-        heartbeat_cancel.cancel();
-        let _ = heartbeat_handle.await;
-
-        let outputs_payload = outputs_to_variable_values(&job_outputs);
-        debug!(job_outputs = ?job_outputs, outputs_payload = %outputs_payload, "completing job");
-        job_client
-            .complete_job(
-                &manifest.plan.plan_id,
-                &manifest.plan.job_id,
-                conclusion,
-                &outputs_payload,
-                &[],
-            )
-            .await
-            .context("completing job")?;
-
-        info!(conclusion = %conclusion, "job completed");
-
-        Ok(())
+        Ok(JobExecutionOutcome {
+            conclusion,
+            outputs,
+        })
     }
 
     pub(super) async fn poll_loop(
