@@ -238,6 +238,146 @@ fn rejects_non_https_or_non_actions_endpoints() {
 }
 
 #[test]
+fn rejects_unsafe_endpoint_components_without_echoing_values() {
+    for (file, field, value) in [
+        (
+            ".runner",
+            "serverUrl",
+            "https://pipelines.actions.githubusercontent.com:443/tenant-id",
+        ),
+        (
+            ".runner",
+            "serverUrl",
+            "https://SECRET_URL_USER@pipelines.actions.githubusercontent.com/tenant-id",
+        ),
+        (
+            ".runner",
+            "serverUrl",
+            "https://pipelines.actions.githubusercontent.com/tenant-id?query=1",
+        ),
+        (
+            ".runner",
+            "serverUrl",
+            "https://pipelines.actions.githubusercontent.com/tenant-id#fragment",
+        ),
+        (
+            ".runner",
+            "serverUrl",
+            "https://pipelines.actions.githubusercontent.com/",
+        ),
+        (
+            ".runner",
+            "serverUrlV2",
+            "https://broker.actions.githubusercontent.com:443",
+        ),
+        (
+            ".runner",
+            "serverUrlV2",
+            "https://user@broker.actions.githubusercontent.com",
+        ),
+        (
+            ".runner",
+            "serverUrlV2",
+            "https://broker.actions.githubusercontent.com?query=1",
+        ),
+        (
+            ".runner",
+            "serverUrlV2",
+            "https://broker.actions.githubusercontent.com#fragment",
+        ),
+        (
+            ".credentials",
+            "authorizationUrl",
+            "https://vstoken.actions.githubusercontent.com:443/tenant-id",
+        ),
+        (
+            ".credentials",
+            "authorizationUrl",
+            "https://user@vstoken.actions.githubusercontent.com/tenant-id",
+        ),
+        (
+            ".credentials",
+            "authorizationUrl",
+            "https://vstoken.actions.githubusercontent.com/tenant-id?query=1",
+        ),
+        (
+            ".credentials",
+            "authorizationUrl",
+            "https://vstoken.actions.githubusercontent.com/tenant-id#fragment",
+        ),
+        (
+            ".credentials",
+            "authorizationUrl",
+            "https://vstoken.actions.githubusercontent.com/",
+        ),
+    ] {
+        let source = copy_fixture();
+        if file == ".runner" {
+            set_runner_value(source.path(), field, json!(value));
+        } else {
+            set_auth_value(source.path(), field, json!(value));
+        }
+
+        let diagnostic = assert_category(source.path(), "unsupported-registration");
+        assert!(!diagnostic.contains("SECRET_URL_USER"));
+    }
+}
+
+#[test]
+fn rejects_default_port_in_repository_url() {
+    let source = copy_fixture();
+    set_runner_value(
+        source.path(),
+        "gitHubUrl",
+        json!("https://github.com:443/example/repository"),
+    );
+
+    assert_category(source.path(), "unsupported-registration");
+}
+
+#[test]
+fn rejects_invalid_auth_boolean_strings_without_echoing_values() {
+    for field in ["requireFipsCryptography", "enableAuthMigrationByDefault"] {
+        let source = copy_fixture();
+        set_auth_value(source.path(), field, json!("SECRET_INVALID_BOOL"));
+
+        let diagnostic = assert_category(source.path(), "invalid-source");
+        assert!(!diagnostic.contains("SECRET_INVALID_BOOL"));
+    }
+}
+
+#[test]
+fn rejects_invalid_client_id_without_echoing_values() {
+    let source = copy_fixture();
+    set_auth_value(source.path(), "clientId", json!("SECRET_CLIENT_ID"));
+
+    let diagnostic = assert_category(source.path(), "invalid-source");
+    assert!(!diagnostic.contains("SECRET_CLIENT_ID"));
+}
+
+#[test]
+fn rejects_empty_runner_name_or_work_folder() {
+    for field in ["agentName", "workFolder"] {
+        let source = copy_fixture();
+        set_runner_value(source.path(), field, json!(""));
+
+        assert_category(source.path(), "invalid-source");
+    }
+}
+
+#[test]
+fn lowercases_identity_scope_without_rewriting_repository_url() {
+    let source = copy_fixture();
+    let repository_url = "https://github.com/Example/Repository";
+    set_runner_value(source.path(), "gitHubUrl", json!(repository_url));
+
+    let registration = read_official_registration(source.path()).unwrap();
+
+    assert_eq!(registration.identity.scope, "github.com/example/repository");
+    assert_eq!(registration.credentials.info.git_hub_url, repository_url);
+}
+
+#[test]
 fn accepts_inactive_auth_migration_flag() {
     let expected = fixture_credentials();
     let source = copy_fixture();

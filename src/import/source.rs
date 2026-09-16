@@ -242,7 +242,7 @@ fn runner_identity(
     if url.scheme() != "https"
         || !host_is_github
         || has_userinfo(&url)
-        || url.port().is_some()
+        || has_explicit_port(git_hub_url)
         || url.query().is_some()
         || url.fragment().is_some()
         || path_segments.len() != 2
@@ -362,7 +362,7 @@ fn validate_actions_url(value: &str, require_non_root_path: bool) -> Result<(), 
     if url.scheme() != "https"
         || !host_is_actions
         || has_userinfo(&url)
-        || url.port().is_some()
+        || has_explicit_port(value)
         || url.query().is_some()
         || url.fragment().is_some()
         || (require_non_root_path && (url.path().is_empty() || url.path() == "/"))
@@ -386,6 +386,24 @@ fn has_userinfo(url: &Url) -> bool {
             authority.contains('@')
         })
         .unwrap_or(false)
+}
+
+fn has_explicit_port(value: &str) -> bool {
+    let Some((_, remainder)) = value.split_once("://") else {
+        return false;
+    };
+    let authority = remainder.split(['/', '?', '#']).next().unwrap_or_default();
+    let host_and_port = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host_and_port)| host_and_port);
+
+    if let Some(bracketed_host) = host_and_port.strip_prefix('[') {
+        return bracketed_host
+            .split_once(']')
+            .is_some_and(|(_, suffix)| suffix.starts_with(':'));
+    }
+
+    host_and_port.contains(':')
 }
 
 fn validate_and_canonicalize_rsa(rsa: OfficialRsaParameters) -> Result<RsaParameters, ImportError> {
