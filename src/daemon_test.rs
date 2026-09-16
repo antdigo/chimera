@@ -1,10 +1,63 @@
 use std::collections::HashMap;
+use std::fs::OpenOptions;
+use std::os::unix::io::AsRawFd;
+use std::path::Path;
+use std::process::{Child, Command};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use tempfile::TempDir;
 
 use super::*;
+
+const LOCK_TEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+struct TestChild {
+    child: Child,
+}
+
+impl TestChild {
+    fn spawn(test_name: &str, path: &Path, control: &Path, id: &str) -> Self {
+        let child = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test_name, "--nocapture"])
+            .env("CHIMERA_PID_LOCK_TEST_PATH", path)
+            .env("CHIMERA_PID_LOCK_TEST_CONTROL", control)
+            .env("CHIMERA_PID_LOCK_TEST_ID", id)
+            .spawn()
+            .unwrap();
+        Self { child }
+    }
+
+    fn wait(&mut self) -> std::process::ExitStatus {
+        self.child.wait().unwrap()
+    }
+}
+
+impl Drop for TestChild {
+    fn drop(&mut self) {
+        if self.child.try_wait().unwrap().is_none() {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+}
+
+fn wait_for_path(path: &Path) {
+    let deadline = Instant::now() + LOCK_TEST_TIMEOUT;
+    while !path.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for {}",
+            path.display()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn wait_for_signal(control: &Path, name: &str) {
+    wait_for_path(&control.join(name));
+}
 
 // --- PID lock tests ---
 
@@ -51,6 +104,146 @@ fn second_lock_cannot_replace_live_lock() {
         std::process::id().to_string()
     );
     drop(first);
+}
+
+#[test]
+fn pid_lock_holds_kernel_lock() {
+    let temp = TempDir::new().unwrap();
+    let path = temp.path().join("chimera.pid");
+    let control = temp.path().join("control");
+    std::fs::create_dir(&control).unwrap();
+    let mut child = TestChild::spawn(
+        "daemon::daemon_test::pid_lock_holder_child",
+        &path,
+        &control,
+        "holder",
+    );
+
+    wait_for_signal(&control, "holder.ready");
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .unwrap();
+    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    let error = std::io::Error::last_os_error();
+    if result == 0 {
+        unsafe {
+            libc::flock(file.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
+
+    assert_eq!(result, -1, "PID lock must be held by the child process");
+    assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+
+    std::fs::write(control.join("release"), []).unwrap();
+    assert!(child.wait().success());
+}
+
+#[test]
+fn pid_lock_holder_child() {
+    let Some(path) = std::env::var_os("CHIMERA_PID_LOCK_TEST_PATH") else {
+        return;
+    };
+    let control =
+        std::path::PathBuf::from(std::env::var_os("CHIMERA_PID_LOCK_TEST_CONTROL").unwrap());
+    let id = std::env::var("CHIMERA_PID_LOCK_TEST_ID").unwrap();
+    let lock = PidLock::acquire(Path::new(&path)).unwrap();
+    std::fs::write(control.join(format!("{id}.ready")), []).unwrap();
+
+    wait_for_signal(&control, "release");
+    drop(lock);
+}
+
+#[test]
+fn concurrent_stale_lock_reclamation_has_single_owner() {
+    let temp = TempDir::new().unwrap();
+    let path = temp.path().join("chimera.pid");
+    let control = temp.path().join("control");
+    std::fs::create_dir(&control).unwrap();
+    std::fs::write(&path, "1000000000").unwrap();
+    let mut first = TestChild::spawn(
+        "daemon::daemon_test::stale_lock_reclamation_child",
+        &path,
+        &control,
+        "first",
+    );
+    let mut second = TestChild::spawn(
+        "daemon::daemon_test::stale_lock_reclamation_child",
+        &path,
+        &control,
+        "second",
+    );
+
+    wait_for_signal(&control, "first.ready");
+    wait_for_signal(&control, "second.ready");
+    std::fs::write(control.join("start"), []).unwrap();
+    wait_for_signal(&control, "first.result");
+    wait_for_signal(&control, "second.result");
+
+    let first_result = std::fs::read_to_string(control.join("first.result")).unwrap();
+    let second_result = std::fs::read_to_string(control.join("second.result")).unwrap();
+    let results = [&first_result, &second_result];
+    assert_eq!(
+        results
+            .iter()
+            .filter(|result| **result == "acquired")
+            .count(),
+        1
+    );
+    assert!(
+        results
+            .iter()
+            .any(|result| result.starts_with("rejected:chimera daemon already running"))
+    );
+
+    std::fs::write(control.join("release"), []).unwrap();
+    assert!(first.wait().success());
+    assert!(second.wait().success());
+}
+
+#[test]
+fn stale_lock_reclamation_child() {
+    let Some(path) = std::env::var_os("CHIMERA_PID_LOCK_TEST_PATH") else {
+        return;
+    };
+    let control =
+        std::path::PathBuf::from(std::env::var_os("CHIMERA_PID_LOCK_TEST_CONTROL").unwrap());
+    let id = std::env::var("CHIMERA_PID_LOCK_TEST_ID").unwrap();
+    std::fs::write(control.join(format!("{id}.ready")), []).unwrap();
+
+    wait_for_signal(&control, "start");
+    match PidLock::acquire(Path::new(&path)) {
+        Ok(lock) => {
+            std::fs::write(control.join(format!("{id}.result")), "acquired").unwrap();
+            wait_for_signal(&control, "release");
+            drop(lock);
+        }
+        Err(error) => {
+            std::fs::write(
+                control.join(format!("{id}.result")),
+                format!("rejected:{error}"),
+            )
+            .unwrap();
+        }
+    }
+}
+
+#[test]
+fn pid_lock_refuses_symlink_and_special_paths() {
+    let temp = TempDir::new().unwrap();
+    let target = temp.path().join("target");
+    std::fs::write(&target, "1000000000").unwrap();
+    let symlink = temp.path().join("chimera.pid");
+    std::os::unix::fs::symlink(&target, &symlink).unwrap();
+
+    let symlink_error = PidLock::acquire(&symlink).unwrap_err();
+    assert!(symlink_error.to_string().contains("unsafe PID lock path"));
+
+    let directory = temp.path().join("directory");
+    std::fs::create_dir(&directory).unwrap();
+    let directory_error = PidLock::acquire(&directory).unwrap_err();
+    assert!(directory_error.to_string().contains("unsafe PID lock path"));
 }
 
 #[test]

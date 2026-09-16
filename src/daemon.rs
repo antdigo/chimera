@@ -28,61 +28,123 @@ pub struct PidLock {
 
 impl PidLock {
     pub fn acquire(path: &Path) -> Result<Self> {
-        use std::io::Write;
-        use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+        use std::io::{Read, Seek, SeekFrom, Write};
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
-        loop {
-            match std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(path)
-            {
-                Ok(mut file) => {
-                    file.set_permissions(std::fs::Permissions::from_mode(0o600))
-                        .with_context(|| {
-                            format!("setting PID file permissions {}", path.display())
-                        })?;
-                    write!(file, "{}", std::process::id())
-                        .with_context(|| format!("writing PID file {}", path.display()))?;
-                    file.sync_all()
-                        .with_context(|| format!("syncing PID file {}", path.display()))?;
-                    let metadata = file
-                        .metadata()
-                        .context("reading acquired PID lock metadata")?;
-                    return Ok(Self {
-                        path: path.to_path_buf(),
-                        device: metadata.dev(),
-                        inode: metadata.ino(),
-                        _file: file,
-                    });
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    let metadata = std::fs::symlink_metadata(path)
-                        .with_context(|| format!("reading PID file metadata {}", path.display()))?;
-                    if metadata.file_type().is_symlink() || !metadata.is_file() {
-                        bail!("unsafe PID lock path: {}", path.display());
-                    }
-                    let content = std::fs::read_to_string(path)
-                        .with_context(|| format!("reading PID file {}", path.display()))?;
-                    let pid: u32 = content
-                        .trim()
-                        .parse()
-                        .with_context(|| format!("parsing PID from {}", path.display()))?;
-                    if is_process_alive(pid) {
-                        bail!(
-                            "chimera daemon already running (pid {pid}). Use 'chimera status' to check."
-                        );
-                    }
-                    remove_if_same_inode(path, metadata.dev(), metadata.ino())?;
-                }
-                Err(error) => {
-                    return Err(error)
-                        .with_context(|| format!("creating PID file {}", path.display()));
-                }
+        let (mut file, was_created) = open_pid_lock_file(path)?;
+        claim_pid_lock(&file, path)?;
+        let metadata = file
+            .metadata()
+            .context("reading acquired PID lock metadata")?;
+        verify_pid_lock_path(path, metadata.dev(), metadata.ino())?;
+
+        if !was_created {
+            file.seek(SeekFrom::Start(0))
+                .with_context(|| format!("seeking PID file {}", path.display()))?;
+            let mut content = String::new();
+            file.read_to_string(&mut content)
+                .with_context(|| format!("reading PID file {}", path.display()))?;
+            let pid: u32 = content
+                .trim()
+                .parse()
+                .with_context(|| format!("parsing PID from {}", path.display()))?;
+            if is_process_alive(pid) {
+                bail!("chimera daemon already running (pid {pid}). Use 'chimera status' to check.");
             }
         }
+
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("setting PID file permissions {}", path.display()))?;
+        file.set_len(0)
+            .with_context(|| format!("clearing PID file {}", path.display()))?;
+        file.seek(SeekFrom::Start(0))
+            .with_context(|| format!("seeking PID file {}", path.display()))?;
+        write!(file, "{}", std::process::id())
+            .with_context(|| format!("writing PID file {}", path.display()))?;
+        file.sync_all()
+            .with_context(|| format!("syncing PID file {}", path.display()))?;
+
+        Ok(Self {
+            path: path.to_path_buf(),
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            _file: file,
+        })
     }
+}
+
+fn open_pid_lock_file(path: &Path) -> Result<(std::fs::File, bool)> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let nofollow_nonblocking = libc::O_NOFOLLOW | libc::O_NONBLOCK;
+    match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(nofollow_nonblocking)
+        .open(path)
+    {
+        Ok(file) => Ok((file, true)),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let metadata = std::fs::symlink_metadata(path)
+                .with_context(|| format!("reading PID file metadata {}", path.display()))?;
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                bail!("unsafe PID lock path: {}", path.display());
+            }
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .custom_flags(nofollow_nonblocking)
+                .open(path)
+                .map_err(|error| {
+                    if error.raw_os_error() == Some(libc::ELOOP) {
+                        anyhow::anyhow!("unsafe PID lock path: {}", path.display())
+                    } else {
+                        error.into()
+                    }
+                })
+                .with_context(|| format!("opening PID file {}", path.display()))?;
+            let metadata = file
+                .metadata()
+                .with_context(|| format!("reading PID file metadata {}", path.display()))?;
+            if !metadata.is_file() {
+                bail!("unsafe PID lock path: {}", path.display());
+            }
+            Ok((file, false))
+        }
+        Err(error) => Err(error).with_context(|| format!("creating PID file {}", path.display())),
+    }
+}
+
+fn claim_pid_lock(file: &std::fs::File, path: &Path) -> Result<()> {
+    use std::os::unix::io::AsRawFd;
+
+    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if result == 0 {
+        return Ok(());
+    }
+
+    let error = std::io::Error::last_os_error();
+    if error.kind() == std::io::ErrorKind::WouldBlock {
+        bail!("chimera daemon already running. Use 'chimera status' to check.");
+    }
+    Err(error).with_context(|| format!("claiming PID lock {}", path.display()))
+}
+
+fn verify_pid_lock_path(path: &Path, device: u64, inode: u64) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = std::fs::symlink_metadata(path)
+        .with_context(|| format!("reading PID lock metadata {}", path.display()))?;
+    if metadata.is_file()
+        && !metadata.file_type().is_symlink()
+        && metadata.dev() == device
+        && metadata.ino() == inode
+    {
+        return Ok(());
+    }
+    bail!("PID lock changed while held: {}", path.display());
 }
 
 fn remove_if_same_inode(path: &Path, device: u64, inode: u64) -> Result<()> {

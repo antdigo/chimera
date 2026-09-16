@@ -21,6 +21,28 @@ fn prepared_root() -> (TempDir, JobResourceRoot) {
     (temp, root)
 }
 
+struct ChildGuard {
+    child: std::process::Child,
+}
+
+impl ChildGuard {
+    fn stop(&mut self) {
+        if self.child.try_wait().unwrap().is_none() {
+            self.child.kill().unwrap();
+        }
+        self.child.wait().unwrap();
+    }
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        if self.child.try_wait().unwrap().is_none() {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+}
+
 #[test]
 fn creates_private_empty_config() {
     let (_temp, root) = prepared_root();
@@ -191,11 +213,13 @@ fn stale_root_with_live_child_is_not_removed() {
     let (temp, root) = prepared_root();
     let mut config = root.create_docker_config().unwrap();
     let stale_dir = config.attempt_dir().to_path_buf();
-    let mut child = std::process::Command::new("sh")
-        .args(["-c", "while :; do sleep 1; done"])
-        .current_dir(config.directory())
-        .spawn()
-        .unwrap();
+    let mut child = ChildGuard {
+        child: std::process::Command::new("sh")
+            .args(["-c", "while :; do sleep 1; done"])
+            .current_dir(config.directory())
+            .spawn()
+            .unwrap(),
+    };
 
     let result = JobResourceRoot::prepare(root.path());
 
@@ -205,8 +229,7 @@ fn stale_root_with_live_child_is_not_removed() {
     ));
     assert!(stale_dir.exists());
 
-    child.kill().unwrap();
-    child.wait().unwrap();
+    child.stop();
     config.cleanup().unwrap();
     assert!(!stale_dir.exists());
     JobResourceRoot::prepare(&temp.path().join("job-resources")).unwrap();
