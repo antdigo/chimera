@@ -16,6 +16,7 @@ use crate::github::broker::{BrokerClient, BrokerError, BrokerMessage, MessageTyp
 use crate::job::JobClient;
 use crate::job::action::ActionCache;
 use crate::job::client::JobConclusion;
+use crate::job::docker_config::JobResourceRoot;
 use crate::job::execute::run_all_steps;
 use crate::job::live_feed::LiveFeed;
 use crate::job::schema::JobManifest;
@@ -32,6 +33,7 @@ pub struct Runner {
     pub(super) credentials: RunnerCredentials,
     pub(super) paths: ChimeraPaths,
     pub(super) state: Option<Arc<DaemonState>>,
+    pub(super) job_resources: JobResourceRoot,
     pub(super) cache_port: u16,
 }
 
@@ -41,6 +43,7 @@ impl Runner {
         credentials: RunnerCredentials,
         paths: ChimeraPaths,
         state: Arc<DaemonState>,
+        job_resources: JobResourceRoot,
         cache_port: u16,
     ) -> Self {
         Self {
@@ -48,6 +51,7 @@ impl Runner {
             credentials,
             paths,
             state: Some(state),
+            job_resources,
             cache_port,
         }
     }
@@ -75,6 +79,7 @@ impl Runner {
 
     pub async fn start(self, mut shutdown_rx: watch::Receiver<bool>) -> Result<()> {
         info!(runner = %self.name, "starting runner");
+        debug!(job_resource_root = %self.job_resources.path().display(), "using prepared job resource root");
 
         let private_key = rsa_params_to_private_key(&self.credentials.rsa_params)
             .context("reconstructing RSA private key")?;

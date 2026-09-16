@@ -187,6 +187,32 @@ fn daemon_docker_config_child() {
 }
 
 #[test]
+fn stale_root_with_live_child_is_not_removed() {
+    let (temp, root) = prepared_root();
+    let mut config = root.create_docker_config().unwrap();
+    let stale_dir = config.attempt_dir().to_path_buf();
+    let mut child = std::process::Command::new("sh")
+        .args(["-c", "while :; do sleep 1; done"])
+        .current_dir(config.directory())
+        .spawn()
+        .unwrap();
+
+    let result = JobResourceRoot::prepare(root.path());
+
+    assert!(matches!(
+        result,
+        Err(JobDockerConfigError::StaleJobResources { .. })
+    ));
+    assert!(stale_dir.exists());
+
+    child.kill().unwrap();
+    child.wait().unwrap();
+    config.cleanup().unwrap();
+    assert!(!stale_dir.exists());
+    JobResourceRoot::prepare(&temp.path().join("job-resources")).unwrap();
+}
+
+#[test]
 fn umask_zero_still_creates_private_paths() {
     let temp = TempDir::new().unwrap();
     let child_test = "job::docker_config::docker_config_test::umask_zero_child";

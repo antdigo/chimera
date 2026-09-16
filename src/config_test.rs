@@ -127,6 +127,10 @@ fn path_construction() {
         paths.state_file(),
         PathBuf::from("/home/user/.chimera/state.json")
     );
+    assert_eq!(
+        paths.job_resources_dir(),
+        PathBuf::from("/home/user/.chimera/job-resources")
+    );
 }
 
 #[test]

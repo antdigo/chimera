@@ -38,6 +38,51 @@ fn acquire_lock_fails_when_already_held() {
 }
 
 #[test]
+fn second_lock_cannot_replace_live_lock() {
+    let temp = TempDir::new().unwrap();
+    let path = temp.path().join("chimera.pid");
+    let first = PidLock::acquire(&path).unwrap();
+
+    let second = PidLock::acquire(&path).unwrap_err();
+
+    assert!(second.to_string().contains("already running"));
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        std::process::id().to_string()
+    );
+    drop(first);
+}
+
+#[test]
+fn dropping_lock_does_not_remove_replacement_inode() {
+    let temp = TempDir::new().unwrap();
+    let path = temp.path().join("chimera.pid");
+    let lock = PidLock::acquire(&path).unwrap();
+    std::fs::remove_file(&path).unwrap();
+    std::fs::write(&path, "replacement").unwrap();
+
+    drop(lock);
+
+    assert_eq!(std::fs::read_to_string(path).unwrap(), "replacement");
+}
+
+#[test]
+fn startup_preparation_rejects_stale_job_resources_without_deleting_them() {
+    let temp = TempDir::new().unwrap();
+    let paths = ChimeraPaths::new(temp.path().to_path_buf());
+    std::fs::create_dir_all(&paths.root).unwrap();
+    let root =
+        crate::job::docker_config::JobResourceRoot::prepare(&paths.job_resources_dir()).unwrap();
+    let stale = root.create_docker_config().unwrap();
+    let stale_dir = stale.attempt_dir().to_path_buf();
+
+    let error = prepare_daemon_root(&paths).unwrap_err();
+
+    assert!(error.to_string().contains("stale-job-resources"));
+    assert!(stale_dir.exists());
+}
+
+#[test]
 fn acquire_lock_removes_stale_file() {
     let tmp = TempDir::new().unwrap();
     let pid_path = tmp.path().join("chimera.pid");

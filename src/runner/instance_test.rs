@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use tempfile::TempDir;
 use tokio::sync::watch;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -37,8 +38,13 @@ async fn setup() -> (MockServer, Arc<TokenManager>, watch::Sender<bool>) {
     (mock_server, tm, shutdown_tx)
 }
 
-fn make_runner() -> Runner {
-    Runner {
+fn make_runner() -> (TempDir, Runner) {
+    let temp = TempDir::new().unwrap();
+    let paths = ChimeraPaths::new(temp.path().to_path_buf());
+    let job_resources =
+        crate::job::docker_config::JobResourceRoot::prepare(&paths.job_resources_dir()).unwrap();
+
+    let runner = Runner {
         name: "test-runner".into(),
         credentials: crate::config::RunnerCredentials {
             info: crate::config::RunnerInfo {
@@ -67,10 +73,13 @@ fn make_runner() -> Runner {
                 q: String::new(),
             },
         },
-        paths: ChimeraPaths::new(std::path::PathBuf::from("/tmp/chimera-test")),
+        paths,
         state: None,
+        job_resources,
         cache_port: 9999,
-    }
+    };
+
+    (temp, runner)
 }
 
 #[tokio::test]
@@ -95,7 +104,7 @@ async fn poll_loop_returns_job_request() {
         tm,
     );
 
-    let runner = make_runner();
+    let (_temp, runner) = make_runner();
     let mut rx = shutdown_tx.subscribe();
     let result = runner.poll_loop(&broker, &mut rx).await.unwrap();
     let msg = result.expect("should return job message");
@@ -141,7 +150,7 @@ async fn poll_loop_skips_control_then_returns_job() {
         tm,
     );
 
-    let runner = make_runner();
+    let (_temp, runner) = make_runner();
     let mut rx = shutdown_tx.subscribe();
     let result = runner.poll_loop(&broker, &mut rx).await.unwrap();
     let msg = result.expect("should return job after skipping control message");
@@ -169,7 +178,7 @@ async fn poll_loop_shutdown_returns_none() {
     let mut rx = shutdown_tx.subscribe();
     shutdown_tx.send(true).unwrap();
 
-    let runner = make_runner();
+    let (_temp, runner) = make_runner();
     let result = runner.poll_loop(&broker, &mut rx).await.unwrap();
     assert!(result.is_none());
 }
@@ -204,7 +213,7 @@ async fn poll_loop_backoff_on_error() {
         let _ = shutdown_tx_clone.send(true);
     });
 
-    let runner = make_runner();
+    let (_temp, runner) = make_runner();
     let mut rx = shutdown_tx.subscribe();
     let result = runner.poll_loop(&broker, &mut rx).await.unwrap();
     assert!(
@@ -237,7 +246,7 @@ async fn poll_loop_refreshes_token_on_401() {
         tm,
     );
 
-    let runner = make_runner();
+    let (_temp, runner) = make_runner();
     let mut rx = shutdown_tx.subscribe();
     let result = runner.poll_loop(&broker, &mut rx).await.unwrap();
     assert!(result.is_none());
