@@ -7,7 +7,7 @@ use tracing::{debug, info};
 
 use super::RUNNER_VERSION;
 use crate::config::{
-    ChimeraConfig, OAuthCredentials, RunnerCredentials, RunnerInfo, load_config,
+    OAuthCredentials, RunnerCredentials, RunnerInfo, load_config_if_exists,
     private_key_to_rsa_params, public_key_to_xml, save_config, save_runner_credentials,
 };
 use crate::storage::RootLock;
@@ -251,11 +251,7 @@ pub async fn register(
     save_runner_credentials(&runners_dir, name, &creds).context("saving runner credentials")?;
 
     let config_path = root.join("config.toml");
-    let mut config = if config_path.exists() {
-        load_config(&config_path)?
-    } else {
-        ChimeraConfig::default()
-    };
+    let mut config = load_config_if_exists(&config_path)?.unwrap_or_default();
 
     if !config.runners.contains(&name.to_string()) {
         config.runners.push(name.to_string());
@@ -287,8 +283,7 @@ pub async fn unregister(name: &str, root: &Path) -> Result<()> {
         .with_context(|| format!("removing runner directory {}", runner_dir.display()))?;
 
     let config_path = root.join("config.toml");
-    if config_path.exists() {
-        let mut config = load_config(&config_path)?;
+    if let Some(mut config) = load_config_if_exists(&config_path)? {
         config.runners.retain(|runner| runner != name);
         save_config(&config_path, &config)?;
     }

@@ -171,17 +171,45 @@ pub fn default_root() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("/tmp/chimera"))
 }
 
+pub fn load_config_if_exists(path: &Path) -> Result<Option<ChimeraConfig>> {
+    use std::io::Read;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).with_context(|| format!("checking {}", path.display())),
+    };
+    anyhow::ensure!(
+        !metadata.file_type().is_symlink() && metadata.file_type().is_file(),
+        "config path is not a regular file"
+    );
+
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .open(path)
+        .with_context(|| format!("opening config from {}", path.display()))?;
+    let opened = file.metadata()?;
+    anyhow::ensure!(
+        opened.is_file() && metadata.dev() == opened.dev() && metadata.ino() == opened.ino(),
+        "config path changed while opening"
+    );
+    let mut text = String::new();
+    file.read_to_string(&mut text)
+        .with_context(|| format!("reading config from {}", path.display()))?;
+    let config =
+        toml::from_str(&text).with_context(|| format!("parsing config from {}", path.display()))?;
+    Ok(Some(config))
+}
+
 pub fn load_config(path: &Path) -> Result<ChimeraConfig> {
-    if !path.exists() {
-        let config = ChimeraConfig::default();
-        save_config(path, &config)
-            .with_context(|| format!("writing default config to {}", path.display()))?;
+    if let Some(config) = load_config_if_exists(path)? {
         return Ok(config);
     }
-    let text = std::fs::read_to_string(path)
-        .with_context(|| format!("reading config from {}", path.display()))?;
-    let config: ChimeraConfig =
-        toml::from_str(&text).with_context(|| format!("parsing config from {}", path.display()))?;
+    let config = ChimeraConfig::default();
+    save_config(path, &config)
+        .with_context(|| format!("writing default config to {}", path.display()))?;
     Ok(config)
 }
 

@@ -135,6 +135,32 @@ fn load_config_creates_default_file_when_missing() {
 }
 
 #[test]
+fn optional_config_load_does_not_create_missing_file() {
+    let tmp = TempDir::new().unwrap();
+    let config_path = tmp.path().join("config.toml");
+
+    let config = load_config_if_exists(&config_path).unwrap();
+
+    assert!(config.is_none());
+    assert!(!config_path.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn optional_config_load_rejects_symlink() {
+    use std::os::unix::fs::symlink;
+
+    let tmp = TempDir::new().unwrap();
+    let outside = tmp.path().join("outside.toml");
+    std::fs::write(&outside, "runners = []\n").unwrap();
+    let config_path = tmp.path().join("config.toml");
+    symlink(&outside, &config_path).unwrap();
+
+    assert!(load_config_if_exists(&config_path).is_err());
+    assert_eq!(std::fs::read_to_string(outside).unwrap(), "runners = []\n");
+}
+
+#[test]
 fn path_construction() {
     let paths = ChimeraPaths::new(PathBuf::from("/home/user/.chimera"));
     assert_eq!(
