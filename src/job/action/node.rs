@@ -8,13 +8,11 @@ use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
 use super::metadata::ActionMetadata;
-use crate::docker::resources::JobDockerResources;
-use crate::job::execute::{JobState, StepResult, build_step_env, run_process};
+use crate::job::execute::{JobExecutionContext, JobState, StepResult, build_step_env, run_process};
 use crate::job::expression::ExprContext;
 use crate::job::logs::LogSender;
 use crate::job::schema::Step;
 use crate::job::workspace::Workspace;
-use crate::node::NodeRuntimes;
 
 use super::build_action_inputs;
 
@@ -29,8 +27,7 @@ pub async fn run_node_action(
     base_env: &HashMap<String, String>,
     log_sender: &LogSender,
     cancel_token: &CancellationToken,
-    docker_resources: Option<&JobDockerResources>,
-    node_runtimes: &NodeRuntimes,
+    execution: &JobExecutionContext<'_>,
 ) -> Result<StepResult> {
     let script_file = match entry_point {
         "pre" => metadata
@@ -51,22 +48,22 @@ pub async fn run_node_action(
     };
 
     let script_path = action_dir.join(script_file);
-
-    // Actions are bundled against a specific Node major; running a node24 bundle on
-    // Node 20 only appears to work until it reaches for something newer.
     let node_major = metadata.runs.using.node_major();
-
-    let mut env = build_step_env(step, job_state, workspace, base_env);
+    let mut env = build_step_env(
+        step,
+        job_state,
+        workspace,
+        base_env,
+        execution.host_docker_config(),
+    )?;
 
     let expr_ctx = ExprContext::new(&env, job_state, false, false);
     env.extend(build_action_inputs(metadata, step, &expr_ctx));
 
-    // Set action-specific env vars
     if let Some(name) = &metadata.name {
         env.insert("GITHUB_ACTION".into(), name.clone());
     }
 
-    // For post steps: inject STATE_<name> env vars from saved state
     if entry_point == "post" {
         let action_ctx = step
             .context_name
@@ -74,24 +71,25 @@ pub async fn run_node_action(
             .unwrap_or("")
             .replace("_post", "");
         if let Some(states) = job_state.action_states.get(&action_ctx) {
-            for (k, v) in states {
-                env.insert(format!("STATE_{}", k), v.clone());
+            for (key, value) in states {
+                env.insert(format!("STATE_{key}"), value.clone());
             }
         }
     }
 
     let timeout = Duration::from_secs(step.timeout_in_minutes.unwrap_or(360) * 60);
 
-    // Container mode: run via docker exec with remapped paths
-    if let Some(resources) = docker_resources.filter(|r| r.job_container_id().is_some()) {
+    if let Some(resources) = execution
+        .docker_resources()
+        .filter(|resources| resources.job_container_id().is_some())
+    {
         let container_id = resources
             .job_container_id()
             .context("no job container for action step")?;
-
         let container_action_dir = resources
             .remap_to_container_path(action_dir)
             .context("cannot remap action dir to container path")?;
-        let container_script = format!("{}/{}", container_action_dir, script_file);
+        let container_script = format!("{container_action_dir}/{script_file}");
 
         env.insert("GITHUB_ACTION_PATH".into(), container_action_dir);
 
@@ -121,7 +119,6 @@ pub async fn run_node_action(
         return result;
     }
 
-    // Host mode
     env.insert(
         "GITHUB_ACTION_PATH".into(),
         action_dir.to_string_lossy().into_owned(),
@@ -135,12 +132,16 @@ pub async fn run_node_action(
     );
 
     let script_path_str = script_path.to_string_lossy();
-    let node_path_str = node_runtimes.resolve(node_major).to_string_lossy();
+    let node_path_str = execution
+        .node_runtimes()
+        .resolve(node_major)
+        .to_string_lossy();
     let result = run_process(
         &node_path_str,
         &[OsStr::new(script_path_str.as_ref())],
         &env,
         workspace.workspace_dir(),
+        execution.docker_config(),
         job_state,
         log_sender,
         timeout,

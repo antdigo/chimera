@@ -16,8 +16,8 @@ use crate::github::broker::{BrokerClient, BrokerError, BrokerMessage, MessageTyp
 use crate::job::JobClient;
 use crate::job::action::ActionCache;
 use crate::job::client::JobConclusion;
-use crate::job::docker_config::JobResourceRoot;
-use crate::job::execute::run_all_steps;
+use crate::job::docker_config::{JobDockerConfig, JobResourceRoot};
+use crate::job::execute::{JobExecutionContext, run_all_steps};
 use crate::job::live_feed::LiveFeed;
 use crate::job::schema::JobManifest;
 use crate::job::workspace::Workspace;
@@ -345,6 +345,11 @@ impl Runner {
             None
         };
 
+        let mut docker_config = self
+            .job_resources
+            .create_docker_config()
+            .context("creating per-job Docker config")?;
+
         // Run the job body — cleanup is guaranteed to run regardless of outcome
         let result = self
             .run_job_body(
@@ -356,6 +361,7 @@ impl Runner {
                 &workspace,
                 &node_runtimes,
                 &mut docker_resources,
+                &docker_config,
             )
             .await;
 
@@ -363,11 +369,23 @@ impl Runner {
             resources.cleanup().await;
         }
 
+        let docker_config_cleanup = docker_config
+            .cleanup()
+            .context("cleaning up per-job Docker config");
+
         if let Err(e) = workspace.cleanup() {
             warn!(error = %e, "workspace cleanup failed");
         }
 
-        result
+        match (result, docker_config_cleanup) {
+            (Err(job_error), Err(cleanup_error)) => {
+                warn!(error = %cleanup_error, "per-job Docker config cleanup failed");
+                Err(job_error)
+            }
+            (Err(job_error), Ok(())) => Err(job_error),
+            (Ok(()), Err(cleanup_error)) => Err(cleanup_error),
+            (Ok(()), Ok(())) => Ok(()),
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -381,12 +399,13 @@ impl Runner {
         workspace: &Workspace,
         node_runtimes: &crate::node::NodeRuntimes,
         docker_resources: &mut Option<JobDockerResources>,
+        docker_config: &JobDockerConfig,
     ) -> Result<()> {
         // Choose env builder based on execution mode
         let mut base_env = if manifest.has_container() {
             build_container_env(manifest, workspace, &self.name)
         } else {
-            build_base_env(manifest, workspace, &self.name)
+            build_base_env(manifest, workspace, &self.name, docker_config)?
         };
 
         // Merge the Docker image's default PATH so tools installed via ENV in
@@ -473,6 +492,8 @@ impl Runner {
         let (heartbeat_handle, heartbeat_cancel) =
             job_client.start_heartbeat(manifest.plan.plan_id.clone(), manifest.plan.job_id.clone());
 
+        let execution =
+            JobExecutionContext::new(docker_config, docker_resources.as_ref(), node_runtimes);
         let job_result = run_all_steps(
             manifest,
             job_client,
@@ -482,8 +503,7 @@ impl Runner {
             &action_cache,
             &github_token,
             cancel_token.clone(),
-            docker_resources.as_ref(),
-            node_runtimes,
+            &execution,
             live_feed.as_ref().map(|f| f.sender()),
         )
         .await;

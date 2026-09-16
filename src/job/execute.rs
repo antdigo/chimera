@@ -23,8 +23,48 @@ use super::timeline::{TimelineLogRef, TimelineRecord, TimelineResult, TimelineSt
 use super::workspace::Workspace;
 use crate::docker::output::OutputProcessor;
 use crate::docker::resources::JobDockerResources;
+use crate::job::docker_config::{DOCKER_CONFIG_ENV, JobDockerConfig};
 use crate::node::NodeRuntimes;
 use crate::utils::{format_results_timestamp, format_timeline_timestamp};
+
+pub struct JobExecutionContext<'a> {
+    docker_config: &'a JobDockerConfig,
+    docker_resources: Option<&'a JobDockerResources>,
+    node_runtimes: &'a NodeRuntimes,
+}
+
+impl<'a> JobExecutionContext<'a> {
+    pub fn new(
+        docker_config: &'a JobDockerConfig,
+        docker_resources: Option<&'a JobDockerResources>,
+        node_runtimes: &'a NodeRuntimes,
+    ) -> Self {
+        Self {
+            docker_config,
+            docker_resources,
+            node_runtimes,
+        }
+    }
+
+    pub fn docker_config(&self) -> &'a JobDockerConfig {
+        self.docker_config
+    }
+
+    pub fn docker_resources(&self) -> Option<&'a JobDockerResources> {
+        self.docker_resources
+    }
+
+    pub fn node_runtimes(&self) -> &'a NodeRuntimes {
+        self.node_runtimes
+    }
+
+    pub fn host_docker_config(&self) -> Option<&'a JobDockerConfig> {
+        self.docker_resources
+            .and_then(JobDockerResources::job_container_id)
+            .is_none()
+            .then_some(self.docker_config)
+    }
+}
 
 /// Per-step result for `steps.<id>.outcome` and `steps.<id>.conclusion`.
 ///
@@ -268,13 +308,14 @@ pub async fn run_host_step(
     base_env: &HashMap<String, String>,
     log_sender: &LogSender,
     cancel_token: &CancellationToken,
+    docker_config: &JobDockerConfig,
 ) -> Result<StepResult> {
     let script_raw = step
         .inputs
         .get("script")
         .context("step has no 'script' input")?;
 
-    let env = build_step_env(step, job_state, workspace, base_env);
+    let env = build_step_env(step, job_state, workspace, base_env, Some(docker_config))?;
 
     let expr_ctx = ExprContext::new(&env, job_state, false, false);
     let script = super::expression::resolve_template(script_raw, &expr_ctx);
@@ -301,6 +342,7 @@ pub async fn run_host_step(
         &[OsStr::new("-e"), script_file.as_os_str()],
         &env,
         &working_dir,
+        docker_config,
         job_state,
         log_sender,
         timeout,
@@ -337,7 +379,7 @@ pub async fn run_container_step(
         .get("script")
         .context("step has no 'script' input")?;
 
-    let env = build_step_env(step, job_state, workspace, base_env);
+    let env = build_step_env(step, job_state, workspace, base_env, None)?;
 
     let expr_ctx = ExprContext::new(&env, job_state, false, false);
     let script = super::expression::resolve_template(script_raw, &expr_ctx);
@@ -387,6 +429,29 @@ pub async fn run_container_step(
     result
 }
 
+fn host_command(
+    program: &str,
+    args: &[&OsStr],
+    env: &HashMap<String, String>,
+    working_dir: &Path,
+    docker_config: &JobDockerConfig,
+) -> Result<Command> {
+    let configured = env
+        .get(DOCKER_CONFIG_ENV)
+        .context("host step is missing runner-owned DOCKER_CONFIG")?;
+    docker_config.validate_override(configured, "host spawn")?;
+
+    let mut command = Command::new(program);
+    command
+        .args(args)
+        .current_dir(working_dir)
+        .env_remove(DOCKER_CONFIG_ENV)
+        .envs(env)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    Ok(command)
+}
+
 /// Shared process runner used by host steps, node actions, and composite steps.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_process(
@@ -394,17 +459,13 @@ pub async fn run_process(
     args: &[&OsStr],
     env: &HashMap<String, String>,
     working_dir: &Path,
+    docker_config: &JobDockerConfig,
     job_state: &mut JobState,
     log_sender: &LogSender,
     timeout: Duration,
     cancel_token: &CancellationToken,
 ) -> Result<StepResult> {
-    let mut child = Command::new(program)
-        .args(args)
-        .current_dir(working_dir)
-        .envs(env)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
+    let mut child = host_command(program, args, env, working_dir, docker_config)?
         .spawn()
         .with_context(|| format!("spawning {program}"))?;
 
@@ -475,33 +536,38 @@ pub fn build_step_env(
     job_state: &JobState,
     workspace: &Workspace,
     base_env: &HashMap<String, String>,
-) -> HashMap<String, String> {
+    docker_config: Option<&JobDockerConfig>,
+) -> Result<HashMap<String, String>> {
     let mut env = base_env.clone();
-    env.extend(job_state.env.clone());
+    merge_checked(&mut env, &job_state.env, docker_config, "job environment")?;
+
     if let Some(step_env) = &step.environment {
-        for (k, v) in step_env {
-            let ctx = ExprContext::new(&env, job_state, false, false);
-            let resolved = super::expression::resolve_expression(v, &ctx);
-            env.insert(k.clone(), resolved);
+        for (key, value) in step_env {
+            let context = ExprContext::new(&env, job_state, false, false);
+            let resolved = super::expression::resolve_expression(value, &context);
+            insert_checked(
+                &mut env,
+                key.clone(),
+                resolved,
+                docker_config,
+                "step environment",
+            )?;
         }
     }
 
-    // Inject STATE_* env vars for pre/post steps so @actions/core.getState() works.
-    // The main step writes state to GITHUB_STATE file, we read it into action_states,
-    // and the post step reads it via STATE_<name> env vars.
     if let Some(ctx_name) = &step.context_name
         && let Some(base_ctx) = ctx_name
             .strip_suffix("_post")
             .or_else(|| ctx_name.strip_suffix("_pre"))
         && let Some(states) = job_state.action_states.get(base_ctx)
     {
-        for (k, v) in states {
-            env.insert(format!("STATE_{k}"), v.clone());
+        for (key, value) in states {
+            env.insert(format!("STATE_{key}"), value.clone());
         }
     }
 
     if let Ok(file_env) = workspace.read_env_file() {
-        env.extend(file_env);
+        merge_checked(&mut env, &file_env, docker_config, "GITHUB_ENV")?;
     }
 
     if let Ok(extra_paths) = workspace.read_path_file() {
@@ -517,7 +583,35 @@ pub fn build_step_env(
         }
     }
 
-    env
+    Ok(env)
+}
+
+fn insert_checked(
+    env: &mut HashMap<String, String>,
+    key: String,
+    value: String,
+    docker_config: Option<&JobDockerConfig>,
+    source: &'static str,
+) -> Result<()> {
+    if key == DOCKER_CONFIG_ENV
+        && let Some(config) = docker_config
+    {
+        config.validate_override(&value, source)?;
+    }
+    env.insert(key, value);
+    Ok(())
+}
+
+fn merge_checked(
+    env: &mut HashMap<String, String>,
+    values: &HashMap<String, String>,
+    docker_config: Option<&JobDockerConfig>,
+    source: &'static str,
+) -> Result<()> {
+    for (key, value) in values {
+        insert_checked(env, key.clone(), value.clone(), docker_config, source)?;
+    }
+    Ok(())
 }
 
 /// Spawn a task that reads stdout, parses workflow commands, and forwards log lines.
@@ -545,8 +639,7 @@ pub async fn run_all_steps(
     action_cache: &ActionCache,
     access_token: &str,
     cancel_token: CancellationToken,
-    docker_resources: Option<&JobDockerResources>,
-    node_runtimes: &NodeRuntimes,
+    execution: &JobExecutionContext<'_>,
     feed_sender: Option<&FeedSender>,
 ) -> Result<(JobConclusion, HashMap<String, String>)> {
     let masks = collect_secret_masks(manifest);
@@ -579,14 +672,17 @@ pub async fn run_all_steps(
 
     // Populate the `job` context for expression evaluation
     if let serde_json::Value::Object(ref mut map) = job_state.context_data {
-        map.insert("job".to_string(), build_job_context(docker_resources));
+        map.insert(
+            "job".to_string(),
+            build_job_context(execution.docker_resources()),
+        );
     }
 
     // In container mode, GITHUB_WORKSPACE points to /github/workspace (container path).
     // hashFiles() runs on the host and needs the real filesystem path.
-    if docker_resources
-        .as_ref()
-        .and_then(|r| r.job_container_id())
+    if execution
+        .docker_resources()
+        .and_then(JobDockerResources::job_container_id)
         .is_some()
     {
         job_state.host_workspace = Some(workspace.workspace_dir().to_string_lossy().into_owned());
@@ -715,8 +811,7 @@ pub async fn run_all_steps(
                 action_cache,
                 access_token,
                 &cancel_token,
-                docker_resources,
-                node_runtimes,
+                execution,
             )
             .await;
 
@@ -854,8 +949,7 @@ pub async fn run_all_steps(
             action_cache,
             access_token,
             &cancel_token,
-            docker_resources,
-            node_runtimes,
+            execution,
         )
         .await;
 
@@ -1043,8 +1137,7 @@ pub async fn run_all_steps(
                 action_cache,
                 access_token,
                 &cancel_token,
-                docker_resources,
-                node_runtimes,
+                execution,
             )
             .await;
 
@@ -1169,12 +1262,11 @@ async fn execute_step(
     action_cache: &ActionCache,
     access_token: &str,
     cancel_token: &CancellationToken,
-    docker_resources: Option<&JobDockerResources>,
-    node_runtimes: &NodeRuntimes,
+    execution: &JobExecutionContext<'_>,
 ) -> (StepConclusion, ResultsConclusion) {
-    let has_docker = docker_resources
-        .as_ref()
-        .and_then(|r| r.job_container_id())
+    let has_docker = execution
+        .docker_resources()
+        .and_then(JobDockerResources::job_container_id)
         .is_some();
 
     log_sender.send_banner(runner_name, has_docker).await;
@@ -1187,7 +1279,10 @@ async fn execute_step(
 
     let result = if step.is_script() {
         // Script steps: container mode if docker_resources has a job container, else host
-        if let Some(resources) = docker_resources.filter(|r| r.job_container_id().is_some()) {
+        if let Some(resources) = execution
+            .docker_resources()
+            .filter(|resources| resources.job_container_id().is_some())
+        {
             run_container_step(
                 step,
                 job_state,
@@ -1206,6 +1301,7 @@ async fn execute_step(
                 base_env,
                 log_sender,
                 cancel_token,
+                execution.docker_config(),
             )
             .await
         }
@@ -1219,8 +1315,7 @@ async fn execute_step(
             action_cache,
             access_token,
             cancel_token,
-            docker_resources,
-            node_runtimes,
+            execution,
         )
         .await
     };
@@ -1247,8 +1342,7 @@ async fn run_action_step(
     action_cache: &ActionCache,
     access_token: &str,
     cancel_token: &CancellationToken,
-    docker_resources: Option<&JobDockerResources>,
-    node_runtimes: &NodeRuntimes,
+    execution: &JobExecutionContext<'_>,
 ) -> Result<StepResult> {
     use super::action::resolve::ActionSource;
 
@@ -1264,7 +1358,7 @@ async fn run_action_step(
             base_env,
             log_sender,
             cancel_token,
-            docker_resources,
+            execution,
         )
         .await;
     }
@@ -1286,8 +1380,7 @@ async fn run_action_step(
             base_env,
             log_sender,
             cancel_token,
-            docker_resources,
-            node_runtimes,
+            execution,
         )
         .await
     } else if metadata.runs.is_composite() {
@@ -1303,8 +1396,7 @@ async fn run_action_step(
             access_token,
             0,
             cancel_token,
-            docker_resources,
-            node_runtimes,
+            execution,
         )
         .await
     } else if metadata.runs.is_docker() {
@@ -1319,7 +1411,7 @@ async fn run_action_step(
             base_env,
             log_sender,
             cancel_token,
-            docker_resources,
+            execution,
         )
         .await
     } else {

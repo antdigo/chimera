@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use super::*;
 use crate::job::action::metadata::{ActionRuns, ActionRuntime};
+use crate::job::docker_config::DOCKER_CONFIG_ENV;
 
 // ── split_shell_args ────────────────────────────────────────────
 
@@ -212,6 +213,7 @@ fn container_env_remaps_github_paths() {
     let mut host = HashMap::new();
     host.insert("GITHUB_WORKSPACE".into(), "/home/runner/work".into());
     host.insert("CUSTOM_VAR".into(), "kept".into());
+    host.insert(DOCKER_CONFIG_ENV.into(), "/private/job/docker".into());
 
     let env = build_container_env(&host);
 
@@ -222,4 +224,5 @@ fn container_env_remaps_github_paths() {
     assert_eq!(env["RUNNER_TEMP"], "/github/tmp");
     assert_eq!(env["RUNNER_TOOL_CACHE"], "/github/tool-cache");
     assert_eq!(env["CUSTOM_VAR"], "kept");
+    assert!(!env.contains_key(DOCKER_CONFIG_ENV));
 }

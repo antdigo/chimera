@@ -14,7 +14,10 @@ use super::build_action_inputs;
 use super::metadata::ActionMetadata;
 use crate::docker::output::OutputProcessor;
 use crate::docker::resources::{JobDockerResources, stop_and_remove};
-use crate::job::execute::{JobState, StepConclusion, StepResult, build_step_env};
+use crate::job::docker_config::DOCKER_CONFIG_ENV;
+use crate::job::execute::{
+    JobExecutionContext, JobState, StepConclusion, StepResult, build_step_env,
+};
 use crate::job::expression::ExprContext;
 use crate::job::logs::LogSender;
 use crate::job::schema::Step;
@@ -30,9 +33,9 @@ pub async fn run_docker_image_action(
     base_env: &HashMap<String, String>,
     log_sender: &LogSender,
     cancel_token: &CancellationToken,
-    docker_resources: Option<&JobDockerResources>,
+    execution: &JobExecutionContext<'_>,
 ) -> Result<StepResult> {
-    let env = build_step_env(step, job_state, workspace, base_env);
+    let env = build_step_env(step, job_state, workspace, base_env, None)?;
     let expr_ctx = ExprContext::new(&env, job_state, false, false);
 
     let entrypoint = step.inputs.get("entrypoint").cloned();
@@ -57,7 +60,7 @@ pub async fn run_docker_image_action(
         workspace,
         log_sender,
         cancel_token,
-        docker_resources,
+        docker_resources: execution.docker_resources(),
         action_dir: None,
     })
     .await;
@@ -78,7 +81,7 @@ pub async fn run_docker_metadata_action(
     base_env: &HashMap<String, String>,
     log_sender: &LogSender,
     cancel_token: &CancellationToken,
-    docker_resources: Option<&JobDockerResources>,
+    execution: &JobExecutionContext<'_>,
 ) -> Result<StepResult> {
     let image = resolve_image(metadata)?;
     let (entrypoint, args) = match resolve_entry_point(metadata, entry_point) {
@@ -90,7 +93,7 @@ pub async fn run_docker_metadata_action(
         }
     };
 
-    let mut env = build_step_env(step, job_state, workspace, base_env);
+    let mut env = build_step_env(step, job_state, workspace, base_env, None)?;
     let expr_ctx = ExprContext::new(&env, job_state, false, false);
     env.extend(build_action_inputs(metadata, step, &expr_ctx));
     merge_action_env(&mut env, metadata, job_state);
@@ -116,7 +119,7 @@ pub async fn run_docker_metadata_action(
         workspace,
         log_sender,
         cancel_token,
-        docker_resources,
+        docker_resources: execution.docker_resources(),
         action_dir: Some(action_dir),
     })
     .await;
@@ -324,6 +327,7 @@ fn build_container_env(host_env: &HashMap<String, String>) -> HashMap<String, St
     // The action's image defines its own PATH; carrying the runner's over would point
     // the container at directories that only exist outside it.
     env.remove("PATH");
+    env.remove(DOCKER_CONFIG_ENV);
 
     let remaps = [
         ("GITHUB_WORKSPACE", "/github/workspace"),

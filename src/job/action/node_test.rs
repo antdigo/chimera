@@ -4,11 +4,17 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 use super::*;
-use crate::job::execute::{JobState, StepConclusion};
+use crate::job::docker_config::{DOCKER_CONFIG_ENV, JobResourceRoot};
+use crate::job::execute::{JobExecutionContext, JobState, StepConclusion};
 use crate::job::logs::StepLogger;
 use crate::job::schema::{Step, StepReference};
 use crate::job::workspace::Workspace;
 use tokio_util::sync::CancellationToken;
+
+fn test_docker_config(tmp: &tempfile::TempDir) -> crate::job::docker_config::JobDockerConfig {
+    let root = JobResourceRoot::prepare(&tmp.path().join("job-resources")).unwrap();
+    root.create_docker_config().unwrap()
+}
 
 fn make_test_workspace(tmp: &tempfile::TempDir) -> Workspace {
     Workspace::create(
@@ -86,7 +92,13 @@ async fn node_action_executes_script() {
     );
     let masks = Arc::new(RwLock::new(Vec::new()));
     let logger = StepLogger::results_for_test(masks);
-    let base_env = HashMap::new();
+    let docker_config = test_docker_config(&tmp);
+    let base_env = HashMap::from([(
+        DOCKER_CONFIG_ENV.to_string(),
+        docker_config.directory().to_string_lossy().into_owned(),
+    )]);
+    let node_runtimes = crate::node::NodeRuntimes::single("node".into());
+    let execution = JobExecutionContext::new(&docker_config, None, &node_runtimes);
 
     let result = run_node_action(
         &action_dir,
@@ -98,8 +110,7 @@ async fn node_action_executes_script() {
         &base_env,
         logger.sender(),
         &CancellationToken::new(),
-        None,
-        &crate::node::NodeRuntimes::single("node".into()),
+        &execution,
     )
     .await;
 
@@ -147,7 +158,13 @@ if (process.env.INPUT_TOKEN !== 'my-secret') {
     );
     let masks = Arc::new(RwLock::new(Vec::new()));
     let logger = StepLogger::results_for_test(masks);
-    let base_env = HashMap::new();
+    let docker_config = test_docker_config(&tmp);
+    let base_env = HashMap::from([(
+        DOCKER_CONFIG_ENV.to_string(),
+        docker_config.directory().to_string_lossy().into_owned(),
+    )]);
+    let node_runtimes = crate::node::NodeRuntimes::single("node".into());
+    let execution = JobExecutionContext::new(&docker_config, None, &node_runtimes);
 
     let result = run_node_action(
         &action_dir,
@@ -159,8 +176,7 @@ if (process.env.INPUT_TOKEN !== 'my-secret') {
         &base_env,
         logger.sender(),
         &CancellationToken::new(),
-        None,
-        &crate::node::NodeRuntimes::single("node".into()),
+        &execution,
     )
     .await;
 
@@ -206,7 +222,13 @@ if (process.env.INPUT_FLAVOR !== 'vanilla') {
     );
     let masks = Arc::new(RwLock::new(Vec::new()));
     let logger = StepLogger::results_for_test(masks);
-    let base_env = HashMap::new();
+    let docker_config = test_docker_config(&tmp);
+    let base_env = HashMap::from([(
+        DOCKER_CONFIG_ENV.to_string(),
+        docker_config.directory().to_string_lossy().into_owned(),
+    )]);
+    let node_runtimes = crate::node::NodeRuntimes::single("node".into());
+    let execution = JobExecutionContext::new(&docker_config, None, &node_runtimes);
 
     let result = run_node_action(
         &action_dir,
@@ -218,8 +240,7 @@ if (process.env.INPUT_FLAVOR !== 'vanilla') {
         &base_env,
         logger.sender(),
         &CancellationToken::new(),
-        None,
-        &crate::node::NodeRuntimes::single("node".into()),
+        &execution,
     )
     .await;
 
@@ -250,7 +271,13 @@ async fn nonzero_exit_fails() {
     );
     let masks = Arc::new(RwLock::new(Vec::new()));
     let logger = StepLogger::results_for_test(masks);
-    let base_env = HashMap::new();
+    let docker_config = test_docker_config(&tmp);
+    let base_env = HashMap::from([(
+        DOCKER_CONFIG_ENV.to_string(),
+        docker_config.directory().to_string_lossy().into_owned(),
+    )]);
+    let node_runtimes = crate::node::NodeRuntimes::single("node".into());
+    let execution = JobExecutionContext::new(&docker_config, None, &node_runtimes);
 
     let result = run_node_action(
         &action_dir,
@@ -262,8 +289,7 @@ async fn nonzero_exit_fails() {
         &base_env,
         logger.sender(),
         &CancellationToken::new(),
-        None,
-        &crate::node::NodeRuntimes::single("node".into()),
+        &execution,
     )
     .await;
 

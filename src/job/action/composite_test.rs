@@ -6,11 +6,17 @@ use tokio::sync::RwLock;
 use super::*;
 use crate::job::action::download::ActionCache;
 use crate::job::action::metadata::{ActionInput, ActionMetadata, ActionRuns};
-use crate::job::execute::{JobState, StepConclusion};
+use crate::job::docker_config::{DOCKER_CONFIG_ENV, JobResourceRoot};
+use crate::job::execute::{JobExecutionContext, JobState, StepConclusion};
 use crate::job::logs::StepLogger;
 use crate::job::schema::{Step, StepReference};
 use crate::job::workspace::Workspace;
 use tokio_util::sync::CancellationToken;
+
+fn test_docker_config(tmp: &tempfile::TempDir) -> crate::job::docker_config::JobDockerConfig {
+    let root = JobResourceRoot::prepare(&tmp.path().join("job-resources")).unwrap();
+    root.create_docker_config().unwrap()
+}
 
 fn make_test_workspace(tmp: &tempfile::TempDir) -> Workspace {
     Workspace::create(
@@ -91,7 +97,13 @@ async fn nested_script_steps_execute() {
     let masks = Arc::new(RwLock::new(Vec::new()));
     let logger = StepLogger::results_for_test(masks);
     let cache = ActionCache::new(tmp.path().join("cache"), reqwest::Client::new());
-    let base_env = HashMap::new();
+    let docker_config = test_docker_config(&tmp);
+    let base_env = HashMap::from([(
+        DOCKER_CONFIG_ENV.to_string(),
+        docker_config.directory().to_string_lossy().into_owned(),
+    )]);
+    let node_runtimes = crate::node::NodeRuntimes::single("node".into());
+    let execution = JobExecutionContext::new(&docker_config, None, &node_runtimes);
 
     let result = run_composite_action(
         &action_dir,
@@ -105,8 +117,7 @@ async fn nested_script_steps_execute() {
         "fake-token",
         0,
         &CancellationToken::new(),
-        None,
-        &crate::node::NodeRuntimes::single("node".into()),
+        &execution,
     )
     .await
     .unwrap();
@@ -139,7 +150,13 @@ async fn failure_propagates() {
     let masks = Arc::new(RwLock::new(Vec::new()));
     let logger = StepLogger::results_for_test(masks);
     let cache = ActionCache::new(tmp.path().join("cache"), reqwest::Client::new());
-    let base_env = HashMap::new();
+    let docker_config = test_docker_config(&tmp);
+    let base_env = HashMap::from([(
+        DOCKER_CONFIG_ENV.to_string(),
+        docker_config.directory().to_string_lossy().into_owned(),
+    )]);
+    let node_runtimes = crate::node::NodeRuntimes::single("node".into());
+    let execution = JobExecutionContext::new(&docker_config, None, &node_runtimes);
 
     let result = run_composite_action(
         &action_dir,
@@ -153,8 +170,7 @@ async fn failure_propagates() {
         "fake-token",
         0,
         &CancellationToken::new(),
-        None,
-        &crate::node::NodeRuntimes::single("node".into()),
+        &execution,
     )
     .await
     .unwrap();
@@ -190,7 +206,13 @@ async fn inputs_available_as_env() {
     let masks = Arc::new(RwLock::new(Vec::new()));
     let logger = StepLogger::results_for_test(masks);
     let cache = ActionCache::new(tmp.path().join("cache"), reqwest::Client::new());
-    let base_env = HashMap::new();
+    let docker_config = test_docker_config(&tmp);
+    let base_env = HashMap::from([(
+        DOCKER_CONFIG_ENV.to_string(),
+        docker_config.directory().to_string_lossy().into_owned(),
+    )]);
+    let node_runtimes = crate::node::NodeRuntimes::single("node".into());
+    let execution = JobExecutionContext::new(&docker_config, None, &node_runtimes);
 
     let result = run_composite_action(
         &action_dir,
@@ -204,8 +226,7 @@ async fn inputs_available_as_env() {
         "fake-token",
         0,
         &CancellationToken::new(),
-        None,
-        &crate::node::NodeRuntimes::single("node".into()),
+        &execution,
     )
     .await
     .unwrap();
@@ -236,7 +257,13 @@ async fn recursion_depth_limit() {
     let masks = Arc::new(RwLock::new(Vec::new()));
     let logger = StepLogger::results_for_test(masks);
     let cache = ActionCache::new(tmp.path().join("cache"), reqwest::Client::new());
-    let base_env = HashMap::new();
+    let docker_config = test_docker_config(&tmp);
+    let base_env = HashMap::from([(
+        DOCKER_CONFIG_ENV.to_string(),
+        docker_config.directory().to_string_lossy().into_owned(),
+    )]);
+    let node_runtimes = crate::node::NodeRuntimes::single("node".into());
+    let execution = JobExecutionContext::new(&docker_config, None, &node_runtimes);
 
     let result = run_composite_action(
         &action_dir,
@@ -250,8 +277,7 @@ async fn recursion_depth_limit() {
         "fake-token",
         10, // Already at limit
         &CancellationToken::new(),
-        None,
-        &crate::node::NodeRuntimes::single("node".into()),
+        &execution,
     )
     .await;
 

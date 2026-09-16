@@ -9,7 +9,8 @@ use chimera::docker::resources::{JobDockerResources, SetupParams};
 use chimera::github::auth::TokenManager;
 use chimera::job::action::ActionCache;
 use chimera::job::client::JobClient;
-use chimera::job::execute::run_all_steps;
+use chimera::job::docker_config::JobResourceRoot;
+use chimera::job::execute::{JobExecutionContext, run_all_steps};
 use chimera::job::schema::JobManifest;
 use chimera::job::workspace::Workspace;
 use chimera::runner::env::{build_base_env, build_container_env};
@@ -24,6 +25,7 @@ pub struct TestEnv {
     pub job_client: Arc<JobClient>,
     pub mock_server: MockServer,
     pub tmp: tempfile::TempDir,
+    pub job_resources: JobResourceRoot,
     actions_dir: std::path::PathBuf,
 }
 
@@ -34,8 +36,9 @@ impl TestEnv {
         let tmp_dir = tmp.path().join("tmp");
         let tool_cache = tmp.path().join("tool-cache");
         let actions_dir = tmp.path().join("actions");
+        let job_resources = JobResourceRoot::prepare(&tmp.path().join("job-resources")).unwrap();
 
-        let ws = Workspace::create(
+        let workspace = Workspace::create(
             &work_dir,
             &tmp_dir,
             &tool_cache,
@@ -46,14 +49,14 @@ impl TestEnv {
 
         let mock_server = MockServer::start().await;
         mount_default_mocks(&mock_server).await;
-
         let job_client = create_job_client(&mock_server).await;
 
         Self {
-            workspace: ws,
+            workspace,
             job_client,
             mock_server,
             tmp,
+            job_resources,
             actions_dir,
         }
     }
@@ -72,23 +75,31 @@ impl TestEnv {
         &self,
         manifest: &JobManifest,
     ) -> anyhow::Result<(chimera::job::client::JobConclusion, HashMap<String, String>)> {
-        let base_env = build_base_env(manifest, &self.workspace, "test-runner");
-        let action_cache = ActionCache::new(self.actions_dir.clone(), reqwest::Client::new());
+        let mut docker_config = self.job_resources.create_docker_config()?;
+        let result = async {
+            let base_env =
+                build_base_env(manifest, &self.workspace, "test-runner", &docker_config)?;
+            let action_cache = ActionCache::new(self.actions_dir.clone(), reqwest::Client::new());
+            let node_runtimes = chimera::node::NodeRuntimes::single("node".into());
+            let execution = JobExecutionContext::new(&docker_config, None, &node_runtimes);
 
-        run_all_steps(
-            manifest,
-            &self.job_client,
-            &self.workspace,
-            &base_env,
-            "test-runner",
-            &action_cache,
-            "fake-token",
-            CancellationToken::new(),
-            None,
-            &chimera::node::NodeRuntimes::single("node".into()),
-            None,
-        )
-        .await
+            run_all_steps(
+                manifest,
+                &self.job_client,
+                &self.workspace,
+                &base_env,
+                "test-runner",
+                &action_cache,
+                "fake-token",
+                CancellationToken::new(),
+                &execution,
+                None,
+            )
+            .await
+        }
+        .await;
+        docker_config.cleanup()?;
+        result
     }
 
     /// Run a manifest in container mode with Docker resources.
@@ -97,26 +108,32 @@ impl TestEnv {
         manifest: &JobManifest,
         docker_resources: &JobDockerResources,
     ) -> anyhow::Result<(chimera::job::client::JobConclusion, HashMap<String, String>)> {
-        let base_env = build_container_env(manifest, &self.workspace, "test-runner");
-        let action_cache = ActionCache::new(self.actions_dir.clone(), reqwest::Client::new());
+        let mut docker_config = self.job_resources.create_docker_config()?;
+        let result = async {
+            let base_env = build_container_env(manifest, &self.workspace, "test-runner");
+            let action_cache = ActionCache::new(self.actions_dir.clone(), reqwest::Client::new());
+            let node_runtimes =
+                chimera::node::NodeRuntimes::single(docker_resources.node_path(None).into());
+            let execution =
+                JobExecutionContext::new(&docker_config, Some(docker_resources), &node_runtimes);
 
-        let node_runtimes =
-            chimera::node::NodeRuntimes::single(docker_resources.node_path(None).into());
-
-        run_all_steps(
-            manifest,
-            &self.job_client,
-            &self.workspace,
-            &base_env,
-            "test-runner",
-            &action_cache,
-            "fake-token",
-            CancellationToken::new(),
-            Some(docker_resources),
-            &node_runtimes,
-            None,
-        )
-        .await
+            run_all_steps(
+                manifest,
+                &self.job_client,
+                &self.workspace,
+                &base_env,
+                "test-runner",
+                &action_cache,
+                "fake-token",
+                CancellationToken::new(),
+                &execution,
+                None,
+            )
+            .await
+        }
+        .await;
+        docker_config.cleanup()?;
+        result
     }
 }
 

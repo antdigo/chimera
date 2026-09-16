@@ -1,21 +1,71 @@
 use std::collections::HashMap;
 
+use anyhow::Result;
+
+use crate::job::docker_config::{DOCKER_CONFIG_ENV, JobDockerConfig};
 use crate::job::schema::JobManifest;
 use crate::job::workspace::Workspace;
 use crate::utils::{arch_label, os_label};
 
-/// Build the base environment variables for step execution.
-///
-/// Combines workspace paths, runner metadata, context data from the manifest,
-/// non-secret variables, and actions runtime URLs into a single env map.
+/// Build the base environment variables for host-mode step execution.
 pub fn build_base_env(
+    manifest: &JobManifest,
+    workspace: &Workspace,
+    runner_name: &str,
+    docker_config: &JobDockerConfig,
+) -> Result<HashMap<String, String>> {
+    for (key, variable) in &manifest.variables {
+        let env_key = key.replace('.', "_").to_uppercase();
+        if env_key == DOCKER_CONFIG_ENV {
+            docker_config.validate_override(&variable.value, "job environment")?;
+        }
+    }
+
+    let mut env = build_common_env(manifest, workspace, runner_name);
+    docker_config.insert_into_host_env(&mut env, "job environment")?;
+    Ok(env)
+}
+
+/// Build environment variables for container-mode execution.
+pub fn build_container_env(
+    manifest: &JobManifest,
+    workspace: &Workspace,
+    runner_name: &str,
+) -> HashMap<String, String> {
+    let mut env = build_common_env(manifest, workspace, runner_name);
+    env.remove(DOCKER_CONFIG_ENV);
+    env.insert("RUNNER_OS".into(), "Linux".into());
+    env.insert("ImageOS".into(), "ubuntu22".into());
+    env.insert("GITHUB_WORKSPACE".into(), "/github/workspace".into());
+    env.insert("GITHUB_ENV".into(), "/github/workflow/_env".into());
+    env.insert("GITHUB_PATH".into(), "/github/workflow/_path".into());
+    env.insert("GITHUB_OUTPUT".into(), "/github/workflow/_output".into());
+    env.insert("GITHUB_STATE".into(), "/github/workflow/_state".into());
+    env.insert(
+        "GITHUB_STEP_SUMMARY".into(),
+        "/github/workflow/_step_summary".into(),
+    );
+    env.insert(
+        "GITHUB_EVENT_PATH".into(),
+        "/github/workflow/_event.json".into(),
+    );
+    env.insert("RUNNER_TEMP".into(), "/github/tmp".into());
+    env.insert("RUNNER_TOOL_CACHE".into(), "/github/tool-cache".into());
+    env.insert(
+        "PATH".into(),
+        "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".into(),
+    );
+    env
+}
+
+/// Build values shared by host and container step environments.
+fn build_common_env(
     manifest: &JobManifest,
     workspace: &Workspace,
     runner_name: &str,
 ) -> HashMap<String, String> {
     let mut env = HashMap::new();
 
-    // Workspace and runner paths
     env.insert("GITHUB_ACTIONS".into(), "true".into());
     env.insert(
         "GITHUB_WORKSPACE".into(),
@@ -57,21 +107,14 @@ pub fn build_base_env(
         workspace.tool_cache().to_string_lossy().into_owned(),
     );
 
-    // Host-mode steps inherit the daemon's PATH from the process environment, but it
-    // must also be in this map: `build_step_env` prepends GITHUB_PATH entries onto
-    // whatever PATH it finds here, and with nothing to prepend onto it would hand the
-    // step a PATH containing only the added directories — losing /bin, /usr/bin and
-    // every other host tool from the first `core.addPath()` onwards.
     if let Ok(path) = std::env::var("PATH") {
         env.insert("PATH".into(), path);
     }
 
-    // GITHUB_TOKEN from manifest variables
     if let Some(token) = manifest.github_token() {
         env.insert("GITHUB_TOKEN".into(), token.into());
     }
 
-    // Extract fields from context_data.github
     if let Some(github) = manifest.context_data.get("github") {
         let mappings = [
             ("workflow", "GITHUB_WORKFLOW"),
@@ -92,72 +135,25 @@ pub fn build_base_env(
         ];
 
         for (json_key, env_key) in mappings {
-            if let Some(val) = github.get(json_key).and_then(|v| v.as_str()) {
-                env.insert(env_key.into(), val.into());
+            if let Some(value) = github.get(json_key).and_then(|value| value.as_str()) {
+                env.insert(env_key.into(), value.into());
             }
         }
     }
 
-    // Add non-secret variables
-    for (key, var) in &manifest.variables {
-        if !var.is_secret {
+    for (key, variable) in &manifest.variables {
+        if !variable.is_secret {
             let env_key = key.replace('.', "_").to_uppercase();
-            env.insert(env_key, var.value.clone());
+            env.insert(env_key, variable.value.clone());
         }
     }
 
-    // Server URL and token for actions runtime
     if let Ok(server_url) = manifest.server_url() {
         env.insert("ACTIONS_RUNTIME_URL".into(), server_url.into());
     }
     if let Ok(token) = manifest.access_token() {
         env.insert("ACTIONS_RUNTIME_TOKEN".into(), token.into());
     }
-
-    env
-}
-
-/// Build environment variables for container-mode execution.
-///
-/// Same as `build_base_env()` but remaps workspace paths to container-internal paths
-/// where bind mounts map host files to the container filesystem.
-pub fn build_container_env(
-    manifest: &JobManifest,
-    workspace: &Workspace,
-    runner_name: &str,
-) -> HashMap<String, String> {
-    let mut env = build_base_env(manifest, workspace, runner_name);
-
-    // Container is always Linux — override host OS/arch so actions
-    // don't try to use macOS tools like brew inside a Linux container.
-    env.insert("RUNNER_OS".into(), "Linux".into());
-    env.insert("ImageOS".into(), "ubuntu22".into());
-
-    // Remap paths to container-internal layout
-    env.insert("GITHUB_WORKSPACE".into(), "/github/workspace".into());
-    env.insert("GITHUB_ENV".into(), "/github/workflow/_env".into());
-    env.insert("GITHUB_PATH".into(), "/github/workflow/_path".into());
-    env.insert("GITHUB_OUTPUT".into(), "/github/workflow/_output".into());
-    env.insert("GITHUB_STATE".into(), "/github/workflow/_state".into());
-    env.insert(
-        "GITHUB_STEP_SUMMARY".into(),
-        "/github/workflow/_step_summary".into(),
-    );
-    env.insert(
-        "GITHUB_EVENT_PATH".into(),
-        "/github/workflow/_event.json".into(),
-    );
-    env.insert("RUNNER_TEMP".into(), "/github/tmp".into());
-    env.insert("RUNNER_TOOL_CACHE".into(), "/github/tool-cache".into());
-
-    // Set a proper default PATH for the Linux container. In host mode PATH
-    // is inherited from the process environment, but docker exec only gets
-    // what we explicitly pass. Without this, any GITHUB_PATH additions
-    // would replace PATH entirely, losing /usr/bin etc.
-    env.insert(
-        "PATH".into(),
-        "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".into(),
-    );
 
     env
 }
