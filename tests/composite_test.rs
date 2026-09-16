@@ -1,5 +1,8 @@
 mod common;
 
+use std::collections::HashMap;
+
+use chimera::docker::container::JobContainerSpec;
 use chimera::job::client::JobConclusion;
 use common::*;
 
@@ -53,6 +56,52 @@ fn composite_step(id: &str, action_path: &str, inputs: serde_json::Value) -> ser
         "environment": null,
         "contextName": id
     })
+}
+
+fn create_docker_config_check_action(workspace_dir: &std::path::Path) {
+    let action_dir = workspace_dir.join(".github/actions/check-docker-config");
+    std::fs::create_dir_all(&action_dir).unwrap();
+    std::fs::write(
+        action_dir.join("action.yml"),
+        r#"
+name: 'Check Docker config isolation'
+runs:
+  using: 'composite'
+  steps:
+    - shell: bash
+      run: test -z "${DOCKER_CONFIG+x}"
+"#,
+    )
+    .unwrap();
+}
+
+#[tokio::test]
+#[ignore]
+async fn composite_nested_container_does_not_receive_runner_docker_config() {
+    let env = TestEnv::setup().await;
+    create_docker_config_check_action(env.workspace.workspace_dir());
+    let job_spec = JobContainerSpec {
+        image: "ubuntu:latest".into(),
+        environment: HashMap::new(),
+        ports: vec![],
+        volumes: vec![],
+        options: None,
+        credentials: None,
+    };
+    let mut resources = setup_docker(&env.tmp, &env.workspace, Some(&job_spec), &[]).await;
+    let manifest = manifest_with_steps(
+        vec![composite_step(
+            "check-docker-config",
+            ".github/actions/check-docker-config",
+            serde_json::json!({}),
+        )],
+        &env.mock_server.uri(),
+    );
+
+    let result = env.run_with_docker(&manifest, &resources).await;
+    resources.cleanup().await;
+
+    assert_eq!(result.unwrap().0, JobConclusion::Succeeded);
 }
 
 #[tokio::test]

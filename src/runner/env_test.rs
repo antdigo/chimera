@@ -233,7 +233,14 @@ fn container_env_preserves_non_path_vars() {
 
 #[test]
 fn container_env_never_contains_host_docker_config() {
-    let manifest = minimal_manifest();
+    let mut manifest = minimal_manifest();
+    manifest.variables.insert(
+        DOCKER_CONFIG_ENV.into(),
+        JobVariable {
+            value: "/shared/.docker".into(),
+            is_secret: false,
+        },
+    );
     let (_tmp, ws) = test_workspace();
 
     let env = build_container_env(&manifest, &ws, "test-runner");

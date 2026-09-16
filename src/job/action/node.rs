@@ -48,7 +48,11 @@ pub async fn run_node_action(
     };
 
     let script_path = action_dir.join(script_file);
+
+    // Actions are bundled against a specific Node major; running a node24 bundle on
+    // Node 20 only appears to work until it reaches for something newer.
     let node_major = metadata.runs.using.node_major();
+
     let mut env = build_step_env(
         step,
         job_state,
@@ -60,10 +64,12 @@ pub async fn run_node_action(
     let expr_ctx = ExprContext::new(&env, job_state, false, false);
     env.extend(build_action_inputs(metadata, step, &expr_ctx));
 
+    // Set action-specific env vars
     if let Some(name) = &metadata.name {
         env.insert("GITHUB_ACTION".into(), name.clone());
     }
 
+    // For post steps: inject STATE_<name> env vars from saved state
     if entry_point == "post" {
         let action_ctx = step
             .context_name
@@ -71,17 +77,18 @@ pub async fn run_node_action(
             .unwrap_or("")
             .replace("_post", "");
         if let Some(states) = job_state.action_states.get(&action_ctx) {
-            for (key, value) in states {
-                env.insert(format!("STATE_{key}"), value.clone());
+            for (k, v) in states {
+                env.insert(format!("STATE_{}", k), v.clone());
             }
         }
     }
 
     let timeout = Duration::from_secs(step.timeout_in_minutes.unwrap_or(360) * 60);
 
+    // Container mode: run via docker exec with remapped paths
     if let Some(resources) = execution
         .docker_resources()
-        .filter(|resources| resources.job_container_id().is_some())
+        .filter(|r| r.job_container_id().is_some())
     {
         let container_id = resources
             .job_container_id()
@@ -89,7 +96,7 @@ pub async fn run_node_action(
         let container_action_dir = resources
             .remap_to_container_path(action_dir)
             .context("cannot remap action dir to container path")?;
-        let container_script = format!("{container_action_dir}/{script_file}");
+        let container_script = format!("{}/{}", container_action_dir, script_file);
 
         env.insert("GITHUB_ACTION_PATH".into(), container_action_dir);
 
@@ -119,6 +126,7 @@ pub async fn run_node_action(
         return result;
     }
 
+    // Host mode
     env.insert(
         "GITHUB_ACTION_PATH".into(),
         action_dir.to_string_lossy().into_owned(),

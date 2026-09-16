@@ -22,8 +22,8 @@ use super::build_action_inputs;
 
 const MAX_COMPOSITE_DEPTH: u32 = 10;
 
-fn ykey(value: &str) -> serde_yaml::Value {
-    serde_yaml::Value::String(value.into())
+fn ykey(s: &str) -> serde_yaml::Value {
+    serde_yaml::Value::String(s.into())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -82,6 +82,7 @@ async fn run_composite_action_inner(
         .as_ref()
         .context("composite action has no steps")?;
 
+    // Build action inputs once — they stay constant across sub-steps
     let initial_env = build_step_env(
         step,
         job_state,
@@ -91,13 +92,16 @@ async fn run_composite_action_inner(
     )?;
     let expr_ctx = ExprContext::new(&initial_env, job_state, false, false);
     let action_inputs = build_action_inputs(metadata, step, &expr_ctx);
+
     let timeout = Duration::from_secs(step.timeout_in_minutes.unwrap_or(360) * 60);
 
-    for (index, nested_step) in steps.iter().enumerate() {
+    for (i, nested_step) in steps.iter().enumerate() {
         let nested_obj = nested_step
             .as_mapping()
             .context("composite step is not a mapping")?;
 
+        // Rebuild env each iteration so PATH/env changes from previous sub-steps
+        // (via ::add-path::, GITHUB_PATH, ::set-env::, GITHUB_ENV) are picked up.
         let mut composite_env = build_step_env(
             step,
             job_state,
@@ -107,11 +111,12 @@ async fn run_composite_action_inner(
         )?;
         composite_env.extend(action_inputs.clone());
 
-        if let Some(condition) = nested_obj.get(ykey("if")).and_then(|value| value.as_str()) {
-            let condition_ctx = ExprContext::new(&composite_env, job_state, false, false);
-            if !crate::job::expression::evaluate_condition(Some(condition), &condition_ctx) {
+        // Evaluate `if:` condition — skip the step if it evaluates to false
+        if let Some(condition) = nested_obj.get(ykey("if")).and_then(|v| v.as_str()) {
+            let cond_ctx = ExprContext::new(&composite_env, job_state, false, false);
+            if !crate::job::expression::evaluate_condition(Some(condition), &cond_ctx) {
                 debug!(
-                    composite_step = index,
+                    composite_step = i,
                     condition, "skipping composite sub-step (condition not met)"
                 );
                 continue;
@@ -119,7 +124,7 @@ async fn run_composite_action_inner(
         }
 
         debug!(
-            composite_step = index,
+            composite_step = i,
             action_dir = %action_dir.display(),
             "running composite sub-step"
         );
@@ -154,7 +159,7 @@ async fn run_composite_action_inner(
         } else {
             log_sender
                 .send(format!(
-                    "Skipping composite step {index}: no 'run' or 'uses' key"
+                    "Skipping composite step {i}: no 'run' or 'uses' key"
                 ))
                 .await;
             continue;
@@ -167,7 +172,7 @@ async fn run_composite_action_inner(
         if result.conclusion == StepConclusion::Failed {
             let continue_on_error = nested_obj
                 .get(ykey("continue-on-error"))
-                .and_then(|value| value.as_bool())
+                .and_then(|v| v.as_bool())
                 .unwrap_or(false);
 
             if !continue_on_error {
@@ -194,45 +199,50 @@ async fn run_nested_script(
 ) -> Result<StepResult> {
     let script = step_map
         .get(ykey("run"))
-        .and_then(|value| value.as_str())
+        .and_then(|v| v.as_str())
         .context("composite step 'run' is not a string")?;
+
     let shell = step_map
         .get(ykey("shell"))
-        .and_then(|value| value.as_str())
+        .and_then(|v| v.as_str())
         .unwrap_or("bash");
 
     let mut step_env = env.clone();
     if let Some(serde_yaml::Value::Mapping(env_map)) = step_map.get(ykey("env")) {
-        for (key, value) in env_map {
-            if let (Some(key), Some(value)) = (key.as_str(), value.as_str()) {
+        for (k, v) in env_map {
+            if let (Some(key), Some(val)) = (k.as_str(), v.as_str()) {
                 let env_ctx = ExprContext::new(&step_env, job_state, false, false);
-                let resolved_value = crate::job::expression::resolve_template(value, &env_ctx);
+                let resolved_val = crate::job::expression::resolve_template(val, &env_ctx);
                 if key == DOCKER_CONFIG_ENV
                     && let Some(config) = execution.host_docker_config()
                 {
-                    config.validate_override(&resolved_value, "step environment")?;
+                    config.validate_override(&resolved_val, "step environment")?;
                 }
-                step_env.insert(key.to_string(), resolved_value);
+                step_env.insert(key.to_string(), resolved_val);
             }
         }
     }
 
+    // Resolve ${{ }} expressions in the script body before writing
     let script_ctx = ExprContext::new(&step_env, job_state, false, false);
     let resolved_script = crate::job::expression::resolve_template(script, &script_ctx);
+
+    // Resolve working-directory (may contain expressions like ${{ inputs.dir || '.' }})
     let raw_workdir = step_map
         .get(ykey("working-directory"))
-        .and_then(|value| value.as_str())
-        .map(|directory| crate::job::expression::resolve_template(directory, &script_ctx));
+        .and_then(|v| v.as_str())
+        .map(|d| crate::job::expression::resolve_template(d, &script_ctx));
 
+    // Container mode: run inline via docker exec
     if let Some(resources) = execution
         .docker_resources()
-        .filter(|resources| resources.job_container_id().is_some())
+        .filter(|r| r.job_container_id().is_some())
     {
         let container_id = resources
             .job_container_id()
             .context("no job container for composite script step")?;
         let working_dir = match &raw_workdir {
-            Some(directory) if directory != "." => format!("/github/workspace/{directory}"),
+            Some(d) if d != "." => format!("/github/workspace/{d}"),
             _ => "/github/workspace".into(),
         };
 
@@ -251,10 +261,12 @@ async fn run_nested_script(
         .await;
     }
 
+    // Host mode
     let working_dir = match &raw_workdir {
-        Some(directory) if directory != "." => workspace.workspace_dir().join(directory),
+        Some(d) if d != "." => workspace.workspace_dir().join(d),
         _ => workspace.workspace_dir().to_path_buf(),
     };
+
     let script_file = workspace
         .runner_temp()
         .join(format!("_composite_step_{}.sh", uuid::Uuid::new_v4()));
@@ -294,15 +306,16 @@ async fn run_nested_action(
 ) -> Result<StepResult> {
     let uses = step_map
         .get(ykey("uses"))
-        .and_then(|value| value.as_str())
+        .and_then(|v| v.as_str())
         .context("composite step 'uses' is not a string")?;
+
     let source = super::parse_uses(uses)?;
 
     let mut inputs = HashMap::new();
     if let Some(serde_yaml::Value::Mapping(with_map)) = step_map.get(ykey("with")) {
-        for (key, value) in with_map {
-            if let (Some(key), Some(value)) = (key.as_str(), value.as_str()) {
-                inputs.insert(key.to_string(), value.to_string());
+        for (k, v) in with_map {
+            if let (Some(key), Some(val)) = (k.as_str(), v.as_str()) {
+                inputs.insert(key.to_string(), val.to_string());
             }
         }
     }
@@ -324,6 +337,7 @@ async fn run_nested_action(
         context_name: None,
     };
 
+    // Handle inline docker://image in composite steps — skip get_action/metadata
     if let super::resolve::ActionSource::Docker { ref image } = source {
         return super::docker::run_docker_image_action(
             image,
