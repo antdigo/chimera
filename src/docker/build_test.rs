@@ -125,19 +125,16 @@ async fn cancelling_build_stops_engine_work_and_never_publishes_image() {
         .unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let unique = uuid::Uuid::new_v4();
-    let marker = format!("CHIMERA_CANCEL_STARTED_{unique}");
-    std::fs::write(tmp.path().join("build-marker.txt"), format!("{marker}\n")).unwrap();
     std::fs::write(
         tmp.path().join("Dockerfile"),
-        format!(
-            "# {unique}\nFROM alpine:3.19\nCOPY build-marker.txt /chimera-build-marker\nRUN cat /chimera-build-marker && sleep 6\n"
-        ),
+        format!("# {unique}\nFROM alpine:3.19\nRUN sleep 30\n"),
     )
     .unwrap();
-    let (logger, mut receiver) = test_log_sender();
-    let builder = std::sync::Arc::new(DockerActionBuilder::new());
+    let (logger, _receiver) = test_log_sender();
+    let (builder, intermediate_container) = builder_signalling_intermediate_container();
     let scope = DockerBuildScope::new("test-runner", format!("test/cancel-{unique}"));
     let cancel = CancellationToken::new();
+    let build_started = Instant::now();
 
     let task = {
         let docker = docker.clone();
@@ -156,40 +153,59 @@ async fn cancelling_build_stops_engine_work_and_never_publishes_image() {
                     registry_auth: None,
                     log_sender: &logger,
                     cancel_token: &cancel,
-                    deadline: Instant::now() + Duration::from_secs(60),
+                    deadline: build_started + Duration::from_secs(90),
                     reuse: None,
                 })
                 .await
         })
     };
 
-    loop {
-        let line = tokio::time::timeout(Duration::from_secs(30), receiver.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        if line.content == marker {
-            break;
-        }
-    }
+    let container_id = tokio::time::timeout(Duration::from_secs(60), intermediate_container)
+        .await
+        .expect("build must reach its RUN step")
+        .unwrap();
+
+    let running = docker
+        .inspect_container(&container_id, None)
+        .await
+        .unwrap()
+        .state
+        .as_ref()
+        .and_then(|state| state.running)
+        .unwrap_or(false);
+    assert!(running, "intermediate container must be running");
+
     cancel.cancel();
 
-    let outcome = tokio::time::timeout(Duration::from_secs(3), task)
+    let outcome = tokio::time::timeout(Duration::from_secs(10), task)
         .await
         .expect("build cancellation must be bounded")
         .unwrap()
         .unwrap();
     assert!(matches!(outcome, DockerBuildOutcome::Cancelled));
 
+    // The poll window ends before the RUN sleep could finish naturally, so a
+    // passing poll proves the Engine stopped the work rather than letting it
+    // run to completion.
+    let poll_budget =
+        (build_started + Duration::from_secs(29)).saturating_duration_since(Instant::now());
+    assert!(
+        !poll_budget.is_zero(),
+        "proving the running state took almost the whole sleep budget"
+    );
+    assert!(
+        wait_until_container_not_running(&docker, &container_id, poll_budget).await,
+        "engine must stop the intermediate container after cancellation"
+    );
+
     let action_dir = trusted_action(tmp.path());
     let tag = builder
         .internal_tag_for_context_for_test(&docker, &action_dir, "Dockerfile", &scope)
         .await
         .unwrap();
-    tokio::time::sleep(Duration::from_secs(8)).await;
     assert!(matches!(
         docker.inspect_image(&tag).await,
-        Err(bollard::errors::Error::DockerResponseServerError {
+        Err(DockerError::DockerResponseServerError {
             status_code: 404,
             ..
         })
@@ -206,18 +222,16 @@ async fn timed_out_build_returns_bounded_and_never_publishes_image() {
         .unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let unique = uuid::Uuid::new_v4();
-    let marker = format!("CHIMERA_TIMEOUT_STARTED_{unique}");
-    std::fs::write(tmp.path().join("build-marker.txt"), format!("{marker}\n")).unwrap();
     std::fs::write(
         tmp.path().join("Dockerfile"),
-        format!(
-            "# {unique}\nFROM alpine:3.19\nCOPY build-marker.txt /chimera-build-marker\nRUN cat /chimera-build-marker && sleep 6\n"
-        ),
+        format!("# {unique}\nFROM alpine:3.19\nRUN sleep 30\n"),
     )
     .unwrap();
-    let (logger, mut receiver) = test_log_sender();
-    let builder = Arc::new(DockerActionBuilder::new());
+    let (logger, _receiver) = test_log_sender();
+    let (builder, intermediate_container) = builder_signalling_intermediate_container();
     let scope = DockerBuildScope::new("test-runner", format!("test/timeout-{unique}"));
+    let build_started = Instant::now();
+    let deadline = build_started + Duration::from_secs(20);
 
     let task = {
         let docker = docker.clone();
@@ -235,46 +249,162 @@ async fn timed_out_build_returns_bounded_and_never_publishes_image() {
                     registry_auth: None,
                     log_sender: &logger,
                     cancel_token: &CancellationToken::new(),
-                    deadline: Instant::now() + Duration::from_secs(2),
+                    deadline,
                     reuse: None,
                 })
                 .await
         })
     };
 
-    loop {
-        let line = tokio::time::timeout(Duration::from_secs(30), receiver.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        if line.content == marker {
-            break;
-        }
-    }
-    let started = Instant::now();
+    let container_id = tokio::time::timeout(Duration::from_secs(20), intermediate_container)
+        .await
+        .expect("build must reach its RUN step before the deadline")
+        .unwrap();
 
-    let outcome = tokio::time::timeout(Duration::from_secs(3), task)
+    let running = docker
+        .inspect_container(&container_id, None)
+        .await
+        .unwrap()
+        .state
+        .as_ref()
+        .and_then(|state| state.running)
+        .unwrap_or(false);
+    assert!(running, "intermediate container must be running");
+    assert!(
+        Instant::now() < deadline,
+        "deadline must fire only after the running state is proven"
+    );
+
+    let bounded_wait = deadline.saturating_duration_since(Instant::now()) + Duration::from_secs(2);
+    let outcome = tokio::time::timeout(bounded_wait, task)
         .await
         .expect("build timeout must be bounded")
         .unwrap()
         .unwrap();
     assert!(matches!(outcome, DockerBuildOutcome::TimedOut));
-    assert!(started.elapsed() < Duration::from_secs(4));
+
+    // As in the cancellation test, the poll window ends before the RUN sleep
+    // could finish naturally, so only an Engine-side stop can pass it.
+    let poll_budget =
+        (build_started + Duration::from_secs(29)).saturating_duration_since(Instant::now());
+    assert!(
+        !poll_budget.is_zero(),
+        "proving the running state took almost the whole sleep budget"
+    );
+    assert!(
+        wait_until_container_not_running(&docker, &container_id, poll_budget).await,
+        "engine must stop the intermediate container before the RUN finishes naturally"
+    );
 
     let action_dir = trusted_action(tmp.path());
     let tag = builder
         .internal_tag_for_context_for_test(&docker, &action_dir, "Dockerfile", &scope)
         .await
         .unwrap();
-    tokio::time::sleep(Duration::from_secs(8)).await;
     assert!(matches!(
         docker.inspect_image(&tag).await,
-        Err(bollard::errors::Error::DockerResponseServerError {
+        Err(DockerError::DockerResponseServerError {
             status_code: 404,
             ..
         })
     ));
     assert_eq!(builder.cache_entry_count_for_test().await, 0);
+}
+
+fn intermediate_container_id_from_builder_stream(line: &str) -> Option<&str> {
+    let rest = line
+        .strip_prefix(" ---> Running in ")
+        .or_else(|| line.strip_prefix("Running in "))?;
+    let id = rest.trim();
+    is_recognized_engine_id(id).then_some(id)
+}
+
+fn builder_signalling_intermediate_container() -> (
+    Arc<DockerActionBuilder>,
+    tokio::sync::oneshot::Receiver<String>,
+) {
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    let sender = std::sync::Mutex::new(Some(sender));
+    let observer = Arc::new(move |info: &BuildInfo| {
+        let Some(id) = info
+            .stream
+            .as_deref()
+            .and_then(intermediate_container_id_from_builder_stream)
+        else {
+            return;
+        };
+        if let Some(sender) = sender.lock().unwrap().take() {
+            let _ = sender.send(id.to_string());
+        }
+    });
+    (
+        Arc::new(DockerActionBuilder::new_with_build_info_observer_for_test(
+            observer,
+        )),
+        receiver,
+    )
+}
+
+async fn wait_until_container_not_running(
+    docker: &Docker,
+    container_id: &str,
+    budget: Duration,
+) -> bool {
+    let deadline = Instant::now() + budget;
+    let mut ticker = tokio::time::interval(Duration::from_millis(250));
+    loop {
+        ticker.tick().await;
+        match docker.inspect_container(container_id, None).await {
+            Err(DockerError::DockerResponseServerError {
+                status_code: 404, ..
+            }) => return true,
+            Err(error) => panic!("inspecting intermediate container failed: {error}"),
+            Ok(inspect) => {
+                let running = inspect
+                    .state
+                    .as_ref()
+                    .and_then(|state| state.running)
+                    .unwrap_or(false);
+                if !running {
+                    return true;
+                }
+            }
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+    }
+}
+
+#[test]
+fn intermediate_container_id_extraction_accepts_builder_v1_variants() {
+    assert_eq!(
+        intermediate_container_id_from_builder_stream(" ---> Running in 1a2b3c4d5e6f\n"),
+        Some("1a2b3c4d5e6f")
+    );
+    assert_eq!(
+        intermediate_container_id_from_builder_stream("Running in 1a2b3c4d5e6f"),
+        Some("1a2b3c4d5e6f")
+    );
+}
+
+#[test]
+fn intermediate_container_id_extraction_rejects_other_stream_lines() {
+    assert_eq!(
+        intermediate_container_id_from_builder_stream("Step 2/2 : RUN sleep 30"),
+        None
+    );
+    assert_eq!(
+        intermediate_container_id_from_builder_stream(" ---> Running in not-an-id"),
+        None
+    );
+    assert_eq!(
+        intermediate_container_id_from_builder_stream(
+            "Removing intermediate container 1a2b3c4d5e6f"
+        ),
+        None
+    );
+    assert_eq!(intermediate_container_id_from_builder_stream("short"), None);
 }
 
 async fn test_build(

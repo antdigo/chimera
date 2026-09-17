@@ -48,9 +48,17 @@ pub struct DockerBuildRequest<'a> {
     pub reuse: Option<&'a BuiltDockerImage>,
 }
 
+// Test-only: lets Engine-state tests observe raw stream elements directly
+// instead of synchronizing on LogSender delivery, whose latency is unrelated
+// to the cancellation behavior under test.
+#[cfg(test)]
+type BuildInfoObserver = std::sync::Arc<dyn Fn(&BuildInfo) + Send + Sync>;
+
 pub struct DockerActionBuilder {
     cache: BuildCache,
     tag_namespace: String,
+    #[cfg(test)]
+    build_info_observer_for_test: Option<BuildInfoObserver>,
 }
 
 impl DockerActionBuilder {
@@ -58,6 +66,8 @@ impl DockerActionBuilder {
         Self {
             cache: BuildCache::new(),
             tag_namespace: uuid::Uuid::new_v4().simple().to_string(),
+            #[cfg(test)]
+            build_info_observer_for_test: None,
         }
     }
 
@@ -146,6 +156,8 @@ impl DockerActionBuilder {
         let build_key = key.clone();
         let logger = request.log_sender.clone();
         let registry_auth = request.registry_auth.cloned();
+        #[cfg(test)]
+        let build_info_observer = self.build_info_observer_for_test.clone();
         let outcome = self
             .cache
             .get_or_build(
@@ -165,6 +177,8 @@ impl DockerActionBuilder {
                         &build_key,
                         registry_auth,
                         &logger,
+                        #[cfg(test)]
+                        build_info_observer,
                     )
                     .await
                 },
@@ -188,6 +202,14 @@ impl DockerActionBuilder {
             .await),
             CacheOutcome::Cancelled => Ok(DockerBuildOutcome::Cancelled),
             CacheOutcome::TimedOut => Ok(DockerBuildOutcome::TimedOut),
+        }
+    }
+
+    #[cfg(test)]
+    fn new_with_build_info_observer_for_test(observer: BuildInfoObserver) -> Self {
+        Self {
+            build_info_observer_for_test: Some(observer),
+            ..Self::new()
         }
     }
 
@@ -230,6 +252,7 @@ async fn build_archive(
     cache_key: &BuildCacheKey,
     registry_auth: Option<RegistryAuth>,
     log_sender: &LogSender,
+    #[cfg(test)] build_info_observer: Option<BuildInfoObserver>,
 ) -> Result<String> {
     let options = BuildImageOptions {
         dockerfile: prepared.dockerfile.clone(),
@@ -248,6 +271,12 @@ async fn build_archive(
     let mut stream = docker.build_image(options, registry_auth, Some(prepared.archive.into()));
 
     while let Some(item) = stream.next().await {
+        #[cfg(test)]
+        if let Some(observer) = build_info_observer.as_ref()
+            && let Ok(info) = item.as_ref()
+        {
+            observer(info);
+        }
         let info = item.map_err(|_| anyhow!("Docker action image build failed"))?;
         if info.error.is_some() {
             return Err(anyhow!("Docker action image build failed"));
