@@ -79,6 +79,20 @@ log_format = "text"           # "text" or "json" (json works well with journald)
 shutdown_timeout_secs = 300
 ```
 
+### Per-job Docker configuration
+
+For each acquired job, Chimera creates
+`<root>/job-resources/<local-attempt-uuid>/docker/config.json`. Host steps receive
+that generated directory as `DOCKER_CONFIG`; the value is reserved and a workflow
+may repeat it but cannot redirect it. Chimera does not copy credentials, named
+contexts, credential helpers, or CLI plugins from `~/.docker` or an inherited
+daemon `DOCKER_CONFIG`.
+
+Chimera refuses startup when stale `job-resources` exist rather than deleting them
+automatically. This prevents accidental credential loss, but it is not tenant or
+same-UID process isolation. Follow the [operator recovery procedure](docs/job-docker-config.md)
+before removing an exact stale attempt directory.
+
 ## Supported features
 
 - Host and container step execution (`run:`, `container:`, `services:`)
@@ -93,7 +107,7 @@ shutdown_timeout_secs = 300
 Chimera-only features:
 - Multi-runner concurrency with independent error isolation
 - Local `actions/cache` server for faster caching and no external dependencies
-- Automatic cleanup of old workspaces, containers and orphaned processes
+- Automatic cleanup of completed workspaces and Chimera-created resources; process-tree escapes require operator recovery
 - Configurable LRU cache (default 10GB)
 
 ## Running as a systemd service
