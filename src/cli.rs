@@ -68,6 +68,25 @@ pub enum Command {
         #[arg(long, default_value_os_t = default_root())]
         root: PathBuf,
     },
+
+    /// Import an existing official runner registration without contacting GitHub
+    ImportOfficial {
+        /// Official runner installation directory
+        #[arg(long)]
+        source: PathBuf,
+
+        /// Local Chimera runner key; does not rename the GitHub agent
+        #[arg(long)]
+        name: String,
+
+        /// Chimera root directory
+        #[arg(long)]
+        root: PathBuf,
+
+        /// Validate and report eligibility without writing files
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 pub async fn run(cli: Cli) -> Result<()> {
@@ -95,6 +114,18 @@ pub async fn run(cli: Cli) -> Result<()> {
         }
 
         Command::Status { root } => run_status(root),
+
+        Command::ImportOfficial {
+            source,
+            name,
+            root,
+            dry_run,
+        } => {
+            init_tracing(&DaemonConfig::default());
+            let outcome = crate::import::import_official(&source, &name, &root, dry_run)?;
+            println!("{outcome}");
+            Ok(())
+        }
     }
 }
 
@@ -172,6 +203,10 @@ fn run_status(root: PathBuf) -> Result<()> {
 
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "cli_test.rs"]
+mod cli_test;
 
 fn init_tracing(daemon_config: &DaemonConfig) {
     use tracing_subscriber::EnvFilter;
