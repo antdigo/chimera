@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use super::*;
 use crate::job::action::metadata::{ActionInput, ActionRuns, ActionRuntime};
-use crate::job::docker_config::DOCKER_CONFIG_ENV;
+use crate::job::docker_config::{DOCKER_CONFIG_ENV, JobResourceRoot};
 use crate::job::logs::LogSender;
 use crate::job::schema::{StepReference, StepReferenceKind};
 use crate::job::workspace::Workspace;
@@ -410,10 +410,47 @@ fn metadata_image_classifies_dockerfile_and_prebuilt_references() {
     ));
 }
 
-#[test]
-fn built_image_trace_omits_local_id_and_keeps_safe_source() {
-    const SENTINEL_IMAGE_ID: &str = "sha256:sentinel-built-image-id";
+// ── trace_docker_metadata_action ────────────────────────────────
 
+const TRACE_ARG_VALUE_SENTINEL: &str = "sentinel-arg-value-never-trace";
+
+/// Resolve args the way the real caller does, so the sentinel value is
+/// genuinely part of the resolved arguments a caller holds at trace time.
+fn sentinel_resolved_args() -> Vec<String> {
+    let (_temp, workspace) = action_workspace();
+    let state = action_job_state();
+    let step = docker_action_step(Some(HashMap::from([(
+        "SENTINEL_ARG".to_string(),
+        TRACE_ARG_VALUE_SENTINEL.to_string(),
+    )])));
+    let raw_args = vec!["${{ env.SENTINEL_ARG }}".to_string()];
+    let base_env = HashMap::new();
+
+    let (_env, resolved_args) = build_metadata_action_env(
+        &make_docker_metadata("alpine:3.19"),
+        "main",
+        &raw_args,
+        &step,
+        &state,
+        &workspace,
+        &base_env,
+    )
+    .unwrap();
+
+    assert_eq!(
+        resolved_args,
+        vec![TRACE_ARG_VALUE_SENTINEL.to_string()],
+        "arrange must produce the sentinel in the resolved args"
+    );
+    resolved_args
+}
+
+fn capture_docker_metadata_trace(
+    selected_image: &SelectedDockerImage,
+    entry_point: &str,
+    entrypoint: &Option<String>,
+    resolved_arg_count: usize,
+) -> String {
     let captured_output = Arc::new(Mutex::new(Vec::new()));
     let writer_output = Arc::clone(&captured_output);
     let subscriber = tracing_subscriber::fmt()
@@ -423,17 +460,119 @@ fn built_image_trace_omits_local_id_and_keeps_safe_source() {
         .with_target(false)
         .with_writer(move || TraceWriter(Arc::clone(&writer_output)))
         .finish();
+    tracing::subscriber::with_default(subscriber, || {
+        trace_docker_metadata_action(selected_image, entry_point, entrypoint, resolved_arg_count);
+    });
+    String::from_utf8(captured_output.lock().unwrap().clone()).unwrap()
+}
+
+#[test]
+fn built_image_trace_omits_arg_values_and_local_id() {
+    const SENTINEL_IMAGE_ID: &str = "sha256:sentinel-built-image-id";
+    let resolved_args = sentinel_resolved_args();
     let selected_image = SelectedDockerImage::Built(SENTINEL_IMAGE_ID.to_string());
     let entrypoint: Option<String> = None;
-    let resolved_args = Vec::new();
 
-    tracing::subscriber::with_default(subscriber, || {
-        trace_docker_metadata_action(&selected_image, "main", &entrypoint, &resolved_args);
-    });
+    let captured =
+        capture_docker_metadata_trace(&selected_image, "main", &entrypoint, resolved_args.len());
 
-    let captured = String::from_utf8(captured_output.lock().unwrap().clone()).unwrap();
     assert!(!captured.contains(SENTINEL_IMAGE_ID), "{captured}");
+    assert!(!captured.contains(TRACE_ARG_VALUE_SENTINEL), "{captured}");
     assert!(captured.contains("image_source=\"built\""), "{captured}");
+    assert!(
+        captured.contains("resolved_arg_count=1"),
+        "resolved argument count must be traced: {captured}"
+    );
+}
+
+#[test]
+fn prebuilt_image_trace_omits_arg_values_and_keeps_reference() {
+    const IMAGE_REFERENCE: &str = "ghcr.io/owner/safe-action:v1";
+    let resolved_args = sentinel_resolved_args();
+    let selected_image = SelectedDockerImage::Prebuilt(IMAGE_REFERENCE.to_string());
+    let entrypoint: Option<String> = None;
+
+    let captured =
+        capture_docker_metadata_trace(&selected_image, "main", &entrypoint, resolved_args.len());
+
+    assert!(!captured.contains(TRACE_ARG_VALUE_SENTINEL), "{captured}");
+    assert!(captured.contains(IMAGE_REFERENCE), "{captured}");
+    assert!(captured.contains("image_source=\"prebuilt\""), "{captured}");
+    assert!(
+        captured.contains("resolved_arg_count=1"),
+        "resolved argument count must be traced: {captured}"
+    );
+}
+
+// ── run_docker_metadata_action ──────────────────────────────────
+
+fn test_docker_config(tmp: &tempfile::TempDir) -> crate::job::docker_config::JobDockerConfig {
+    let root = JobResourceRoot::prepare(&tmp.path().join("job-resources")).unwrap();
+    root.create_docker_config().unwrap()
+}
+
+#[tokio::test]
+async fn build_timeout_log_send_never_blocks_on_a_full_log_channel() {
+    let action = tempfile::tempdir().unwrap();
+    std::fs::write(
+        action.path().join("action.yml"),
+        "name: dockerfile-action\nruns:\n  using: docker\n  image: Dockerfile\n",
+    )
+    .unwrap();
+    std::fs::write(action.path().join("Dockerfile"), "FROM alpine:3.19\n").unwrap();
+    let action_dir = TrustedActionDirectory::resolve(action.path(), Path::new(".")).unwrap();
+    let (_work_temp, workspace) = action_workspace();
+    let mut job_state = action_job_state();
+    let step = docker_action_step(None);
+    let metadata = make_docker_metadata("Dockerfile");
+
+    // A capacity-1 channel already holding one line has no room for the
+    // timeout notice, and nothing drains it for the lifetime of the test.
+    let masks = Arc::new(tokio::sync::RwLock::new(Vec::new()));
+    let (log_tx, _log_rx) = tokio::sync::mpsc::channel(1);
+    let log_sender = LogSender::new_for_test(log_tx, Arc::clone(&masks));
+    log_sender.send("filler line".into()).await;
+
+    let docker_action_builder = DockerActionBuilder::new();
+    let docker_build_scope = DockerBuildScope::new("test-runner", "test/timeout-notice");
+    let base_env = HashMap::new();
+    let resources = tempfile::tempdir().unwrap();
+    let docker_config = test_docker_config(&resources);
+    let node_runtimes = crate::node::NodeRuntimes::single("node".into());
+    // An HTTP-transport client never dials until a request is made, so the
+    // expired-deadline short-circuit is under test, not daemon reachability.
+    let docker = Docker::connect_with_http("127.0.0.1:9", 120, bollard::API_DEFAULT_VERSION)
+        .expect("lazy HTTP docker client must construct without a daemon");
+    let docker_resources = JobDockerResources::new(docker);
+    let execution =
+        JobExecutionContext::new(&docker_config, Some(&docker_resources), &node_runtimes);
+    let deadline = Instant::now() - Duration::from_secs(1);
+    let cancel_token = CancellationToken::new();
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(2),
+        run_docker_metadata_action(
+            &action_dir,
+            &metadata,
+            "main",
+            &step,
+            &mut job_state,
+            &workspace,
+            &base_env,
+            &log_sender,
+            &docker_action_builder,
+            &docker_build_scope,
+            None,
+            deadline,
+            &cancel_token,
+            &execution,
+        ),
+    )
+    .await
+    .expect("timeout notice must not wait for log channel capacity")
+    .unwrap();
+
+    assert_eq!(result.conclusion, StepConclusion::Failed);
 }
 
 #[test]

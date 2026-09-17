@@ -146,9 +146,14 @@ pub(crate) async fn run_docker_metadata_action(
                     });
                 }
                 DockerBuildOutcome::TimedOut => {
-                    log_sender
-                        .send("Docker action image build timed out".into())
-                        .await;
+                    // Dropping the timeout notice is acceptable; extending the
+                    // step's lifecycle to wait for log channel capacity is not.
+                    let _ = within_budget(
+                        deadline,
+                        cancel_token,
+                        log_sender.send("Docker action image build timed out".into()),
+                    )
+                    .await;
                     return Ok(StepResult {
                         conclusion: StepConclusion::Failed,
                     });
@@ -167,7 +172,12 @@ pub(crate) async fn run_docker_metadata_action(
         base_env,
     )?;
 
-    trace_docker_metadata_action(&selected_image, entry_point, &entrypoint, &resolved_args);
+    trace_docker_metadata_action(
+        &selected_image,
+        entry_point,
+        &entrypoint,
+        resolved_args.len(),
+    );
 
     let result = run_docker_container(RunDockerParams {
         docker,
@@ -284,11 +294,13 @@ impl SelectedDockerImage {
     }
 }
 
+/// Resolved argument values bypass the masking pipeline, so they must never
+/// enter global tracing; only their count is recorded here.
 fn trace_docker_metadata_action(
     selected_image: &SelectedDockerImage,
     entry_point: &str,
     entrypoint: &Option<String>,
-    resolved_args: &[String],
+    resolved_arg_count: usize,
 ) {
     match selected_image {
         SelectedDockerImage::Prebuilt(image) => debug!(
@@ -296,14 +308,14 @@ fn trace_docker_metadata_action(
             image_source = "prebuilt",
             entry_point,
             ?entrypoint,
-            ?resolved_args,
+            resolved_arg_count,
             "running docker metadata action"
         ),
         SelectedDockerImage::Built(_) => debug!(
             image_source = "built",
             entry_point,
             ?entrypoint,
-            ?resolved_args,
+            resolved_arg_count,
             "running docker metadata action"
         ),
     }
