@@ -48,6 +48,15 @@ chimera start
 
 Jobs with `container:` run inside Docker. Jobs without it run on the host. Services always run as containers on a shared bridge network. Logs stream live to the GitHub UI.
 
+### Runner context compatibility
+
+Chimera exposes the standard `runner.environment == 'self-hosted'` expression
+property. For compatibility with existing workflows it also exposes
+`runner.labels` as the typed array `["self-hosted"]`. This compatibility array
+is intentionally not the complete set of labels registered on GitHub and does
+not affect job assignment. See [Runner context compatibility](docs/runner-context.md)
+for the exact contract and environment-override behavior.
+
 All state and data is stored in `~/.chimera` by default.
 
 ## CLI
@@ -112,7 +121,7 @@ an exact stale attempt directory.
 
 - Host and container step execution (`run:`, `container:`, `services:`)
 - All action types: Node.js, Docker, composite
-- Full `${{ }}` expressions — `success()`, `failure()`, `hashFiles()`, `contains()`, `format()`, all contexts
+- `${{ }}` expressions, including status/string functions and the documented GitHub/runner/job/steps/needs/matrix/vars contexts
 - All workflow commands (`set-output`, `set-env`, `add-mask`, `save-state`, etc.)
 - Step conditions, timeouts, `continue-on-error`, cancellation
 - Per-job Docker network, port mapping, volumes, `--privileged`/`--cap-add`
