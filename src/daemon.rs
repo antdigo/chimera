@@ -13,6 +13,9 @@ use tracing::{Instrument, error, info, warn};
 use crate::cache::manager::CacheManager;
 use crate::cache::server as cache_server;
 use crate::config::{ChimeraConfig, ChimeraPaths, load_config, load_runner_credentials};
+use crate::job::docker_config::{
+    JobDockerConfigError, JobResourceCleanupFatalError, JobResourceRoot,
+};
 use crate::runner::Runner;
 use crate::storage::RootLock;
 
@@ -21,38 +24,172 @@ use crate::storage::RootLock;
 #[derive(Debug)]
 pub struct PidLock {
     path: PathBuf,
+    device: u64,
+    inode: u64,
+    _file: std::fs::File,
 }
 
 impl PidLock {
     pub fn acquire(path: &Path) -> Result<Self> {
-        if path.exists() {
-            let content = std::fs::read_to_string(path)
-                .with_context(|| format!("reading PID file {}", path.display()))?;
+        Self::acquire_with_hooks(path, || {}, || {})
+    }
+
+    fn acquire_with_hooks<AfterOpen, AfterLock>(
+        path: &Path,
+        after_open: AfterOpen,
+        after_lock: AfterLock,
+    ) -> Result<Self>
+    where
+        AfterOpen: FnOnce(),
+        AfterLock: FnOnce(),
+    {
+        use std::io::{Read, Seek, SeekFrom, Write};
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let mut file = open_pid_lock_file(path)?;
+        after_open();
+        claim_pid_lock(&file, path)?;
+        let metadata = file
+            .metadata()
+            .context("reading acquired PID lock metadata")?;
+        verify_pid_lock_path(path, metadata.dev(), metadata.ino())?;
+        after_lock();
+
+        file.seek(SeekFrom::Start(0))
+            .with_context(|| format!("seeking PID file {}", path.display()))?;
+        let mut content = String::new();
+        file.read_to_string(&mut content)
+            .with_context(|| format!("reading PID file {}", path.display()))?;
+        if !content.is_empty() {
             let pid: u32 = content
                 .trim()
                 .parse()
                 .with_context(|| format!("parsing PID from {}", path.display()))?;
-
             if is_process_alive(pid) {
                 bail!("chimera daemon already running (pid {pid}). Use 'chimera status' to check.");
             }
-
-            std::fs::remove_file(path)
-                .with_context(|| format!("removing stale PID file {}", path.display()))?;
         }
 
-        std::fs::write(path, std::process::id().to_string())
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("setting PID file permissions {}", path.display()))?;
+        file.set_len(0)
+            .with_context(|| format!("clearing PID file {}", path.display()))?;
+        file.seek(SeekFrom::Start(0))
+            .with_context(|| format!("seeking PID file {}", path.display()))?;
+        write!(file, "{}", std::process::id())
             .with_context(|| format!("writing PID file {}", path.display()))?;
+        file.sync_all()
+            .with_context(|| format!("syncing PID file {}", path.display()))?;
 
         Ok(Self {
             path: path.to_path_buf(),
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            _file: file,
         })
+    }
+}
+
+fn open_pid_lock_file(path: &Path) -> Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let nofollow_nonblocking = libc::O_NOFOLLOW | libc::O_NONBLOCK;
+    match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(nofollow_nonblocking)
+        .open(path)
+    {
+        Ok(file) => Ok(file),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let metadata = std::fs::symlink_metadata(path)
+                .with_context(|| format!("reading PID file metadata {}", path.display()))?;
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                bail!("unsafe PID lock path: {}", path.display());
+            }
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .custom_flags(nofollow_nonblocking)
+                .open(path)
+                .map_err(|error| {
+                    if error.raw_os_error() == Some(libc::ELOOP) {
+                        anyhow::anyhow!("unsafe PID lock path: {}", path.display())
+                    } else {
+                        error.into()
+                    }
+                })
+                .with_context(|| format!("opening PID file {}", path.display()))?;
+            let metadata = file
+                .metadata()
+                .with_context(|| format!("reading PID file metadata {}", path.display()))?;
+            if !metadata.is_file() {
+                bail!("unsafe PID lock path: {}", path.display());
+            }
+            Ok(file)
+        }
+        Err(error) => Err(error).with_context(|| format!("creating PID file {}", path.display())),
+    }
+}
+
+fn claim_pid_lock(file: &std::fs::File, path: &Path) -> Result<()> {
+    use std::os::unix::io::AsRawFd;
+
+    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if result == 0 {
+        return Ok(());
+    }
+
+    let error = std::io::Error::last_os_error();
+    if error.kind() == std::io::ErrorKind::WouldBlock {
+        bail!("chimera daemon already running. Use 'chimera status' to check.");
+    }
+    Err(error).with_context(|| format!("claiming PID lock {}", path.display()))
+}
+
+fn verify_pid_lock_path(path: &Path, device: u64, inode: u64) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = std::fs::symlink_metadata(path)
+        .with_context(|| format!("reading PID lock metadata {}", path.display()))?;
+    if metadata.is_file()
+        && !metadata.file_type().is_symlink()
+        && metadata.dev() == device
+        && metadata.ino() == inode
+    {
+        return Ok(());
+    }
+    bail!("PID lock changed while held: {}", path.display());
+}
+
+fn remove_if_same_inode(path: &Path, device: u64, inode: u64) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    match std::fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => {
+            Err(error).with_context(|| format!("reading PID lock metadata {}", path.display()))
+        }
+        Ok(metadata)
+            if metadata.is_file()
+                && !metadata.file_type().is_symlink()
+                && metadata.dev() == device
+                && metadata.ino() == inode =>
+        {
+            std::fs::remove_file(path)
+                .with_context(|| format!("removing PID lock {}", path.display()))
+        }
+        Ok(_) => bail!("PID lock changed while held: {}", path.display()),
     }
 }
 
 impl Drop for PidLock {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        if let Err(error) = remove_if_same_inode(&self.path, self.device, self.inode) {
+            warn!(error = %error, path = %self.path.display(), "failed to release PID lock");
+        }
     }
 }
 
@@ -65,6 +202,12 @@ pub fn is_process_alive(pid: u32) -> bool {
     }
     // EPERM means the process exists but we lack permission to signal it
     std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+fn prepare_daemon_root(paths: &ChimeraPaths) -> Result<(PidLock, JobResourceRoot)> {
+    let pid_lock = PidLock::acquire(&paths.pid_file()).context("acquiring PID lock")?;
+    let job_resources = JobResourceRoot::prepare(&paths.job_resources_dir())?;
+    Ok((pid_lock, job_resources))
 }
 
 // --- Runner state ---
@@ -199,6 +342,19 @@ pub fn read_state_file(path: &Path) -> Result<StateSnapshot> {
     serde_json::from_str(&text).with_context(|| format!("parsing state file {}", path.display()))
 }
 
+fn is_fatal_job_resource_error(error: &anyhow::Error) -> bool {
+    // anyhow's downcast_ref walks the error chain, so wrappers added along
+    // the way do not hide the fatal marker.
+    let poisoned = matches!(
+        error.downcast_ref::<JobDockerConfigError>(),
+        Some(JobDockerConfigError::PoisonedRoot { .. })
+    );
+    let cleanup_fatal = error
+        .downcast_ref::<JobResourceCleanupFatalError>()
+        .is_some();
+    poisoned || cleanup_fatal
+}
+
 // --- Daemon ---
 
 pub struct Daemon {
@@ -227,7 +383,7 @@ impl Daemon {
     }
 
     pub async fn run(self, mut shutdown_rx: watch::Receiver<bool>) -> Result<()> {
-        let _pid_lock = PidLock::acquire(&self.paths.pid_file()).context("acquiring PID lock")?;
+        let (_pid_lock, job_resources) = prepare_daemon_root(&self.paths)?;
 
         // Start cache server if configured
         let cache_config = self.config.cache.clone();
@@ -267,6 +423,7 @@ impl Daemon {
                 creds,
                 self.paths.clone(),
                 Arc::clone(&state),
+                job_resources.clone(),
                 cache_port,
             );
 
@@ -319,6 +476,7 @@ impl Daemon {
         let shutdown_timeout = self.config.daemon.shutdown_timeout_secs;
 
         info!(runners = started, "daemon started");
+        let mut fatal_error = None;
 
         // Wait for either: all runners exit or shutdown signal
         loop {
@@ -328,8 +486,13 @@ impl Daemon {
                         Some(Ok((name, Ok(())))) => {
                             info!(runner = %name, "runner exited cleanly");
                         }
-                        Some(Ok((name, Err(e)))) => {
-                            error!(runner = %name, error = %e, "runner exited with error");
+                        Some(Ok((name, Err(error)))) => {
+                            let fatal = is_fatal_job_resource_error(&error);
+                            error!(runner = %name, error = %error, "runner exited with error");
+                            if fatal {
+                                fatal_error = Some(error);
+                                break;
+                            }
                         }
                         Some(Err(e)) => {
                             error!(error = %e, "runner task panicked");
@@ -378,7 +541,10 @@ impl Daemon {
         let _ = std::fs::remove_file(self.paths.state_file());
 
         info!("daemon shut down");
-        Ok(())
+        match fatal_error {
+            Some(error) => Err(error.context("job resource cleanup made the daemon unhealthy")),
+            None => Ok(()),
+        }
     }
 }
 

@@ -1,6 +1,8 @@
 use super::*;
-use crate::job::schema::JobManifest;
+use crate::job::docker_config::{DOCKER_CONFIG_ENV, JobDockerConfig, JobResourceRoot};
+use crate::job::schema::{JobManifest, JobVariable};
 use serde_json::json;
+
 fn minimal_manifest() -> JobManifest {
     serde_json::from_value(json!({
         "plan": { "planId": "p", "jobId": "j", "timelineId": "t" },
@@ -50,12 +52,20 @@ fn test_workspace() -> (tempfile::TempDir, Workspace) {
     (tmp, ws)
 }
 
+fn test_docker_config() -> (tempfile::TempDir, JobDockerConfig) {
+    let temp = tempfile::TempDir::new().unwrap();
+    let root = JobResourceRoot::prepare(&temp.path().join("job-resources")).unwrap();
+    let config = root.create_docker_config().unwrap();
+    (temp, config)
+}
+
 #[test]
 fn sets_github_context_vars() {
     let manifest = minimal_manifest();
     let (_tmp, ws) = test_workspace();
+    let (_resources, config) = test_docker_config();
 
-    let env = build_base_env(&manifest, &ws, "test-runner");
+    let env = build_base_env(&manifest, &ws, "test-runner", &config).unwrap();
 
     assert_eq!(env.get("GITHUB_REPOSITORY").unwrap(), "owner/repo");
     assert_eq!(env.get("GITHUB_SHA").unwrap(), "abc123");
@@ -72,8 +82,9 @@ fn sets_github_context_vars() {
 fn sets_github_token() {
     let manifest = minimal_manifest();
     let (_tmp, ws) = test_workspace();
+    let (_resources, config) = test_docker_config();
 
-    let env = build_base_env(&manifest, &ws, "test-runner");
+    let env = build_base_env(&manifest, &ws, "test-runner", &config).unwrap();
 
     assert_eq!(env.get("GITHUB_TOKEN").unwrap(), "ghs_test123");
 }
@@ -82,8 +93,9 @@ fn sets_github_token() {
 fn sets_runner_vars() {
     let manifest = minimal_manifest();
     let (_tmp, ws) = test_workspace();
+    let (_resources, config) = test_docker_config();
 
-    let env = build_base_env(&manifest, &ws, "my-runner");
+    let env = build_base_env(&manifest, &ws, "my-runner", &config).unwrap();
 
     assert_eq!(env.get("RUNNER_NAME").unwrap(), "my-runner");
     assert!(env.contains_key("RUNNER_OS"));
@@ -96,8 +108,9 @@ fn sets_runner_vars() {
 fn sets_workspace_paths() {
     let manifest = minimal_manifest();
     let (_tmp, ws) = test_workspace();
+    let (_resources, config) = test_docker_config();
 
-    let env = build_base_env(&manifest, &ws, "test-runner");
+    let env = build_base_env(&manifest, &ws, "test-runner", &config).unwrap();
 
     assert_eq!(env.get("GITHUB_ACTIONS").unwrap(), "true");
     assert!(!env.get("GITHUB_WORKSPACE").unwrap().is_empty());
@@ -113,8 +126,9 @@ fn sets_workspace_paths() {
 fn seeds_host_path_from_process() {
     let manifest = minimal_manifest();
     let (_tmp, ws) = test_workspace();
+    let (_resources, config) = test_docker_config();
 
-    let env = build_base_env(&manifest, &ws, "test-runner");
+    let env = build_base_env(&manifest, &ws, "test-runner", &config).unwrap();
 
     assert_eq!(env.get("PATH"), std::env::var("PATH").ok().as_ref());
 }
@@ -123,11 +137,11 @@ fn seeds_host_path_from_process() {
 fn sets_non_secret_variables() {
     let manifest = minimal_manifest();
     let (_tmp, ws) = test_workspace();
+    let (_resources, config) = test_docker_config();
 
-    let env = build_base_env(&manifest, &ws, "test-runner");
+    let env = build_base_env(&manifest, &ws, "test-runner", &config).unwrap();
 
     assert_eq!(env.get("MY_VAR").unwrap(), "hello");
-    // Secret variables should NOT appear as their raw key
     assert!(!env.contains_key("system.github.token"));
 }
 
@@ -135,14 +149,45 @@ fn sets_non_secret_variables() {
 fn sets_actions_runtime() {
     let manifest = minimal_manifest();
     let (_tmp, ws) = test_workspace();
+    let (_resources, config) = test_docker_config();
 
-    let env = build_base_env(&manifest, &ws, "test-runner");
+    let env = build_base_env(&manifest, &ws, "test-runner", &config).unwrap();
 
     assert_eq!(
         env.get("ACTIONS_RUNTIME_URL").unwrap(),
         "https://pipelines.actions.githubusercontent.com/abc/"
     );
     assert_eq!(env.get("ACTIONS_RUNTIME_TOKEN").unwrap(), "runtime-token");
+}
+
+#[test]
+fn host_env_sets_runner_owned_docker_config() {
+    let manifest = minimal_manifest();
+    let (_tmp, ws) = test_workspace();
+    let (resources, config) = test_docker_config();
+
+    let env = build_base_env(&manifest, &ws, "test-runner", &config).unwrap();
+
+    assert_eq!(env[DOCKER_CONFIG_ENV], config.directory().to_string_lossy());
+    drop(resources);
+}
+
+#[test]
+fn host_env_rejects_manifest_override() {
+    let mut manifest = minimal_manifest();
+    manifest.variables.insert(
+        "DOCKER_CONFIG".into(),
+        JobVariable {
+            value: "/shared/.docker".into(),
+            is_secret: true,
+        },
+    );
+    let (_tmp, ws) = test_workspace();
+    let (_resources, config) = test_docker_config();
+
+    let error = build_base_env(&manifest, &ws, "test-runner", &config).unwrap_err();
+
+    assert!(error.to_string().contains("reserved-environment-variable"));
 }
 
 #[test]
@@ -179,12 +224,26 @@ fn container_env_preserves_non_path_vars() {
 
     let env = build_container_env(&manifest, &ws, "test-runner");
 
-    // Non-path variables should still be present
     assert_eq!(env.get("GITHUB_ACTIONS").unwrap(), "true");
     assert_eq!(env.get("GITHUB_REPOSITORY").unwrap(), "owner/repo");
     assert_eq!(env.get("GITHUB_TOKEN").unwrap(), "ghs_test123");
-
-    // Container is always Linux regardless of host OS
     assert_eq!(env.get("RUNNER_OS").unwrap(), "Linux");
     assert!(env.contains_key("RUNNER_ARCH"));
+}
+
+#[test]
+fn container_env_never_contains_host_docker_config() {
+    let mut manifest = minimal_manifest();
+    manifest.variables.insert(
+        DOCKER_CONFIG_ENV.into(),
+        JobVariable {
+            value: "/shared/.docker".into(),
+            is_secret: false,
+        },
+    );
+    let (_tmp, ws) = test_workspace();
+
+    let env = build_container_env(&manifest, &ws, "test-runner");
+
+    assert!(!env.contains_key(DOCKER_CONFIG_ENV));
 }

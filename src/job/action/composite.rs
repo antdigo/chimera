@@ -9,13 +9,14 @@ use tracing::debug;
 
 use super::download::ActionCache;
 use super::metadata::ActionMetadata;
-use crate::docker::resources::JobDockerResources;
-use crate::job::execute::{JobState, StepConclusion, StepResult, build_step_env, run_process};
+use crate::job::docker_config::DOCKER_CONFIG_ENV;
+use crate::job::execute::{
+    JobExecutionContext, JobState, StepConclusion, StepResult, build_step_env, run_process,
+};
 use crate::job::expression::ExprContext;
 use crate::job::logs::LogSender;
 use crate::job::schema::Step;
 use crate::job::workspace::Workspace;
-use crate::node::NodeRuntimes;
 
 use super::build_action_inputs;
 
@@ -38,8 +39,7 @@ pub fn run_composite_action<'a>(
     access_token: &'a str,
     depth: u32,
     cancel_token: &'a CancellationToken,
-    docker_resources: Option<&'a JobDockerResources>,
-    node_runtimes: &'a NodeRuntimes,
+    execution: &'a JobExecutionContext<'_>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<StepResult>> + Send + 'a>> {
     Box::pin(run_composite_action_inner(
         action_dir,
@@ -53,8 +53,7 @@ pub fn run_composite_action<'a>(
         access_token,
         depth,
         cancel_token,
-        docker_resources,
-        node_runtimes,
+        execution,
     ))
 }
 
@@ -71,8 +70,7 @@ async fn run_composite_action_inner(
     access_token: &str,
     depth: u32,
     cancel_token: &CancellationToken,
-    docker_resources: Option<&JobDockerResources>,
-    node_runtimes: &NodeRuntimes,
+    execution: &JobExecutionContext<'_>,
 ) -> Result<StepResult> {
     if depth >= MAX_COMPOSITE_DEPTH {
         bail!("composite action recursion depth limit ({MAX_COMPOSITE_DEPTH}) exceeded");
@@ -85,7 +83,13 @@ async fn run_composite_action_inner(
         .context("composite action has no steps")?;
 
     // Build action inputs once — they stay constant across sub-steps
-    let initial_env = build_step_env(step, job_state, workspace, base_env);
+    let initial_env = build_step_env(
+        step,
+        job_state,
+        workspace,
+        base_env,
+        execution.host_docker_config(),
+    )?;
     let expr_ctx = ExprContext::new(&initial_env, job_state, false, false);
     let action_inputs = build_action_inputs(metadata, step, &expr_ctx);
 
@@ -98,7 +102,13 @@ async fn run_composite_action_inner(
 
         // Rebuild env each iteration so PATH/env changes from previous sub-steps
         // (via ::add-path::, GITHUB_PATH, ::set-env::, GITHUB_ENV) are picked up.
-        let mut composite_env = build_step_env(step, job_state, workspace, base_env);
+        let mut composite_env = build_step_env(
+            step,
+            job_state,
+            workspace,
+            base_env,
+            execution.host_docker_config(),
+        )?;
         composite_env.extend(action_inputs.clone());
 
         // Evaluate `if:` condition — skip the step if it evaluates to false
@@ -131,8 +141,7 @@ async fn run_composite_action_inner(
                 timeout,
                 depth,
                 cancel_token,
-                docker_resources,
-                node_runtimes,
+                execution,
             )
             .await?
         } else if nested_obj.contains_key(ykey("run")) {
@@ -144,7 +153,7 @@ async fn run_composite_action_inner(
                 log_sender,
                 timeout,
                 cancel_token,
-                docker_resources,
+                execution,
             )
             .await?
         } else {
@@ -186,7 +195,7 @@ async fn run_nested_script(
     log_sender: &LogSender,
     timeout: Duration,
     cancel_token: &CancellationToken,
-    docker_resources: Option<&JobDockerResources>,
+    execution: &JobExecutionContext<'_>,
 ) -> Result<StepResult> {
     let script = step_map
         .get(ykey("run"))
@@ -204,6 +213,11 @@ async fn run_nested_script(
             if let (Some(key), Some(val)) = (k.as_str(), v.as_str()) {
                 let env_ctx = ExprContext::new(&step_env, job_state, false, false);
                 let resolved_val = crate::job::expression::resolve_template(val, &env_ctx);
+                if key == DOCKER_CONFIG_ENV
+                    && let Some(config) = execution.host_docker_config()
+                {
+                    config.validate_override(&resolved_val, "step environment")?;
+                }
                 step_env.insert(key.to_string(), resolved_val);
             }
         }
@@ -220,11 +234,13 @@ async fn run_nested_script(
         .map(|d| crate::job::expression::resolve_template(d, &script_ctx));
 
     // Container mode: run inline via docker exec
-    if let Some(resources) = docker_resources.filter(|r| r.job_container_id().is_some()) {
+    if let Some(resources) = execution
+        .docker_resources()
+        .filter(|r| r.job_container_id().is_some())
+    {
         let container_id = resources
             .job_container_id()
             .context("no job container for composite script step")?;
-
         let working_dir = match &raw_workdir {
             Some(d) if d != "." => format!("/github/workspace/{d}"),
             _ => "/github/workspace".into(),
@@ -262,6 +278,7 @@ async fn run_nested_script(
         &[OsStr::new("-e"), script_file.as_os_str()],
         &step_env,
         &working_dir,
+        execution.docker_config(),
         job_state,
         log_sender,
         timeout,
@@ -285,8 +302,7 @@ async fn run_nested_action(
     timeout: Duration,
     depth: u32,
     cancel_token: &CancellationToken,
-    docker_resources: Option<&JobDockerResources>,
-    node_runtimes: &NodeRuntimes,
+    execution: &JobExecutionContext<'_>,
 ) -> Result<StepResult> {
     let uses = step_map
         .get(ykey("uses"))
@@ -304,6 +320,18 @@ async fn run_nested_action(
         }
     }
 
+    let environment = step_map
+        .get(ykey("env"))
+        .and_then(serde_yaml::Value::as_mapping)
+        .map(|env_map| {
+            env_map
+                .iter()
+                .filter_map(|(key, value)| {
+                    Some((key.as_str()?.to_string(), value.as_str()?.to_string()))
+                })
+                .collect()
+        });
+
     let nested_step = Step {
         id: format!("composite_{}", uuid::Uuid::new_v4()),
         display_name: uses.to_string(),
@@ -317,7 +345,7 @@ async fn run_nested_action(
         timeout_in_minutes: Some(timeout.as_secs() / 60),
         continue_on_error: false,
         order: 0,
-        environment: None,
+        environment,
         context_name: None,
     };
 
@@ -331,7 +359,7 @@ async fn run_nested_action(
             env,
             log_sender,
             cancel_token,
-            docker_resources,
+            execution,
         )
         .await;
     }
@@ -352,8 +380,7 @@ async fn run_nested_action(
             env,
             log_sender,
             cancel_token,
-            docker_resources,
-            node_runtimes,
+            execution,
         )
         .await
     } else if metadata.runs.is_composite() {
@@ -369,8 +396,7 @@ async fn run_nested_action(
             access_token,
             depth + 1,
             cancel_token,
-            docker_resources,
-            node_runtimes,
+            execution,
         )
         .await
     } else if metadata.runs.is_docker() {
@@ -384,7 +410,7 @@ async fn run_nested_action(
             env,
             log_sender,
             cancel_token,
-            docker_resources,
+            execution,
         )
         .await
     } else {

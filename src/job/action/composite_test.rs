@@ -6,11 +6,17 @@ use tokio::sync::RwLock;
 use super::*;
 use crate::job::action::download::ActionCache;
 use crate::job::action::metadata::{ActionInput, ActionMetadata, ActionRuns};
-use crate::job::execute::{JobState, StepConclusion};
+use crate::job::docker_config::{DOCKER_CONFIG_ENV, JobResourceRoot};
+use crate::job::execute::{JobExecutionContext, JobState, StepConclusion};
 use crate::job::logs::StepLogger;
 use crate::job::schema::{Step, StepReference};
 use crate::job::workspace::Workspace;
 use tokio_util::sync::CancellationToken;
+
+fn test_docker_config(tmp: &tempfile::TempDir) -> crate::job::docker_config::JobDockerConfig {
+    let root = JobResourceRoot::prepare(&tmp.path().join("job-resources")).unwrap();
+    root.create_docker_config().unwrap()
+}
 
 fn make_test_workspace(tmp: &tempfile::TempDir) -> Workspace {
     Workspace::create(
@@ -45,6 +51,19 @@ fn make_composite_metadata(steps_yaml: &str) -> ActionMetadata {
             env: None,
         },
     }
+}
+
+fn write_local_node_action(workspace: &Workspace, script: &str) {
+    let action_dir = workspace
+        .workspace_dir()
+        .join(".github/actions/nested-node");
+    std::fs::create_dir_all(&action_dir).unwrap();
+    std::fs::write(
+        action_dir.join("action.yml"),
+        "name: nested-node\nruns:\n  using: node20\n  main: main.js\n",
+    )
+    .unwrap();
+    std::fs::write(action_dir.join("main.js"), script).unwrap();
 }
 
 fn make_step() -> Step {
@@ -91,7 +110,13 @@ async fn nested_script_steps_execute() {
     let masks = Arc::new(RwLock::new(Vec::new()));
     let logger = StepLogger::results_for_test(masks);
     let cache = ActionCache::new(tmp.path().join("cache"), reqwest::Client::new());
-    let base_env = HashMap::new();
+    let docker_config = test_docker_config(&tmp);
+    let base_env = HashMap::from([(
+        DOCKER_CONFIG_ENV.to_string(),
+        docker_config.directory().to_string_lossy().into_owned(),
+    )]);
+    let node_runtimes = crate::node::NodeRuntimes::single("node".into());
+    let execution = JobExecutionContext::new(&docker_config, None, &node_runtimes);
 
     let result = run_composite_action(
         &action_dir,
@@ -105,8 +130,7 @@ async fn nested_script_steps_execute() {
         "fake-token",
         0,
         &CancellationToken::new(),
-        None,
-        &crate::node::NodeRuntimes::single("node".into()),
+        &execution,
     )
     .await
     .unwrap();
@@ -139,7 +163,13 @@ async fn failure_propagates() {
     let masks = Arc::new(RwLock::new(Vec::new()));
     let logger = StepLogger::results_for_test(masks);
     let cache = ActionCache::new(tmp.path().join("cache"), reqwest::Client::new());
-    let base_env = HashMap::new();
+    let docker_config = test_docker_config(&tmp);
+    let base_env = HashMap::from([(
+        DOCKER_CONFIG_ENV.to_string(),
+        docker_config.directory().to_string_lossy().into_owned(),
+    )]);
+    let node_runtimes = crate::node::NodeRuntimes::single("node".into());
+    let execution = JobExecutionContext::new(&docker_config, None, &node_runtimes);
 
     let result = run_composite_action(
         &action_dir,
@@ -153,8 +183,7 @@ async fn failure_propagates() {
         "fake-token",
         0,
         &CancellationToken::new(),
-        None,
-        &crate::node::NodeRuntimes::single("node".into()),
+        &execution,
     )
     .await
     .unwrap();
@@ -190,7 +219,13 @@ async fn inputs_available_as_env() {
     let masks = Arc::new(RwLock::new(Vec::new()));
     let logger = StepLogger::results_for_test(masks);
     let cache = ActionCache::new(tmp.path().join("cache"), reqwest::Client::new());
-    let base_env = HashMap::new();
+    let docker_config = test_docker_config(&tmp);
+    let base_env = HashMap::from([(
+        DOCKER_CONFIG_ENV.to_string(),
+        docker_config.directory().to_string_lossy().into_owned(),
+    )]);
+    let node_runtimes = crate::node::NodeRuntimes::single("node".into());
+    let execution = JobExecutionContext::new(&docker_config, None, &node_runtimes);
 
     let result = run_composite_action(
         &action_dir,
@@ -204,13 +239,235 @@ async fn inputs_available_as_env() {
         "fake-token",
         0,
         &CancellationToken::new(),
-        None,
-        &crate::node::NodeRuntimes::single("node".into()),
+        &execution,
     )
     .await
     .unwrap();
 
     assert_eq!(result.conclusion, StepConclusion::Succeeded);
+}
+
+#[tokio::test]
+async fn nested_host_script_rejects_mismatched_docker_config_before_spawn() {
+    let tmp = tempfile::tempdir().unwrap();
+    let workspace = make_test_workspace(&tmp);
+    let action_dir = tmp.path().join("action");
+    std::fs::create_dir_all(&action_dir).unwrap();
+    let marker = tmp.path().join("nested-script-ran");
+    let metadata = make_composite_metadata(&format!(
+        r#"
+- run: touch "{}"
+  shell: bash
+  env:
+    DOCKER_CONFIG: /shared/.docker
+"#,
+        marker.display()
+    ));
+    let step = make_step();
+    let mut state = JobState::new(
+        Arc::new(RwLock::new(Vec::new())),
+        HashMap::new(),
+        serde_json::json!({}),
+    );
+    let logger = StepLogger::results_for_test(Arc::new(RwLock::new(Vec::new())));
+    let cache = ActionCache::new(tmp.path().join("cache"), reqwest::Client::new());
+    let docker_config = test_docker_config(&tmp);
+    let base_env = HashMap::from([(
+        DOCKER_CONFIG_ENV.to_string(),
+        docker_config.directory().to_string_lossy().into_owned(),
+    )]);
+    let node_runtimes = crate::node::NodeRuntimes::single("node".into());
+    let execution = JobExecutionContext::new(&docker_config, None, &node_runtimes);
+
+    let error = run_composite_action(
+        &action_dir,
+        &metadata,
+        &step,
+        &mut state,
+        &workspace,
+        &base_env,
+        logger.sender(),
+        &cache,
+        "fake-token",
+        0,
+        &CancellationToken::new(),
+        &execution,
+    )
+    .await
+    .unwrap_err();
+
+    assert!(error.to_string().contains("reserved-environment-variable"));
+    assert!(!marker.exists());
+}
+
+#[tokio::test]
+async fn nested_host_script_allows_matching_docker_config() {
+    let tmp = tempfile::tempdir().unwrap();
+    let workspace = make_test_workspace(&tmp);
+    let action_dir = tmp.path().join("action");
+    std::fs::create_dir_all(&action_dir).unwrap();
+    let metadata = make_composite_metadata(
+        r#"
+- run: test "$DOCKER_CONFIG" = "$EXPECTED_CONFIG"
+  shell: bash
+  env:
+    DOCKER_CONFIG: ${{ env.EXPECTED_CONFIG }}
+"#,
+    );
+    let step = make_step();
+    let mut state = JobState::new(
+        Arc::new(RwLock::new(Vec::new())),
+        HashMap::new(),
+        serde_json::json!({}),
+    );
+    let logger = StepLogger::results_for_test(Arc::new(RwLock::new(Vec::new())));
+    let cache = ActionCache::new(tmp.path().join("cache"), reqwest::Client::new());
+    let docker_config = test_docker_config(&tmp);
+    let docker_config_path = docker_config.directory().to_string_lossy().into_owned();
+    let base_env = HashMap::from([
+        (DOCKER_CONFIG_ENV.to_string(), docker_config_path.clone()),
+        ("EXPECTED_CONFIG".into(), docker_config_path),
+    ]);
+    let node_runtimes = crate::node::NodeRuntimes::single("node".into());
+    let execution = JobExecutionContext::new(&docker_config, None, &node_runtimes);
+
+    let result = run_composite_action(
+        &action_dir,
+        &metadata,
+        &step,
+        &mut state,
+        &workspace,
+        &base_env,
+        logger.sender(),
+        &cache,
+        "fake-token",
+        0,
+        &CancellationToken::new(),
+        &execution,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(result.conclusion, StepConclusion::Succeeded);
+}
+
+#[tokio::test]
+async fn nested_local_node_rejects_mismatched_docker_config_before_spawn() {
+    let tmp = tempfile::tempdir().unwrap();
+    let workspace = make_test_workspace(&tmp);
+    write_local_node_action(&workspace, r#": > "$GITHUB_WORKSPACE/nested-node-ran""#);
+    let action_dir = tmp.path().join("action");
+    std::fs::create_dir_all(&action_dir).unwrap();
+    let metadata = make_composite_metadata(
+        r#"
+- uses: ./.github/actions/nested-node
+  env:
+    DOCKER_CONFIG: /shared/.docker
+"#,
+    );
+    let step = make_step();
+    let mut state = JobState::new(
+        Arc::new(RwLock::new(Vec::new())),
+        HashMap::new(),
+        serde_json::json!({}),
+    );
+    let logger = StepLogger::results_for_test(Arc::new(RwLock::new(Vec::new())));
+    let cache = ActionCache::new(tmp.path().join("cache"), reqwest::Client::new());
+    let docker_config = test_docker_config(&tmp);
+    let base_env = HashMap::from([
+        (
+            DOCKER_CONFIG_ENV.to_string(),
+            docker_config.directory().to_string_lossy().into_owned(),
+        ),
+        (
+            "GITHUB_WORKSPACE".into(),
+            workspace.workspace_dir().to_string_lossy().into_owned(),
+        ),
+    ]);
+    let node_runtimes = crate::node::NodeRuntimes::single("/bin/sh".into());
+    let execution = JobExecutionContext::new(&docker_config, None, &node_runtimes);
+
+    let error = run_composite_action(
+        &action_dir,
+        &metadata,
+        &step,
+        &mut state,
+        &workspace,
+        &base_env,
+        logger.sender(),
+        &cache,
+        "fake-token",
+        0,
+        &CancellationToken::new(),
+        &execution,
+    )
+    .await
+    .unwrap_err();
+
+    assert!(error.to_string().contains("reserved-environment-variable"));
+    assert!(!workspace.workspace_dir().join("nested-node-ran").exists());
+}
+
+#[tokio::test]
+async fn nested_local_node_allows_matching_docker_config() {
+    let tmp = tempfile::tempdir().unwrap();
+    let workspace = make_test_workspace(&tmp);
+    write_local_node_action(
+        &workspace,
+        r#"
+test "$DOCKER_CONFIG" = "$EXPECTED_CONFIG"
+: > "$GITHUB_WORKSPACE/nested-node-ran"
+"#,
+    );
+    let action_dir = tmp.path().join("action");
+    std::fs::create_dir_all(&action_dir).unwrap();
+    let metadata = make_composite_metadata(
+        r#"
+- uses: ./.github/actions/nested-node
+  env:
+    DOCKER_CONFIG: ${{ env.EXPECTED_CONFIG }}
+"#,
+    );
+    let step = make_step();
+    let mut state = JobState::new(
+        Arc::new(RwLock::new(Vec::new())),
+        HashMap::new(),
+        serde_json::json!({}),
+    );
+    let logger = StepLogger::results_for_test(Arc::new(RwLock::new(Vec::new())));
+    let cache = ActionCache::new(tmp.path().join("cache"), reqwest::Client::new());
+    let docker_config = test_docker_config(&tmp);
+    let docker_config_path = docker_config.directory().to_string_lossy().into_owned();
+    let base_env = HashMap::from([
+        (DOCKER_CONFIG_ENV.to_string(), docker_config_path.clone()),
+        ("EXPECTED_CONFIG".into(), docker_config_path),
+        (
+            "GITHUB_WORKSPACE".into(),
+            workspace.workspace_dir().to_string_lossy().into_owned(),
+        ),
+    ]);
+    let node_runtimes = crate::node::NodeRuntimes::single("/bin/sh".into());
+    let execution = JobExecutionContext::new(&docker_config, None, &node_runtimes);
+
+    let result = run_composite_action(
+        &action_dir,
+        &metadata,
+        &step,
+        &mut state,
+        &workspace,
+        &base_env,
+        logger.sender(),
+        &cache,
+        "fake-token",
+        0,
+        &CancellationToken::new(),
+        &execution,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(result.conclusion, StepConclusion::Succeeded);
+    assert!(workspace.workspace_dir().join("nested-node-ran").exists());
 }
 
 #[tokio::test]
@@ -236,7 +493,13 @@ async fn recursion_depth_limit() {
     let masks = Arc::new(RwLock::new(Vec::new()));
     let logger = StepLogger::results_for_test(masks);
     let cache = ActionCache::new(tmp.path().join("cache"), reqwest::Client::new());
-    let base_env = HashMap::new();
+    let docker_config = test_docker_config(&tmp);
+    let base_env = HashMap::from([(
+        DOCKER_CONFIG_ENV.to_string(),
+        docker_config.directory().to_string_lossy().into_owned(),
+    )]);
+    let node_runtimes = crate::node::NodeRuntimes::single("node".into());
+    let execution = JobExecutionContext::new(&docker_config, None, &node_runtimes);
 
     let result = run_composite_action(
         &action_dir,
@@ -250,8 +513,7 @@ async fn recursion_depth_limit() {
         "fake-token",
         10, // Already at limit
         &CancellationToken::new(),
-        None,
-        &crate::node::NodeRuntimes::single("node".into()),
+        &execution,
     )
     .await;
 

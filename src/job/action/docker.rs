@@ -14,7 +14,10 @@ use super::build_action_inputs;
 use super::metadata::ActionMetadata;
 use crate::docker::output::OutputProcessor;
 use crate::docker::resources::{JobDockerResources, stop_and_remove};
-use crate::job::execute::{JobState, StepConclusion, StepResult, build_step_env};
+use crate::job::docker_config::DOCKER_CONFIG_ENV;
+use crate::job::execute::{
+    JobExecutionContext, JobState, StepConclusion, StepResult, build_step_env,
+};
 use crate::job::expression::ExprContext;
 use crate::job::logs::LogSender;
 use crate::job::schema::Step;
@@ -30,34 +33,23 @@ pub async fn run_docker_image_action(
     base_env: &HashMap<String, String>,
     log_sender: &LogSender,
     cancel_token: &CancellationToken,
-    docker_resources: Option<&JobDockerResources>,
+    execution: &JobExecutionContext<'_>,
 ) -> Result<StepResult> {
-    let env = build_step_env(step, job_state, workspace, base_env);
-    let expr_ctx = ExprContext::new(&env, job_state, false, false);
+    let plan = build_inline_action_env(step, job_state, workspace, base_env)?;
 
-    let entrypoint = step.inputs.get("entrypoint").cloned();
-    let args = step
-        .inputs
-        .get("args")
-        .map(|a| {
-            let resolved = crate::job::expression::resolve_expression(a, &expr_ctx);
-            split_shell_args(&resolved)
-        })
-        .unwrap_or_default();
-
-    debug!(image, ?entrypoint, ?args, "running inline docker action");
+    debug!(image, entrypoint = ?plan.entrypoint, args = ?plan.args, "running inline docker action");
 
     let result = run_docker_container(RunDockerParams {
         image,
-        entrypoint: entrypoint.as_deref(),
-        args: &args,
-        env: &env,
+        entrypoint: plan.entrypoint.as_deref(),
+        args: &plan.args,
+        env: &plan.env,
         step,
         job_state,
         workspace,
         log_sender,
         cancel_token,
-        docker_resources,
+        docker_resources: execution.docker_resources(),
         action_dir: None,
     })
     .await;
@@ -78,7 +70,7 @@ pub async fn run_docker_metadata_action(
     base_env: &HashMap<String, String>,
     log_sender: &LogSender,
     cancel_token: &CancellationToken,
-    docker_resources: Option<&JobDockerResources>,
+    execution: &JobExecutionContext<'_>,
 ) -> Result<StepResult> {
     let image = resolve_image(metadata)?;
     let (entrypoint, args) = match resolve_entry_point(metadata, entry_point) {
@@ -90,13 +82,15 @@ pub async fn run_docker_metadata_action(
         }
     };
 
-    let mut env = build_step_env(step, job_state, workspace, base_env);
-    let expr_ctx = ExprContext::new(&env, job_state, false, false);
-    env.extend(build_action_inputs(metadata, step, &expr_ctx));
-    merge_action_env(&mut env, metadata, job_state);
-    inject_post_state(&mut env, entry_point, step, job_state);
-
-    let resolved_args = resolve_args(&args, &env, job_state);
+    let (env, resolved_args) = build_metadata_action_env(
+        metadata,
+        entry_point,
+        &args,
+        step,
+        job_state,
+        workspace,
+        base_env,
+    )?;
 
     debug!(
         image,
@@ -116,13 +110,89 @@ pub async fn run_docker_metadata_action(
         workspace,
         log_sender,
         cancel_token,
-        docker_resources,
+        docker_resources: execution.docker_resources(),
         action_dir: Some(action_dir),
     })
     .await;
 
     rekey_action_state(job_state, step);
     result
+}
+
+// ── Env assembly ────────────────────────────────────────────────
+
+/// Env every docker-action expression resolves against: step env, INPUT_*
+/// vars, runs.env, and args. The runner owns DOCKER_CONFIG for host-side
+/// docker calls, but action images are untrusted code: the variable must not
+/// be observable through `${{ env.DOCKER_CONFIG }}`. Host shell and Node
+/// action steps keep it — they legitimately call the docker CLI with it.
+fn build_docker_action_env(
+    step: &Step,
+    job_state: &JobState,
+    workspace: &Workspace,
+    base_env: &HashMap<String, String>,
+) -> Result<HashMap<String, String>> {
+    let mut base = base_env.clone();
+    base.remove(DOCKER_CONFIG_ENV);
+    let mut env = build_step_env(step, job_state, workspace, &base, None)?;
+    // The job env and GITHUB_ENV writes are validated to carry the
+    // runner-owned value, which the merge above would reintroduce.
+    env.remove(DOCKER_CONFIG_ENV);
+    Ok(env)
+}
+
+/// Case 1 expression surface: step env plus the `entrypoint`/`args` inputs.
+struct InlineActionPlan {
+    env: HashMap<String, String>,
+    entrypoint: Option<String>,
+    args: Vec<String>,
+}
+
+fn build_inline_action_env(
+    step: &Step,
+    job_state: &JobState,
+    workspace: &Workspace,
+    base_env: &HashMap<String, String>,
+) -> Result<InlineActionPlan> {
+    let env = build_docker_action_env(step, job_state, workspace, base_env)?;
+    let expr_ctx = ExprContext::new(&env, job_state, false, false);
+
+    let entrypoint = step.inputs.get("entrypoint").cloned();
+    let args = step
+        .inputs
+        .get("args")
+        .map(|a| {
+            let resolved = crate::job::expression::resolve_expression(a, &expr_ctx);
+            split_shell_args(&resolved)
+        })
+        .unwrap_or_default();
+
+    Ok(InlineActionPlan {
+        env,
+        entrypoint,
+        args,
+    })
+}
+
+/// Case 2 expression surface: step env, INPUT_* vars, runs.env, post state,
+/// and args.
+fn build_metadata_action_env(
+    metadata: &ActionMetadata,
+    entry_point: &str,
+    args: &[String],
+    step: &Step,
+    job_state: &JobState,
+    workspace: &Workspace,
+    base_env: &HashMap<String, String>,
+) -> Result<(HashMap<String, String>, Vec<String>)> {
+    let mut env = build_docker_action_env(step, job_state, workspace, base_env)?;
+    let expr_ctx = ExprContext::new(&env, job_state, false, false);
+    env.extend(build_action_inputs(metadata, step, &expr_ctx));
+    merge_action_env(&mut env, metadata, job_state);
+    inject_post_state(&mut env, entry_point, step, job_state);
+
+    let resolved_args = resolve_args(args, &env, job_state);
+    Ok((env, resolved_args))
 }
 
 // ── Metadata helpers ────────────────────────────────────────────
@@ -324,6 +394,7 @@ fn build_container_env(host_env: &HashMap<String, String>) -> HashMap<String, St
     // The action's image defines its own PATH; carrying the runner's over would point
     // the container at directories that only exist outside it.
     env.remove("PATH");
+    env.remove(DOCKER_CONFIG_ENV);
 
     let remaps = [
         ("GITHUB_WORKSPACE", "/github/workspace"),

@@ -83,6 +83,31 @@ log_format = "text"           # "text" or "json" (json works well with journald)
 shutdown_timeout_secs = 300
 ```
 
+### Per-job Docker configuration
+
+For each acquired job, Chimera creates
+`<root>/job-resources/<local-attempt-uuid>/docker/config.json`. Host steps receive
+that generated directory as `DOCKER_CONFIG`. Chimera rejects conflicting job-,
+step-, and `GITHUB_ENV`-level values before the affected host spawn, while allowing
+a workflow to repeat the generated value. It does not copy credentials, named
+contexts, credential helpers, or CLI plugins from `~/.docker` or an inherited
+daemon `DOCKER_CONFIG`.
+
+On Linux, the effective `PATH` for every host spawn must not expose executable
+`docker-credential-pass` or `docker-credential-secretservice` helpers. Docker can
+select either helper implicitly even from the exact initial `{}` config and thereby
+share an external credential store across job directories. Chimera checks the
+step-effective `PATH` immediately before each spawn and fails closed with a
+`reserved-host-capability` error; operators must keep those helpers out of the
+service and workflow `PATH` until explicit helper isolation is supported.
+
+This is not tenant or same-UID process isolation: an already-running same-UID host
+process can change its own environment or invoke `docker --config`. The helper check
+and cleanup identity checks are not an adversarial same-UID race guarantee. Chimera
+refuses startup when stale `job-resources` exist rather than deleting them automatically.
+Follow the [operator recovery procedure](docs/job-docker-config.md) before removing
+an exact stale attempt directory.
+
 ## Supported features
 
 - Host and container step execution (`run:`, `container:`, `services:`)
@@ -97,10 +122,15 @@ shutdown_timeout_secs = 300
 Chimera-only features:
 - Multi-runner concurrency with independent error isolation
 - Local `actions/cache` server for faster caching and no external dependencies
-- Automatic cleanup of old workspaces, containers and orphaned processes
+- Automatic cleanup of completed workspaces and Chimera-created resources; process-tree escapes require operator recovery
 - Configurable LRU cache (default 10GB)
 
 ## Running as a systemd service
+
+### Rootful system Docker
+
+The following base unit is for a rootful system Docker daemon only: it explicitly
+orders Chimera after, and requires, the system `docker.service`.
 
 Create the unit file:
 
@@ -125,7 +155,36 @@ WantedBy=multi-user.target
 EOF
 ```
 
-Then enable and start it:
+### Rootless Docker alternative
+
+Do not use the rootful base unit unchanged with rootless Docker. The daemon UID's
+rootless Docker user service and `/run/user/<numeric-uid>/docker.sock` must already
+be enabled and remain available. If the daemon user is not persistently logged in,
+enable user-service persistence first (for example, `sudo loginctl enable-linger chimera`
+when `User=chimera`).
+
+Add this drop-in to remove the inherited system-Docker dependency. Replace every
+`<numeric-uid>` placeholder with the numeric UID of the daemon user, and adjust
+`PATH` if Docker is installed elsewhere:
+
+```bash
+sudo systemctl edit chimera.service
+```
+
+```ini
+[Unit]
+After=
+After=network-online.target
+Requires=
+
+[Service]
+Environment=DOCKER_HOST=unix:///run/user/<numeric-uid>/docker.sock
+Environment=XDG_RUNTIME_DIR=/run/user/<numeric-uid>
+Environment=PATH=/home/chimera/.local/bin:/usr/local/bin:/usr/bin:/bin
+# Do not set DOCKER_CONFIG here.
+```
+
+This drop-in has no system `docker.service` dependency. Then enable and start it:
 
 ```bash
 sudo systemctl daemon-reload

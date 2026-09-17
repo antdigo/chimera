@@ -1,7 +1,13 @@
+use std::os::unix::ffi::OsStringExt;
+use std::os::unix::fs::PermissionsExt;
+
 use super::*;
 use crate::github::auth::TokenManager;
 use crate::job::action::ActionCache;
 use crate::job::client::JobConclusion;
+use crate::job::docker_config::{
+    DOCKER_CONFIG_ENV, JobDockerConfig, JobDockerConfigError, JobResourceRoot,
+};
 use crate::job::schema::{StepReference, StepReferenceKind};
 use rsa::RsaPrivateKey;
 use tokio_util::sync::CancellationToken;
@@ -95,6 +101,131 @@ fn make_step(id: &str, script: &str) -> Step {
     }
 }
 
+fn test_step() -> Step {
+    make_step("step", "true")
+}
+
+fn test_job_state() -> JobState {
+    JobState::new(
+        Arc::new(RwLock::new(Vec::new())),
+        HashMap::new(),
+        serde_json::json!({}),
+    )
+}
+
+fn test_workspace() -> (tempfile::TempDir, Workspace) {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = Workspace::create(
+        &temp.path().join("work"),
+        &temp.path().join("tmp"),
+        &temp.path().join("tool-cache"),
+        "test-runner",
+        "owner/repo",
+    )
+    .unwrap();
+    (temp, workspace)
+}
+
+fn test_docker_config() -> (tempfile::TempDir, JobDockerConfig) {
+    let temp = tempfile::tempdir().unwrap();
+    let root = JobResourceRoot::prepare(&temp.path().join("job-resources")).unwrap();
+    let config = root.create_docker_config().unwrap();
+    (temp, config)
+}
+
+fn step_with_environment(key: &str, value: &str) -> Step {
+    let mut step = test_step();
+    step.environment = Some(HashMap::from([(key.to_string(), value.to_string())]));
+    step
+}
+
+fn host_base_env(config: &JobDockerConfig) -> HashMap<String, String> {
+    HashMap::from([(
+        DOCKER_CONFIG_ENV.to_string(),
+        config.directory().to_string_lossy().into_owned(),
+    )])
+}
+
+fn write_executable(path: &std::path::Path) {
+    std::fs::write(path, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+#[test]
+fn step_environment_cannot_override_docker_config() {
+    let (_temp, workspace) = test_workspace();
+    let (_resources, config) = test_docker_config();
+    let state = test_job_state();
+    let step = step_with_environment(DOCKER_CONFIG_ENV, "/shared/.docker");
+    let base = host_base_env(&config);
+
+    let error = build_step_env(&step, &state, &workspace, &base, Some(&config)).unwrap_err();
+
+    assert!(matches!(
+        error.downcast_ref::<JobDockerConfigError>(),
+        Some(JobDockerConfigError::ReservedEnvironmentOverride {
+            source: "step environment"
+        })
+    ));
+}
+
+#[test]
+fn job_environment_cannot_override_docker_config() {
+    let (_temp, workspace) = test_workspace();
+    let (_resources, config) = test_docker_config();
+    let mut state = test_job_state();
+    state
+        .env
+        .insert(DOCKER_CONFIG_ENV.into(), "/shared/.docker".into());
+    let base = host_base_env(&config);
+
+    let error = build_step_env(&test_step(), &state, &workspace, &base, Some(&config)).unwrap_err();
+
+    assert!(matches!(
+        error.downcast_ref::<JobDockerConfigError>(),
+        Some(JobDockerConfigError::ReservedEnvironmentOverride {
+            source: "job environment"
+        })
+    ));
+}
+
+#[test]
+fn github_env_cannot_override_docker_config() {
+    let (_temp, workspace) = test_workspace();
+    let (_resources, config) = test_docker_config();
+    std::fs::write(workspace.env_file(), "DOCKER_CONFIG=/shared/.docker\n").unwrap();
+    let base = host_base_env(&config);
+
+    let error = build_step_env(
+        &test_step(),
+        &test_job_state(),
+        &workspace,
+        &base,
+        Some(&config),
+    )
+    .unwrap_err();
+
+    assert!(matches!(
+        error.downcast_ref::<JobDockerConfigError>(),
+        Some(JobDockerConfigError::ReservedEnvironmentOverride {
+            source: "GITHUB_ENV"
+        })
+    ));
+}
+
+#[test]
+fn matching_override_is_allowed() {
+    let (_temp, workspace) = test_workspace();
+    let (_resources, config) = test_docker_config();
+    let value = config.directory().to_string_lossy().into_owned();
+    let step = step_with_environment(DOCKER_CONFIG_ENV, &value);
+    let base = HashMap::from([(DOCKER_CONFIG_ENV.to_string(), value.clone())]);
+
+    let env = build_step_env(&step, &test_job_state(), &workspace, &base, Some(&config)).unwrap();
+
+    assert_eq!(env.get(DOCKER_CONFIG_ENV), Some(&value));
+}
+
 #[tokio::test]
 async fn echo_step_stdout_captured() {
     let (_tmp, ws, client, _mock) = setup_execute().await;
@@ -107,7 +238,8 @@ async fn echo_step_stdout_captured() {
         HashMap::new(),
         serde_json::json!({}),
     );
-    let base_env = HashMap::new();
+    let (_resources, docker_config) = test_docker_config();
+    let base_env = host_base_env(&docker_config);
 
     let result = run_host_step(
         &step,
@@ -116,6 +248,7 @@ async fn echo_step_stdout_captured() {
         &base_env,
         logger.sender(),
         &CancellationToken::new(),
+        &docker_config,
     )
     .await
     .unwrap();
@@ -136,7 +269,8 @@ async fn nonzero_exit_returns_failed() {
         HashMap::new(),
         serde_json::json!({}),
     );
-    let base_env = HashMap::new();
+    let (_resources, docker_config) = test_docker_config();
+    let base_env = host_base_env(&docker_config);
 
     let result = run_host_step(
         &step,
@@ -145,6 +279,7 @@ async fn nonzero_exit_returns_failed() {
         &base_env,
         logger.sender(),
         &CancellationToken::new(),
+        &docker_config,
     )
     .await
     .unwrap();
@@ -165,7 +300,8 @@ async fn set_env_updates_job_state() {
         HashMap::new(),
         serde_json::json!({}),
     );
-    let base_env = HashMap::new();
+    let (_resources, docker_config) = test_docker_config();
+    let base_env = host_base_env(&docker_config);
 
     run_host_step(
         &step,
@@ -174,6 +310,7 @@ async fn set_env_updates_job_state() {
         &base_env,
         logger.sender(),
         &CancellationToken::new(),
+        &docker_config,
     )
     .await
     .unwrap();
@@ -194,7 +331,8 @@ async fn add_path_updates_path() {
         HashMap::new(),
         serde_json::json!({}),
     );
-    let base_env = HashMap::new();
+    let (_resources, docker_config) = test_docker_config();
+    let base_env = host_base_env(&docker_config);
 
     run_host_step(
         &step,
@@ -203,6 +341,7 @@ async fn add_path_updates_path() {
         &base_env,
         logger.sender(),
         &CancellationToken::new(),
+        &docker_config,
     )
     .await
     .unwrap();
@@ -223,7 +362,8 @@ async fn set_output_populates_outputs() {
         HashMap::new(),
         serde_json::json!({}),
     );
-    let base_env = HashMap::new();
+    let (_resources, docker_config) = test_docker_config();
+    let base_env = host_base_env(&docker_config);
 
     run_host_step(
         &step,
@@ -232,6 +372,7 @@ async fn set_output_populates_outputs() {
         &base_env,
         logger.sender(),
         &CancellationToken::new(),
+        &docker_config,
     )
     .await
     .unwrap();
@@ -252,7 +393,8 @@ async fn env_propagation_across_steps() {
         HashMap::new(),
         serde_json::json!({}),
     );
-    let base_env = HashMap::new();
+    let (_resources, docker_config) = test_docker_config();
+    let base_env = host_base_env(&docker_config);
 
     run_host_step(
         &step1,
@@ -261,6 +403,7 @@ async fn env_propagation_across_steps() {
         &base_env,
         logger.sender(),
         &CancellationToken::new(),
+        &docker_config,
     )
     .await
     .unwrap();
@@ -273,6 +416,7 @@ async fn env_propagation_across_steps() {
         &base_env,
         logger.sender(),
         &CancellationToken::new(),
+        &docker_config,
     )
     .await
     .unwrap();
@@ -319,8 +463,11 @@ async fn continue_on_error_works() {
     }"#;
 
     let manifest: crate::job::schema::JobManifest = serde_json::from_str(manifest_json).unwrap();
-    let base_env = HashMap::new();
+    let (_resources, docker_config) = test_docker_config();
+    let base_env = host_base_env(&docker_config);
     let action_cache = ActionCache::new(tmp.path().join("actions"), reqwest::Client::new());
+    let node_runtimes = crate::node::NodeRuntimes::single("node".into());
+    let execution = JobExecutionContext::new(&docker_config, None, &node_runtimes);
 
     let result = run_all_steps(
         &manifest,
@@ -331,8 +478,7 @@ async fn continue_on_error_works() {
         &action_cache,
         "fake-token",
         CancellationToken::new(),
-        None,
-        &crate::node::NodeRuntimes::single("node".into()),
+        &execution,
         None,
     )
     .await
@@ -378,8 +524,11 @@ async fn failure_stops_remaining_steps() {
     }"#;
 
     let manifest: crate::job::schema::JobManifest = serde_json::from_str(manifest_json).unwrap();
-    let base_env = HashMap::new();
+    let (_resources, docker_config) = test_docker_config();
+    let base_env = host_base_env(&docker_config);
     let action_cache = ActionCache::new(tmp.path().join("actions"), reqwest::Client::new());
+    let node_runtimes = crate::node::NodeRuntimes::single("node".into());
+    let execution = JobExecutionContext::new(&docker_config, None, &node_runtimes);
 
     let result = run_all_steps(
         &manifest,
@@ -390,8 +539,7 @@ async fn failure_stops_remaining_steps() {
         &action_cache,
         "fake-token",
         CancellationToken::new(),
-        None,
-        &crate::node::NodeRuntimes::single("node".into()),
+        &execution,
         None,
     )
     .await
@@ -430,8 +578,11 @@ async fn secrets_from_context_data_resolved() {
     }"#;
 
     let manifest: crate::job::schema::JobManifest = serde_json::from_str(manifest_json).unwrap();
-    let base_env = HashMap::new();
+    let (_resources, docker_config) = test_docker_config();
+    let base_env = host_base_env(&docker_config);
     let action_cache = ActionCache::new(tmp.path().join("actions"), reqwest::Client::new());
+    let node_runtimes = crate::node::NodeRuntimes::single("node".into());
+    let execution = JobExecutionContext::new(&docker_config, None, &node_runtimes);
 
     let result = run_all_steps(
         &manifest,
@@ -442,8 +593,7 @@ async fn secrets_from_context_data_resolved() {
         &action_cache,
         "fake-token",
         CancellationToken::new(),
-        None,
-        &crate::node::NodeRuntimes::single("node".into()),
+        &execution,
         None,
     )
     .await
@@ -489,8 +639,11 @@ async fn cancel_token_returns_cancelled_between_steps() {
     }"#;
 
     let manifest: crate::job::schema::JobManifest = serde_json::from_str(manifest_json).unwrap();
-    let base_env = HashMap::new();
+    let (_resources, docker_config) = test_docker_config();
+    let base_env = host_base_env(&docker_config);
     let action_cache = ActionCache::new(tmp.path().join("actions"), reqwest::Client::new());
+    let node_runtimes = crate::node::NodeRuntimes::single("node".into());
+    let execution = JobExecutionContext::new(&docker_config, None, &node_runtimes);
 
     let cancel_token = CancellationToken::new();
     // Cancel immediately — step 1 may run but the conclusion should be "cancelled"
@@ -505,8 +658,7 @@ async fn cancel_token_returns_cancelled_between_steps() {
         &action_cache,
         "fake-token",
         cancel_token,
-        None,
-        &crate::node::NodeRuntimes::single("node".into()),
+        &execution,
         None,
     )
     .await
@@ -526,7 +678,8 @@ async fn cancel_token_kills_running_process() {
         HashMap::new(),
         serde_json::json!({}),
     );
-    let base_env = HashMap::new();
+    let (_resources, docker_config) = test_docker_config();
+    let base_env = host_base_env(&docker_config);
 
     let cancel_token = CancellationToken::new();
     let cancel_clone = cancel_token.clone();
@@ -545,6 +698,7 @@ async fn cancel_token_kills_running_process() {
         &base_env,
         logger.sender(),
         &cancel_token,
+        &docker_config,
     )
     .await
     .unwrap();
@@ -554,6 +708,174 @@ async fn cancel_token_kills_running_process() {
     assert_eq!(result.conclusion, StepConclusion::Cancelled);
 
     drop(logger);
+}
+
+#[test]
+fn host_command_rejects_default_docker_credential_helpers_on_effective_path() {
+    for helper in ["docker-credential-pass", "docker-credential-secretservice"] {
+        let temp = tempfile::tempdir().unwrap();
+        let root = JobResourceRoot::prepare(&temp.path().join("job-resources")).unwrap();
+        let config = root.create_docker_config().unwrap();
+        let bin = temp.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        write_executable(&bin.join(helper));
+        let mut env = host_base_env(&config);
+        env.insert("PATH".into(), bin.to_string_lossy().into_owned());
+
+        let error = host_command("/usr/bin/true", &[], &env, temp.path(), &config).unwrap_err();
+
+        assert!(error.to_string().contains("reserved-host-capability"));
+        assert!(error.to_string().contains(helper));
+    }
+}
+
+#[test]
+fn host_command_allows_non_executable_default_credential_helper() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = JobResourceRoot::prepare(&temp.path().join("job-resources")).unwrap();
+    let config = root.create_docker_config().unwrap();
+    let bin = temp.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let helper = bin.join("docker-credential-pass");
+    std::fs::write(&helper, "not executable").unwrap();
+    std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let mut env = host_base_env(&config);
+    env.insert("PATH".into(), bin.to_string_lossy().into_owned());
+
+    host_command("/usr/bin/true", &[], &env, temp.path(), &config).unwrap();
+}
+
+#[test]
+fn host_command_prefers_step_path_and_falls_back_to_non_utf8_inherited_path() {
+    let temp = tempfile::tempdir().unwrap();
+    let helper_dir = temp.path().join("helper-bin");
+    std::fs::create_dir(&helper_dir).unwrap();
+    write_executable(&helper_dir.join("docker-credential-pass"));
+    let safe_dir = temp.path().join("safe-bin");
+    std::fs::create_dir(&safe_dir).unwrap();
+    let mut inherited_path = std::ffi::OsString::from_vec(b"/missing-\xff:".to_vec());
+    inherited_path.push(&helper_dir);
+
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "job::execute::execute_test::host_command_path_precedence_child",
+            "--nocapture",
+        ])
+        .env("PATH", inherited_path)
+        .env("CHIMERA_EFFECTIVE_PATH_CHILD", &safe_dir)
+        .status()
+        .unwrap();
+
+    assert!(status.success());
+}
+
+#[test]
+fn host_command_path_precedence_child() {
+    let Some(safe_dir) = std::env::var_os("CHIMERA_EFFECTIVE_PATH_CHILD") else {
+        return;
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let root = JobResourceRoot::prepare(&temp.path().join("job-resources")).unwrap();
+    let config = root.create_docker_config().unwrap();
+    let mut explicit = host_base_env(&config);
+    explicit.insert("PATH".into(), safe_dir.to_string_lossy().into_owned());
+
+    host_command("/usr/bin/true", &[], &explicit, temp.path(), &config).unwrap();
+
+    let inherited = host_base_env(&config);
+    let error = host_command("/usr/bin/true", &[], &inherited, temp.path(), &config).unwrap_err();
+    assert!(error.to_string().contains("docker-credential-pass"));
+}
+
+#[test]
+fn host_command_rejects_missing_runner_owned_docker_config() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = JobResourceRoot::prepare(&temp.path().join("job-resources")).unwrap();
+    let config = root.create_docker_config().unwrap();
+
+    let error =
+        host_command("/usr/bin/true", &[], &HashMap::new(), temp.path(), &config).unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("host step is missing runner-owned DOCKER_CONFIG")
+    );
+}
+
+#[test]
+fn host_command_explicitly_overrides_inherited_docker_config() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = JobResourceRoot::prepare(&temp.path().join("job-resources")).unwrap();
+    let config = root.create_docker_config().unwrap();
+    let env = host_base_env(&config);
+
+    let command = host_command("/usr/bin/true", &[], &env, temp.path(), &config).unwrap();
+    let configured = command
+        .as_std()
+        .get_envs()
+        .find(|(key, _)| *key == DOCKER_CONFIG_ENV)
+        .and_then(|(_, value)| value)
+        .unwrap();
+
+    assert_eq!(configured, std::ffi::OsStr::new(&env[DOCKER_CONFIG_ENV]));
+}
+
+#[test]
+fn host_command_preserves_original_socket_runtime_and_path() {
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "job::execute::execute_test::host_command_inheritance_child",
+            "--nocapture",
+        ])
+        .env(DOCKER_CONFIG_ENV, "/daemon/shared-docker")
+        .env("DOCKER_HOST", "unix:///synthetic/docker.sock")
+        .env("XDG_RUNTIME_DIR", "/synthetic/runtime")
+        .env("PATH", "/synthetic/path")
+        .status()
+        .unwrap();
+
+    assert!(status.success());
+}
+
+#[tokio::test]
+async fn host_command_inheritance_child() {
+    if std::env::var_os("DOCKER_HOST").as_deref()
+        != Some(std::ffi::OsStr::new("unix:///synthetic/docker.sock"))
+    {
+        return;
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let root = JobResourceRoot::prepare(&temp.path().join("job-resources")).unwrap();
+    let config = root.create_docker_config().unwrap();
+    let job_config = config.directory().to_path_buf();
+    let env = HashMap::from([(
+        DOCKER_CONFIG_ENV.to_string(),
+        job_config.to_string_lossy().into_owned(),
+    )]);
+    let script = r#"
+        test "$DOCKER_CONFIG" = "$EXPECTED_CONFIG"
+        test "$DOCKER_HOST" = 'unix:///synthetic/docker.sock'
+        test "$XDG_RUNTIME_DIR" = '/synthetic/runtime'
+        test "$PATH" = '/synthetic/path'
+    "#;
+    let expected = job_config.to_string_lossy().into_owned();
+    let mut command = host_command(
+        "/bin/sh",
+        &[std::ffi::OsStr::new("-c"), std::ffi::OsStr::new(script)],
+        &env,
+        temp.path(),
+        &config,
+    )
+    .unwrap();
+    command.env("EXPECTED_CONFIG", expected);
+
+    let status = command.status().await.unwrap();
+
+    assert!(status.success());
 }
 
 #[test]

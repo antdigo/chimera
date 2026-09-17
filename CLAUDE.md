@@ -104,7 +104,7 @@ mod auth_test;
 
 The `#[path]` attribute is required because Rust's module system would otherwise look for the file in a subdirectory.
 
-Tests that require Docker are tagged `#[ignore]` so they don't run in environments without a socket, but do run in CI. When modifying Docker-related code (`src/docker/`, `src/job/action/docker.rs`, container mode logic) or Docker integration tests, run `cargo test -- --ignored` locally to verify.
+Tests that require Docker are tagged `#[ignore]` so they don't run in environments without a socket, but do run in CI. When modifying Docker-related code (`src/docker/`, `src/job/action/docker.rs`, container mode logic) or Docker integration tests, run `cargo test -- --ignored` locally to verify. On macOS, do not improvise around Docker Desktop's missing Linux host socket or split loopback networking: follow the [macOS rootless DinD runbook](docs/testing-macos-docker.md).
 
 Keep tests readable. A test should be obvious about what it's checking. Arrange / Act / Assert with a blank line between sections is a good default structure.
 

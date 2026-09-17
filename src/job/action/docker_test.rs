@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 
 use super::*;
-use crate::job::action::metadata::{ActionRuns, ActionRuntime};
+use crate::job::action::metadata::{ActionInput, ActionRuns, ActionRuntime};
+use crate::job::docker_config::DOCKER_CONFIG_ENV;
+use crate::job::schema::{StepReference, StepReferenceKind};
 
 // ── split_shell_args ────────────────────────────────────────────
 
@@ -212,6 +214,7 @@ fn container_env_remaps_github_paths() {
     let mut host = HashMap::new();
     host.insert("GITHUB_WORKSPACE".into(), "/home/runner/work".into());
     host.insert("CUSTOM_VAR".into(), "kept".into());
+    host.insert(DOCKER_CONFIG_ENV.into(), "/private/job/docker".into());
 
     let env = build_container_env(&host);
 
@@ -222,4 +225,167 @@ fn container_env_remaps_github_paths() {
     assert_eq!(env["RUNNER_TEMP"], "/github/tmp");
     assert_eq!(env["RUNNER_TOOL_CACHE"], "/github/tool-cache");
     assert_eq!(env["CUSTOM_VAR"], "kept");
+    assert!(!env.contains_key(DOCKER_CONFIG_ENV));
+}
+
+// ── docker action env boundary ──────────────────────────────────
+
+const HOST_DOCKER_CONFIG_PATH: &str = "/var/lib/chimera/job-resources/attempt/docker";
+
+fn action_workspace() -> (tempfile::TempDir, Workspace) {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = Workspace::create(
+        &temp.path().join("work"),
+        &temp.path().join("tmp"),
+        &temp.path().join("tool-cache"),
+        "test-runner",
+        "owner/repo",
+    )
+    .unwrap();
+    (temp, workspace)
+}
+
+fn action_job_state() -> JobState {
+    JobState::new(
+        std::sync::Arc::new(tokio::sync::RwLock::new(Vec::new())),
+        HashMap::new(),
+        serde_json::json!({}),
+    )
+}
+
+fn docker_action_step(environment: Option<HashMap<String, String>>) -> Step {
+    Step {
+        id: "step".into(),
+        display_name: "Run docker action".into(),
+        reference: StepReference {
+            name: "uses".into(),
+            kind: StepReferenceKind::ContainerRegistry,
+            ..Default::default()
+        },
+        inputs: HashMap::new(),
+        condition: None,
+        timeout_in_minutes: None,
+        continue_on_error: false,
+        order: 1,
+        environment,
+        context_name: None,
+    }
+}
+
+fn docker_host_base_env() -> HashMap<String, String> {
+    HashMap::from([
+        (
+            DOCKER_CONFIG_ENV.to_string(),
+            HOST_DOCKER_CONFIG_PATH.to_string(),
+        ),
+        (
+            "PATH".to_string(),
+            "/usr/local/bin:/usr/bin:/bin".to_string(),
+        ),
+    ])
+}
+
+#[test]
+fn docker_action_step_env_cannot_alias_docker_config() {
+    let (_temp, workspace) = action_workspace();
+    let state = action_job_state();
+    let step = docker_action_step(Some(HashMap::from([(
+        "LEAK".to_string(),
+        "${{ env.DOCKER_CONFIG }}".to_string(),
+    )])));
+
+    let env = build_docker_action_env(&step, &state, &workspace, &docker_host_base_env()).unwrap();
+
+    assert!(!env.contains_key(DOCKER_CONFIG_ENV));
+    assert_eq!(env.get("LEAK").map(String::as_str), Some(""));
+}
+
+#[test]
+fn docker_action_metadata_expressions_cannot_alias_docker_config() {
+    let (_temp, workspace) = action_workspace();
+    let state = action_job_state();
+    let step = docker_action_step(None);
+    let mut metadata = make_docker_metadata("alpine:3");
+    metadata.inputs.insert(
+        "config_path".into(),
+        ActionInput {
+            default: Some("${{ env.DOCKER_CONFIG }}".into()),
+        },
+    );
+    metadata.runs.env = Some(HashMap::from([(
+        "LEAK".to_string(),
+        "${{ env.DOCKER_CONFIG }}".to_string(),
+    )]));
+    let raw_args = vec![
+        "--verbose".to_string(),
+        "${{ env.DOCKER_CONFIG }}".to_string(),
+    ];
+
+    let (env, resolved_args) = build_metadata_action_env(
+        &metadata,
+        "main",
+        &raw_args,
+        &step,
+        &state,
+        &workspace,
+        &docker_host_base_env(),
+    )
+    .unwrap();
+
+    assert!(!env.contains_key(DOCKER_CONFIG_ENV));
+    assert_eq!(env.get("INPUT_CONFIG_PATH").map(String::as_str), Some(""));
+    assert_eq!(env.get("LEAK").map(String::as_str), Some(""));
+    assert_eq!(resolved_args, vec!["--verbose".to_string(), String::new()]);
+}
+
+#[test]
+fn docker_action_inline_args_cannot_alias_docker_config() {
+    let (_temp, workspace) = action_workspace();
+    let state = action_job_state();
+    let mut step = docker_action_step(Some(HashMap::from([(
+        "LEAK".to_string(),
+        "${{ env.DOCKER_CONFIG }}".to_string(),
+    )])));
+    step.inputs
+        .insert("args".to_string(), "${{ env.DOCKER_CONFIG }}".to_string());
+
+    let plan = build_inline_action_env(&step, &state, &workspace, &docker_host_base_env()).unwrap();
+
+    assert!(!plan.env.contains_key(DOCKER_CONFIG_ENV));
+    assert_eq!(plan.env.get("LEAK").map(String::as_str), Some(""));
+    assert!(plan.args.is_empty());
+}
+
+#[test]
+fn docker_action_env_drops_job_env_docker_config() {
+    let (_temp, workspace) = action_workspace();
+    let mut state = action_job_state();
+    state
+        .env
+        .insert(DOCKER_CONFIG_ENV.into(), HOST_DOCKER_CONFIG_PATH.into());
+    let step = docker_action_step(None);
+    let mut base = docker_host_base_env();
+    base.remove(DOCKER_CONFIG_ENV);
+
+    let env = build_docker_action_env(&step, &state, &workspace, &base).unwrap();
+
+    assert!(!env.contains_key(DOCKER_CONFIG_ENV));
+}
+
+#[test]
+fn docker_action_env_drops_github_env_docker_config() {
+    let (_temp, workspace) = action_workspace();
+    std::fs::write(
+        workspace.env_file(),
+        format!("{DOCKER_CONFIG_ENV}={HOST_DOCKER_CONFIG_PATH}\n"),
+    )
+    .unwrap();
+    let state = action_job_state();
+    let step = docker_action_step(None);
+    let mut base = docker_host_base_env();
+    base.remove(DOCKER_CONFIG_ENV);
+
+    let env = build_docker_action_env(&step, &state, &workspace, &base).unwrap();
+
+    assert!(!env.contains_key(DOCKER_CONFIG_ENV));
 }

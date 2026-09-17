@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -16,7 +17,10 @@ use crate::github::broker::{BrokerClient, BrokerError, BrokerMessage, MessageTyp
 use crate::job::JobClient;
 use crate::job::action::ActionCache;
 use crate::job::client::JobConclusion;
-use crate::job::execute::run_all_steps;
+use crate::job::docker_config::{
+    JobDockerConfig, JobDockerConfigError, JobResourceCleanupFatalError, JobResourceRoot,
+};
+use crate::job::execute::{JobExecutionContext, run_all_steps};
 use crate::job::live_feed::LiveFeed;
 use crate::job::schema::JobManifest;
 use crate::job::workspace::Workspace;
@@ -27,11 +31,103 @@ use super::report::{outputs_to_variable_values, report_setup_failure};
 
 const CONTROL_MSG_DELAY: Duration = Duration::from_millis(2000);
 
+struct JobExecutionOutcome {
+    conclusion: JobConclusion,
+    outputs: HashMap<String, String>,
+}
+
+#[derive(Debug)]
+struct CompletionPublicationError {
+    source: anyhow::Error,
+}
+
+impl std::fmt::Display for CompletionPublicationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}", self.source)
+    }
+}
+
+impl std::error::Error for CompletionPublicationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
+fn conclusion_after_cleanup_failure(conclusion: JobConclusion) -> JobConclusion {
+    match conclusion {
+        JobConclusion::Succeeded => JobConclusion::Failed,
+        JobConclusion::Failed => JobConclusion::Failed,
+        JobConclusion::Cancelled => JobConclusion::Cancelled,
+    }
+}
+
+fn is_poisoned_job_resource_error(error: &anyhow::Error) -> bool {
+    matches!(
+        error.downcast_ref::<JobDockerConfigError>(),
+        Some(JobDockerConfigError::PoisonedRoot { .. })
+    )
+}
+
+/// A job error the runner must not recover from by polling again: the job
+/// resource root is known-untrustworthy (poisoned) or a completion was already
+/// published after a failed cleanup. Classified by construction, not by the
+/// separate poisoning side effect.
+fn job_execution_error_is_terminal(error: &anyhow::Error) -> bool {
+    is_poisoned_job_resource_error(error) || is_job_resource_cleanup_fatal(error)
+}
+
+fn is_job_resource_cleanup_fatal(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<JobResourceCleanupFatalError>()
+        .is_some()
+}
+
+async fn finish_job(
+    job_client: &Arc<JobClient>,
+    manifest: &JobManifest,
+    execution_result: Result<JobExecutionOutcome>,
+    cleanup_result: std::result::Result<(), JobDockerConfigError>,
+) -> Result<()> {
+    let mut outcome = match execution_result {
+        Ok(outcome) => outcome,
+        Err(execution_error) => {
+            return match cleanup_result {
+                Ok(()) => Err(execution_error),
+                Err(cleanup_error) => Err(execution_error.context(cleanup_error.to_string())),
+            };
+        }
+    };
+
+    let cleanup_error = cleanup_result.err();
+    if cleanup_error.is_some() {
+        outcome.conclusion = conclusion_after_cleanup_failure(outcome.conclusion);
+    }
+
+    let outputs = outputs_to_variable_values(&outcome.outputs);
+    job_client
+        .complete_job(
+            &manifest.plan.plan_id,
+            &manifest.plan.job_id,
+            outcome.conclusion,
+            &outputs,
+            &[],
+        )
+        .await
+        .context("completing job")
+        .map_err(|source| anyhow::Error::new(CompletionPublicationError { source }))?;
+
+    match cleanup_error {
+        Some(source) => Err(anyhow::Error::new(JobResourceCleanupFatalError { source })),
+        None => Ok(()),
+    }
+}
+
 pub struct Runner {
     pub(super) name: String,
     pub(super) credentials: RunnerCredentials,
     pub(super) paths: ChimeraPaths,
     pub(super) state: Option<Arc<DaemonState>>,
+    pub(super) job_resources: JobResourceRoot,
     pub(super) cache_port: u16,
 }
 
@@ -41,6 +137,7 @@ impl Runner {
         credentials: RunnerCredentials,
         paths: ChimeraPaths,
         state: Arc<DaemonState>,
+        job_resources: JobResourceRoot,
         cache_port: u16,
     ) -> Self {
         Self {
@@ -48,6 +145,7 @@ impl Runner {
             credentials,
             paths,
             state: Some(state),
+            job_resources,
             cache_port,
         }
     }
@@ -75,6 +173,7 @@ impl Runner {
 
     pub async fn start(self, mut shutdown_rx: watch::Receiver<bool>) -> Result<()> {
         info!(runner = %self.name, "starting runner");
+        debug!(job_resource_root = %self.job_resources.path().display(), "using prepared job resource root");
 
         let private_key = rsa_params_to_private_key(&self.credentials.rsa_params)
             .context("reconstructing RSA private key")?;
@@ -110,6 +209,7 @@ impl Runner {
         info!(session_id = %broker.session_id(), "broker session created");
         self.report_phase(RunnerPhase::Idle).await;
         info!("entering poll loop, waiting for jobs...");
+        let mut terminal_error = None;
 
         loop {
             let result = self.poll_loop(&broker, &mut shutdown_rx).await;
@@ -122,8 +222,13 @@ impl Runner {
                         "received job message"
                     );
 
-                    self.handle_job_message(&msg, &broker, &client, token_manager.clone())
-                        .await;
+                    if let Err(error) = self
+                        .handle_job_message(&msg, &broker, &client, token_manager.clone())
+                        .await
+                    {
+                        terminal_error = Some(error);
+                        break;
+                    }
                     self.report_phase(RunnerPhase::Idle).await;
 
                     if *shutdown_rx.borrow() {
@@ -137,8 +242,11 @@ impl Runner {
                     info!("poll loop exited (shutdown)");
                     break;
                 }
-                Err(e) => {
-                    error!(error = %e, "poll loop error");
+                Err(error) => {
+                    error!(error = %error, "poll loop error");
+                    if is_poisoned_job_resource_error(&error) {
+                        terminal_error = Some(error);
+                    }
                     break;
                 }
             }
@@ -150,7 +258,10 @@ impl Runner {
             info!("session deleted");
         }
 
-        Ok(())
+        match terminal_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 
     async fn handle_job_message(
@@ -159,12 +270,12 @@ impl Runner {
         broker: &BrokerClient,
         client: &reqwest::Client,
         token_manager: Arc<TokenManager>,
-    ) {
+    ) -> Result<()> {
         let (runner_request_id, run_service_url) = match msg.parse_job_request() {
             Ok(pair) => pair,
             Err(e) => {
                 warn!(error = %e, "failed to parse job request");
-                return;
+                return Ok(());
             }
         };
 
@@ -191,9 +302,17 @@ impl Runner {
         cancel_token.cancel();
         let _ = poller_handle.await;
 
-        if let Err(e) = result {
-            error!(error = %e, cause = ?e, "job execution failed");
+        if let Err(error) = result {
+            if job_execution_error_is_terminal(&error) {
+                // Correct by construction, not by the poisoning side effect:
+                // the runner stops on the fatal marker itself.
+                return Err(error);
+            }
+            error!(error = %error, cause = ?error, "job execution failed");
         }
+
+        self.job_resources.ensure_healthy()?;
+        Ok(())
     }
 
     async fn execute_job(
@@ -252,22 +371,35 @@ impl Runner {
 
         self.report_running(&repo, &manifest.plan.job_id).await;
 
-        // From this point, any failure must report back to GitHub via complete_job.
-        // Otherwise GitHub hangs waiting for a completion that never comes.
         let job_client = Arc::new(job_client);
         let result = self
             .run_job(&manifest, &job_client, client, cancel_token, &repo)
             .await;
 
-        if let Err(ref e) = result {
-            error!(error = %e, cause = ?e, "job failed, reporting failure to GitHub");
-
-            if let Err(report_err) = report_setup_failure(&job_client, &manifest, e).await {
-                error!(error = %report_err, "failed to report setup failure to GitHub");
+        match result {
+            Ok(()) => Ok(()),
+            Err(error) if error.downcast_ref::<CompletionPublicationError>().is_some() => {
+                error!(error = %error, cause = ?error, "job completion request failed; not retrying completion");
+                Err(error)
+            }
+            Err(error)
+                if error
+                    .downcast_ref::<JobResourceCleanupFatalError>()
+                    .is_some() =>
+            {
+                error!(error = %error, cause = ?error, "job completed after cleanup failure; stopping runner");
+                Err(error)
+            }
+            Err(error) => {
+                error!(error = %error, cause = ?error, "job failed before completion, reporting failure to GitHub");
+                if let Err(report_error) =
+                    report_setup_failure(&job_client, &manifest, &error).await
+                {
+                    error!(error = %report_error, "failed to report setup failure to GitHub");
+                }
+                Err(error)
             }
         }
-
-        result
     }
 
     async fn run_job(
@@ -278,6 +410,47 @@ impl Runner {
         cancel_token: CancellationToken,
         repo: &str,
     ) -> Result<()> {
+        let mut docker_config = self
+            .job_resources
+            .create_docker_config()
+            .context("creating per-job Docker config")?;
+        let attempt_id = docker_config.attempt_id();
+        info!(%attempt_id, "created job Docker config");
+
+        let execution_result = self
+            .run_job_body(
+                manifest,
+                job_client,
+                client,
+                cancel_token,
+                repo,
+                &docker_config,
+            )
+            .await;
+
+        let cleanup_result = docker_config.cleanup();
+        match &cleanup_result {
+            Ok(()) => info!(%attempt_id, "cleaned job Docker config"),
+            Err(cleanup_error) => error!(
+                category = "job-resource-cleanup",
+                %attempt_id,
+                error = %cleanup_error,
+                "job Docker config cleanup failed"
+            ),
+        }
+
+        finish_job(job_client, manifest, execution_result, cleanup_result).await
+    }
+
+    async fn run_job_body(
+        &self,
+        manifest: &JobManifest,
+        job_client: &Arc<JobClient>,
+        client: &reqwest::Client,
+        cancel_token: CancellationToken,
+        repo: &str,
+        docker_config: &JobDockerConfig,
+    ) -> Result<JobExecutionOutcome> {
         let workspace = Workspace::create(
             &self.paths.work_dir(),
             &self.paths.tmp_dir(),
@@ -286,63 +459,55 @@ impl Runner {
             repo,
         )
         .context("creating workspace")?;
+        let mut docker_resources = None;
 
-        // Write the event payload so actions can read it via GITHUB_EVENT_PATH
-        let event_data = manifest
-            .context_data
-            .get("github")
-            .and_then(|g| g.get("event"))
-            .cloned()
-            .unwrap_or_default();
-        workspace
-            .write_event_file(&event_data)
-            .context("writing event payload")?;
+        let execution_result = async {
+            let event_data = manifest
+                .context_data
+                .get("github")
+                .and_then(|github| github.get("event"))
+                .cloned()
+                .unwrap_or_default();
+            workspace
+                .write_event_file(&event_data)
+                .context("writing event payload")?;
 
-        // Ensure the node binaries are available for the host platform.
-        // Used by node actions in host mode; container mode downloads its own Linux set.
-        let node_runtimes = crate::node::ensure_node(&self.paths.externals_dir())
-            .await
-            .context("ensuring node binaries")?;
-
-        // Set up Docker resources if the job needs containers or services
-        let mut docker_resources = if manifest.has_container() || manifest.has_services() {
-            let docker = crate::docker::client::connect(None)?;
-            crate::docker::client::ping(&docker).await?;
-            let mut resources = JobDockerResources::new(docker);
-
-            let services = manifest.service_containers.as_deref().unwrap_or_default();
-
-            let workflow_files_path = workspace
-                .workspace_dir()
-                .parent()
-                .context("workspace has no parent")?;
-
-            if let Err(e) = resources
-                .setup(&SetupParams {
-                    runner_name: &self.name,
-                    job_id: &manifest.plan.job_id,
-                    job_container: manifest.job_container.as_ref(),
-                    services,
-                    workspace_host_path: workspace.workspace_dir(),
-                    workflow_files_host_path: workflow_files_path,
-                    runner_temp_host_path: workspace.runner_temp(),
-                    actions_host_path: &self.paths.actions_dir(),
-                    tool_cache_host_path: workspace.tool_cache(),
-                    externals_dir: &self.paths.externals_dir(),
-                })
+            let node_runtimes = crate::node::ensure_node(&self.paths.externals_dir())
                 .await
-            {
-                resources.cleanup().await;
-                return Err(e.context("setting up Docker resources"));
-            }
-            Some(resources)
-        } else {
-            None
-        };
+                .context("ensuring node binaries")?;
 
-        // Run the job body — cleanup is guaranteed to run regardless of outcome
-        let result = self
-            .run_job_body(
+            if manifest.has_container() || manifest.has_services() {
+                let docker = crate::docker::client::connect(None)?;
+                crate::docker::client::ping(&docker).await?;
+                let mut resources = JobDockerResources::new(docker);
+                let services = manifest.service_containers.as_deref().unwrap_or_default();
+                let workflow_files_path = workspace
+                    .workspace_dir()
+                    .parent()
+                    .context("workspace has no parent")?;
+
+                if let Err(setup_error) = resources
+                    .setup(&SetupParams {
+                        runner_name: &self.name,
+                        job_id: &manifest.plan.job_id,
+                        job_container: manifest.job_container.as_ref(),
+                        services,
+                        workspace_host_path: workspace.workspace_dir(),
+                        workflow_files_host_path: workflow_files_path,
+                        runner_temp_host_path: workspace.runner_temp(),
+                        actions_host_path: &self.paths.actions_dir(),
+                        tool_cache_host_path: workspace.tool_cache(),
+                        externals_dir: &self.paths.externals_dir(),
+                    })
+                    .await
+                {
+                    resources.cleanup().await;
+                    return Err(setup_error.context("setting up Docker resources"));
+                }
+                docker_resources = Some(resources);
+            }
+
+            self.run_job_steps(
                 manifest,
                 job_client,
                 client,
@@ -351,22 +516,24 @@ impl Runner {
                 &workspace,
                 &node_runtimes,
                 &mut docker_resources,
+                docker_config,
             )
-            .await;
+            .await
+        }
+        .await;
 
-        if let Some(ref mut resources) = docker_resources {
+        if let Some(resources) = docker_resources.as_mut() {
             resources.cleanup().await;
         }
-
-        if let Err(e) = workspace.cleanup() {
-            warn!(error = %e, "workspace cleanup failed");
+        if let Err(cleanup_error) = workspace.cleanup() {
+            warn!(error = %cleanup_error, "workspace cleanup failed");
         }
 
-        result
+        execution_result
     }
 
     #[allow(clippy::too_many_arguments)]
-    async fn run_job_body(
+    async fn run_job_steps(
         &self,
         manifest: &JobManifest,
         job_client: &Arc<JobClient>,
@@ -376,12 +543,13 @@ impl Runner {
         workspace: &Workspace,
         node_runtimes: &crate::node::NodeRuntimes,
         docker_resources: &mut Option<JobDockerResources>,
-    ) -> Result<()> {
+        docker_config: &JobDockerConfig,
+    ) -> Result<JobExecutionOutcome> {
         // Choose env builder based on execution mode
         let mut base_env = if manifest.has_container() {
             build_container_env(manifest, workspace, &self.name)
         } else {
-            build_base_env(manifest, workspace, &self.name)
+            build_base_env(manifest, workspace, &self.name, docker_config)?
         };
 
         // Merge the Docker image's default PATH so tools installed via ENV in
@@ -468,6 +636,8 @@ impl Runner {
         let (heartbeat_handle, heartbeat_cancel) =
             job_client.start_heartbeat(manifest.plan.plan_id.clone(), manifest.plan.job_id.clone());
 
+        let execution =
+            JobExecutionContext::new(docker_config, docker_resources.as_ref(), node_runtimes);
         let job_result = run_all_steps(
             manifest,
             job_client,
@@ -477,44 +647,37 @@ impl Runner {
             &action_cache,
             &github_token,
             cancel_token.clone(),
-            docker_resources.as_ref(),
-            node_runtimes,
+            &execution,
             live_feed.as_ref().map(|f| f.sender()),
         )
         .await;
 
-        // Close the live feed so remaining lines are flushed over WebSocket
+        // Close the live feed so remaining lines are flushed over WebSocket.
         if let Some(feed) = live_feed {
             feed.close().await;
         }
 
-        let (mut conclusion, job_outputs) = job_result.context("running job steps")?;
+        heartbeat_cancel.cancel();
+        let heartbeat_result = heartbeat_handle.await.context("heartbeat task panicked");
+        let job_result = job_result.context("running job steps");
+        let (mut conclusion, outputs) = match (job_result, heartbeat_result) {
+            (Ok(outcome), Ok(())) => outcome,
+            (Err(job_error), Ok(())) => return Err(job_error),
+            (Ok(_), Err(heartbeat_error)) => return Err(heartbeat_error),
+            (Err(job_error), Err(heartbeat_error)) => {
+                return Err(job_error.context(heartbeat_error.to_string()));
+            }
+        };
 
         if cancel_token.is_cancelled() && conclusion != JobConclusion::Cancelled {
             conclusion = JobConclusion::Cancelled;
         }
 
         info!(conclusion = %conclusion, "job steps completed");
-
-        heartbeat_cancel.cancel();
-        let _ = heartbeat_handle.await;
-
-        let outputs_payload = outputs_to_variable_values(&job_outputs);
-        debug!(job_outputs = ?job_outputs, outputs_payload = %outputs_payload, "completing job");
-        job_client
-            .complete_job(
-                &manifest.plan.plan_id,
-                &manifest.plan.job_id,
-                conclusion,
-                &outputs_payload,
-                &[],
-            )
-            .await
-            .context("completing job")?;
-
-        info!(conclusion = %conclusion, "job completed");
-
-        Ok(())
+        Ok(JobExecutionOutcome {
+            conclusion,
+            outputs,
+        })
     }
 
     pub(super) async fn poll_loop(
@@ -524,8 +687,10 @@ impl Runner {
     ) -> Result<Option<BrokerMessage>> {
         let mut backoff = Duration::from_secs(1);
         let max_backoff = Duration::from_secs(30);
+        let mut poisoned_rx = self.job_resources.poisoned_receiver();
 
         loop {
+            self.job_resources.ensure_healthy()?;
             if *shutdown_rx.borrow() {
                 info!("shutdown signal received, exiting poll loop");
                 return Ok(None);
@@ -536,6 +701,10 @@ impl Runner {
                 _ = shutdown_rx.changed() => {
                     info!("shutdown signal received, cancelling poll");
                     return Ok(None);
+                }
+                _ = poisoned_rx.changed() => {
+                    self.job_resources.ensure_healthy()?;
+                    continue;
                 }
             };
 
@@ -584,6 +753,10 @@ impl Runner {
                                 info!("shutdown signal received during token retry");
                                 return Ok(None);
                             }
+                            _ = poisoned_rx.changed() => {
+                                self.job_resources.ensure_healthy()?;
+                                continue;
+                            }
                         };
                         match retry {
                             Ok(result) => return Ok(result),
@@ -600,6 +773,10 @@ impl Runner {
                         _ = tokio::time::sleep(backoff) => {}
                         _ = shutdown_rx.changed() => {
                             return Ok(None);
+                        }
+                        _ = poisoned_rx.changed() => {
+                            self.job_resources.ensure_healthy()?;
+                            continue;
                         }
                     }
 

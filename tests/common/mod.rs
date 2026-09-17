@@ -1,5 +1,8 @@
 #![allow(dead_code)]
 
+pub mod docker_registry;
+pub mod pinned_action;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -8,8 +11,9 @@ use chimera::docker::container::{JobContainerSpec, ServiceContainerSpec};
 use chimera::docker::resources::{JobDockerResources, SetupParams};
 use chimera::github::auth::TokenManager;
 use chimera::job::action::ActionCache;
-use chimera::job::client::JobClient;
-use chimera::job::execute::run_all_steps;
+use chimera::job::client::{JobClient, JobConclusion};
+use chimera::job::docker_config::JobResourceRoot;
+use chimera::job::execute::{JobExecutionContext, run_all_steps};
 use chimera::job::schema::JobManifest;
 use chimera::job::workspace::Workspace;
 use chimera::runner::env::{build_base_env, build_container_env};
@@ -18,24 +22,41 @@ use tokio_util::sync::CancellationToken;
 use wiremock::matchers::{method, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+/// The result of an execution after its per-job Docker configuration was cleaned up.
+pub struct ObservedRun {
+    pub conclusion: JobConclusion,
+    pub outputs: HashMap<String, String>,
+    pub docker_config_dir: std::path::PathBuf,
+    pub attempt_dir: std::path::PathBuf,
+}
+
 /// Everything needed to run integration tests against the execution engine.
 pub struct TestEnv {
     pub workspace: Workspace,
     pub job_client: Arc<JobClient>,
     pub mock_server: MockServer,
     pub tmp: tempfile::TempDir,
+    pub job_resources: JobResourceRoot,
     actions_dir: std::path::PathBuf,
 }
 
 impl TestEnv {
     pub async fn setup() -> Self {
         let tmp = tempfile::tempdir().unwrap();
+        let job_resources = JobResourceRoot::prepare(&tmp.path().join("job-resources")).unwrap();
+        Self::setup_with_tmp(tmp, job_resources).await
+    }
+
+    pub async fn setup_with_job_resources(job_resources: JobResourceRoot) -> Self {
+        Self::setup_with_tmp(tempfile::tempdir().unwrap(), job_resources).await
+    }
+
+    async fn setup_with_tmp(tmp: tempfile::TempDir, job_resources: JobResourceRoot) -> Self {
         let work_dir = tmp.path().join("work");
         let tmp_dir = tmp.path().join("tmp");
         let tool_cache = tmp.path().join("tool-cache");
         let actions_dir = tmp.path().join("actions");
-
-        let ws = Workspace::create(
+        let workspace = Workspace::create(
             &work_dir,
             &tmp_dir,
             &tool_cache,
@@ -43,19 +64,22 @@ impl TestEnv {
             "owner/repo",
         )
         .unwrap();
-
         let mock_server = MockServer::start().await;
         mount_default_mocks(&mock_server).await;
-
         let job_client = create_job_client(&mock_server).await;
 
         Self {
-            workspace: ws,
+            workspace,
             job_client,
             mock_server,
             tmp,
+            job_resources,
             actions_dir,
         }
+    }
+
+    pub fn actions_dir(&self) -> &std::path::Path {
+        &self.actions_dir
     }
 
     /// Point the client at the manifest's Results endpoint. Without this a run
@@ -67,28 +91,76 @@ impl TestEnv {
             .unwrap();
     }
 
+    /// Run a manifest in host mode and retain the paths used during execution.
+    pub async fn run_observed(
+        &self,
+        manifest: &JobManifest,
+        cancel_token: CancellationToken,
+    ) -> anyhow::Result<ObservedRun> {
+        let node_runtimes = chimera::node::NodeRuntimes::single("node".into());
+        self.run_observed_with_runtimes(manifest, cancel_token, &node_runtimes)
+            .await
+    }
+
+    pub async fn run_observed_with_runtimes(
+        &self,
+        manifest: &JobManifest,
+        cancel_token: CancellationToken,
+        node_runtimes: &chimera::node::NodeRuntimes,
+    ) -> anyhow::Result<ObservedRun> {
+        let mut docker_config = self.job_resources.create_docker_config()?;
+        let docker_config_dir = docker_config.directory().to_path_buf();
+        let attempt_dir = docker_config.attempt_dir().to_path_buf();
+        let run_result =
+            match build_base_env(manifest, &self.workspace, "test-runner", &docker_config) {
+                Ok(base_env) => {
+                    let action_cache =
+                        ActionCache::new(self.actions_dir.clone(), reqwest::Client::new());
+                    let execution = JobExecutionContext::new(&docker_config, None, node_runtimes);
+                    run_all_steps(
+                        manifest,
+                        &self.job_client,
+                        &self.workspace,
+                        &base_env,
+                        "test-runner",
+                        &action_cache,
+                        "fake-token",
+                        cancel_token,
+                        &execution,
+                        None,
+                    )
+                    .await
+                }
+                Err(error) => Err(error),
+            };
+        let cleanup_result = docker_config.cleanup();
+
+        let (conclusion, outputs) = match (run_result, cleanup_result) {
+            (Ok(value), Ok(())) => value,
+            (Err(run_error), Ok(())) => return Err(run_error),
+            (Ok(_), Err(cleanup_error)) => return Err(cleanup_error.into()),
+            (Err(run_error), Err(cleanup_error)) => {
+                return Err(run_error.context(cleanup_error.to_string()));
+            }
+        };
+
+        Ok(ObservedRun {
+            conclusion,
+            outputs,
+            docker_config_dir,
+            attempt_dir,
+        })
+    }
+
     /// Run a manifest in host mode and return (conclusion, outputs).
     pub async fn run(
         &self,
         manifest: &JobManifest,
-    ) -> anyhow::Result<(chimera::job::client::JobConclusion, HashMap<String, String>)> {
-        let base_env = build_base_env(manifest, &self.workspace, "test-runner");
-        let action_cache = ActionCache::new(self.actions_dir.clone(), reqwest::Client::new());
-
-        run_all_steps(
-            manifest,
-            &self.job_client,
-            &self.workspace,
-            &base_env,
-            "test-runner",
-            &action_cache,
-            "fake-token",
-            CancellationToken::new(),
-            None,
-            &chimera::node::NodeRuntimes::single("node".into()),
-            None,
-        )
-        .await
+    ) -> anyhow::Result<(JobConclusion, HashMap<String, String>)> {
+        let observed = self
+            .run_observed(manifest, CancellationToken::new())
+            .await?;
+        Ok((observed.conclusion, observed.outputs))
     }
 
     /// Run a manifest in container mode with Docker resources.
@@ -96,14 +168,15 @@ impl TestEnv {
         &self,
         manifest: &JobManifest,
         docker_resources: &JobDockerResources,
-    ) -> anyhow::Result<(chimera::job::client::JobConclusion, HashMap<String, String>)> {
+    ) -> anyhow::Result<(JobConclusion, HashMap<String, String>)> {
+        let mut docker_config = self.job_resources.create_docker_config()?;
         let base_env = build_container_env(manifest, &self.workspace, "test-runner");
         let action_cache = ActionCache::new(self.actions_dir.clone(), reqwest::Client::new());
-
         let node_runtimes =
             chimera::node::NodeRuntimes::single(docker_resources.node_path(None).into());
-
-        run_all_steps(
+        let execution =
+            JobExecutionContext::new(&docker_config, Some(docker_resources), &node_runtimes);
+        let run_result = run_all_steps(
             manifest,
             &self.job_client,
             &self.workspace,
@@ -112,11 +185,20 @@ impl TestEnv {
             &action_cache,
             "fake-token",
             CancellationToken::new(),
-            Some(docker_resources),
-            &node_runtimes,
+            &execution,
             None,
         )
-        .await
+        .await;
+        let cleanup_result = docker_config.cleanup();
+
+        match (run_result, cleanup_result) {
+            (Ok(value), Ok(())) => Ok(value),
+            (Err(run_error), Ok(())) => Err(run_error),
+            (Ok(_), Err(cleanup_error)) => Err(cleanup_error.into()),
+            (Err(run_error), Err(cleanup_error)) => {
+                Err(run_error.context(cleanup_error.to_string()))
+            }
+        }
     }
 }
 

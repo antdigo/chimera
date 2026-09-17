@@ -37,6 +37,27 @@ fn cleanup_removes_dirs() {
 }
 
 #[test]
+fn failed_creation_removes_partial_runner_dirs_without_touching_tool_cache() {
+    let root = tempfile::tempdir().unwrap();
+    let work_dir = root.path().join("work");
+    let tmp_dir = root.path().join("tmp");
+    let tool_cache = root.path().join("tool-cache");
+    let tool_cache_entry = tool_cache.join("shared-tool");
+    std::fs::create_dir_all(&tool_cache).unwrap();
+    std::fs::write(&tool_cache_entry, "keep").unwrap();
+    std::fs::write(&tmp_dir, "not a directory").unwrap();
+
+    let error = Workspace::create(&work_dir, &tmp_dir, &tool_cache, "runner-0", "owner/repo")
+        .err()
+        .unwrap();
+
+    assert!(format!("{error:#}").contains("creating runner temp dir"));
+    assert!(!work_dir.join("runner-0").exists());
+    assert!(!tmp_dir.join("runner-0").exists());
+    assert_eq!(std::fs::read_to_string(&tool_cache_entry).unwrap(), "keep");
+}
+
+#[test]
 fn read_env_file_key_value() {
     let (_tmp, ws) = make_workspace();
     std::fs::write(ws.env_file(), "FOO=bar\nBAZ=qux\n").unwrap();

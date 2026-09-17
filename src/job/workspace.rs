@@ -29,8 +29,10 @@ impl Workspace {
             .split('/')
             .next_back()
             .unwrap_or(repo_full_name);
-        let workspace_dir = work_dir.join(runner_name).join(repo_short).join(repo_short);
+        let runner_work = work_dir.join(runner_name);
+        let workspace_dir = runner_work.join(repo_short).join(repo_short);
         let runner_temp = tmp_dir.join(runner_name);
+        let runner_temp_for_cleanup = runner_temp.clone();
         let tool_cache = tool_cache_dir.to_path_buf();
 
         // Files live one level above workspace
@@ -42,40 +44,55 @@ impl Workspace {
         let step_summary_file = parent.join("_step_summary");
         let event_file = parent.join("_event.json");
 
-        std::fs::create_dir_all(&workspace_dir)
-            .with_context(|| format!("creating workspace dir {}", workspace_dir.display()))?;
-        std::fs::create_dir_all(&runner_temp)
-            .with_context(|| format!("creating runner temp dir {}", runner_temp.display()))?;
-        std::fs::create_dir_all(&tool_cache)
-            .with_context(|| format!("creating tool cache dir {}", tool_cache.display()))?;
+        let creation_result = (|| {
+            std::fs::create_dir_all(&workspace_dir)
+                .with_context(|| format!("creating workspace dir {}", workspace_dir.display()))?;
+            std::fs::create_dir_all(&runner_temp)
+                .with_context(|| format!("creating runner temp dir {}", runner_temp.display()))?;
+            std::fs::create_dir_all(&tool_cache)
+                .with_context(|| format!("creating tool cache dir {}", tool_cache.display()))?;
 
-        // Create empty env/path/output/state/summary files
-        std::fs::write(&env_file, "")
-            .with_context(|| format!("creating env file {}", env_file.display()))?;
-        std::fs::write(&path_file, "")
-            .with_context(|| format!("creating path file {}", path_file.display()))?;
-        std::fs::write(&output_file, "")
-            .with_context(|| format!("creating output file {}", output_file.display()))?;
-        std::fs::write(&state_file, "")
-            .with_context(|| format!("creating state file {}", state_file.display()))?;
-        std::fs::write(&step_summary_file, "").with_context(|| {
-            format!("creating step summary file {}", step_summary_file.display())
-        })?;
-        // Event file starts as empty JSON object — overwritten by write_event_file()
-        std::fs::write(&event_file, "{}")
-            .with_context(|| format!("creating event file {}", event_file.display()))?;
+            // Create empty env/path/output/state/summary files
+            std::fs::write(&env_file, "")
+                .with_context(|| format!("creating env file {}", env_file.display()))?;
+            std::fs::write(&path_file, "")
+                .with_context(|| format!("creating path file {}", path_file.display()))?;
+            std::fs::write(&output_file, "")
+                .with_context(|| format!("creating output file {}", output_file.display()))?;
+            std::fs::write(&state_file, "")
+                .with_context(|| format!("creating state file {}", state_file.display()))?;
+            std::fs::write(&step_summary_file, "").with_context(|| {
+                format!("creating step summary file {}", step_summary_file.display())
+            })?;
+            // Event file starts as empty JSON object — overwritten by write_event_file()
+            std::fs::write(&event_file, "{}")
+                .with_context(|| format!("creating event file {}", event_file.display()))?;
 
-        Ok(Self {
-            workspace_dir,
-            runner_temp,
-            tool_cache,
-            env_file,
-            path_file,
-            output_file,
-            state_file,
-            step_summary_file,
-            event_file,
-        })
+            Ok(Self {
+                workspace_dir,
+                runner_temp,
+                tool_cache,
+                env_file,
+                path_file,
+                output_file,
+                state_file,
+                step_summary_file,
+                event_file,
+            })
+        })();
+
+        match creation_result {
+            Ok(workspace) => Ok(workspace),
+            Err(creation_error) => {
+                match cleanup_partial_workspace(&runner_work, &runner_temp_for_cleanup) {
+                    Ok(()) => Err(creation_error),
+                    Err(cleanup_error) => {
+                        warn!(error = %cleanup_error, "failed to clean partial workspace creation");
+                        Err(creation_error.context(cleanup_error.to_string()))
+                    }
+                }
+            }
+        }
     }
 
     pub fn workspace_dir(&self) -> &Path {
@@ -194,6 +211,31 @@ impl Workspace {
         }
 
         Ok(())
+    }
+}
+
+fn cleanup_partial_workspace(runner_work: &Path, runner_temp: &Path) -> Result<()> {
+    let mut cleanup_error = None;
+
+    for path in [runner_work, runner_temp] {
+        if !path.exists() {
+            continue;
+        }
+        if let Err(error) = std::fs::remove_dir_all(path) {
+            let error = anyhow::Error::new(error).context(format!(
+                "removing partial workspace resource {}",
+                path.display()
+            ));
+            warn!(error = %error, "failed to remove partial workspace resource");
+            if cleanup_error.is_none() {
+                cleanup_error = Some(error);
+            }
+        }
+    }
+
+    match cleanup_error {
+        Some(error) => Err(error),
+        None => Ok(()),
     }
 }
 

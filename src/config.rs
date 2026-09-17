@@ -143,6 +143,10 @@ impl ChimeraPaths {
         self.root.join("chimera.pid")
     }
 
+    pub fn job_resources_dir(&self) -> PathBuf {
+        self.root.join("job-resources")
+    }
+
     pub fn root_lock_file(&self) -> PathBuf {
         self.root.join(".chimera.lock")
     }

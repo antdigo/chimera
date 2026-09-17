@@ -1,6 +1,7 @@
 pub mod action;
 pub mod client;
 pub mod commands;
+pub mod docker_config;
 pub mod execute;
 pub mod expression;
 pub mod live_feed;
