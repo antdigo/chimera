@@ -128,33 +128,33 @@ where
     call_checkpoint(checkpoint, CommitPoint::AfterCreateStaging)?;
     validate_original_state(prepared, None, None)?;
 
-    let runner_identity =
-        write_private_json_at(&staging, CREDENTIAL_FILES[0], &prepared.credentials().info)
-            .map_err(|_| ImportError::WriteFailed("unable to stage runner credentials".into()))?;
-    staging_cleanup
-        .track_leaf(CREDENTIAL_FILES[0], runner_identity)
-        .map_err(|_| ImportError::WriteFailed("unable to stage runner credentials".into()))?;
+    write_private_json_at(
+        &staging,
+        &mut staging_cleanup,
+        CREDENTIAL_FILES[0],
+        &prepared.credentials().info,
+    )
+    .map_err(|_| ImportError::WriteFailed("unable to stage runner credentials".into()))?;
     call_checkpoint(checkpoint, CommitPoint::AfterRunnerJson)?;
     validate_original_state(prepared, None, None)?;
 
-    let credentials_identity =
-        write_private_json_at(&staging, CREDENTIAL_FILES[1], &prepared.credentials().oauth)
-            .map_err(|_| ImportError::WriteFailed("unable to stage runner credentials".into()))?;
-    staging_cleanup
-        .track_leaf(CREDENTIAL_FILES[1], credentials_identity)
-        .map_err(|_| ImportError::WriteFailed("unable to stage runner credentials".into()))?;
+    write_private_json_at(
+        &staging,
+        &mut staging_cleanup,
+        CREDENTIAL_FILES[1],
+        &prepared.credentials().oauth,
+    )
+    .map_err(|_| ImportError::WriteFailed("unable to stage runner credentials".into()))?;
     call_checkpoint(checkpoint, CommitPoint::AfterCredentialsJson)?;
     validate_original_state(prepared, None, None)?;
 
-    let rsa_identity = write_private_json_at(
+    write_private_json_at(
         &staging,
+        &mut staging_cleanup,
         CREDENTIAL_FILES[2],
         &prepared.credentials().rsa_params,
     )
     .map_err(|_| ImportError::WriteFailed("unable to stage runner credentials".into()))?;
-    staging_cleanup
-        .track_leaf(CREDENTIAL_FILES[2], rsa_identity)
-        .map_err(|_| ImportError::WriteFailed("unable to stage runner credentials".into()))?;
     call_checkpoint(checkpoint, CommitPoint::AfterRsaJson)?;
     validate_original_state(prepared, None, None)?;
 
@@ -238,19 +238,21 @@ fn create_staging_directory(
 
 fn write_private_json_at<T: Serialize>(
     directory: &File,
+    cleanup: &mut CleanupGuard,
     name: &str,
     value: &T,
-) -> io::Result<EntryIdentity> {
+) -> io::Result<()> {
     let name = path_component(OsStr::new(name))?;
     let flags = libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC;
     let mut file = open_file_at(directory, &name, flags, 0o600)?;
+    let identity = file_identity(&file)?;
+    ensure_entry_identity(directory, &name, identity)?;
+    cleanup.track_leaf(name, identity);
+
     set_file_mode(&file, 0o600)?;
     serde_json::to_writer_pretty(&mut file, value).map_err(io::Error::other)?;
     file.write_all(b"\n")?;
-    file.sync_all()?;
-    let identity = file_identity(&file)?;
-    ensure_entry_identity(directory, &name, identity)?;
-    Ok(identity)
+    file.sync_all()
 }
 
 fn validate_staging(staging: &File, prepared: &PreparedImport) -> Result<(), ImportError> {
@@ -849,7 +851,10 @@ impl CleanupGuard {
             name: name.to_owned(),
             expected,
             kind,
-            tracked_leaves: Vec::new(),
+            tracked_leaves: match kind {
+                CleanupKind::Directory => Vec::with_capacity(CREDENTIAL_FILES.len()),
+                CleanupKind::File => Vec::new(),
+            },
             armed: true,
         }
     }
@@ -858,12 +863,8 @@ impl CleanupGuard {
         self.armed = false;
     }
 
-    fn track_leaf(&mut self, name: &str, expected: EntryIdentity) -> io::Result<()> {
-        self.tracked_leaves.push(TrackedLeaf {
-            name: path_component(OsStr::new(name))?,
-            expected,
-        });
-        Ok(())
+    fn track_leaf(&mut self, name: CString, expected: EntryIdentity) {
+        self.tracked_leaves.push(TrackedLeaf { name, expected });
     }
 
     fn remove_directory(&self) -> io::Result<()> {

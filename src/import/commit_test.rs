@@ -855,6 +855,48 @@ fn staging_cleanup_preserves_every_entry_when_a_tracked_leaf_is_replaced() {
 }
 
 #[test]
+fn post_create_staging_write_failure_cleans_partial_credentials() {
+    struct FailingSerialize;
+
+    impl serde::Serialize for FailingSerialize {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            let mut map = serializer.serialize_map(Some(2))?;
+            serde::ser::SerializeMap::serialize_entry(&mut map, "partial", &true)?;
+            Err(serde::ser::Error::custom(
+                "injected staging serialization failure",
+            ))
+        }
+    }
+
+    let root = tempfile::tempdir().unwrap();
+    let lock = RootLock::acquire(root.path()).unwrap();
+    let root_file = lock.try_clone_root().unwrap();
+    let staging_name = path_component(OsStr::new(".import-partial-write")).unwrap();
+    let (staging, _, mut staging_cleanup) =
+        create_staging_directory(&root_file, &staging_name).unwrap();
+
+    let result = write_private_json_at(
+        &staging,
+        &mut staging_cleanup,
+        CREDENTIAL_FILES[0],
+        &FailingSerialize,
+    );
+    assert!(
+        result.is_err(),
+        "injected staging write unexpectedly succeeded"
+    );
+    drop(staging);
+    drop(staging_cleanup);
+
+    assert!(import_artifacts(root.path()).is_empty());
+    assert!(!root.path().join("config.toml").exists());
+    assert!(!root.path().join("runners/local-runner").exists());
+}
+
+#[test]
 fn replaced_config_temp_is_neither_published_nor_deleted() {
     let root = tempfile::tempdir().unwrap();
     let (_lock, prepared) = prepare_locked_import(&fixture_path(), "local-runner", root.path());
