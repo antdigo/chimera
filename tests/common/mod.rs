@@ -1,5 +1,8 @@
 #![allow(dead_code)]
 
+pub mod docker_registry;
+pub mod pinned_action;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -114,7 +117,7 @@ impl TestEnv {
                     let action_cache =
                         ActionCache::new(self.actions_dir.clone(), reqwest::Client::new());
                     let execution = JobExecutionContext::new(&docker_config, None, node_runtimes);
-                    let result = run_all_steps(
+                    run_all_steps(
                         manifest,
                         &self.job_client,
                         &self.workspace,
@@ -126,9 +129,7 @@ impl TestEnv {
                         &execution,
                         None,
                     )
-                    .await;
-                    drop(execution);
-                    result
+                    .await
                 }
                 Err(error) => Err(error),
             };
@@ -188,7 +189,6 @@ impl TestEnv {
             None,
         )
         .await;
-        drop(execution);
         let cleanup_result = docker_config.cleanup();
 
         match (run_result, cleanup_result) {
