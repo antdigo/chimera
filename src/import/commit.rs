@@ -307,9 +307,11 @@ where
         .map_err(|_| ImportError::WriteFailed("unable to publish config.toml".into()))?;
     temp_cleanup.disarm();
     call_checkpoint(checkpoint, CommitPoint::AfterConfigPublish)?;
+    validate_runners(runners_handle)?;
 
     sync_directory(DurabilityPoint::Root, root)
-        .map_err(|_| ImportError::WriteFailed("unable to sync chimera root".into()))
+        .map_err(|_| ImportError::WriteFailed("unable to sync chimera root".into()))?;
+    validate_runners(runners_handle)
 }
 
 fn call_checkpoint<F>(checkpoint: &mut F, point: CommitPoint) -> Result<(), ImportError>

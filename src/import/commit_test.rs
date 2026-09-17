@@ -671,6 +671,37 @@ fn displaced_runners_before_resume_config_publish_prevents_config_publish() {
     assert_runner_once(root.path(), "local-runner");
 }
 
+#[cfg(unix)]
+#[test]
+fn displaced_runners_after_resume_config_publish_returns_write_failed() {
+    let root = tempfile::tempdir().unwrap();
+    write_chimera_credentials(root.path(), "local-runner");
+    let (_lock, prepared) = prepare_locked_import(&fixture_path(), "local-runner", root.path());
+    let displaced = RefCell::new(None::<(PathBuf, u64)>);
+
+    let error = commit_with_checkpoint(prepared, |point| {
+        if point == CommitPoint::AfterConfigPublish {
+            displaced.replace(Some(displace_runners(
+                root.path(),
+                "displaced-runners-after-config",
+            )));
+        }
+        Ok(())
+    })
+    .unwrap_err();
+
+    assert_eq!(error.category(), "write-failed");
+    let (displaced_path, replacement_inode) = displaced.borrow().clone().unwrap();
+    assert_directory_empty(&root.path().join("runners"));
+    assert!(load_runner_credentials(&displaced_path, "local-runner").is_ok());
+    assert_eq!(
+        directory_inode(&root.path().join("runners")),
+        replacement_inode
+    );
+    assert_runner_once(root.path(), "local-runner");
+    assert!(import_artifacts(root.path()).is_empty());
+}
+
 #[test]
 fn replaced_staging_is_neither_published_nor_deleted() {
     let root = tempfile::tempdir().unwrap();
@@ -864,6 +895,41 @@ fn failed_root_durability_barrier_recovers_without_rewriting_state() {
         credentials_before
     );
     assert_eq!(snapshot(&root.path().join("config.toml")), config_before);
+}
+
+#[cfg(unix)]
+#[test]
+fn displaced_runners_during_new_root_durability_returns_write_failed() {
+    let root = tempfile::tempdir().unwrap();
+    let (_lock, prepared) = prepare_locked_import(&fixture_path(), "local-runner", root.path());
+    let displaced = RefCell::new(None::<(PathBuf, u64)>);
+
+    let error = commit_with_checkpoint_and_sync(
+        prepared,
+        |_| Ok(()),
+        |point, directory| {
+            open_syncable_directory(directory)?.sync_all()?;
+            if point == DurabilityPoint::Root {
+                displaced.replace(Some(displace_runners(
+                    root.path(),
+                    "displaced-runners-during-root-sync",
+                )));
+            }
+            Ok(())
+        },
+    )
+    .unwrap_err();
+
+    assert_eq!(error.category(), "write-failed");
+    let (displaced_path, replacement_inode) = displaced.borrow().clone().unwrap();
+    assert_directory_empty(&root.path().join("runners"));
+    assert!(load_runner_credentials(&displaced_path, "local-runner").is_ok());
+    assert_eq!(
+        directory_inode(&root.path().join("runners")),
+        replacement_inode
+    );
+    assert_runner_once(root.path(), "local-runner");
+    assert!(import_artifacts(root.path()).is_empty());
 }
 
 #[cfg(unix)]
