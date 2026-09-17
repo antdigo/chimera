@@ -1,3 +1,4 @@
+use std::ffi::OsString;
 use std::fs;
 use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::os::unix::process::CommandExt;
@@ -13,6 +14,7 @@ use tempfile::TempDir;
 
 const CREDENTIAL_FILES: [&str; 3] = ["runner.json", "credentials.json", "rsa_params.json"];
 const OFFICIAL_FILES: [&str; 3] = [".runner", ".credentials", ".credentials_rsaparams"];
+const SYNTHETIC_AGENT_ID: u64 = 42;
 
 type SourceMutation = fn(&Path, &str);
 
@@ -21,6 +23,17 @@ struct FileSnapshot {
     bytes: Vec<u8>,
     inode: u64,
     modified: SystemTime,
+}
+
+#[derive(PartialEq, Eq)]
+struct TargetSnapshot {
+    files: Vec<FileSnapshot>,
+    root_entries: Vec<OsString>,
+    runners_entries: Vec<OsString>,
+    runner_entries: Vec<OsString>,
+    root_mode: u32,
+    runners_mode: u32,
+    runner_mode: u32,
 }
 
 fn fixture_path() -> PathBuf {
@@ -82,13 +95,37 @@ fn output_contains(output: &Output, text: &str) -> bool {
         || String::from_utf8_lossy(&output.stderr).contains(text)
 }
 
+fn assert_success_output(output: &Output, status: &str, name: &str, source: &Path) {
+    assert!(output.status.success());
+    let expected = format!(
+        "{status}: local-name={name}, agent-id={SYNTHETIC_AGENT_ID}; offline validation only\n"
+    );
+    assert_eq!(output.stdout.as_slice(), expected.as_bytes());
+    assert!(output.stderr.is_empty());
+    assert_source_credentials_redacted(output, source);
+}
+
 fn assert_error_category(output: &Output, category: &str) {
     assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains(category));
+    let expected_prefix = format!("Error: {category}:");
+    assert!(String::from_utf8_lossy(&output.stderr).starts_with(&expected_prefix));
 }
 
 fn assert_redacted(output: &Output, secret: &str) {
     assert!(!output_contains(output, secret));
+}
+
+fn assert_source_credentials_redacted(output: &Output, source: &Path) {
+    let credentials = read_json(&source.join(".credentials"));
+    let rsa = read_json(&source.join(".credentials_rsaparams"));
+    assert_redacted(output, json_string(&credentials["data"], "clientId"));
+    assert_redacted(
+        output,
+        json_string(&credentials["data"], "authorizationUrl"),
+    );
+    for field in ["D", "DP", "DQ", "Exponent", "InverseQ", "Modulus", "P", "Q"] {
+        assert_redacted(output, json_string(&rsa, field));
+    }
 }
 
 fn snapshot(path: &Path) -> FileSnapshot {
@@ -114,17 +151,62 @@ fn json_string<'a>(value: &'a Value, key: &str) -> &'a str {
     value[key].as_str().unwrap()
 }
 
-fn assert_exact_mode(path: &Path, expected: u32) {
-    assert_eq!(
-        fs::metadata(path).unwrap().permissions().mode() & 0o777,
-        expected
-    );
+fn mode(path: &Path) -> u32 {
+    fs::metadata(path).unwrap().permissions().mode() & 0o777
 }
 
-fn assert_private_import_modes(root: &Path, name: &str) {
+fn assert_exact_mode(path: &Path, expected: u32) {
+    assert_eq!(mode(path), expected);
+}
+
+fn directory_entries(path: &Path) -> Vec<OsString> {
+    let mut entries: Vec<_> = fs::read_dir(path)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    entries.sort();
+    entries
+}
+
+fn snapshot_target(root: &Path, name: &str) -> TargetSnapshot {
+    let runner = root.join("runners").join(name);
+    let mut files = vec![snapshot(&root.join("config.toml"))];
+    files.extend(
+        CREDENTIAL_FILES
+            .iter()
+            .map(|file| snapshot(&runner.join(file))),
+    );
+
+    TargetSnapshot {
+        files,
+        root_entries: directory_entries(root),
+        runners_entries: directory_entries(&root.join("runners")),
+        runner_entries: directory_entries(&runner),
+        root_mode: mode(root),
+        runners_mode: mode(&root.join("runners")),
+        runner_mode: mode(&runner),
+    }
+}
+
+fn assert_private_target_modes(root: &Path, name: &str) {
     assert_exact_mode(root, 0o700);
     assert_exact_mode(&root.join("runners"), 0o700);
     assert_exact_mode(&root.join("runners").join(name), 0o700);
+}
+
+fn assert_conflict_target_unchanged(
+    before: &TargetSnapshot,
+    root: &Path,
+    name: &str,
+    alternative_name: &str,
+) {
+    assert!(!root.join("runners").join(alternative_name).exists());
+    assert_private_target_modes(root, name);
+    assert!(before == &snapshot_target(root, name));
+}
+
+fn assert_private_import_modes(root: &Path, name: &str) {
+    assert_private_target_modes(root, name);
     assert_exact_mode(&root.join(".chimera.lock"), 0o600);
     assert_exact_mode(&root.join("config.toml"), 0o600);
     for file in CREDENTIAL_FILES {
@@ -138,8 +220,7 @@ fn imports_fixture_and_chimera_loader_preserves_every_field() {
     let root = parent.path().join("chimera");
     let output = run_import(&fixture_path(), "imported-runner", &root, false);
 
-    assert!(output.status.success());
-    assert!(String::from_utf8_lossy(&output.stdout).starts_with("imported:"));
+    assert_success_output(&output, "imported", "imported-runner", &fixture_path());
 
     let official_runner = read_json(&fixture_path().join(".runner"));
     let official_credentials = read_json(&fixture_path().join(".credentials"));
@@ -230,20 +311,8 @@ fn dry_run_is_offline_and_does_not_create_new_root() {
     let root = parent.path().join("missing-root");
     let output = run_import(&fixture_path(), "dry-runner", &root, true);
 
-    assert!(output.status.success());
-    assert!(String::from_utf8_lossy(&output.stdout).starts_with("eligible:"));
+    assert_success_output(&output, "eligible", "dry-runner", &fixture_path());
     assert!(!root.exists());
-
-    let credentials = read_json(&fixture_path().join(".credentials"));
-    let rsa = read_json(&fixture_path().join(".credentials_rsaparams"));
-    assert_redacted(&output, json_string(&credentials["data"], "clientId"));
-    assert_redacted(
-        &output,
-        json_string(&credentials["data"], "authorizationUrl"),
-    );
-    for field in ["D", "DP", "DQ", "Exponent", "InverseQ", "Modulus", "P", "Q"] {
-        assert_redacted(&output, json_string(&rsa, field));
-    }
 }
 
 #[test]
@@ -252,7 +321,7 @@ fn repeat_reports_already_imported_without_duplicate_or_rewrite() {
     let root = parent.path().join("chimera");
     let name = "repeat-runner";
     let first = run_import(&fixture_path(), name, &root, false);
-    assert!(first.status.success());
+    assert_success_output(&first, "imported", name, &fixture_path());
 
     let credentials_before: Vec<_> = CREDENTIAL_FILES
         .iter()
@@ -264,8 +333,7 @@ fn repeat_reports_already_imported_without_duplicate_or_rewrite() {
         .map(|file| snapshot(&root.join("runners").join(name).join(file)))
         .collect();
 
-    assert!(second.status.success());
-    assert!(String::from_utf8_lossy(&second.stdout).starts_with("already-imported:"));
+    assert_success_output(&second, "already-imported", name, &fixture_path());
     assert!(credentials_before == credentials_after);
     assert_eq!(
         load_config(&root.join("config.toml")).unwrap().runners,
@@ -278,16 +346,10 @@ fn same_name_or_same_identity_conflict_leaves_target_unchanged() {
     let parent = tempfile::tempdir().unwrap();
     let root = parent.path().join("chimera");
     let name = "conflict-runner";
+    let alternative_name = "another-local-runner";
     let first = run_import(&fixture_path(), name, &root, false);
-    assert!(first.status.success());
-
-    let tracked_paths = [
-        root.join("config.toml"),
-        root.join("runners").join(name).join("runner.json"),
-        root.join("runners").join(name).join("credentials.json"),
-        root.join("runners").join(name).join("rsa_params.json"),
-    ];
-    let before: Vec<_> = tracked_paths.iter().map(|path| snapshot(path)).collect();
+    assert_success_output(&first, "imported", name, &fixture_path());
+    let before = snapshot_target(&root, name);
 
     let changed_source = copy_fixture();
     let same_name_secret = "same-name-credential-canary";
@@ -297,12 +359,11 @@ fn same_name_or_same_identity_conflict_leaves_target_unchanged() {
     let same_name = run_import(changed_source.path(), name, &root, false);
     assert_error_category(&same_name, "identity-conflict");
     assert_redacted(&same_name, same_name_secret);
+    assert_conflict_target_unchanged(&before, &root, name, alternative_name);
 
-    let same_identity = run_import(&fixture_path(), "another-local-runner", &root, false);
+    let same_identity = run_import(&fixture_path(), alternative_name, &root, false);
     assert_error_category(&same_identity, "identity-conflict");
-
-    let after: Vec<_> = tracked_paths.iter().map(|path| snapshot(path)).collect();
-    assert!(before == after);
+    assert_conflict_target_unchanged(&before, &root, name, alternative_name);
 }
 
 #[test]
@@ -357,11 +418,21 @@ fn invalid_inputs_fail_before_publish_and_redact_secrets() {
         let root = parent.path().join(label);
         let secret = format!("redaction-{label}-canary");
         mutate(source.path(), &secret);
+        let injected_rsa_value = (label == "malformed-rsa").then(|| {
+            json_string(
+                &read_json(&source.path().join(".credentials_rsaparams")),
+                "D",
+            )
+            .to_owned()
+        });
 
         let output = run_import(source.path(), "invalid-runner", &root, false);
 
         assert_error_category(&output, category);
         assert_redacted(&output, &secret);
+        if let Some(injected_rsa_value) = injected_rsa_value {
+            assert_redacted(&output, &injected_rsa_value);
+        }
         assert!(!root.exists());
     }
 }
@@ -409,7 +480,10 @@ fn published_directory_without_config_is_recovered_by_cli() {
     let completed_root = parent.path().join("completed");
     let name = "resume-runner";
     let completed = run_import(&fixture_path(), name, &completed_root, false);
-    assert!(completed.status.success());
+    assert_success_output(&completed, "imported", name, &fixture_path());
+    let completed_lock = completed_root.join(".chimera.lock");
+    assert!(fs::metadata(&completed_lock).unwrap().is_file());
+    assert_exact_mode(&completed_lock, 0o600);
 
     let crash_root = parent.path().join("crash-window");
     let crash_runner = crash_root.join("runners").join(name);
@@ -430,11 +504,18 @@ fn published_directory_without_config_is_recovered_by_cli() {
         .unwrap();
         fs::set_permissions(destination, fs::Permissions::from_mode(0o600)).unwrap();
     }
+    let crash_lock = crash_root.join(".chimera.lock");
+    fs::copy(&completed_lock, &crash_lock).unwrap();
+    fs::set_permissions(&crash_lock, fs::Permissions::from_mode(0o600)).unwrap();
+    assert!(fs::metadata(&crash_lock).unwrap().is_file());
+    assert_exact_mode(&crash_lock, 0o600);
+    let lock_before = snapshot(&crash_lock);
+    assert!(!crash_root.join("config.toml").exists());
 
     let recovered = run_import(&fixture_path(), name, &crash_root, false);
 
-    assert!(recovered.status.success());
-    assert!(String::from_utf8_lossy(&recovered.stdout).starts_with("imported:"));
+    assert_success_output(&recovered, "imported", name, &fixture_path());
+    assert!(lock_before == snapshot(&crash_lock));
     assert_eq!(
         load_config(&crash_root.join("config.toml"))
             .unwrap()
@@ -449,7 +530,7 @@ fn umask_zero_still_creates_private_credentials() {
     let root = parent.path().join("chimera");
     let output = run_import_with_umask(&fixture_path(), "umask-zero", &root, 0o000);
 
-    assert!(output.status.success());
+    assert_success_output(&output, "imported", "umask-zero", &fixture_path());
     assert_private_import_modes(&root, "umask-zero");
 }
 
@@ -459,6 +540,6 @@ fn restrictive_umask_still_creates_exact_private_modes() {
     let root = parent.path().join("chimera");
     let output = run_import_with_umask(&fixture_path(), "umask-restrictive", &root, 0o777);
 
-    assert!(output.status.success());
+    assert_success_output(&output, "imported", "umask-restrictive", &fixture_path());
     assert_private_import_modes(&root, "umask-restrictive");
 }
