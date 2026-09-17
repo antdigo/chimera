@@ -1,11 +1,27 @@
 use std::cell::{Cell, RefCell};
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 
 use crate::config::{load_config_if_exists, load_runner_credentials};
-use crate::import::target::prepare_import;
+use crate::import::target::{PreparedImport, prepare_import, prepare_import_locked};
 use crate::import::test_support::{copy_fixture, fixture_path, write_chimera_credentials};
+use crate::storage::RootLock;
 
 use super::*;
+
+fn prepare_locked_import(source: &Path, name: &str, root: &Path) -> (RootLock, PreparedImport) {
+    let initial = prepare_import(source, name, root).unwrap();
+    let canonical_root = initial.canonical_root().to_path_buf();
+    let lock = RootLock::acquire(&canonical_root).unwrap();
+    let prepared = prepare_import_locked(
+        source,
+        name,
+        &canonical_root,
+        lock.try_clone_root().unwrap(),
+    )
+    .unwrap();
+    (lock, prepared)
+}
 
 #[cfg(unix)]
 fn snapshot(path: &Path) -> (Vec<u8>, u64, std::time::SystemTime) {
@@ -105,13 +121,29 @@ fn assert_runner_once(root: &Path, name: &str) {
     );
 }
 
+#[test]
+fn durability_sync_reopens_the_pinned_directory() {
+    let root = tempfile::tempdir().unwrap();
+    let lock = RootLock::acquire(root.path()).unwrap();
+    let pinned = lock.try_clone_root().unwrap();
+
+    let syncable = open_syncable_directory(&pinned).unwrap();
+
+    assert_ne!(syncable.as_raw_fd(), pinned.as_raw_fd());
+    assert_eq!(
+        file_identity(&syncable).unwrap(),
+        file_identity(&pinned).unwrap()
+    );
+    syncable.sync_all().unwrap();
+}
+
 #[cfg(unix)]
 #[test]
 fn published_credentials_without_config_are_completed_on_retry() {
     let root = tempfile::tempdir().unwrap();
     write_chimera_credentials(root.path(), "local-runner");
     let before = credential_snapshot(root.path(), "local-runner");
-    let prepared = prepare_import(&fixture_path(), "local-runner", root.path()).unwrap();
+    let (_lock, prepared) = prepare_locked_import(&fixture_path(), "local-runner", root.path());
     let mut checkpoints = Vec::new();
 
     let outcome = commit_with_checkpoint(prepared, |point| {
@@ -159,7 +191,7 @@ fn config_update_preserves_daemon_cache_unknown_settings_and_existing_runners() 
     )
     .unwrap();
     std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o640)).unwrap();
-    let prepared = prepare_import(&fixture_path(), "local-runner", root.path()).unwrap();
+    let (_lock, prepared) = prepare_locked_import(&fixture_path(), "local-runner", root.path());
 
     let outcome = commit_with_checkpoint(prepared, |_| Ok(())).unwrap();
 
@@ -188,7 +220,7 @@ fn config_update_preserves_daemon_cache_unknown_settings_and_existing_runners() 
 #[test]
 fn target_created_after_prepare_is_never_replaced() {
     let root = tempfile::tempdir().unwrap();
-    let prepared = prepare_import(&fixture_path(), "local-runner", root.path()).unwrap();
+    let (_lock, prepared) = prepare_locked_import(&fixture_path(), "local-runner", root.path());
     let target = root.path().join("runners/local-runner");
     let marker = target.join("marker");
     let marker_inode = Cell::new(None);
@@ -245,7 +277,7 @@ fn every_commit_checkpoint_is_recoverable_and_preserves_invariants() {
         let previous_directory_inode = directory_inode(&previous_directory);
         let previous_before = credential_snapshot(root.path(), "previous");
         let config_before = snapshot(&root.path().join("config.toml"));
-        let prepared = prepare_import(source.path(), "local-runner", root.path()).unwrap();
+        let (lock, prepared) = prepare_locked_import(source.path(), "local-runner", root.path());
 
         let error = commit_with_checkpoint(prepared, |point| {
             if point == failed_point {
@@ -322,6 +354,7 @@ fn every_commit_checkpoint_is_recoverable_and_preserves_invariants() {
             None
         };
 
+        drop(lock);
         let retry =
             crate::import::import_official(source.path(), "local-runner", root.path(), false)
                 .unwrap();
@@ -380,7 +413,7 @@ fn every_commit_checkpoint_is_recoverable_and_preserves_invariants() {
 #[test]
 fn config_cleanup_does_not_delete_a_new_file_after_publish() {
     let root = tempfile::tempdir().unwrap();
-    let prepared = prepare_import(&fixture_path(), "local-runner", root.path()).unwrap();
+    let (_lock, prepared) = prepare_locked_import(&fixture_path(), "local-runner", root.path());
     let temp_path = RefCell::new(None::<PathBuf>);
 
     let error = commit_with_checkpoint(prepared, |point| {
@@ -452,7 +485,7 @@ fn new_import_uses_exact_private_modes() {
 #[test]
 fn stock_loader_rejects_staging_tampering_before_publish() {
     let root = tempfile::tempdir().unwrap();
-    let prepared = prepare_import(&fixture_path(), "local-runner", root.path()).unwrap();
+    let (_lock, prepared) = prepare_locked_import(&fixture_path(), "local-runner", root.path());
 
     let error = commit_with_checkpoint(prepared, |point| {
         if point == CommitPoint::AfterRsaJson {
@@ -486,7 +519,7 @@ fn group_or_world_writable_runners_directory_is_rejected() {
     let runners = root.path().join("runners");
     std::fs::create_dir(&runners).unwrap();
     std::fs::set_permissions(&runners, std::fs::Permissions::from_mode(0o777)).unwrap();
-    let prepared = prepare_import(&fixture_path(), "local-runner", root.path()).unwrap();
+    let (_lock, prepared) = prepare_locked_import(&fixture_path(), "local-runner", root.path());
 
     let error = commit_with_checkpoint(prepared, |_| Ok(())).unwrap_err();
 
@@ -498,4 +531,260 @@ fn group_or_world_writable_runners_directory_is_rejected() {
             .is_none()
     );
     assert!(import_artifacts(root.path()).is_empty());
+}
+
+#[test]
+fn replaced_staging_is_neither_published_nor_deleted() {
+    let root = tempfile::tempdir().unwrap();
+    let (_lock, prepared) = prepare_locked_import(&fixture_path(), "local-runner", root.path());
+    let replacement_path = RefCell::new(None::<PathBuf>);
+
+    let error = commit_with_checkpoint(prepared, |point| {
+        if point == CommitPoint::AfterStagingValidation {
+            let staging = staging_path(root.path());
+            std::fs::rename(&staging, root.path().join("displaced-staging"))?;
+            std::fs::create_dir(&staging)?;
+            std::fs::write(staging.join("marker"), b"REPLACEMENT_STAGING")?;
+            replacement_path.replace(Some(staging));
+        }
+        Ok(())
+    })
+    .unwrap_err();
+
+    assert_eq!(error.category(), "write-failed");
+    let replacement = replacement_path.borrow().clone().unwrap();
+    assert_eq!(
+        std::fs::read(replacement.join("marker")).unwrap(),
+        b"REPLACEMENT_STAGING"
+    );
+    assert!(!root.path().join("runners/local-runner").exists());
+    assert!(
+        load_config_if_exists(&root.path().join("config.toml"))
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn staging_cleanup_does_not_delete_a_replacement() {
+    let root = tempfile::tempdir().unwrap();
+    let (_lock, prepared) = prepare_locked_import(&fixture_path(), "local-runner", root.path());
+    let replacement_path = RefCell::new(None::<PathBuf>);
+
+    let error = commit_with_checkpoint(prepared, |point| {
+        if point == CommitPoint::AfterRunnerJson {
+            let staging = staging_path(root.path());
+            std::fs::rename(&staging, root.path().join("displaced-staging"))?;
+            std::fs::create_dir(&staging)?;
+            std::fs::write(staging.join("marker"), b"REPLACEMENT_STAGING")?;
+            replacement_path.replace(Some(staging));
+            return Err(std::io::Error::other("injected staging failure"));
+        }
+        Ok(())
+    })
+    .unwrap_err();
+
+    assert_eq!(error.category(), "write-failed");
+    let replacement = replacement_path.borrow().clone().unwrap();
+    assert_eq!(
+        std::fs::read(replacement.join("marker")).unwrap(),
+        b"REPLACEMENT_STAGING"
+    );
+}
+
+#[test]
+fn replaced_config_temp_is_neither_published_nor_deleted() {
+    let root = tempfile::tempdir().unwrap();
+    let (_lock, prepared) = prepare_locked_import(&fixture_path(), "local-runner", root.path());
+    let replacement_path = RefCell::new(None::<PathBuf>);
+
+    let error = commit_with_checkpoint(prepared, |point| {
+        if point == CommitPoint::AfterConfigTempWrite {
+            let temp = import_artifacts(root.path())
+                .into_iter()
+                .find(|path| {
+                    path.file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.starts_with(".config.toml."))
+                })
+                .ok_or_else(|| std::io::Error::other("config temp is missing"))?;
+            std::fs::rename(&temp, root.path().join("displaced-config-temp"))?;
+            std::fs::write(&temp, b"REPLACEMENT_CONFIG_TEMP")?;
+            replacement_path.replace(Some(temp));
+        }
+        Ok(())
+    })
+    .unwrap_err();
+
+    assert_eq!(error.category(), "write-failed");
+    let replacement = replacement_path.borrow().clone().unwrap();
+    assert_eq!(
+        std::fs::read(replacement).unwrap(),
+        b"REPLACEMENT_CONFIG_TEMP"
+    );
+    assert!(!root.path().join("config.toml").exists());
+}
+
+#[test]
+fn config_temp_cleanup_does_not_delete_a_replacement_before_publish() {
+    let root = tempfile::tempdir().unwrap();
+    let (_lock, prepared) = prepare_locked_import(&fixture_path(), "local-runner", root.path());
+    let replacement_path = RefCell::new(None::<PathBuf>);
+
+    let error = commit_with_checkpoint(prepared, |point| {
+        if point == CommitPoint::AfterConfigTempWrite {
+            let temp = import_artifacts(root.path())
+                .into_iter()
+                .find(|path| {
+                    path.file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.starts_with(".config.toml."))
+                })
+                .ok_or_else(|| std::io::Error::other("config temp is missing"))?;
+            std::fs::rename(&temp, root.path().join("displaced-config-temp"))?;
+            std::fs::write(&temp, b"REPLACEMENT_CONFIG_TEMP")?;
+            replacement_path.replace(Some(temp));
+            return Err(std::io::Error::other("injected config failure"));
+        }
+        Ok(())
+    })
+    .unwrap_err();
+
+    assert_eq!(error.category(), "write-failed");
+    let replacement = replacement_path.borrow().clone().unwrap();
+    assert_eq!(
+        std::fs::read(replacement).unwrap(),
+        b"REPLACEMENT_CONFIG_TEMP"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn failed_runners_durability_barrier_recovers_without_rewriting_credentials() {
+    let root = tempfile::tempdir().unwrap();
+    let (lock, prepared) = prepare_locked_import(&fixture_path(), "local-runner", root.path());
+
+    let error = commit_with_checkpoint_and_sync(
+        prepared,
+        |_| Ok(()),
+        |point, directory| {
+            if point == DurabilityPoint::Runners {
+                Err(std::io::Error::other("injected runners sync failure"))
+            } else {
+                directory.sync_all()
+            }
+        },
+    )
+    .unwrap_err();
+
+    assert_eq!(error.category(), "write-failed");
+    let before = credential_snapshot(root.path(), "local-runner");
+    assert!(
+        load_config_if_exists(&root.path().join("config.toml"))
+            .unwrap()
+            .is_none()
+    );
+    drop(lock);
+
+    let retry = crate::import::import_official(&fixture_path(), "local-runner", root.path(), false)
+        .unwrap();
+
+    assert_eq!(retry.status, ImportStatus::Imported);
+    assert_eq!(credential_snapshot(root.path(), "local-runner"), before);
+}
+
+#[cfg(unix)]
+#[test]
+fn failed_root_durability_barrier_recovers_without_rewriting_state() {
+    let root = tempfile::tempdir().unwrap();
+    let (lock, prepared) = prepare_locked_import(&fixture_path(), "local-runner", root.path());
+
+    let error = commit_with_checkpoint_and_sync(
+        prepared,
+        |_| Ok(()),
+        |point, directory| {
+            if point == DurabilityPoint::Root {
+                Err(std::io::Error::other("injected root sync failure"))
+            } else {
+                directory.sync_all()
+            }
+        },
+    )
+    .unwrap_err();
+
+    assert_eq!(error.category(), "write-failed");
+    let credentials_before = credential_snapshot(root.path(), "local-runner");
+    let config_before = snapshot(&root.path().join("config.toml"));
+    drop(lock);
+
+    let retry = crate::import::import_official(&fixture_path(), "local-runner", root.path(), false)
+        .unwrap();
+
+    assert_eq!(retry.status, ImportStatus::AlreadyImported);
+    assert_eq!(
+        credential_snapshot(root.path(), "local-runner"),
+        credentials_before
+    );
+    assert_eq!(snapshot(&root.path().join("config.toml")), config_before);
+}
+
+#[cfg(unix)]
+#[test]
+fn resume_requires_runners_durability_before_config_publish() {
+    let root = tempfile::tempdir().unwrap();
+    write_chimera_credentials(root.path(), "local-runner");
+    let before = credential_snapshot(root.path(), "local-runner");
+    let (_lock, prepared) = prepare_locked_import(&fixture_path(), "local-runner", root.path());
+
+    let error = commit_with_checkpoint_and_sync(
+        prepared,
+        |_| Ok(()),
+        |point, directory| {
+            if point == DurabilityPoint::Runners {
+                Err(std::io::Error::other("injected runners sync failure"))
+            } else {
+                directory.sync_all()
+            }
+        },
+    )
+    .unwrap_err();
+
+    assert_eq!(error.category(), "write-failed");
+    assert_eq!(credential_snapshot(root.path(), "local-runner"), before);
+    assert!(!root.path().join("config.toml").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn already_imported_requires_root_durability_without_rewriting_state() {
+    let root = tempfile::tempdir().unwrap();
+    write_chimera_credentials(root.path(), "local-runner");
+    std::fs::write(
+        root.path().join("config.toml"),
+        "runners = [\"local-runner\"]\n",
+    )
+    .unwrap();
+    let credentials_before = credential_snapshot(root.path(), "local-runner");
+    let config_before = snapshot(&root.path().join("config.toml"));
+    let (_lock, prepared) = prepare_locked_import(&fixture_path(), "local-runner", root.path());
+
+    let error = commit_with_checkpoint_and_sync(
+        prepared,
+        |_| Ok(()),
+        |point, directory| {
+            if point == DurabilityPoint::Root {
+                Err(std::io::Error::other("injected root sync failure"))
+            } else {
+                directory.sync_all()
+            }
+        },
+    )
+    .unwrap_err();
+
+    assert_eq!(error.category(), "write-failed");
+    assert_eq!(
+        credential_snapshot(root.path(), "local-runner"),
+        credentials_before
+    );
+    assert_eq!(snapshot(&root.path().join("config.toml")), config_before);
 }

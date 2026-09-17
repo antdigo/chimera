@@ -40,6 +40,7 @@ pub(crate) struct PreparedImport {
     paths: ChimeraPaths,
     config: PreservedConfig,
     disposition: TargetDisposition,
+    locked_root: Option<File>,
 }
 
 impl PreparedImport {
@@ -67,10 +68,6 @@ impl PreparedImport {
         &self.registration.credentials
     }
 
-    pub(super) const fn paths(&self) -> &ChimeraPaths {
-        &self.paths
-    }
-
     pub(super) fn configured_runners(&self) -> &[String] {
         &self.config.model.runners
     }
@@ -81,6 +78,12 @@ impl PreparedImport {
 
     pub(super) const fn config_mode(&self) -> Option<u32> {
         self.config.original_mode
+    }
+
+    pub(super) fn locked_root(&self) -> Result<&File, ImportError> {
+        self.locked_root.as_ref().ok_or_else(|| {
+            ImportError::WriteFailed("import commit is missing the locked root descriptor".into())
+        })
     }
 }
 
@@ -97,7 +100,39 @@ pub(crate) fn prepare_import(
     if let Some(root) = opened_root.as_ref() {
         verify_opened_root_matches_path(root, &canonical_root)?;
     }
-    let paths = ChimeraPaths::new(canonical_root);
+    prepare_with_root(
+        name,
+        registration,
+        ChimeraPaths::new(canonical_root),
+        opened_root,
+        false,
+    )
+}
+
+pub(crate) fn prepare_import_locked(
+    source: &Path,
+    name: &str,
+    canonical_root: &Path,
+    locked_root: File,
+) -> Result<PreparedImport, ImportError> {
+    validate_local_name(name)?;
+    let registration = read_official_registration(source)?;
+    prepare_with_root(
+        name,
+        registration,
+        ChimeraPaths::new(canonical_root.to_path_buf()),
+        Some(locked_root),
+        true,
+    )
+}
+
+fn prepare_with_root(
+    name: &str,
+    registration: ValidatedRegistration,
+    paths: ChimeraPaths,
+    opened_root: Option<File>,
+    retain_locked_root: bool,
+) -> Result<PreparedImport, ImportError> {
     let target = paths.runner_dir(name);
     if registration.canonical_source.starts_with(&target)
         || target.starts_with(&registration.canonical_source)
@@ -123,6 +158,11 @@ pub(crate) fn prepare_import(
         paths,
         config,
         disposition,
+        locked_root: if retain_locked_root {
+            opened_root
+        } else {
+            None
+        },
     })
 }
 

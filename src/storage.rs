@@ -12,7 +12,7 @@ const MAX_SYMLINK_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug)]
 pub(crate) struct RootLock {
-    _root: File,
+    root: File,
     _file: File,
 }
 
@@ -60,10 +60,11 @@ impl RootLock {
             return Err(RootLockError::Io(error));
         }
 
-        Ok(Self {
-            _root: root,
-            _file: file,
-        })
+        Ok(Self { root, _file: file })
+    }
+
+    pub(crate) fn try_clone_root(&self) -> std::io::Result<File> {
+        self.root.try_clone()
     }
 }
 
@@ -137,7 +138,7 @@ fn open_root(root: &Path, create_missing: bool) -> Result<File, RootLockError> {
                             return Err(RootLockError::Io(error));
                         }
 
-                        let created = create_directory_at(parent.file.as_raw_fd(), &name)?;
+                        let created = create_directory_at(&parent.file, &name)?;
                         let directory = if created {
                             open_new_directory_at(parent.file.as_raw_fd(), &name)?
                         } else {
@@ -268,9 +269,21 @@ fn open_chmod_directory_at(parent: RawFd, name: &CString) -> io::Result<File> {
     owned_file(fd)
 }
 
-fn create_directory_at(parent: RawFd, name: &CString) -> Result<bool, RootLockError> {
-    let result = unsafe { libc::mkdirat(parent, name.as_ptr(), 0o700) };
+fn create_directory_at(parent: &File, name: &CString) -> Result<bool, RootLockError> {
+    create_directory_at_with_sync(parent, name, sync_directory)
+}
+
+fn create_directory_at_with_sync<F>(
+    parent: &File,
+    name: &CString,
+    sync_parent: F,
+) -> Result<bool, RootLockError>
+where
+    F: FnOnce(&File) -> io::Result<()>,
+{
+    let result = unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) };
     if result == 0 {
+        sync_parent(parent)?;
         return Ok(true);
     }
 
@@ -279,6 +292,13 @@ fn create_directory_at(parent: RawFd, name: &CString) -> Result<bool, RootLockEr
         return Ok(false);
     }
     Err(RootLockError::Io(error))
+}
+
+fn sync_directory(directory: &File) -> io::Result<()> {
+    let current = CString::new(".").map_err(|_| invalid_path_component())?;
+    let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    let fd = unsafe { libc::openat(directory.as_raw_fd(), current.as_ptr(), flags) };
+    owned_file(fd)?.sync_all()
 }
 
 fn open_lock_file(root: &File) -> Result<File, RootLockError> {

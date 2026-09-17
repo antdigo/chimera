@@ -164,3 +164,102 @@ fn missing_config_remains_missing_during_read_only_gate() {
             .is_none()
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn locked_apply_remains_anchored_when_root_path_is_replaced() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let parent = tempfile::tempdir().unwrap();
+    let root = parent.path().join("root");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let initial = target::prepare_import(&fixture_path(), "local-runner", &root).unwrap();
+    let canonical_root = initial.canonical_root().to_path_buf();
+    let lock = RootLock::acquire(&canonical_root).unwrap();
+    let locked_root = lock.try_clone_root().unwrap();
+    let displaced = parent.path().join("locked-root");
+    std::fs::rename(&root, &displaced).unwrap();
+    std::fs::create_dir(&root).unwrap();
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::write(root.join("marker"), b"REPLACEMENT_ROOT").unwrap();
+    let prepared = target::prepare_import_locked(
+        &fixture_path(),
+        "local-runner",
+        &canonical_root,
+        locked_root,
+    )
+    .unwrap();
+
+    let outcome = commit::commit(prepared).unwrap();
+
+    assert_eq!(outcome.status, ImportStatus::Imported);
+    assert_eq!(
+        load_config(&displaced.join("config.toml")).unwrap().runners,
+        ["local-runner"]
+    );
+    assert!(displaced.join("runners/local-runner/runner.json").is_file());
+    assert_eq!(
+        std::fs::read(root.join("marker")).unwrap(),
+        b"REPLACEMENT_ROOT"
+    );
+    assert!(!root.join("config.toml").exists());
+    assert!(!root.join("runners").exists());
+    drop(lock);
+}
+
+#[cfg(unix)]
+#[test]
+fn resume_rejects_unsafe_runners_without_mutating_state() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = tempfile::tempdir().unwrap();
+    crate::import::test_support::write_chimera_credentials(root.path(), "local-runner");
+    let credential_paths = [
+        root.path().join("runners/local-runner/runner.json"),
+        root.path().join("runners/local-runner/credentials.json"),
+        root.path().join("runners/local-runner/rsa_params.json"),
+    ];
+    let before: Vec<_> = credential_paths.iter().map(|path| snapshot(path)).collect();
+    std::fs::set_permissions(
+        root.path().join("runners"),
+        std::fs::Permissions::from_mode(0o777),
+    )
+    .unwrap();
+
+    let error = import_official(&fixture_path(), "local-runner", root.path(), false).unwrap_err();
+
+    assert_eq!(error.category(), "write-failed");
+    assert!(!root.path().join("config.toml").exists());
+    let after: Vec<_> = credential_paths.iter().map(|path| snapshot(path)).collect();
+    assert_eq!(after, before);
+}
+
+#[cfg(unix)]
+#[test]
+fn already_imported_rejects_unsafe_runners_without_mutating_state() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = tempfile::tempdir().unwrap();
+    crate::import::test_support::write_chimera_credentials(root.path(), "local-runner");
+    let config_path = root.path().join("config.toml");
+    std::fs::write(&config_path, "runners = [\"local-runner\"]\n").unwrap();
+    let paths = [
+        config_path,
+        root.path().join("runners/local-runner/runner.json"),
+        root.path().join("runners/local-runner/credentials.json"),
+        root.path().join("runners/local-runner/rsa_params.json"),
+    ];
+    let before: Vec<_> = paths.iter().map(|path| snapshot(path)).collect();
+    std::fs::set_permissions(
+        root.path().join("runners"),
+        std::fs::Permissions::from_mode(0o777),
+    )
+    .unwrap();
+
+    let error = import_official(&fixture_path(), "local-runner", root.path(), false).unwrap_err();
+
+    assert_eq!(error.category(), "write-failed");
+    let after: Vec<_> = paths.iter().map(|path| snapshot(path)).collect();
+    assert_eq!(after, before);
+}

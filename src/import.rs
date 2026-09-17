@@ -145,17 +145,12 @@ pub fn import_official(
     }
 
     let canonical_root = initial.canonical_root().to_path_buf();
-    let _lock = RootLock::acquire(&canonical_root).map_err(map_root_lock_error)?;
-    let prepared = target::prepare_import(source, name, &canonical_root)?;
-
-    match prepared.disposition() {
-        target::TargetDisposition::AlreadyImported => {
-            Ok(prepared.outcome(ImportStatus::AlreadyImported))
-        }
-        target::TargetDisposition::New | target::TargetDisposition::Resume => {
-            commit::commit(prepared)
-        }
-    }
+    let lock = RootLock::acquire(&canonical_root).map_err(map_root_lock_error)?;
+    let locked_root = lock
+        .try_clone_root()
+        .map_err(|_| ImportError::WriteFailed("unable to retain locked chimera root".into()))?;
+    let prepared = target::prepare_import_locked(source, name, &canonical_root, locked_root)?;
+    commit::commit(prepared)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

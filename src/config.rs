@@ -1,3 +1,6 @@
+use std::ffi::CString;
+use std::fs::File;
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -235,6 +238,30 @@ pub fn load_runner_credentials(runners_dir: &Path, name: &str) -> Result<RunnerC
         oauth,
         rsa_params,
     })
+}
+
+pub(crate) fn load_runner_credentials_from_directory(
+    directory: &File,
+) -> Result<RunnerCredentials> {
+    let info = load_json_at(directory, "runner.json")?;
+    let oauth = load_json_at(directory, "credentials.json")?;
+    let rsa_params = load_json_at(directory, "rsa_params.json")?;
+    Ok(RunnerCredentials {
+        info,
+        oauth,
+        rsa_params,
+    })
+}
+
+fn load_json_at<T: serde::de::DeserializeOwned>(directory: &File, name: &str) -> Result<T> {
+    let name_component = CString::new(name).context("credential file name contains NUL")?;
+    let flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK;
+    let fd = unsafe { libc::openat(directory.as_raw_fd(), name_component.as_ptr(), flags) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error()).with_context(|| format!("opening {name}"));
+    }
+    let file = unsafe { File::from_raw_fd(fd) };
+    serde_json::from_reader(file).with_context(|| format!("parsing {name}"))
 }
 
 pub fn save_runner_credentials(

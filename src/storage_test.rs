@@ -184,3 +184,21 @@ fn creates_new_root_and_lock_with_private_modes() {
     );
     drop(lock);
 }
+
+#[test]
+fn successful_missing_component_creation_requires_parent_sync() {
+    let parent = tempfile::tempdir().unwrap();
+    let parent_directory = open_existing_root(parent.path()).unwrap();
+    let name = std::ffi::CString::new("durable-child").unwrap();
+    let sync_called = std::cell::Cell::new(false);
+
+    let error = create_directory_at_with_sync(&parent_directory, &name, |_| {
+        sync_called.set(true);
+        Err(std::io::Error::other("injected parent sync failure"))
+    })
+    .unwrap_err();
+
+    assert!(sync_called.get());
+    assert!(matches!(error, RootLockError::Io(_)));
+    assert!(parent.path().join("durable-child").is_dir());
+}
