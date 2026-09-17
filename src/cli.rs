@@ -1,11 +1,11 @@
 use std::path::PathBuf;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
 use tokio::sync::watch;
 use tracing::{info, warn};
 
-use crate::config::{ChimeraConfig, ChimeraPaths, DaemonConfig, default_root, load_config};
+use crate::config::{ChimeraPaths, DaemonConfig, default_root};
 use crate::daemon::{Daemon, format_status_display, is_process_alive, read_state_file};
 
 #[derive(Parser)]
@@ -68,6 +68,25 @@ pub enum Command {
         #[arg(long, default_value_os_t = default_root())]
         root: PathBuf,
     },
+
+    /// Import an existing official runner registration without contacting GitHub
+    ImportOfficial {
+        /// Official runner installation directory
+        #[arg(long)]
+        source: PathBuf,
+
+        /// Local Chimera runner key; does not rename the GitHub agent
+        #[arg(long)]
+        name: String,
+
+        /// Chimera root directory
+        #[arg(long)]
+        root: PathBuf,
+
+        /// Validate and report eligibility without writing files
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 pub async fn run(cli: Cli) -> Result<()> {
@@ -89,18 +108,29 @@ pub async fn run(cli: Cli) -> Result<()> {
         }
 
         Command::Start { root } => {
-            let paths = ChimeraPaths::new(root);
-            let config = load_config(&paths.config_file()).context("loading config")?;
-            init_tracing(&config.daemon);
-            run_start(paths, config).await
+            let daemon = Daemon::load(ChimeraPaths::new(root))?;
+            init_tracing(&daemon.config().daemon);
+            run_start(daemon).await
         }
 
         Command::Status { root } => run_status(root),
+
+        Command::ImportOfficial {
+            source,
+            name,
+            root,
+            dry_run,
+        } => {
+            init_tracing(&DaemonConfig::default());
+            let outcome = crate::import::import_official(&source, &name, &root, dry_run)?;
+            println!("{outcome}");
+            Ok(())
+        }
     }
 }
 
-async fn run_start(paths: ChimeraPaths, config: ChimeraConfig) -> Result<()> {
-    if config.runners.is_empty() {
+async fn run_start(daemon: Daemon) -> Result<()> {
+    if daemon.config().runners.is_empty() {
         bail!("no runners registered. Use 'chimera register' first.");
     }
 
@@ -124,7 +154,6 @@ async fn run_start(paths: ChimeraPaths, config: ChimeraConfig) -> Result<()> {
         let _ = shutdown_tx.send(true);
     });
 
-    let daemon = Daemon::new(paths, config);
     daemon.run(shutdown_rx).await
 }
 
@@ -149,7 +178,7 @@ fn run_status(root: PathBuf) -> Result<()> {
         return Ok(());
     }
 
-    let config = load_config(&config_path)?;
+    let config = crate::config::load_config(&config_path)?;
     if config.runners.is_empty() {
         println!("No runners registered.");
         return Ok(());
@@ -174,6 +203,10 @@ fn run_status(root: PathBuf) -> Result<()> {
 
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "cli_test.rs"]
+mod cli_test;
 
 fn init_tracing(daemon_config: &DaemonConfig) {
     use tracing_subscriber::EnvFilter;

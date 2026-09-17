@@ -12,9 +12,10 @@ use tracing::{Instrument, error, info, warn};
 
 use crate::cache::manager::CacheManager;
 use crate::cache::server as cache_server;
-use crate::config::{ChimeraConfig, ChimeraPaths, load_runner_credentials};
+use crate::config::{ChimeraConfig, ChimeraPaths, load_config, load_runner_credentials};
 use crate::job::docker_config::JobResourceRoot;
 use crate::runner::Runner;
+use crate::storage::RootLock;
 
 // --- PID Lock ---
 
@@ -344,11 +345,26 @@ pub fn read_state_file(path: &Path) -> Result<StateSnapshot> {
 pub struct Daemon {
     paths: ChimeraPaths,
     config: ChimeraConfig,
+    _root_lock: RootLock,
 }
 
 impl Daemon {
-    pub fn new(paths: ChimeraPaths, config: ChimeraConfig) -> Self {
-        Self { paths, config }
+    pub fn load(paths: ChimeraPaths) -> Result<Self> {
+        let root_lock = RootLock::acquire(&paths.root).map_err(|error| {
+            let context = format!("acquiring root storage lock: {error}");
+            anyhow::Error::new(error).context(context)
+        })?;
+        let config = load_config(&paths.config_file()).context("loading config")?;
+
+        Ok(Self {
+            paths,
+            config,
+            _root_lock: root_lock,
+        })
+    }
+
+    pub fn config(&self) -> &ChimeraConfig {
+        &self.config
     }
 
     pub async fn run(self, mut shutdown_rx: watch::Receiver<bool>) -> Result<()> {

@@ -188,7 +188,7 @@ impl BrokerClient {
                 name: agent_name.to_string(),
                 version: RUNNER_VERSION.to_string(),
                 os_description: format!("{} {}", std::env::consts::OS, std::env::consts::ARCH),
-                ephemeral: true,
+                ephemeral: false,
                 status: 0,
             },
             use_fips_encryption: false,

@@ -93,7 +93,7 @@ async fn connect_version_rejected() {
 }
 
 #[tokio::test]
-async fn connect_request_body_shape() {
+async fn connect_marks_persistent_runner_as_non_ephemeral() {
     let (mock_server, tm) = setup().await;
 
     Mock::given(method("POST"))
@@ -101,8 +101,10 @@ async fn connect_request_body_shape() {
         .and(body_partial_json(serde_json::json!({
             "useFipsEncryption": false,
             "agent": {
+                "id": 1,
+                "name": "r0",
                 "version": RUNNER_VERSION,
-                "ephemeral": true,
+                "ephemeral": false,
                 "status": 0
             }
         })))

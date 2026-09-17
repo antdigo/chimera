@@ -57,6 +57,8 @@ chimera register --url <url> --token <token> --name <name> [--labels a,b] [--roo
 chimera unregister --name <name> [--root ~/.chimera]
 chimera start [--root ~/.chimera]
 chimera status [--root ~/.chimera]
+chimera import-official --source <official-runner-dir> --name <local-name> --root <chimera-root> --dry-run
+chimera import-official --source <official-runner-dir> --name <local-name> --root <chimera-root>
 ```
 
 **register** — Register a runner with GitHub. Token comes from Settings > Actions > Runners.
@@ -66,6 +68,8 @@ chimera status [--root ~/.chimera]
 **start** — Start all registered runners concurrently. 
 
 **status** — Show daemon uptime, per-runner phase (Idle/Running/Stopped), and current job info.
+
+**import-official** — Import an existing persistent, repository-scoped github.com identity completely offline. `--name` does not rename the GitHub agent; it is only a local key. A dry-run is required first. See [the registration import runbook](docs/registration-import.md) for the detailed procedure.
 
 ## Config
 
