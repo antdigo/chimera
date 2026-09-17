@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::PermissionsExt;
 
 use tempfile::TempDir;
@@ -371,6 +372,65 @@ fn read_only_root_fails_without_fallback() {
 }
 
 #[test]
+fn utf8_path_rejects_non_utf8_bytes() {
+    let invalid =
+        std::path::PathBuf::from(std::ffi::OsString::from_vec(b"job-resources-\xff".to_vec()));
+
+    let error = utf8_path(&invalid).unwrap_err();
+
+    assert!(matches!(
+        error,
+        JobDockerConfigError::UnsafeRoot {
+            reason: "path is not valid UTF-8",
+            ..
+        }
+    ));
+}
+
+#[test]
+fn prepare_rejects_non_utf8_path_before_creating_it() {
+    let temp = TempDir::new().unwrap();
+    let invalid = temp
+        .path()
+        .join(std::ffi::OsString::from_vec(b"job-resources-\xff".to_vec()));
+
+    let error = JobResourceRoot::prepare(&invalid).unwrap_err();
+
+    assert!(
+        matches!(
+            &error,
+            JobDockerConfigError::UnsafeRoot {
+                reason: "path is not valid UTF-8",
+                ..
+            }
+        ),
+        "unexpected error: {error:?}"
+    );
+    assert!(!invalid.exists());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn prepare_rejects_non_utf8_canonical_root() {
+    let temp = TempDir::new().unwrap();
+    let invalid_name = std::ffi::OsString::from_vec(b"job-resources-\xff".to_vec());
+    let path = temp.path().join(invalid_name);
+
+    let error = JobResourceRoot::prepare(&path).unwrap_err();
+
+    assert!(
+        matches!(
+            &error,
+            JobDockerConfigError::UnsafeRoot {
+                reason: "path is not valid UTF-8",
+                ..
+            }
+        ),
+        "unexpected error: {error:?}"
+    );
+}
+
+#[test]
 fn prepare_rejects_symlink_root() {
     let temp = TempDir::new().unwrap();
     let target = temp.path().join("target");
@@ -402,6 +462,28 @@ fn cleanup_refuses_special_file() {
         Err(JobDockerConfigError::UnsafeEntry { .. })
     ));
     assert!(config.attempt_dir().exists());
+    drop(socket);
+    std::fs::remove_file(socket_path).unwrap();
+    config.cleanup().unwrap();
+}
+
+#[test]
+fn cleanup_failure_poisoned_root_blocks_sibling_creation() {
+    let temp = TempDir::new_in("/tmp").unwrap();
+    let root = JobResourceRoot::prepare(&temp.path().join("job-resources")).unwrap();
+    let sibling_root = root.clone();
+    let mut config = root.create_docker_config().unwrap();
+    let socket_path = config.attempt_dir().join("unexpected.sock");
+    let socket = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+
+    config.cleanup().unwrap_err();
+    let creation_error = sibling_root.create_docker_config().unwrap_err();
+
+    assert!(
+        creation_error
+            .to_string()
+            .contains("poisoned-job-resource-root")
+    );
     drop(socket);
     std::fs::remove_file(socket_path).unwrap();
     config.cleanup().unwrap();

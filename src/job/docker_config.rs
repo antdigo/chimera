@@ -3,7 +3,9 @@ use std::fs::{self, DirBuilder, OpenOptions};
 use std::io::{self, Write};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, MutexGuard};
 
+use tokio::sync::watch;
 use uuid::Uuid;
 
 pub const DOCKER_CONFIG_ENV: &str = "DOCKER_CONFIG";
@@ -16,6 +18,9 @@ pub enum JobDockerConfigError {
     UnsafeRoot {
         path: PathBuf,
         reason: &'static str,
+    },
+    PoisonedRoot {
+        path: PathBuf,
     },
     AttemptCollision {
         attempt_id: Uuid,
@@ -56,6 +61,11 @@ impl std::fmt::Display for JobDockerConfigError {
             Self::UnsafeRoot { path, reason } => write!(
                 formatter,
                 "unsafe-job-resource-root: {reason}: {}",
+                path.display()
+            ),
+            Self::PoisonedRoot { path } => write!(
+                formatter,
+                "poisoned-job-resource-root: cleanup failed; refusing new jobs: {}",
                 path.display()
             ),
             Self::AttemptCollision { attempt_id } => write!(
@@ -110,32 +120,101 @@ impl std::error::Error for JobDockerConfigError {
     }
 }
 
+/// A job completed and its completion was published, but the per-job Docker
+/// config cleanup failed. Terminal for the runner: the resource root is no
+/// longer trustworthy, so the daemon must stop instead of taking new jobs.
+#[derive(Debug)]
+pub struct JobResourceCleanupFatalError {
+    pub source: JobDockerConfigError,
+}
+
+impl std::fmt::Display for JobResourceCleanupFatalError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "job-resource-cleanup-fatal: completion published after cleanup failed: {}",
+            self.source
+        )
+    }
+}
+
+impl std::error::Error for JobResourceCleanupFatalError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct DirectoryIdentity {
     device: u64,
     inode: u64,
 }
 
+#[derive(Debug)]
+struct JobResourceState {
+    operation_gate: Mutex<()>,
+    poisoned: watch::Sender<bool>,
+}
+
+impl JobResourceState {
+    fn new() -> Self {
+        let (poisoned, _) = watch::channel(false);
+        Self {
+            operation_gate: Mutex::new(()),
+            poisoned,
+        }
+    }
+
+    fn lock<'a>(&'a self, path: &Path) -> Result<MutexGuard<'a, ()>, JobDockerConfigError> {
+        self.operation_gate.lock().map_err(|_| {
+            self.poison();
+            JobDockerConfigError::PoisonedRoot {
+                path: path.to_path_buf(),
+            }
+        })
+    }
+
+    fn ensure_healthy(&self, path: &Path) -> Result<(), JobDockerConfigError> {
+        if *self.poisoned.borrow() {
+            return Err(JobDockerConfigError::PoisonedRoot {
+                path: path.to_path_buf(),
+            });
+        }
+        Ok(())
+    }
+
+    fn poison(&self) {
+        self.poisoned.send_replace(true);
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct JobResourceRoot {
     canonical_path: PathBuf,
     identity: DirectoryIdentity,
+    state: Arc<JobResourceState>,
 }
 
 #[derive(Debug)]
 pub struct JobDockerConfig {
     root: PathBuf,
     root_identity: DirectoryIdentity,
+    state: Arc<JobResourceState>,
     attempt_id: Uuid,
     attempt_dir: PathBuf,
     attempt_identity: DirectoryIdentity,
     config_dir: PathBuf,
+    config_dir_env: String,
     config_file: PathBuf,
     cleaned: bool,
 }
 
 impl JobResourceRoot {
     pub fn prepare(path: &Path) -> Result<Self, JobDockerConfigError> {
+        // Reject before any mutation: creating the directory first would leave
+        // behind a non-UTF-8 path that fails every later start until removed
+        // by hand.
+        utf8_path(path)?;
         match fs::symlink_metadata(path) {
             Ok(_) => {}
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -147,6 +226,7 @@ impl JobResourceRoot {
         validate_private_directory(path)?;
         let canonical_path = fs::canonicalize(path)
             .map_err(|source| io_error("canonicalizing job resource root", path, source))?;
+        utf8_path(&canonical_path)?;
         let mut entries = fs::read_dir(&canonical_path)
             .map_err(|source| io_error("reading job resource root", &canonical_path, source))?;
         if entries
@@ -164,6 +244,7 @@ impl JobResourceRoot {
         Ok(Self {
             canonical_path,
             identity,
+            state: Arc::new(JobResourceState::new()),
         })
     }
 
@@ -171,13 +252,26 @@ impl JobResourceRoot {
         &self.canonical_path
     }
 
+    pub(crate) fn ensure_healthy(&self) -> Result<(), JobDockerConfigError> {
+        self.state.ensure_healthy(&self.canonical_path)
+    }
+
+    pub(crate) fn poisoned_receiver(&self) -> watch::Receiver<bool> {
+        self.state.poisoned.subscribe()
+    }
+
     pub fn create_docker_config(&self) -> Result<JobDockerConfig, JobDockerConfigError> {
         self.create_with_id(Uuid::new_v4())
     }
 
     fn create_with_id(&self, attempt_id: Uuid) -> Result<JobDockerConfig, JobDockerConfigError> {
+        let _operation = self.state.lock(&self.canonical_path)?;
+        self.ensure_healthy()?;
         validate_bound_private_directory(&self.canonical_path, self.identity)?;
         let attempt_dir = self.canonical_path.join(attempt_id.simple().to_string());
+        let config_dir = attempt_dir.join("docker");
+        let config_dir_env = utf8_path(&config_dir)?.to_owned();
+        let config_file = config_dir.join("config.json");
         match create_private_dir(&attempt_dir, "creating job attempt directory") {
             Ok(()) => {}
             Err(JobDockerConfigError::Io { source, .. })
@@ -188,8 +282,6 @@ impl JobResourceRoot {
             Err(error) => return Err(error),
         }
 
-        let config_dir = attempt_dir.join("docker");
-        let config_file = config_dir.join("config.json");
         let creation = (|| {
             let attempt_identity =
                 directory_identity(&attempt_dir, "reading job attempt directory identity")?;
@@ -215,11 +307,14 @@ impl JobResourceRoot {
             Err(create) => {
                 return match fs::remove_dir_all(&attempt_dir) {
                     Ok(()) => Err(create),
-                    Err(cleanup) => Err(JobDockerConfigError::CreationRollback {
-                        path: attempt_dir,
-                        create: Box::new(create),
-                        cleanup,
-                    }),
+                    Err(cleanup) => {
+                        self.state.poison();
+                        Err(JobDockerConfigError::CreationRollback {
+                            path: attempt_dir,
+                            create: Box::new(create),
+                            cleanup,
+                        })
+                    }
                 };
             }
         };
@@ -227,10 +322,12 @@ impl JobResourceRoot {
         Ok(JobDockerConfig {
             root: self.canonical_path.clone(),
             root_identity: self.identity,
+            state: Arc::clone(&self.state),
             attempt_id,
             attempt_dir,
             attempt_identity,
             config_dir,
+            config_dir_env,
             config_file,
             cleaned: false,
         })
@@ -259,7 +356,7 @@ impl JobDockerConfig {
         value: &str,
         source: &'static str,
     ) -> Result<(), JobDockerConfigError> {
-        if value == self.directory().to_string_lossy() {
+        if value == self.config_dir_env.as_str() {
             return Ok(());
         }
         Err(JobDockerConfigError::ReservedEnvironmentOverride { source })
@@ -273,10 +370,7 @@ impl JobDockerConfig {
         if let Some(existing) = env.get(DOCKER_CONFIG_ENV) {
             self.validate_override(existing, source)?;
         }
-        env.insert(
-            DOCKER_CONFIG_ENV.to_string(),
-            self.directory().to_string_lossy().into_owned(),
-        );
+        env.insert(DOCKER_CONFIG_ENV.to_string(), self.config_dir_env.clone());
         Ok(())
     }
 
@@ -285,6 +379,16 @@ impl JobDockerConfig {
             return Ok(());
         }
 
+        let state = Arc::clone(&self.state);
+        let _operation = state.lock(&self.root)?;
+        let result = self.cleanup_locked();
+        if result.is_err() {
+            state.poison();
+        }
+        result
+    }
+
+    fn cleanup_locked(&mut self) -> Result<(), JobDockerConfigError> {
         let root_metadata =
             fs::symlink_metadata(&self.root).map_err(|source| JobDockerConfigError::Cleanup {
                 path: self.root.clone(),
@@ -433,6 +537,14 @@ fn validate_removal_tree(path: &Path) -> Result<(), JobDockerConfigError> {
         }
     }
     Ok(())
+}
+
+fn utf8_path(path: &Path) -> Result<&str, JobDockerConfigError> {
+    path.to_str()
+        .ok_or_else(|| JobDockerConfigError::UnsafeRoot {
+            path: path.to_path_buf(),
+            reason: "path is not valid UTF-8",
+        })
 }
 
 fn io_error(operation: &'static str, path: &Path, source: io::Error) -> JobDockerConfigError {

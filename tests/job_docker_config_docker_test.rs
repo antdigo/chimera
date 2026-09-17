@@ -394,6 +394,124 @@ fn registry_cleanup_removes_only_exact_container_with_volumes() {
     );
 }
 
+// ── Docker CLI isolation in the test harness ─────────────────────
+
+const SYNTHETIC_AUTH_VALUE: &str = "c3ludGhldGljLWF1dGg=";
+
+fn write_cli_executable(path: &Path) {
+    std::fs::write(path, "#!/bin/sh\n").unwrap();
+    let mut permissions = std::fs::metadata(path).unwrap().permissions();
+    use std::os::unix::fs::PermissionsExt;
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(path, permissions).unwrap();
+}
+
+#[test]
+fn docker_cli_resolution_uses_the_first_executable_match() {
+    let root = tempfile::tempdir().unwrap();
+    let first = root.path().join("first");
+    let second = root.path().join("second");
+    for dir in [&first, &second] {
+        std::fs::create_dir(dir).unwrap();
+    }
+    write_cli_executable(&first.join("docker"));
+    write_cli_executable(&second.join("docker"));
+    std::fs::write(first.join("not-docker"), "plain file").unwrap();
+    let path_value = std::env::join_paths([&first, &second]).unwrap();
+
+    let resolved = resolve_docker_cli(&path_value).unwrap();
+
+    assert_eq!(resolved, first.join("docker"));
+}
+
+#[test]
+fn docker_cli_resolution_skips_non_executables_and_fails_closed() {
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("bin");
+    std::fs::create_dir(&dir).unwrap();
+    std::fs::write(dir.join("docker"), "not executable").unwrap();
+    let path_value = std::env::join_paths([&dir]).unwrap();
+
+    assert!(resolve_docker_cli(&path_value).is_err());
+    let empty_path = std::env::join_paths(Vec::<&Path>::new()).unwrap();
+    assert!(resolve_docker_cli(&empty_path).is_err());
+}
+
+#[test]
+fn harness_child_env_is_helper_free_and_forwards_socket_variables() {
+    let environment = harness_child_env(
+        Path::new("/test-assets/harness-config"),
+        Path::new("/test-assets/harness-empty-path"),
+        Some("unix:///run/user/1000/docker.sock"),
+        Some("/run/user/1000"),
+        Some("/chimera-tmp"),
+    );
+
+    assert_eq!(environment["DOCKER_CONFIG"], "/test-assets/harness-config");
+    assert_eq!(environment["PATH"], "/test-assets/harness-empty-path");
+    assert_eq!(
+        environment["DOCKER_HOST"],
+        "unix:///run/user/1000/docker.sock"
+    );
+    assert_eq!(environment["XDG_RUNTIME_DIR"], "/run/user/1000");
+    assert_eq!(environment["TMPDIR"], "/chimera-tmp");
+    assert!(!environment.contains_key("DOCKER_CONTEXT"));
+    assert!(!environment.contains_key("HOME"));
+}
+
+#[test]
+fn harness_child_env_omits_absent_socket_variables() {
+    let environment = harness_child_env(Path::new("/c"), Path::new("/p"), None, None, None);
+
+    assert_eq!(environment.len(), 2);
+    assert!(!environment.contains_key("DOCKER_HOST"));
+    assert!(!environment.contains_key("XDG_RUNTIME_DIR"));
+    assert!(!environment.contains_key("TMPDIR"));
+}
+
+#[test]
+fn local_auth_assertion_accepts_inline_only_credentials() {
+    let config = format!(r#"{{"auths":{{"127.0.0.1:5000":{{"auth":"{SYNTHETIC_AUTH_VALUE}"}}}}}}"#);
+
+    assert_local_auth_only(&config, "127.0.0.1:5000").unwrap();
+}
+
+#[test]
+fn local_auth_assertion_rejects_credential_stores_without_echoing_the_secret() {
+    let cred_store = format!(
+        r#"{{"credsStore":"desktop","auths":{{"127.0.0.1:5000":{{"auth":"{SYNTHETIC_AUTH_VALUE}"}}}}}}"#
+    );
+    let cred_helpers = format!(
+        r#"{{"credHelpers":{{"127.0.0.1:5000":"desktop"}},"auths":{{"127.0.0.1:5000":{{"auth":"{SYNTHETIC_AUTH_VALUE}"}}}}}}"#
+    );
+
+    let error = assert_local_auth_only(&cred_store, "127.0.0.1:5000").unwrap_err();
+    assert!(error.to_string().contains("credential store"));
+    assert!(!error.to_string().contains(SYNTHETIC_AUTH_VALUE));
+    assert!(assert_local_auth_only(&cred_helpers, "127.0.0.1:5000").is_err());
+}
+
+#[test]
+fn local_auth_assertion_requires_a_non_empty_entry_for_the_test_registry() {
+    assert!(assert_local_auth_only("{}", "127.0.0.1:5000").is_err());
+    assert!(assert_local_auth_only("not json", "127.0.0.1:5000").is_err());
+    let empty_auth = r#"{"auths":{"127.0.0.1:5000":{"auth":""}}}"#;
+    assert!(assert_local_auth_only(empty_auth, "127.0.0.1:5000").is_err());
+    let other_registry = r#"{"auths":{"other.example:5000":{"auth":"value"}}}"#;
+    assert!(assert_local_auth_only(other_registry, "127.0.0.1:5000").is_err());
+}
+
+#[test]
+fn local_auth_absence_assertion_holds_only_after_logout() {
+    let present =
+        format!(r#"{{"auths":{{"127.0.0.1:5000":{{"auth":"{SYNTHETIC_AUTH_VALUE}"}}}}}}"#);
+    assert!(assert_local_auth_absent(&present, "127.0.0.1:5000").is_err());
+
+    assert_local_auth_absent("{}", "127.0.0.1:5000").unwrap();
+    let other_registry = r#"{"auths":{"other.example:5000":{"auth":"value"}}}"#;
+    assert_local_auth_absent(other_registry, "127.0.0.1:5000").unwrap();
+}
+
 fn timeline_record_update(name: &str, state: u8, result: Option<u8>) -> Vec<u8> {
     serde_json::to_vec(&serde_json::json!({
         "value": [{
@@ -884,6 +1002,11 @@ async fn docker_cli_atomic_rewrite_stays_private() {
         .unwrap();
     assert_eq!(auths.len(), 1);
     assert!(auths.contains_key(registry.address()));
+    assert_local_auth_only(
+        &std::fs::read_to_string(config.config_file()).unwrap(),
+        registry.address(),
+    )
+    .unwrap();
 
     docker_output(&["logout", registry.address()], config.directory(), None)
         .await

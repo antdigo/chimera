@@ -409,6 +409,39 @@ fn startup_preparation_rejects_stale_job_resources_without_deleting_them() {
 }
 
 #[test]
+fn poisoned_job_resource_error_requires_daemon_shutdown() {
+    let poisoned = anyhow::Error::new(JobDockerConfigError::PoisonedRoot {
+        path: "/synthetic/job-resources".into(),
+    });
+    let unrelated = anyhow::anyhow!("unrelated runner failure");
+
+    assert!(is_fatal_job_resource_error(&poisoned));
+    assert!(!is_fatal_job_resource_error(&unrelated));
+}
+
+#[test]
+fn cleanup_fatal_error_requires_daemon_shutdown() {
+    let fatal = anyhow::Error::new(JobResourceCleanupFatalError {
+        source: JobDockerConfigError::Cleanup {
+            path: "/synthetic/job-resources/attempt".into(),
+            source: std::io::Error::other("synthetic cleanup failure"),
+        },
+    });
+
+    assert!(is_fatal_job_resource_error(&fatal));
+}
+
+#[test]
+fn fatal_job_resource_errors_are_detected_through_wrapping_context() {
+    let wrapped = anyhow::Error::new(JobDockerConfigError::PoisonedRoot {
+        path: "/synthetic/job-resources".into(),
+    })
+    .context("runner exited");
+
+    assert!(is_fatal_job_resource_error(&wrapped));
+}
+
+#[test]
 fn acquire_lock_removes_stale_file() {
     let tmp = TempDir::new().unwrap();
     let pid_path = tmp.path().join("chimera.pid");

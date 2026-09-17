@@ -1,7 +1,9 @@
+use std::collections::HashMap;
+use std::ffi::OsStr;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -191,6 +193,10 @@ impl AuthenticatedRegistry {
             Some(ALICE_PASSWORD.as_bytes()),
         )
         .await?;
+        assert_local_auth_only(
+            &setup_config_json(&self.setup_docker_config)?,
+            &self.address,
+        )?;
         self.track_local_image(image.clone());
         let operation = async {
             docker_output(
@@ -207,8 +213,17 @@ impl AuthenticatedRegistry {
             docker_output(&["logout", &self.address], &self.setup_docker_config, None).await;
         operation?;
         logout?;
+        assert_local_auth_absent(
+            &setup_config_json(&self.setup_docker_config)?,
+            &self.address,
+        )?;
         Ok(image)
     }
+}
+
+fn setup_config_json(setup_docker_config: &Path) -> Result<String> {
+    std::fs::read_to_string(setup_docker_config.join("config.json"))
+        .context("reading the harness setup Docker config")
 }
 
 impl Drop for AuthenticatedRegistry {
@@ -243,10 +258,149 @@ pub fn registry_container_cleanup_args(container_name: &str) -> [&str; 5] {
     ["rm", "--force", "--volumes", "--", container_name]
 }
 
+/// Resolve the exact docker CLI from a PATH value so harness children run a
+/// known executable instead of re-resolving `docker` inside an environment the
+/// harness does not control.
+pub fn resolve_docker_cli(path_value: &OsStr) -> Result<PathBuf> {
+    for dir in std::env::split_paths(path_value) {
+        let candidate = dir.join("docker");
+        if let Ok(metadata) = std::fs::metadata(&candidate)
+            && metadata.is_file()
+            && metadata.permissions().mode() & 0o111 != 0
+        {
+            return Ok(candidate);
+        }
+    }
+    bail!("no executable docker CLI found on the test PATH")
+}
+
+/// The exact environment harness docker children run with: the local
+/// DOCKER_CONFIG credential store, a PATH that cannot resolve
+/// docker-credential-* helpers (credentials must live in config.json, never in
+/// an implicit keychain), and the rootless socket variables when the test
+/// runner provides them. Everything ambient is deliberately dropped — notably
+/// DOCKER_CONTEXT and HOME (an ambient context or user config must not
+/// redirect the harness) and HTTP(S)_PROXY/ALL_PROXY/NO_PROXY (the harness
+/// talks to loopback endpoints only).
+pub fn harness_child_env(
+    docker_config: &Path,
+    helper_free_path: &Path,
+    docker_host: Option<&str>,
+    xdg_runtime_dir: Option<&str>,
+    tmpdir: Option<&str>,
+) -> HashMap<String, String> {
+    let mut environment = HashMap::from([
+        (
+            "DOCKER_CONFIG".to_string(),
+            docker_config.to_string_lossy().into_owned(),
+        ),
+        (
+            "PATH".to_string(),
+            helper_free_path.to_string_lossy().into_owned(),
+        ),
+    ]);
+    if let Some(value) = docker_host {
+        environment.insert("DOCKER_HOST".to_string(), value.to_string());
+    }
+    if let Some(value) = xdg_runtime_dir {
+        environment.insert("XDG_RUNTIME_DIR".to_string(), value.to_string());
+    }
+    if let Some(value) = tmpdir {
+        environment.insert("TMPDIR".to_string(), value.to_string());
+    }
+    environment
+}
+
+/// A private directory that will never contain docker-credential-* helpers;
+/// the harness PATH points here so implicit credential helpers cannot load.
+fn helper_free_bin_dir() -> Result<PathBuf> {
+    static BIN_DIR: OnceLock<PathBuf> = OnceLock::new();
+    if let Some(path) = BIN_DIR.get() {
+        return Ok(path.clone());
+    }
+    let dir = std::env::temp_dir().join(format!(
+        "chimera-docker-harness-path-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::create_dir(&dir).context("creating helper-free harness PATH directory")?;
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+        .context("restricting helper-free harness PATH directory")?;
+    // The directory intentionally lives for the whole test process; the OS
+    // reclaims it under the system temp dir once the process exits.
+    Ok(BIN_DIR.get_or_init(|| dir).clone())
+}
+
+fn harness_child_env_from_process(docker_config: &Path) -> Result<HashMap<String, String>> {
+    let non_empty = |name: &str| std::env::var(name).ok().filter(|value| !value.is_empty());
+    let docker_host = non_empty("DOCKER_HOST");
+    let xdg_runtime_dir = non_empty("XDG_RUNTIME_DIR");
+    let tmpdir = non_empty("TMPDIR");
+    Ok(harness_child_env(
+        docker_config,
+        &helper_free_bin_dir()?,
+        docker_host.as_deref(),
+        xdg_runtime_dir.as_deref(),
+        tmpdir.as_deref(),
+    ))
+}
+
+/// The harness must keep registry credentials in the local DOCKER_CONFIG store
+/// only: no credential store or per-registry helper may be configured, and the
+/// test registry must have a non-empty inline auth entry. Fails closed without
+/// echoing the credential value.
+pub fn assert_local_auth_only(config_json: &str, registry: &str) -> Result<()> {
+    let config: serde_json::Value =
+        serde_json::from_str(config_json).context("Docker config was not valid JSON")?;
+    if config
+        .get("credsStore")
+        .is_some_and(|value| !value.is_null())
+    {
+        bail!("Docker config must not configure a credential store");
+    }
+    if config
+        .get("credHelpers")
+        .is_some_and(|value| !value.is_null())
+    {
+        bail!("Docker config must not configure per-registry credential helpers");
+    }
+    let has_inline_auth = config
+        .get("auths")
+        .and_then(|auths| auths.get(registry))
+        .and_then(|entry| entry.get("auth"))
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|value| !value.is_empty());
+    if !has_inline_auth {
+        bail!("Docker config has no non-empty auth entry for the test registry");
+    }
+    Ok(())
+}
+
+/// After logout the local store must no longer carry an entry for the test
+/// registry; a remaining entry means the credential flow bypassed config.json.
+pub fn assert_local_auth_absent(config_json: &str, registry: &str) -> Result<()> {
+    let config: serde_json::Value =
+        serde_json::from_str(config_json).context("Docker config was not valid JSON")?;
+    if config
+        .get("auths")
+        .and_then(|auths| auths.get(registry))
+        .is_some()
+    {
+        bail!("Docker config still has an auth entry for the test registry");
+    }
+    Ok(())
+}
+
+fn docker_cli_from_process() -> Result<PathBuf> {
+    resolve_docker_cli(
+        &std::env::var_os("PATH").context("the test process has no PATH to resolve docker")?,
+    )
+}
+
 pub fn docker_cleanup(args: &[&str], docker_config: &Path) -> Result<()> {
-    let mut child = std::process::Command::new("docker")
+    let mut child = std::process::Command::new(docker_cli_from_process()?)
         .args(args)
-        .env("DOCKER_CONFIG", docker_config)
+        .env_clear()
+        .envs(&harness_child_env_from_process(docker_config)?)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -274,10 +428,11 @@ pub async fn docker_output(
     docker_config: &Path,
     stdin: Option<&[u8]>,
 ) -> Result<String> {
-    let mut command = tokio::process::Command::new("docker");
+    let mut command = tokio::process::Command::new(docker_cli_from_process()?);
     command
         .args(args)
-        .env("DOCKER_CONFIG", docker_config)
+        .env_clear()
+        .envs(&harness_child_env_from_process(docker_config)?)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);

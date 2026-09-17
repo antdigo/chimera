@@ -186,6 +186,47 @@ async fn poll_loop_shutdown_returns_none() {
 }
 
 #[tokio::test]
+async fn poll_loop_stops_when_job_resource_root_is_poisoned() {
+    let (mock_server, tm, shutdown_tx) = setup().await;
+
+    Mock::given(method("GET"))
+        .and(path("/message"))
+        .respond_with(ResponseTemplate::new(202).set_delay(Duration::from_secs(10)))
+        .mount(&mock_server)
+        .await;
+
+    let broker = BrokerClient::new(
+        reqwest::Client::new(),
+        mock_server.uri(),
+        "session-123".into(),
+        tm,
+    );
+
+    let (_temp, runner) = make_runner();
+    let root = runner.job_resources.clone();
+    let mut rx = shutdown_tx.subscribe();
+    let poll = tokio::spawn(async move { runner.poll_loop(&broker, &mut rx).await });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let mut config = root.create_docker_config().unwrap();
+    let outside = root.path().parent().unwrap().join("outside");
+    std::fs::write(&outside, "outside").unwrap();
+    let symlink_path = config.attempt_dir().join("unexpected-link");
+    std::os::unix::fs::symlink(&outside, &symlink_path).unwrap();
+    config.cleanup().unwrap_err();
+    std::fs::remove_file(symlink_path).unwrap();
+    config.cleanup().unwrap();
+
+    let error = tokio::time::timeout(Duration::from_secs(1), poll)
+        .await
+        .expect("poisoning the resource root should interrupt broker polling")
+        .unwrap()
+        .unwrap_err();
+
+    assert!(error.to_string().contains("poisoned-job-resource-root"));
+}
+
+#[tokio::test]
 async fn poll_loop_backoff_on_error() {
     let (mock_server, tm, shutdown_tx) = setup().await;
 
@@ -316,6 +357,25 @@ fn cleanup_failure_only_downgrades_success() {
     );
 }
 
+#[test]
+fn job_execution_error_is_terminal_covers_both_fatal_markers() {
+    let cleanup_fatal = anyhow::Error::new(JobResourceCleanupFatalError {
+        source: JobDockerConfigError::Cleanup {
+            path: "/synthetic/job-resources/attempt".into(),
+            source: std::io::Error::other("synthetic cleanup failure"),
+        },
+    })
+    .context("runner job path");
+    let poisoned = anyhow::Error::new(JobDockerConfigError::PoisonedRoot {
+        path: "/synthetic/job-resources".into(),
+    });
+    let ordinary = anyhow::anyhow!("job execution failed for an ordinary reason");
+
+    assert!(job_execution_error_is_terminal(&cleanup_fatal));
+    assert!(job_execution_error_is_terminal(&poisoned));
+    assert!(!job_execution_error_is_terminal(&ordinary));
+}
+
 #[tokio::test]
 async fn successful_job_reports_failed_when_docker_config_cleanup_fails() {
     use wiremock::matchers::body_json;
@@ -344,9 +404,11 @@ async fn successful_job_reports_failed_when_docker_config_cleanup_fails() {
         path: "/synthetic/job-resource/entry".into(),
     });
 
-    finish_job(&client, &manifest, execution, cleanup)
+    let error = finish_job(&client, &manifest, execution, cleanup)
         .await
-        .unwrap();
+        .unwrap_err();
+
+    assert!(error.to_string().contains("job-resource-cleanup-fatal"));
 }
 
 #[tokio::test]

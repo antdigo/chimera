@@ -17,7 +17,9 @@ use crate::github::broker::{BrokerClient, BrokerError, BrokerMessage, MessageTyp
 use crate::job::JobClient;
 use crate::job::action::ActionCache;
 use crate::job::client::JobConclusion;
-use crate::job::docker_config::{JobDockerConfig, JobDockerConfigError, JobResourceRoot};
+use crate::job::docker_config::{
+    JobDockerConfig, JobDockerConfigError, JobResourceCleanupFatalError, JobResourceRoot,
+};
 use crate::job::execute::{JobExecutionContext, run_all_steps};
 use crate::job::live_feed::LiveFeed;
 use crate::job::schema::JobManifest;
@@ -59,6 +61,27 @@ fn conclusion_after_cleanup_failure(conclusion: JobConclusion) -> JobConclusion 
     }
 }
 
+fn is_poisoned_job_resource_error(error: &anyhow::Error) -> bool {
+    matches!(
+        error.downcast_ref::<JobDockerConfigError>(),
+        Some(JobDockerConfigError::PoisonedRoot { .. })
+    )
+}
+
+/// A job error the runner must not recover from by polling again: the job
+/// resource root is known-untrustworthy (poisoned) or a completion was already
+/// published after a failed cleanup. Classified by construction, not by the
+/// separate poisoning side effect.
+fn job_execution_error_is_terminal(error: &anyhow::Error) -> bool {
+    is_poisoned_job_resource_error(error) || is_job_resource_cleanup_fatal(error)
+}
+
+fn is_job_resource_cleanup_fatal(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<JobResourceCleanupFatalError>()
+        .is_some()
+}
+
 async fn finish_job(
     job_client: &Arc<JobClient>,
     manifest: &JobManifest,
@@ -75,7 +98,8 @@ async fn finish_job(
         }
     };
 
-    if cleanup_result.is_err() {
+    let cleanup_error = cleanup_result.err();
+    if cleanup_error.is_some() {
         outcome.conclusion = conclusion_after_cleanup_failure(outcome.conclusion);
     }
 
@@ -90,7 +114,12 @@ async fn finish_job(
         )
         .await
         .context("completing job")
-        .map_err(|source| anyhow::Error::new(CompletionPublicationError { source }))
+        .map_err(|source| anyhow::Error::new(CompletionPublicationError { source }))?;
+
+    match cleanup_error {
+        Some(source) => Err(anyhow::Error::new(JobResourceCleanupFatalError { source })),
+        None => Ok(()),
+    }
 }
 
 pub struct Runner {
@@ -180,6 +209,7 @@ impl Runner {
         info!(session_id = %broker.session_id(), "broker session created");
         self.report_phase(RunnerPhase::Idle).await;
         info!("entering poll loop, waiting for jobs...");
+        let mut terminal_error = None;
 
         loop {
             let result = self.poll_loop(&broker, &mut shutdown_rx).await;
@@ -192,8 +222,13 @@ impl Runner {
                         "received job message"
                     );
 
-                    self.handle_job_message(&msg, &broker, &client, token_manager.clone())
-                        .await;
+                    if let Err(error) = self
+                        .handle_job_message(&msg, &broker, &client, token_manager.clone())
+                        .await
+                    {
+                        terminal_error = Some(error);
+                        break;
+                    }
                     self.report_phase(RunnerPhase::Idle).await;
 
                     if *shutdown_rx.borrow() {
@@ -207,8 +242,11 @@ impl Runner {
                     info!("poll loop exited (shutdown)");
                     break;
                 }
-                Err(e) => {
-                    error!(error = %e, "poll loop error");
+                Err(error) => {
+                    error!(error = %error, "poll loop error");
+                    if is_poisoned_job_resource_error(&error) {
+                        terminal_error = Some(error);
+                    }
                     break;
                 }
             }
@@ -220,7 +258,10 @@ impl Runner {
             info!("session deleted");
         }
 
-        Ok(())
+        match terminal_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 
     async fn handle_job_message(
@@ -229,12 +270,12 @@ impl Runner {
         broker: &BrokerClient,
         client: &reqwest::Client,
         token_manager: Arc<TokenManager>,
-    ) {
+    ) -> Result<()> {
         let (runner_request_id, run_service_url) = match msg.parse_job_request() {
             Ok(pair) => pair,
             Err(e) => {
                 warn!(error = %e, "failed to parse job request");
-                return;
+                return Ok(());
             }
         };
 
@@ -261,9 +302,17 @@ impl Runner {
         cancel_token.cancel();
         let _ = poller_handle.await;
 
-        if let Err(e) = result {
-            error!(error = %e, cause = ?e, "job execution failed");
+        if let Err(error) = result {
+            if job_execution_error_is_terminal(&error) {
+                // Correct by construction, not by the poisoning side effect:
+                // the runner stops on the fatal marker itself.
+                return Err(error);
+            }
+            error!(error = %error, cause = ?error, "job execution failed");
         }
+
+        self.job_resources.ensure_healthy()?;
+        Ok(())
     }
 
     async fn execute_job(
@@ -331,6 +380,14 @@ impl Runner {
             Ok(()) => Ok(()),
             Err(error) if error.downcast_ref::<CompletionPublicationError>().is_some() => {
                 error!(error = %error, cause = ?error, "job completion request failed; not retrying completion");
+                Err(error)
+            }
+            Err(error)
+                if error
+                    .downcast_ref::<JobResourceCleanupFatalError>()
+                    .is_some() =>
+            {
+                error!(error = %error, cause = ?error, "job completed after cleanup failure; stopping runner");
                 Err(error)
             }
             Err(error) => {
@@ -630,8 +687,10 @@ impl Runner {
     ) -> Result<Option<BrokerMessage>> {
         let mut backoff = Duration::from_secs(1);
         let max_backoff = Duration::from_secs(30);
+        let mut poisoned_rx = self.job_resources.poisoned_receiver();
 
         loop {
+            self.job_resources.ensure_healthy()?;
             if *shutdown_rx.borrow() {
                 info!("shutdown signal received, exiting poll loop");
                 return Ok(None);
@@ -642,6 +701,10 @@ impl Runner {
                 _ = shutdown_rx.changed() => {
                     info!("shutdown signal received, cancelling poll");
                     return Ok(None);
+                }
+                _ = poisoned_rx.changed() => {
+                    self.job_resources.ensure_healthy()?;
+                    continue;
                 }
             };
 
@@ -690,6 +753,10 @@ impl Runner {
                                 info!("shutdown signal received during token retry");
                                 return Ok(None);
                             }
+                            _ = poisoned_rx.changed() => {
+                                self.job_resources.ensure_healthy()?;
+                                continue;
+                            }
                         };
                         match retry {
                             Ok(result) => return Ok(result),
@@ -706,6 +773,10 @@ impl Runner {
                         _ = tokio::time::sleep(backoff) => {}
                         _ = shutdown_rx.changed() => {
                             return Ok(None);
+                        }
+                        _ = poisoned_rx.changed() => {
+                            self.job_resources.ensure_healthy()?;
+                            continue;
                         }
                     }
 

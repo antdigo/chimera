@@ -13,7 +13,9 @@ use tracing::{Instrument, error, info, warn};
 use crate::cache::manager::CacheManager;
 use crate::cache::server as cache_server;
 use crate::config::{ChimeraConfig, ChimeraPaths, load_config, load_runner_credentials};
-use crate::job::docker_config::JobResourceRoot;
+use crate::job::docker_config::{
+    JobDockerConfigError, JobResourceCleanupFatalError, JobResourceRoot,
+};
 use crate::runner::Runner;
 use crate::storage::RootLock;
 
@@ -340,6 +342,19 @@ pub fn read_state_file(path: &Path) -> Result<StateSnapshot> {
     serde_json::from_str(&text).with_context(|| format!("parsing state file {}", path.display()))
 }
 
+fn is_fatal_job_resource_error(error: &anyhow::Error) -> bool {
+    // anyhow's downcast_ref walks the error chain, so wrappers added along
+    // the way do not hide the fatal marker.
+    let poisoned = matches!(
+        error.downcast_ref::<JobDockerConfigError>(),
+        Some(JobDockerConfigError::PoisonedRoot { .. })
+    );
+    let cleanup_fatal = error
+        .downcast_ref::<JobResourceCleanupFatalError>()
+        .is_some();
+    poisoned || cleanup_fatal
+}
+
 // --- Daemon ---
 
 pub struct Daemon {
@@ -461,6 +476,7 @@ impl Daemon {
         let shutdown_timeout = self.config.daemon.shutdown_timeout_secs;
 
         info!(runners = started, "daemon started");
+        let mut fatal_error = None;
 
         // Wait for either: all runners exit or shutdown signal
         loop {
@@ -470,8 +486,13 @@ impl Daemon {
                         Some(Ok((name, Ok(())))) => {
                             info!(runner = %name, "runner exited cleanly");
                         }
-                        Some(Ok((name, Err(e)))) => {
-                            error!(runner = %name, error = %e, "runner exited with error");
+                        Some(Ok((name, Err(error)))) => {
+                            let fatal = is_fatal_job_resource_error(&error);
+                            error!(runner = %name, error = %error, "runner exited with error");
+                            if fatal {
+                                fatal_error = Some(error);
+                                break;
+                            }
                         }
                         Some(Err(e)) => {
                             error!(error = %e, "runner task panicked");
@@ -520,7 +541,10 @@ impl Daemon {
         let _ = std::fs::remove_file(self.paths.state_file());
 
         info!("daemon shut down");
-        Ok(())
+        match fatal_error {
+            Some(error) => Err(error.context("job resource cleanup made the daemon unhealthy")),
+            None => Ok(()),
+        }
     }
 }
 

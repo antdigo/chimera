@@ -12,9 +12,10 @@ container compiles and runs the test suite against that daemon. The exact pin se
 below was verified on Apple Silicon (`arm64`); fail closed on another architecture
 until equivalent immutable pins have passed the same suite.
 
-Run every command from the repository root in the same Bash shell. Stop at the
-first error; do not continue with a partially prepared environment. Only one copy
-of this setup may run at a time because its outer Docker resource names are fixed.
+Run every command from the repository root in the same Bash shell with strict
+mode enabled. Stop at the first error; do not continue with a partially prepared
+environment. Only one copy of this setup may run at a time because its outer
+Docker resource names are fixed.
 
 ## Why the shared network namespace is required
 
@@ -59,19 +60,39 @@ used to run it; they do not make those pre-existing test references immutable.
 
 ## 1. Check Docker Desktop and prepare constants
 
-The active Docker context must point to a running Docker Desktop engine. Start in
-a shell where `DOCKER_HOST` is not redirecting the host CLI to another daemon.
+Every command below assumes strict mode; enable it before the first check so a
+failed check stops the runbook instead of letting it continue half-prepared:
+
+```bash
+set -Eeuo pipefail
+```
+
+The active Docker context must point to a running Docker Desktop engine, the
+shell must not carry a `DOCKER_HOST` override, and the daemon must use the
+containerd image store. The containerd requirement is load-bearing: the
+verified image identity checks (`.Id` equal to the manifest digest, and
+`docker save`/`docker load` round trips) were validated against
+`io.containerd.snapshotter.v1` and fail closed on the classic graph driver
+store.
 
 ```bash
 test "$(uname -s)" = "Darwin"
 test "$(uname -m)" = "arm64"
+test -z "${DOCKER_HOST:-}"
+context_host="$(docker context inspect --format '{{.Endpoints.docker.Host}}')"
+test "$context_host" = "unix://$HOME/.docker/run/docker.sock"
 docker context show
 docker version
 docker info >/dev/null
+docker info --format \
+  '{{range .DriverStatus}}{{if eq (index . 0) "driver-type"}}{{index . 1}}{{end}}{{end}}' \
+  | grep -Fx io.containerd.snapshotter.v1
 cargo fetch --locked
 ```
 
-Define the verified image pins and test-owned resource names:
+Define the verified image pins and test-owned resource names. The label marks
+every resource this runbook creates, so cleanup can prove ownership instead of
+removing whatever happens to carry a known name:
 
 ```bash
 ROOT="$(git rev-parse --show-toplevel)"
@@ -81,12 +102,40 @@ SCRATCH="$ROOT/.tmp/macos-docker-tests"
 TOOLS="$SCRATCH/linux-tools"
 IMAGE_ARCHIVE="$SCRATCH/rootless-dind-images.tar"
 
+CHIMERA_LABEL="org.chimera.owner"
+CHIMERA_LABEL_VALUE="macos-docker-tests"
+
 DIND_NAME="chimera-job-docker-config-rootless-dind"
 DIND_RUNTIME_VOLUME="chimera-job-docker-config-dind-runtime"
 DIND_TMP_VOLUME="chimera-job-docker-config-dind-tmp"
 TARGET_VOLUME="chimera-job-docker-config-linux-target"
 CARGO_VOLUME="chimera-job-docker-config-cargo-home"
 
+# A fixed test-owned resource name may already exist only if a previous run
+# failed midway; the labeled cleanup section owns that recovery. Anything else
+# is a collision and stops the runbook before it creates or reuses anything.
+for container in "$DIND_NAME" chimera-macos-docker-cli-extract chimera-macos-node-extract; do
+  if docker container inspect "$container" >/dev/null 2>&1; then
+    echo "test container name already exists: $container" >&2
+    false
+  fi
+done
+for volume in \
+  "$DIND_RUNTIME_VOLUME" \
+  "$DIND_TMP_VOLUME" \
+  "$TARGET_VOLUME" \
+  "$CARGO_VOLUME"
+do
+  if docker volume inspect "$volume" >/dev/null 2>&1; then
+    echo "test volume name already exists: $volume" >&2
+    false
+  fi
+done
+```
+
+Define the verified image pins:
+
+```bash
 RUST_IMAGE="rust@sha256:3914072ca0c3b8aad871db9169a651ccfce30cf58303e5d6f2db16d1d8a7e58f"
 NODE_IMAGE="node@sha256:83f487e0a63425e5b4d146fb5e5be574bcbe1b7b843d3ebafdd95eaf7767a7e5"
 DOCKER_CLI_IMAGE="docker@sha256:9f36dfce2d1fd053d700a4eca00c358df79bf7d8cb69d4a9e8d9981af18834ea"
@@ -126,7 +175,10 @@ docker pull "$BUILDKIT_IMAGE"
 
 # These fixed temporary names make stale setup state visible instead of silently
 # reusing it.
-docker create --name chimera-macos-docker-cli-extract "$DOCKER_CLI_IMAGE"
+docker create \
+  --label "$CHIMERA_LABEL=$CHIMERA_LABEL_VALUE" \
+  --name chimera-macos-docker-cli-extract \
+  "$DOCKER_CLI_IMAGE"
 docker cp chimera-macos-docker-cli-extract:/usr/local/bin/docker \
   "$TOOLS/bin/docker"
 docker cp \
@@ -134,7 +186,10 @@ docker cp \
   "$TOOLS/cli-plugins/docker-buildx"
 docker rm -- chimera-macos-docker-cli-extract
 
-docker create --name chimera-macos-node-extract "$NODE_IMAGE"
+docker create \
+  --label "$CHIMERA_LABEL=$CHIMERA_LABEL_VALUE" \
+  --name chimera-macos-node-extract \
+  "$NODE_IMAGE"
 docker cp chimera-macos-node-extract:/usr/local/bin/node "$TOOLS/bin/node"
 docker rm -- chimera-macos-node-extract
 ```
@@ -151,7 +206,7 @@ for volume in \
   "$TARGET_VOLUME" \
   "$CARGO_VOLUME"
 do
-  docker volume create "$volume"
+  docker volume create --label "$CHIMERA_LABEL=$CHIMERA_LABEL_VALUE" "$volume"
 done
 
 docker run --rm \
@@ -166,6 +221,7 @@ docker run --rm \
 
 docker run -d \
   --privileged \
+  --label "$CHIMERA_LABEL=$CHIMERA_LABEL_VALUE" \
   --name "$DIND_NAME" \
   -e DOCKER_TLS_CERTDIR= \
   -e XDG_RUNTIME_DIR=/run/user/1000 \
@@ -339,16 +395,47 @@ docker exec \
 
 ## 8. Cleanup
 
-Run this after success or failure. It removes only the fixed resources owned by
-this runbook. It deliberately leaves the host's downloaded image cache intact and
-never runs a global prune.
+Run this after success or failure. It removes only the fixed resources this
+runbook created, proven by the ownership label — a resource that carries a
+known name but not the label is refused, not removed. Failures are accumulated
+rather than aborting mid-section, so one foreign name-collision cannot strand
+the owned resources behind it; the final `test` reports the overall outcome.
+It deliberately leaves the host's downloaded image cache intact and never runs
+a global prune.
 
 ```bash
-docker rm --force --volumes -- "$DIND_NAME" 2>/dev/null || true
-docker rm --force --volumes -- \
-  chimera-macos-docker-cli-extract \
-  chimera-macos-node-extract \
-  2>/dev/null || true
+remove_owned_container() {
+  container="$1"
+  if ! docker container inspect "$container" >/dev/null 2>&1; then
+    return 0
+  fi
+  owner="$(docker container inspect \
+    --format "{{index .Config.Labels \"$CHIMERA_LABEL\"}}" "$container")"
+  if test "$owner" != "$CHIMERA_LABEL_VALUE"; then
+    echo "refusing to remove container without runbook ownership label: $container" >&2
+    return 1
+  fi
+  docker rm --force --volumes -- "$container"
+}
+
+remove_owned_volume() {
+  volume="$1"
+  if ! docker volume inspect "$volume" >/dev/null 2>&1; then
+    return 0
+  fi
+  owner="$(docker volume inspect \
+    --format "{{index .Labels \"$CHIMERA_LABEL\"}}" "$volume")"
+  if test "$owner" != "$CHIMERA_LABEL_VALUE"; then
+    echo "refusing to remove volume without runbook ownership label: $volume" >&2
+    return 1
+  fi
+  docker volume rm "$volume"
+}
+
+cleanup_failed=0
+remove_owned_container "$DIND_NAME" || cleanup_failed=1
+remove_owned_container chimera-macos-docker-cli-extract || cleanup_failed=1
+remove_owned_container chimera-macos-node-extract || cleanup_failed=1
 
 for volume in \
   "$DIND_RUNTIME_VOLUME" \
@@ -356,14 +443,16 @@ for volume in \
   "$TARGET_VOLUME" \
   "$CARGO_VOLUME"
 do
-  docker volume rm "$volume" 2>/dev/null || true
+  remove_owned_volume "$volume" || cleanup_failed=1
 done
 
 if test "$SCRATCH" = "$ROOT/.tmp/macos-docker-tests"; then
   rm -rf -- "$SCRATCH"
 fi
 
-unset -f run_in_chimera_test_container
+unset -f run_in_chimera_test_container remove_owned_container remove_owned_volume
+
+test "$cleanup_failed" -eq 0
 ```
 
 Confirm that no outer test resources remain:
@@ -401,6 +490,15 @@ must obtain explicit user approval before running:
 ```bash
 docker desktop restart
 ```
+
+### Containerd image store preflight fails
+
+The step-1 `driver-type` check is a hard requirement, not a preference. Enable
+the containerd image store in Docker Desktop (Settings → General → "Use
+containerd for pulling and storing images") and re-run the preflight. Do not
+weaken the check: with the classic graph driver store, image IDs and
+`docker save` round trips behave differently and the C-10 identity assertions
+no longer test what they claim.
 
 ### Rootless preflight fails
 
