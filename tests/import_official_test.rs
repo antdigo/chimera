@@ -100,7 +100,7 @@ fn assert_success_output(output: &Output, status: &str, name: &str, source: &Pat
     let expected = format!(
         "{status}: local-name={name}, agent-id={SYNTHETIC_AGENT_ID}; offline validation only\n"
     );
-    assert_eq!(output.stdout.as_slice(), expected.as_bytes());
+    assert!(output.stdout.as_slice() == expected.as_bytes());
     assert!(output.stderr.is_empty());
     assert_source_credentials_redacted(output, source);
 }
