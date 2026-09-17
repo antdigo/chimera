@@ -359,9 +359,11 @@ fn validate_ancestor(stat: &libc::stat) -> Result<bool, RootLockError> {
         ));
     }
 
-    let mode = stat.st_mode as u32;
+    // `mode_t` differs per platform (u16 on macOS, u32 on Linux), so mode
+    // checks stay in `mode_t` end to end instead of casting to a fixed width.
+    let mode = stat.st_mode;
     let shared = mode & 0o022 != 0;
-    if shared && mode & libc::S_ISVTX as u32 == 0 {
+    if shared && mode & libc::S_ISVTX == 0 {
         return Err(RootLockError::UnsafeRoot(
             "root ancestry is writable by untrusted users".into(),
         ));
@@ -378,7 +380,7 @@ fn validate_root(stat: &libc::stat) -> Result<(), RootLockError> {
             "root is not owned by the current user".into(),
         ));
     }
-    if stat.st_mode as u32 & 0o022 != 0 {
+    if stat.st_mode & 0o022 != 0 {
         return Err(RootLockError::UnsafeRoot(
             "root is group- or world-writable".into(),
         ));
@@ -388,8 +390,7 @@ fn validate_root(stat: &libc::stat) -> Result<(), RootLockError> {
 
 fn validate_lock_file(file: &File) -> Result<(), RootLockError> {
     let stat = stat_fd(file)?;
-    if !is_regular_file(&stat) || stat.st_uid != effective_uid() || stat.st_mode as u32 & 0o077 != 0
-    {
+    if !is_regular_file(&stat) || stat.st_uid != effective_uid() || stat.st_mode & 0o077 != 0 {
         return Err(RootLockError::UnsafeRoot(
             "lock file is not private regular storage owned by the current user".into(),
         ));
@@ -471,15 +472,15 @@ fn effective_uid() -> libc::uid_t {
 }
 
 fn is_directory(stat: &libc::stat) -> bool {
-    stat.st_mode as u32 & libc::S_IFMT as u32 == libc::S_IFDIR as u32
+    stat.st_mode & libc::S_IFMT == libc::S_IFDIR
 }
 
 fn is_regular_file(stat: &libc::stat) -> bool {
-    stat.st_mode as u32 & libc::S_IFMT as u32 == libc::S_IFREG as u32
+    stat.st_mode & libc::S_IFMT == libc::S_IFREG
 }
 
 fn is_symlink(stat: &libc::stat) -> bool {
-    stat.st_mode as u32 & libc::S_IFMT as u32 == libc::S_IFLNK as u32
+    stat.st_mode & libc::S_IFMT == libc::S_IFLNK
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
