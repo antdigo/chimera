@@ -318,7 +318,7 @@ Timeout: 30s
     "name": "chimera-0",
     "version": "2.329.0",
     "osDescription": "linux aarch64",
-    "ephemeral": true,
+    "ephemeral": false,
     "status": 0
   },
   "useFipsEncryption": false
@@ -334,7 +334,9 @@ Response:
 
 **Notes**:
 - `status: 0` means Online (1 = Offline).
-- `ephemeral: true` indicates the runner is transient (single-use per session).
+- Persistent registrations created by `chimera register` and accepted by
+  `import-official` create non-ephemeral broker sessions; registration deletion
+  is never performed on session disconnect.
 - The broker may return a different `sessionId` than the one you sent (use the
   response value for all subsequent calls).
 - A 400 response usually means the runner version is too old.

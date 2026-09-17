@@ -1,3 +1,6 @@
+use std::ffi::CString;
+use std::fs::File;
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -45,7 +48,7 @@ fn default_log_format() -> String {
     "text".into()
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RunnerInfo {
     pub agent_id: u64,
@@ -63,7 +66,7 @@ fn default_true() -> bool {
     true
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OAuthCredentials {
     pub scheme: String,
@@ -72,7 +75,7 @@ pub struct OAuthCredentials {
 }
 
 /// RSA private key parameters in .NET-compatible base64 format.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RsaParameters {
     pub d: String,
@@ -87,7 +90,7 @@ pub struct RsaParameters {
 }
 
 /// All credential data for a single runner, loaded from three JSON files.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunnerCredentials {
     pub info: RunnerInfo,
     pub oauth: OAuthCredentials,
@@ -140,6 +143,10 @@ impl ChimeraPaths {
         self.root.join("chimera.pid")
     }
 
+    pub fn root_lock_file(&self) -> PathBuf {
+        self.root.join(".chimera.lock")
+    }
+
     pub fn state_file(&self) -> PathBuf {
         self.root.join("state.json")
     }
@@ -167,17 +174,45 @@ pub fn default_root() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("/tmp/chimera"))
 }
 
+pub fn load_config_if_exists(path: &Path) -> Result<Option<ChimeraConfig>> {
+    use std::io::Read;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).with_context(|| format!("checking {}", path.display())),
+    };
+    anyhow::ensure!(
+        !metadata.file_type().is_symlink() && metadata.file_type().is_file(),
+        "config path is not a regular file"
+    );
+
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .open(path)
+        .with_context(|| format!("opening config from {}", path.display()))?;
+    let opened = file.metadata()?;
+    anyhow::ensure!(
+        opened.is_file() && metadata.dev() == opened.dev() && metadata.ino() == opened.ino(),
+        "config path changed while opening"
+    );
+    let mut text = String::new();
+    file.read_to_string(&mut text)
+        .with_context(|| format!("reading config from {}", path.display()))?;
+    let config =
+        toml::from_str(&text).with_context(|| format!("parsing config from {}", path.display()))?;
+    Ok(Some(config))
+}
+
 pub fn load_config(path: &Path) -> Result<ChimeraConfig> {
-    if !path.exists() {
-        let config = ChimeraConfig::default();
-        save_config(path, &config)
-            .with_context(|| format!("writing default config to {}", path.display()))?;
+    if let Some(config) = load_config_if_exists(path)? {
         return Ok(config);
     }
-    let text = std::fs::read_to_string(path)
-        .with_context(|| format!("reading config from {}", path.display()))?;
-    let config: ChimeraConfig =
-        toml::from_str(&text).with_context(|| format!("parsing config from {}", path.display()))?;
+    let config = ChimeraConfig::default();
+    save_config(path, &config)
+        .with_context(|| format!("writing default config to {}", path.display()))?;
     Ok(config)
 }
 
@@ -203,6 +238,30 @@ pub fn load_runner_credentials(runners_dir: &Path, name: &str) -> Result<RunnerC
         oauth,
         rsa_params,
     })
+}
+
+pub(crate) fn load_runner_credentials_from_directory(
+    directory: &File,
+) -> Result<RunnerCredentials> {
+    let info = load_json_at(directory, "runner.json")?;
+    let oauth = load_json_at(directory, "credentials.json")?;
+    let rsa_params = load_json_at(directory, "rsa_params.json")?;
+    Ok(RunnerCredentials {
+        info,
+        oauth,
+        rsa_params,
+    })
+}
+
+fn load_json_at<T: serde::de::DeserializeOwned>(directory: &File, name: &str) -> Result<T> {
+    let name_component = CString::new(name).context("credential file name contains NUL")?;
+    let flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK;
+    let fd = unsafe { libc::openat(directory.as_raw_fd(), name_component.as_ptr(), flags) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error()).with_context(|| format!("opening {name}"));
+    }
+    let file = unsafe { File::from_raw_fd(fd) };
+    serde_json::from_reader(file).with_context(|| format!("parsing {name}"))
 }
 
 pub fn save_runner_credentials(
@@ -238,12 +297,29 @@ pub fn rsa_params_to_private_key(params: &RsaParameters) -> Result<RsaPrivateKey
     let d = decode_biguint(&params.d, "d")?;
     let p = decode_biguint(&params.p, "p")?;
     let q = decode_biguint(&params.q, "q")?;
+    let dp = decode_biguint(&params.dp, "dp")?;
+    let dq = decode_biguint(&params.dq, "dq")?;
+    let inverse_q = decode_biguint(&params.inverse_q, "inverseQ")?;
 
-    let primes = vec![p, q];
-    let key = RsaPrivateKey::from_components(n, e, d, primes)
+    let key = RsaPrivateKey::from_components(n, e, d, vec![p, q])
         .context("constructing RSA private key from parameters")?;
-
     key.validate().context("validating RSA private key")?;
+
+    let expected_dp = key.dp().context("RSA key missing dp component")?;
+    let expected_dq = key.dq().context("RSA key missing dq component")?;
+    let expected_inverse_q = key
+        .qinv()
+        .context("RSA key missing inverseQ component")?
+        .to_biguint()
+        .context("RSA inverseQ is negative")?;
+
+    anyhow::ensure!(&dp == expected_dp, "RSA parameter 'dp' is inconsistent");
+    anyhow::ensure!(&dq == expected_dq, "RSA parameter 'dq' is inconsistent");
+    anyhow::ensure!(
+        inverse_q == expected_inverse_q,
+        "RSA parameter 'inverseQ' is inconsistent"
+    );
+
     Ok(key)
 }
 

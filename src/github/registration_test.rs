@@ -1,5 +1,6 @@
 use super::*;
 use crate::config::{ChimeraConfig, load_config, save_config};
+use crate::storage::RootLock;
 use tempfile::TempDir;
 use wiremock::matchers::method;
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -120,4 +121,81 @@ async fn unregister_removes_files() {
 
     let updated_config = load_config(&root.join("config.toml")).unwrap();
     assert_eq!(updated_config.runners, vec!["other-runner"]);
+}
+
+#[tokio::test]
+async fn unregister_refuses_busy_root() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    let _held = RootLock::acquire(root).unwrap();
+    let runner_dir = root.join("runners").join("test-runner");
+    std::fs::create_dir_all(&runner_dir).unwrap();
+    std::fs::write(runner_dir.join("runner.json"), b"runner data").unwrap();
+
+    let config = ChimeraConfig {
+        runners: vec!["test-runner".into(), "other-runner".into()],
+        ..Default::default()
+    };
+    let config_path = root.join("config.toml");
+    save_config(&config_path, &config).unwrap();
+    let original_config = std::fs::read(&config_path).unwrap();
+
+    let error = unregister("test-runner", root).await.unwrap_err();
+
+    assert!(error.to_string().contains("root storage is busy"));
+    assert_eq!(
+        std::fs::read(runner_dir.join("runner.json")).unwrap(),
+        b"runner data"
+    );
+    assert_eq!(std::fs::read(&config_path).unwrap(), original_config);
+    let unchanged_config = load_config(&config_path).unwrap();
+    assert_eq!(
+        unchanged_config.runners,
+        vec!["test-runner", "other-runner"]
+    );
+}
+
+#[tokio::test]
+async fn malformed_config_stops_register_before_remote_or_local_side_effects() {
+    let root = TempDir::new().unwrap();
+    let config_path = root.path().join("config.toml");
+    let malformed = b"runners = [\"SECRET_CONFIG\"";
+    std::fs::write(&config_path, malformed).unwrap();
+
+    let error = register(
+        "not-a-github-url",
+        "unused-token",
+        "test-runner",
+        &[],
+        root.path(),
+    )
+    .await
+    .unwrap_err();
+    let diagnostic = error.to_string();
+
+    assert!(diagnostic.contains("parsing config"));
+    assert!(!diagnostic.contains("SECRET_CONFIG"));
+    assert!(std::fs::read(&config_path).unwrap() == malformed);
+    assert!(!root.path().join("runners").exists());
+}
+
+#[tokio::test]
+async fn malformed_config_stops_unregister_before_credential_deletion() {
+    let root = TempDir::new().unwrap();
+    let runner_dir = root.path().join("runners/test-runner");
+    std::fs::create_dir_all(&runner_dir).unwrap();
+    let marker_path = runner_dir.join("runner.json");
+    let marker = b"synthetic-runner-marker";
+    std::fs::write(&marker_path, marker).unwrap();
+    let config_path = root.path().join("config.toml");
+    let malformed = b"runners = [\"SECRET_CONFIG\"";
+    std::fs::write(&config_path, malformed).unwrap();
+
+    let error = unregister("test-runner", root.path()).await.unwrap_err();
+    let diagnostic = error.to_string();
+
+    assert!(diagnostic.contains("parsing config"));
+    assert!(!diagnostic.contains("SECRET_CONFIG"));
+    assert!(std::fs::read(&config_path).unwrap() == malformed);
+    assert!(std::fs::read(&marker_path).unwrap() == marker);
 }
