@@ -1,5 +1,7 @@
+use std::io;
 use std::path::Path;
 
+use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use rsa::traits::PublicKeyParts;
 use serde_json::json;
 
@@ -9,7 +11,10 @@ use crate::import::test_support::{copy_fixture, fixture_credentials, fixture_pat
 use super::*;
 
 fn assert_category(source: &Path, category: &str) -> String {
-    let error = read_official_registration(source).unwrap_err();
+    let error = match read_official_registration(source) {
+        Ok(_) => panic!("source was unexpectedly accepted"),
+        Err(error) => error,
+    };
     assert_eq!(error.category(), category);
     format!("{error:#}")
 }
@@ -432,4 +437,117 @@ fn allows_same_numeric_agent_id_to_be_scoped_by_repo() {
     assert_ne!(first.identity.scope, second.identity.scope);
     assert_eq!(first.identity.scope, "github.com/example/one");
     assert_eq!(second.identity.scope, "github.com/example/two");
+}
+
+#[test]
+fn preserves_leading_zero_bytes_for_every_rsa_component() {
+    let original_key = rsa_params_to_private_key(&fixture_credentials().rsa_params).unwrap();
+
+    for field in ["D", "DP", "DQ", "Exponent", "InverseQ", "Modulus", "P", "Q"] {
+        let source = copy_fixture();
+        let path = source.path().join(".credentials_rsaparams");
+        let mut document: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let encoded = document[field].as_str().unwrap();
+        let mut expected_bytes = BASE64.decode(encoded).unwrap();
+        expected_bytes.insert(0, 0);
+        document[field] = json!(BASE64.encode(&expected_bytes));
+        std::fs::write(&path, serde_json::to_vec_pretty(&document).unwrap()).unwrap();
+
+        let registration = read_official_registration(source.path()).unwrap();
+        let imported = match field {
+            "D" => &registration.credentials.rsa_params.d,
+            "DP" => &registration.credentials.rsa_params.dp,
+            "DQ" => &registration.credentials.rsa_params.dq,
+            "Exponent" => &registration.credentials.rsa_params.exponent,
+            "InverseQ" => &registration.credentials.rsa_params.inverse_q,
+            "Modulus" => &registration.credentials.rsa_params.modulus,
+            "P" => &registration.credentials.rsa_params.p,
+            "Q" => &registration.credentials.rsa_params.q,
+            _ => unreachable!("table contains only the eight RSA fields"),
+        };
+        let imported_bytes = BASE64.decode(imported).unwrap();
+        assert!(
+            imported_bytes == expected_bytes,
+            "RSA component width changed for {field}"
+        );
+
+        let imported_key = rsa_params_to_private_key(&registration.credentials.rsa_params).unwrap();
+        assert!(
+            imported_key.n() == original_key.n() && imported_key.e() == original_key.e(),
+            "RSA public key changed for {field}"
+        );
+    }
+}
+
+#[test]
+fn rejects_duplicate_oauth_metadata_keys_from_raw_json() {
+    for duplicate_entries in [
+        concat!(
+            "\"clientId\":\"00000000-0000-4000-8000-000000000042\",",
+            "\"clientId\":\"00000000-0000-4000-8000-000000000043\","
+        ),
+        concat!(
+            "\"authorizationUrl\":\"https://vstoken.actions.githubusercontent.com/tenant-id\",",
+            "\"authorizationUrl\":\"https://vstoken.actions.githubusercontent.com/other\","
+        ),
+        concat!(
+            "\"requireFipsCryptography\":\"False\",",
+            "\"requireFipsCryptography\":\"True\","
+        ),
+        concat!(
+            "\"enableAuthMigrationByDefault\":\"false\",",
+            "\"enableAuthMigrationByDefault\":\"true\","
+        ),
+    ] {
+        let source = copy_fixture();
+        let raw = format!(
+            concat!(
+                "{{\"scheme\":\"OAuth\",\"data\":{{{}",
+                "\"clientId\":\"00000000-0000-4000-8000-000000000042\",",
+                "\"authorizationUrl\":\"https://vstoken.actions.githubusercontent.com/tenant-id\"}}}}"
+            ),
+            duplicate_entries
+        );
+        std::fs::write(source.path().join(".credentials"), raw).unwrap();
+
+        let diagnostic = assert_category(source.path(), "invalid-source");
+
+        assert!(!diagnostic.contains("00000000-0000-4000-8000-000000000043"));
+        assert!(!diagnostic.contains("/other"));
+    }
+}
+
+#[test]
+fn rejects_percent_encoded_repository_scope_aliases() {
+    for repository_url in [
+        "https://github.com/%65xample/repository",
+        "https://github.com/example/repo%73itory",
+        "https://github.com/example%2Frepository/alias",
+        "https://github.com/example/%2e%2e",
+    ] {
+        let source = copy_fixture();
+        set_runner_value(source.path(), "gitHubUrl", json!(repository_url));
+
+        assert_category(source.path(), "unsupported-registration");
+    }
+}
+
+#[test]
+fn migration_marker_metadata_classification_fails_closed() {
+    let marker = Path::new("marker-name");
+
+    assert!(migration_marker_exists_with(marker, |_| Ok(())).unwrap());
+    assert!(
+        !migration_marker_exists_with(marker, |_| Err(io::Error::from(io::ErrorKind::NotFound)))
+            .unwrap()
+    );
+    let error = migration_marker_exists_with(marker, |_| {
+        Err(io::Error::other("SECRET_MARKER_METADATA_FAILURE"))
+    })
+    .unwrap_err();
+    let diagnostic = error.to_string();
+
+    assert_eq!(error.category(), "invalid-source");
+    assert!(!diagnostic.contains("SECRET_MARKER_METADATA_FAILURE"));
 }

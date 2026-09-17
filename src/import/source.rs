@@ -1,14 +1,15 @@
 use std::collections::BTreeMap;
+use std::fmt;
 use std::path::{Path, PathBuf};
 
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use reqwest::Url;
-use serde::de::DeserializeOwned;
+use serde::Deserializer;
+use serde::de::{self, DeserializeOwned, MapAccess, Visitor};
 use uuid::Uuid;
 
 use crate::config::{
-    OAuthCredentials, RsaParameters, RunnerCredentials, RunnerInfo, private_key_to_rsa_params,
-    rsa_params_to_private_key,
+    OAuthCredentials, RsaParameters, RunnerCredentials, RunnerInfo, rsa_params_to_private_key,
 };
 
 use super::{ImportError, RunnerIdentity, ValidatedRegistration, read_regular_no_follow};
@@ -56,7 +57,40 @@ struct OfficialRunnerSettings {
 #[serde(deny_unknown_fields)]
 struct OfficialCredentialData {
     scheme: String,
+    #[serde(deserialize_with = "deserialize_unique_string_map")]
     data: BTreeMap<String, String>,
+}
+
+fn deserialize_unique_string_map<'de, D>(
+    deserializer: D,
+) -> Result<BTreeMap<String, String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct UniqueStringMapVisitor;
+
+    impl<'de> Visitor<'de> for UniqueStringMapVisitor {
+        type Value = BTreeMap<String, String>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("credential metadata with unique keys")
+        }
+
+        fn visit_map<A>(self, mut entries: A) -> Result<Self::Value, A::Error>
+        where
+            A: MapAccess<'de>,
+        {
+            let mut values = BTreeMap::new();
+            while let Some((key, value)) = entries.next_entry::<String, String>()? {
+                if values.insert(key, value).is_some() {
+                    return Err(de::Error::custom("duplicate credential metadata key"));
+                }
+            }
+            Ok(values)
+        }
+    }
+
+    deserializer.deserialize_map(UniqueStringMapVisitor)
 }
 
 #[derive(serde::Deserialize)]
@@ -216,6 +250,7 @@ pub(super) fn runner_identity(
         || has_explicit_port(git_hub_url)
         || url.query().is_some()
         || url.fragment().is_some()
+        || url.path().contains('%')
         || path_segments.len() != 2
         || path_segments.iter().any(|segment| segment.is_empty())
     {
@@ -287,8 +322,8 @@ fn validate_oauth(
             "credential auth migration is not supported".into(),
         ));
     }
-    if migration_marker_exists(source, ".runner_migrated")
-        || migration_marker_exists(source, ".credentials_migrated")
+    if migration_marker_exists(source, ".runner_migrated")?
+        || migration_marker_exists(source, ".credentials_migrated")?
     {
         return Err(ImportError::UnsupportedRegistration(
             "credential auth migration is not supported".into(),
@@ -316,8 +351,23 @@ fn parse_bool(value: &str, field: &str) -> Result<bool, ImportError> {
     )))
 }
 
-fn migration_marker_exists(source: &Path, name: &str) -> bool {
-    std::fs::symlink_metadata(source.join(name)).is_ok()
+fn migration_marker_exists(source: &Path, name: &str) -> Result<bool, ImportError> {
+    migration_marker_exists_with(&source.join(name), |path| {
+        std::fs::symlink_metadata(path).map(drop)
+    })
+}
+
+fn migration_marker_exists_with<F>(path: &Path, inspect: F) -> Result<bool, ImportError>
+where
+    F: FnOnce(&Path) -> std::io::Result<()>,
+{
+    match inspect(path) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(_) => Err(ImportError::InvalidSource(
+            "unable to inspect credential migration marker".into(),
+        )),
+    }
 }
 
 fn validate_actions_url(value: &str, require_non_root_path: bool) -> Result<(), ImportError> {
@@ -378,52 +428,26 @@ fn has_explicit_port(value: &str) -> bool {
 }
 
 fn validate_and_canonicalize_rsa(rsa: OfficialRsaParameters) -> Result<RsaParameters, ImportError> {
-    let source_params = RsaParameters {
-        d: rsa.d,
-        dp: rsa.dp,
-        dq: rsa.dq,
-        exponent: rsa.exponent,
-        inverse_q: rsa.inverse_q,
-        modulus: rsa.modulus,
-        p: rsa.p,
-        q: rsa.q,
+    let canonical_params = RsaParameters {
+        d: canonicalize_rsa_component(&rsa.d)?,
+        dp: canonicalize_rsa_component(&rsa.dp)?,
+        dq: canonicalize_rsa_component(&rsa.dq)?,
+        exponent: canonicalize_rsa_component(&rsa.exponent)?,
+        inverse_q: canonicalize_rsa_component(&rsa.inverse_q)?,
+        modulus: canonicalize_rsa_component(&rsa.modulus)?,
+        p: canonicalize_rsa_component(&rsa.p)?,
+        q: canonicalize_rsa_component(&rsa.q)?,
     };
-    let key = rsa_params_to_private_key(&source_params)
+    rsa_params_to_private_key(&canonical_params)
         .map_err(|_| ImportError::InvalidSource("RSA parameters are invalid".into()))?;
-    let canonical_params = private_key_to_rsa_params(&key)
-        .map_err(|_| ImportError::InvalidSource("RSA parameters are invalid".into()))?;
-
-    for (source_value, canonical_value) in rsa_components(&source_params)
-        .into_iter()
-        .zip(rsa_components(&canonical_params))
-    {
-        let source_bytes = BASE64
-            .decode(source_value)
-            .map_err(|_| ImportError::InvalidSource("RSA parameters are invalid".into()))?;
-        let canonical_bytes = BASE64
-            .decode(canonical_value)
-            .map_err(|_| ImportError::InvalidSource("RSA parameters are invalid".into()))?;
-        if source_bytes != canonical_bytes {
-            return Err(ImportError::InvalidSource(
-                "RSA parameters are not canonical".into(),
-            ));
-        }
-    }
-
     Ok(canonical_params)
 }
 
-fn rsa_components(params: &RsaParameters) -> [&str; 8] {
-    [
-        &params.d,
-        &params.dp,
-        &params.dq,
-        &params.exponent,
-        &params.inverse_q,
-        &params.modulus,
-        &params.p,
-        &params.q,
-    ]
+fn canonicalize_rsa_component(value: &str) -> Result<String, ImportError> {
+    let bytes = BASE64
+        .decode(value)
+        .map_err(|_| ImportError::InvalidSource("RSA parameters are invalid".into()))?;
+    Ok(BASE64.encode(bytes))
 }
 
 #[cfg(test)]
