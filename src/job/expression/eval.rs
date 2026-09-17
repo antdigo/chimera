@@ -4,6 +4,7 @@ use tracing::debug;
 
 use super::ExprContext;
 use super::parser::{BinOp, Expr, PropertySegment};
+use super::runner::build_runner_context;
 use super::value::Value;
 
 pub(crate) fn eval(expr: &Expr, ctx: &ExprContext) -> Result<Value, String> {
@@ -109,17 +110,7 @@ fn resolve_property(segments: &[PropertySegment], ctx: &ExprContext) -> Result<V
             }
             walk_json(ctx.context_data, segments, ctx)
         }
-        "runner" => {
-            if let Some(seg) = rest.first()
-                && let Ok(key) = segment_to_key(seg, ctx)
-            {
-                let env_key = format!("RUNNER_{}", key.to_uppercase().replace(['.', '-'], "_"));
-                if let Some(val) = ctx.env.get(&env_key) {
-                    return Ok(Value::String(val.clone()));
-                }
-            }
-            Ok(Value::Null)
-        }
+        "runner" => resolve_runner(rest, ctx),
         "env" => {
             let key = rest
                 .first()
@@ -182,6 +173,26 @@ fn resolve_property(segments: &[PropertySegment], ctx: &ExprContext) -> Result<V
             Ok(Value::Null)
         }
     }
+}
+
+fn resolve_runner(rest: &[PropertySegment], ctx: &ExprContext<'_>) -> Result<Value, String> {
+    let runner = build_runner_context(ctx.env);
+
+    let Some(first) = rest.first() else {
+        return Ok(json_to_value(&runner));
+    };
+    if matches!(first, PropertySegment::Wildcard) {
+        return Ok(Value::Null);
+    }
+
+    let key = segment_to_key(first, ctx)?
+        .to_ascii_lowercase()
+        .replace(['.', '-'], "_");
+    let Some(property) = runner.get(&key) else {
+        return Ok(Value::Null);
+    };
+
+    walk_json_inner(property, &rest[1..], ctx)
 }
 
 fn resolve_steps(rest: &[PropertySegment], ctx: &ExprContext) -> Result<Value, String> {

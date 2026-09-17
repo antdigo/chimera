@@ -1658,3 +1658,170 @@ fn job_services_port_numeric_bracket() {
         "5432"
     );
 }
+
+// ── runner context ───────────────────────────────────────────────────
+
+#[test]
+fn runner_labels_are_a_typed_array_without_environment_setup() {
+    let ctx = empty_ctx();
+
+    let labels = parse_and_eval("runner.labels", &ctx).unwrap();
+    let serialized = parse_and_eval("toJSON(runner.labels)", &ctx)
+        .unwrap()
+        .to_display();
+
+    assert_eq!(
+        labels,
+        Value::Array(vec![Value::String("self-hosted".into())])
+    );
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&serialized).unwrap(),
+        serde_json::json!(["self-hosted"]),
+    );
+}
+
+#[test]
+fn runner_labels_use_exact_array_membership() {
+    let ctx = empty_ctx();
+
+    assert!(
+        parse_and_eval("contains(runner.labels, 'self-hosted')", &ctx)
+            .unwrap()
+            .is_truthy()
+    );
+    assert!(
+        !parse_and_eval("contains(runner.labels, 'host')", &ctx)
+            .unwrap()
+            .is_truthy()
+    );
+    assert!(
+        !parse_and_eval("contains(runner.labels, 'sandbox-prod')", &ctx)
+            .unwrap()
+            .is_truthy()
+    );
+}
+
+#[test]
+fn contains_returns_false_for_an_empty_array_fixture() {
+    let data = serde_json::json!({ "matrix": { "labels": [] } });
+    let ctx = ctx_with_json(&data);
+
+    assert!(
+        !parse_and_eval("contains(matrix.labels, 'self-hosted')", &ctx)
+            .unwrap()
+            .is_truthy()
+    );
+}
+
+#[test]
+fn runner_environment_is_self_hosted() {
+    let ctx = empty_ctx();
+
+    assert_eq!(
+        parse_and_eval("runner.environment", &ctx).unwrap(),
+        Value::String("self-hosted".into()),
+    );
+}
+
+#[test]
+fn runner_object_matches_property_access_and_preserves_existing_properties() {
+    let environment = HashMap::from([
+        ("RUNNER_OS".to_string(), "Linux".to_string()),
+        ("RUNNER_ARCH".to_string(), "X64".to_string()),
+        ("RUNNER_NAME".to_string(), "chimera-1".to_string()),
+        ("RUNNER_TEMP".to_string(), "/tmp/chimera-1".to_string()),
+        (
+            "RUNNER_TOOL_CACHE".to_string(),
+            "/opt/chimera/tool-cache".to_string(),
+        ),
+        ("RUNNER_LABELS".to_string(), "host,sandbox-prod".to_string()),
+        (
+            "RUNNER_ENVIRONMENT".to_string(),
+            "github-hosted".to_string(),
+        ),
+    ]);
+    let ctx = ctx_with_env(&environment);
+
+    let serialized = parse_and_eval("toJSON(runner)", &ctx).unwrap().to_display();
+    let runner: serde_json::Value = serde_json::from_str(&serialized).unwrap();
+
+    assert_eq!(runner["labels"], serde_json::json!(["self-hosted"]));
+    assert_eq!(runner["environment"], "self-hosted");
+    assert_eq!(runner["os"], "Linux");
+    assert_eq!(runner["arch"], "X64");
+    assert_eq!(runner["name"], "chimera-1");
+    assert_eq!(runner["temp"], "/tmp/chimera-1");
+    assert_eq!(runner["tool_cache"], "/opt/chimera/tool-cache");
+    assert_eq!(
+        parse_and_eval("runner.labels[0]", &ctx)
+            .unwrap()
+            .to_display(),
+        "self-hosted",
+    );
+    assert_eq!(
+        parse_and_eval("runner['tool-cache']", &ctx)
+            .unwrap()
+            .to_display(),
+        "/opt/chimera/tool-cache",
+    );
+    assert_eq!(parse_and_eval("runner.missing", &ctx).unwrap(), Value::Null);
+}
+
+#[test]
+fn runner_properties_map_only_canonical_env_suffixes() {
+    let environment = HashMap::from([
+        ("RUNNER_OS".to_string(), "Linux".to_string()),
+        ("RUNNER_os".to_string(), "other".to_string()),
+        ("RUNNER_custom".to_string(), "value".to_string()),
+    ]);
+    let ctx = ctx_with_env(&environment);
+
+    assert_eq!(
+        parse_and_eval("runner.os", &ctx).unwrap().to_display(),
+        "Linux"
+    );
+    assert_eq!(parse_and_eval("runner.custom", &ctx).unwrap(), Value::Null);
+
+    let serialized = parse_and_eval("toJSON(runner)", &ctx).unwrap().to_display();
+    assert!(!serialized.contains("custom"));
+    let runner: serde_json::Value = serde_json::from_str(&serialized).unwrap();
+    assert_eq!(runner["os"], "Linux");
+}
+
+#[test]
+fn runner_wildcard_and_index_access_follow_json_walking_rules() {
+    let ctx = empty_ctx();
+
+    assert_eq!(parse_and_eval("runner.*", &ctx).unwrap(), Value::Null);
+    assert_eq!(
+        parse_and_eval("runner.labels.*", &ctx).unwrap(),
+        Value::Array(vec![Value::String("self-hosted".into())]),
+    );
+    assert_eq!(
+        parse_and_eval("runner['labels'][0]", &ctx)
+            .unwrap()
+            .to_display(),
+        "self-hosted",
+    );
+    assert_eq!(
+        parse_and_eval("runner.labels[1]", &ctx).unwrap(),
+        Value::Null,
+    );
+}
+
+#[test]
+fn original_runner_labels_condition_survives_failure_and_cancellation() {
+    let mut ctx = empty_ctx();
+    ctx.job_failed = true;
+
+    assert!(evaluate_condition(
+        Some("always() && contains(runner.labels, 'self-hosted')"),
+        &ctx,
+    ));
+
+    ctx.job_cancelled = true;
+    assert!(evaluate_condition(
+        Some("always() && contains(runner.labels, 'self-hosted')"),
+        &ctx,
+    ));
+}
