@@ -42,6 +42,23 @@ fn directory_inode(path: &Path) -> u64 {
     std::fs::metadata(path).unwrap().ino()
 }
 
+#[cfg(unix)]
+fn displace_runners(root: &Path, displaced_name: &str) -> (PathBuf, u64) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let runners = root.join("runners");
+    let displaced = root.join(displaced_name);
+    std::fs::rename(&runners, &displaced).unwrap();
+    std::fs::create_dir(&runners).unwrap();
+    std::fs::set_permissions(&runners, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let replacement_inode = directory_inode(&runners);
+    (displaced, replacement_inode)
+}
+
+fn assert_directory_empty(path: &Path) {
+    assert!(std::fs::read_dir(path).unwrap().next().is_none());
+}
+
 fn credential_paths(root: &Path, name: &str) -> [PathBuf; 3] {
     let directory = root.join("runners").join(name);
     [
@@ -533,6 +550,127 @@ fn group_or_world_writable_runners_directory_is_rejected() {
     assert!(import_artifacts(root.path()).is_empty());
 }
 
+#[cfg(unix)]
+#[test]
+fn displaced_runners_after_staging_validation_prevents_credential_publish() {
+    let root = tempfile::tempdir().unwrap();
+    let (lock, prepared) = prepare_locked_import(&fixture_path(), "local-runner", root.path());
+    let displaced = RefCell::new(None::<(PathBuf, u64)>);
+
+    let error = commit_with_checkpoint(prepared, |point| {
+        if point == CommitPoint::AfterStagingValidation {
+            displaced.replace(Some(displace_runners(
+                root.path(),
+                "displaced-runners-after-validation",
+            )));
+        }
+        Ok(())
+    })
+    .unwrap_err();
+
+    assert_eq!(error.category(), "write-failed");
+    let (displaced_path, replacement_inode) = displaced.borrow().clone().unwrap();
+    assert_directory_empty(&root.path().join("runners"));
+    assert_directory_empty(&displaced_path);
+    assert_eq!(
+        directory_inode(&root.path().join("runners")),
+        replacement_inode
+    );
+    assert!(!root.path().join("config.toml").exists());
+    drop(lock);
+
+    let retry = crate::import::import_official(&fixture_path(), "local-runner", root.path(), false)
+        .unwrap();
+
+    assert_eq!(retry.status, ImportStatus::Imported);
+    assert_eq!(
+        directory_inode(&root.path().join("runners")),
+        replacement_inode
+    );
+    assert_runner_once(root.path(), "local-runner");
+}
+
+#[cfg(unix)]
+#[test]
+fn displaced_runners_after_credential_publish_prevents_config_publish() {
+    let root = tempfile::tempdir().unwrap();
+    let (lock, prepared) = prepare_locked_import(&fixture_path(), "local-runner", root.path());
+    let displaced = RefCell::new(None::<(PathBuf, u64)>);
+
+    let error = commit_with_checkpoint(prepared, |point| {
+        if point == CommitPoint::AfterCredentialPublish {
+            displaced.replace(Some(displace_runners(
+                root.path(),
+                "displaced-runners-after-publish",
+            )));
+        }
+        Ok(())
+    })
+    .unwrap_err();
+
+    assert_eq!(error.category(), "write-failed");
+    let (displaced_path, replacement_inode) = displaced.borrow().clone().unwrap();
+    assert_directory_empty(&root.path().join("runners"));
+    assert!(displaced_path.join("local-runner/runner.json").is_file());
+    assert_eq!(
+        directory_inode(&root.path().join("runners")),
+        replacement_inode
+    );
+    assert!(!root.path().join("config.toml").exists());
+    drop(lock);
+
+    let retry = crate::import::import_official(&fixture_path(), "local-runner", root.path(), false)
+        .unwrap();
+
+    assert_eq!(retry.status, ImportStatus::Imported);
+    assert_eq!(
+        directory_inode(&root.path().join("runners")),
+        replacement_inode
+    );
+    assert_runner_once(root.path(), "local-runner");
+}
+
+#[cfg(unix)]
+#[test]
+fn displaced_runners_before_resume_config_publish_prevents_config_publish() {
+    let root = tempfile::tempdir().unwrap();
+    write_chimera_credentials(root.path(), "local-runner");
+    let (lock, prepared) = prepare_locked_import(&fixture_path(), "local-runner", root.path());
+    let displaced = RefCell::new(None::<(PathBuf, u64)>);
+
+    let error = commit_with_checkpoint(prepared, |point| {
+        if point == CommitPoint::BeforeConfigPublish {
+            displaced.replace(Some(displace_runners(
+                root.path(),
+                "displaced-runners-before-config",
+            )));
+        }
+        Ok(())
+    })
+    .unwrap_err();
+
+    assert_eq!(error.category(), "write-failed");
+    let (displaced_path, replacement_inode) = displaced.borrow().clone().unwrap();
+    assert_directory_empty(&root.path().join("runners"));
+    assert!(load_runner_credentials(&displaced_path, "local-runner").is_ok());
+    assert_eq!(
+        directory_inode(&root.path().join("runners")),
+        replacement_inode
+    );
+    assert!(!root.path().join("config.toml").exists());
+    drop(lock);
+
+    let retry = crate::import::import_official(&fixture_path(), "local-runner", root.path(), false)
+        .unwrap();
+
+    assert_eq!(retry.status, ImportStatus::Imported);
+    assert_eq!(
+        directory_inode(&root.path().join("runners")),
+        replacement_inode
+    );
+    assert_runner_once(root.path(), "local-runner");
+}
+
 #[test]
 fn replaced_staging_is_neither_published_nor_deleted() {
     let root = tempfile::tempdir().unwrap();
@@ -787,4 +925,42 @@ fn already_imported_requires_root_durability_without_rewriting_state() {
         credentials_before
     );
     assert_eq!(snapshot(&root.path().join("config.toml")), config_before);
+}
+
+#[cfg(unix)]
+#[test]
+fn already_imported_revalidates_runners_after_root_durability() {
+    let root = tempfile::tempdir().unwrap();
+    write_chimera_credentials(root.path(), "local-runner");
+    let config_path = root.path().join("config.toml");
+    std::fs::write(&config_path, "runners = [\"local-runner\"]\n").unwrap();
+    let config_before = snapshot(&config_path);
+    let (_lock, prepared) = prepare_locked_import(&fixture_path(), "local-runner", root.path());
+    let displaced = RefCell::new(None::<(PathBuf, u64)>);
+
+    let error = commit_with_checkpoint_and_sync(
+        prepared,
+        |_| Ok(()),
+        |point, directory| {
+            open_syncable_directory(directory)?.sync_all()?;
+            if point == DurabilityPoint::Root {
+                displaced.replace(Some(displace_runners(
+                    root.path(),
+                    "displaced-runners-already-imported",
+                )));
+            }
+            Ok(())
+        },
+    )
+    .unwrap_err();
+
+    assert_eq!(error.category(), "write-failed");
+    let (displaced_path, replacement_inode) = displaced.borrow().clone().unwrap();
+    assert_directory_empty(&root.path().join("runners"));
+    assert!(load_runner_credentials(&displaced_path, "local-runner").is_ok());
+    assert_eq!(
+        directory_inode(&root.path().join("runners")),
+        replacement_inode
+    );
+    assert_eq!(snapshot(&config_path), config_before);
 }

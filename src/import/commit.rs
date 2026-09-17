@@ -61,28 +61,32 @@ where
     S: FnMut(DurabilityPoint, &File) -> io::Result<()>,
 {
     let root = prepared.locked_root()?;
-    match prepared.disposition() {
+    let runners = match prepared.disposition() {
         TargetDisposition::AlreadyImported => {
-            let _runners = open_runners_directory(root, false).map_err(|_| {
+            let runners = open_runners_directory(root, false).map_err(|_| {
                 ImportError::WriteFailed("runners directory is not safe for import".into())
             })?;
+            validate_runners(&runners)?;
             sync_directory(DurabilityPoint::Root, root)
                 .map_err(|_| ImportError::WriteFailed("unable to sync chimera root".into()))?;
+            validate_runners(&runners)?;
             return Ok(prepared.outcome(ImportStatus::AlreadyImported));
         }
         TargetDisposition::New => {
-            publish_credentials(&prepared, &mut checkpoint, &mut sync_directory)?;
+            publish_credentials(&prepared, &mut checkpoint, &mut sync_directory)?
         }
         TargetDisposition::Resume => {
             let runners = open_runners_directory(root, false).map_err(|_| {
                 ImportError::WriteFailed("runners directory is not safe for import".into())
             })?;
-            sync_directory(DurabilityPoint::Runners, &runners)
+            sync_directory(DurabilityPoint::Runners, runners.directory())
                 .map_err(|_| ImportError::WriteFailed("unable to sync runners directory".into()))?;
+            validate_runners(&runners)?;
+            runners
         }
-    }
+    };
 
-    write_config(&prepared, &mut checkpoint, &mut sync_directory)?;
+    write_config(&prepared, &runners, &mut checkpoint, &mut sync_directory)?;
     Ok(prepared.outcome(ImportStatus::Imported))
 }
 
@@ -90,7 +94,7 @@ fn publish_credentials<F, S>(
     prepared: &PreparedImport,
     checkpoint: &mut F,
     sync_directory: &mut S,
-) -> Result<(), ImportError>
+) -> Result<RunnersHandle, ImportError>
 where
     F: FnMut(CommitPoint) -> io::Result<()>,
     S: FnMut(DurabilityPoint, &File) -> io::Result<()>,
@@ -125,6 +129,7 @@ where
     let runners = open_runners_directory(root, true)
         .map_err(|_| ImportError::WriteFailed("runners directory is not safe for import".into()))?;
     call_checkpoint(checkpoint, CommitPoint::AfterStagingValidation)?;
+    validate_runners(&runners)?;
 
     ensure_entry_identity(root, &staging_name, staging_identity)
         .map_err(|_| ImportError::WriteFailed("staging directory changed before publish".into()))?;
@@ -133,7 +138,7 @@ where
 
     let target_name = path_component(OsStr::new(prepared.name()))
         .map_err(|_| ImportError::WriteFailed("local runner name is invalid".into()))?;
-    match entry_identity(&runners, &target_name) {
+    match entry_identity(runners.directory(), &target_name) {
         Ok(_) => {
             return Err(ImportError::IdentityConflict(
                 "local name appeared during credential publication".into(),
@@ -147,7 +152,8 @@ where
         }
     }
 
-    match rename_noreplace_at(root, &staging_name, &runners, &target_name) {
+    validate_runners(&runners)?;
+    match rename_noreplace_at(root, &staging_name, runners.directory(), &target_name) {
         Ok(()) => staging_cleanup.disarm(),
         Err(error)
             if error.kind() == io::ErrorKind::AlreadyExists
@@ -165,8 +171,11 @@ where
     }
 
     call_checkpoint(checkpoint, CommitPoint::AfterCredentialPublish)?;
-    sync_directory(DurabilityPoint::Runners, &runners)
-        .map_err(|_| ImportError::WriteFailed("unable to sync runners directory".into()))
+    validate_runners(&runners)?;
+    sync_directory(DurabilityPoint::Runners, runners.directory())
+        .map_err(|_| ImportError::WriteFailed("unable to sync runners directory".into()))?;
+    validate_runners(&runners)?;
+    Ok(runners)
 }
 
 fn create_staging_directory(
@@ -208,7 +217,8 @@ fn validate_staging(staging: &File, prepared: &PreparedImport) -> Result<(), Imp
         .map_err(|_| ImportError::WriteFailed("unable to sync staging directory".into()))
 }
 
-fn open_runners_directory(root: &File, create_missing: bool) -> io::Result<File> {
+fn open_runners_directory(root: &File, create_missing: bool) -> io::Result<RunnersHandle> {
+    let parent = root.try_clone()?;
     let name = path_component(OsStr::new("runners"))?;
     let created = match entry_identity(root, &name) {
         Ok(_) => false,
@@ -232,11 +242,17 @@ fn open_runners_directory(root: &File, create_missing: bool) -> io::Result<File>
         set_file_mode(&directory, 0o700)?;
     }
     validate_private_directory(&directory, created)?;
-    Ok(directory)
+    Ok(RunnersHandle {
+        directory,
+        parent,
+        name,
+        expected,
+    })
 }
 
 fn write_config<F, S>(
     prepared: &PreparedImport,
+    runners_handle: &RunnersHandle,
     checkpoint: &mut F,
     sync_directory: &mut S,
 ) -> Result<(), ImportError>
@@ -245,6 +261,7 @@ where
     S: FnMut(DurabilityPoint, &File) -> io::Result<()>,
 {
     let root = prepared.locked_root()?;
+    validate_runners(runners_handle)?;
     let mut runners = prepared.configured_runners().to_vec();
     if !runners.iter().any(|name| name == prepared.name()) {
         runners.push(prepared.name().to_owned());
@@ -277,6 +294,7 @@ where
         .and_then(|()| file.sync_all())
         .map_err(|_| ImportError::WriteFailed("unable to write config temp file".into()))?;
     call_checkpoint(checkpoint, CommitPoint::AfterConfigTempWrite)?;
+    validate_runners(runners_handle)?;
 
     call_checkpoint(checkpoint, CommitPoint::BeforeConfigPublish)?;
     ensure_entry_identity(root, &temp_name, identity)
@@ -284,6 +302,7 @@ where
         .map_err(|_| ImportError::WriteFailed("config temp file changed before publish".into()))?;
     let config_name = path_component(OsStr::new("config.toml"))
         .map_err(|_| ImportError::WriteFailed("config file name is invalid".into()))?;
+    validate_runners(runners_handle)?;
     rename_at(root, &temp_name, root, &config_name)
         .map_err(|_| ImportError::WriteFailed("unable to publish config.toml".into()))?;
     temp_cleanup.disarm();
@@ -305,6 +324,32 @@ where
 struct EntryIdentity {
     device: libc::dev_t,
     inode: libc::ino_t,
+}
+
+#[derive(Debug)]
+struct RunnersHandle {
+    directory: File,
+    parent: File,
+    name: CString,
+    expected: EntryIdentity,
+}
+
+impl RunnersHandle {
+    const fn directory(&self) -> &File {
+        &self.directory
+    }
+
+    fn validate(&self) -> io::Result<()> {
+        ensure_entry_identity(&self.parent, &self.name, self.expected)?;
+        ensure_file_identity(&self.directory, self.expected)?;
+        validate_private_directory(&self.directory, false)
+    }
+}
+
+fn validate_runners(runners: &RunnersHandle) -> Result<(), ImportError> {
+    runners
+        .validate()
+        .map_err(|_| ImportError::WriteFailed("runners directory changed during import".into()))
 }
 
 fn file_identity(file: &File) -> io::Result<EntryIdentity> {
