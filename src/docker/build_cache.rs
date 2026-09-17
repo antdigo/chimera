@@ -172,11 +172,20 @@ impl BuildCache {
 
         match within_budget(deadline, cancel_token, build()).await {
             BudgetOutcome::Ready(Ok(image_id)) => {
-                self.entries.lock().await.insert(key, image_id.clone());
-                Ok(CacheOutcome::Ready {
-                    image_id,
-                    cache_hit: false,
-                })
+                match within_budget(deadline, cancel_token, self.entries.lock()).await {
+                    BudgetOutcome::Ready(mut entries) => {
+                        entries.insert(key, image_id.clone());
+                        Ok(CacheOutcome::Ready {
+                            image_id,
+                            cache_hit: false,
+                        })
+                    }
+                    // The image exists locally but the job has moved on; it is
+                    // left unindexed rather than cleaned up so a retry of the
+                    // same key stays free to rebuild or later reuse it.
+                    BudgetOutcome::Cancelled => Ok(CacheOutcome::Cancelled),
+                    BudgetOutcome::TimedOut => Ok(CacheOutcome::TimedOut),
+                }
             }
             BudgetOutcome::Ready(Err(error)) => Err(error),
             BudgetOutcome::Cancelled => Ok(CacheOutcome::Cancelled),
@@ -197,6 +206,13 @@ impl BuildCache {
     #[cfg(test)]
     pub(super) async fn entry_count_for_test(&self) -> usize {
         self.entries.lock().await.len()
+    }
+
+    #[cfg(test)]
+    pub(super) async fn entries_guard_for_test(
+        &self,
+    ) -> tokio::sync::MutexGuard<'_, HashMap<BuildCacheKey, String>> {
+        self.entries.lock().await
     }
 }
 

@@ -266,6 +266,154 @@ async fn timed_out_build_does_not_publish_and_can_retry() {
     assert!(matches!(retry, CacheOutcome::Ready { .. }));
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn cancelled_during_publication_does_not_index_built_image() {
+    let cache = Arc::new(BuildCache::new());
+    let cancel = CancellationToken::new();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let (build_started_tx, build_started_rx) = tokio::sync::oneshot::channel::<()>();
+    let (release_build_tx, release_build_rx) = tokio::sync::oneshot::channel::<()>();
+    let (build_resolved_tx, build_resolved_rx) = tokio::sync::oneshot::channel::<()>();
+
+    let runner = {
+        let cache = cache.clone();
+        let cancel = cancel.clone();
+        tokio::spawn(async move {
+            cache
+                .get_or_build(
+                    key("daemon-a", 1),
+                    deadline,
+                    &cancel,
+                    |_| async { Ok(true) },
+                    move || async move {
+                        build_started_tx
+                            .send(())
+                            .expect("test waits for build start");
+                        release_build_rx.await.expect("test holds the entries lock");
+                        build_resolved_tx
+                            .send(())
+                            .expect("test waits for the resolved build");
+                        Ok("sha256:built".to_string())
+                    },
+                )
+                .await
+        })
+    };
+
+    build_started_rx.await.expect("build closure must run");
+    let entries_guard = cache.entries_guard_for_test().await;
+    release_build_tx
+        .send(())
+        .expect("runner still waits for the release signal");
+    // The current-thread flavour parks the runner on the entries mutex (its
+    // build result already delivered) before this task resumes, so the cancel
+    // below can only abort the publication wait, never the build wait.
+    build_resolved_rx
+        .await
+        .expect("build result must be delivered for publication");
+    cancel.cancel();
+
+    let outcome = tokio::time::timeout(Duration::from_secs(1), runner)
+        .await
+        .expect("publication must honour the cancel token")
+        .expect("runner task must not panic")
+        .unwrap();
+    assert!(matches!(outcome, CacheOutcome::Cancelled));
+
+    drop(entries_guard);
+    assert_eq!(cache.entry_count_for_test().await, 0);
+
+    let retry = cache
+        .get_or_build(
+            key("daemon-a", 1),
+            deadline,
+            &CancellationToken::new(),
+            |_| async { Ok(true) },
+            || async { Ok("sha256:retry".to_string()) },
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        retry,
+        CacheOutcome::Ready {
+            cache_hit: false,
+            ..
+        }
+    ));
+    assert_eq!(cache.entry_count_for_test().await, 1);
+}
+
+#[tokio::test]
+async fn deadline_during_publication_does_not_index_built_image() {
+    let cache = Arc::new(BuildCache::new());
+    let (build_started_tx, build_started_rx) = tokio::sync::oneshot::channel::<()>();
+    let (release_build_tx, release_build_rx) = tokio::sync::oneshot::channel::<()>();
+    // Long enough for the runner to reach the build closure, short enough to
+    // expire while the entries mutex is unavailable.
+    let deadline = Instant::now() + Duration::from_millis(250);
+
+    let runner = {
+        let cache = cache.clone();
+        tokio::spawn(async move {
+            cache
+                .get_or_build(
+                    key("daemon-a", 1),
+                    deadline,
+                    &CancellationToken::new(),
+                    |_| async { Ok(true) },
+                    move || async move {
+                        build_started_tx
+                            .send(())
+                            .expect("test waits for build start");
+                        release_build_rx
+                            .await
+                            .expect("test releases the built result");
+                        Ok("sha256:built".to_string())
+                    },
+                )
+                .await
+        })
+    };
+
+    tokio::time::timeout(Duration::from_secs(1), build_started_rx)
+        .await
+        .expect("build must start before the deadline matters")
+        .expect("build closure must not be dropped");
+    let entries_guard = cache.entries_guard_for_test().await;
+    release_build_tx
+        .send(())
+        .expect("runner still waits for the release signal");
+
+    let outcome = tokio::time::timeout(Duration::from_secs(2), runner)
+        .await
+        .expect("publication must honour the deadline")
+        .expect("runner task must not panic")
+        .unwrap();
+    assert!(matches!(outcome, CacheOutcome::TimedOut));
+
+    drop(entries_guard);
+    assert_eq!(cache.entry_count_for_test().await, 0);
+
+    let retry = cache
+        .get_or_build(
+            key("daemon-a", 1),
+            Instant::now() + Duration::from_secs(5),
+            &CancellationToken::new(),
+            |_| async { Ok(true) },
+            || async { Ok("sha256:retry".to_string()) },
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        retry,
+        CacheOutcome::Ready {
+            cache_hit: false,
+            ..
+        }
+    ));
+    assert_eq!(cache.entry_count_for_test().await, 1);
+}
+
 #[tokio::test]
 async fn failed_build_does_not_publish_and_can_retry() {
     let cache = BuildCache::new();
