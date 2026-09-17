@@ -114,6 +114,11 @@ Chimera-only features:
 
 ## Running as a systemd service
 
+### Rootful system Docker
+
+The following base unit is for a rootful system Docker daemon only: it explicitly
+orders Chimera after, and requires, the system `docker.service`.
+
 Create the unit file:
 
 ```bash
@@ -137,17 +142,28 @@ WantedBy=multi-user.target
 EOF
 ```
 
-### Rootless Docker service environment
+### Rootless Docker alternative
 
-For a rootless Docker daemon, add a service drop-in with the daemon user's actual
-numeric UID. Replace every `<numeric-uid>` placeholder before applying it, and
-adjust `PATH` if Docker is installed elsewhere:
+Do not use the rootful base unit unchanged with rootless Docker. The daemon UID's
+rootless Docker user service and `/run/user/<numeric-uid>/docker.sock` must already
+be enabled and remain available. If the daemon user is not persistently logged in,
+enable user-service persistence first (for example, `sudo loginctl enable-linger chimera`
+when `User=chimera`).
+
+Add this drop-in to remove the inherited system-Docker dependency. Replace every
+`<numeric-uid>` placeholder with the numeric UID of the daemon user, and adjust
+`PATH` if Docker is installed elsewhere:
 
 ```bash
 sudo systemctl edit chimera.service
 ```
 
 ```ini
+[Unit]
+After=
+After=network-online.target
+Requires=
+
 [Service]
 Environment=DOCKER_HOST=unix:///run/user/<numeric-uid>/docker.sock
 Environment=XDG_RUNTIME_DIR=/run/user/<numeric-uid>
@@ -155,7 +171,7 @@ Environment=PATH=/home/chimera/.local/bin:/usr/local/bin:/usr/bin:/bin
 # Do not set DOCKER_CONFIG here.
 ```
 
-Then enable and start it:
+This drop-in has no system `docker.service` dependency. Then enable and start it:
 
 ```bash
 sudo systemctl daemon-reload

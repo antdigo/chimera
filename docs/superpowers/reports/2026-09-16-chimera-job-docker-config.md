@@ -20,6 +20,15 @@ stop/no-delete/no-restart on missing, unavailable, or uncertain evidence. The
 README also provides a rootless systemd drop-in that sets `DOCKER_HOST`,
 `XDG_RUNTIME_DIR`, and `PATH` without setting daemon-level `DOCKER_CONFIG`.
 
+## Documentation correction: Task 7 fix round 2
+
+The README now labels the base unit as rootful system-Docker only. Its rootless
+alternative uses empty `After=` and `Requires=` assignments before restoring only
+`After=network-online.target`, so it does not inherit a system `docker.service`
+dependency. It also requires the daemon UID's rootless Docker user service and
+socket to be enabled and available, with user-service persistence/linger where
+needed.
+
 | ID | Evidence and status |
 |---|---|
 | C-01 | Passed: `tests/job_docker_config_test.rs::concurrent_jobs_use_distinct_configs` |
