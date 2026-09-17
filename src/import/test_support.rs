@@ -27,6 +27,14 @@ pub(crate) fn fixture_credentials() -> crate::config::RunnerCredentials {
 }
 
 pub(crate) fn write_chimera_credentials(root: &Path, name: &str) {
+    use std::os::unix::fs::PermissionsExt;
+
     crate::config::save_runner_credentials(&root.join("runners"), name, &fixture_credentials())
         .unwrap();
+    let directory = root.join("runners").join(name);
+    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+    for file in ["runner.json", "credentials.json", "rsa_params.json"] {
+        std::fs::set_permissions(directory.join(file), std::fs::Permissions::from_mode(0o600))
+            .unwrap();
+    }
 }

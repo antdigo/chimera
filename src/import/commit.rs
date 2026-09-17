@@ -4,14 +4,15 @@ use std::io::{self, Write};
 use std::mem::MaybeUninit;
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::MetadataExt;
 
 use serde::Serialize;
 use uuid::Uuid;
 
 use crate::config::load_runner_credentials_from_directory;
 
-use super::target::{PreparedImport, TargetDisposition};
-use super::{ImportError, ImportOutcome, ImportStatus};
+use super::target::{PinnedCredentialSet, PreparedImport, TargetDisposition, pin_credential_set};
+use super::{ImportError, ImportOutcome, ImportStatus, read_opened_regular};
 
 const CREDENTIAL_FILES: [&str; 3] = ["runner.json", "credentials.json", "rsa_params.json"];
 
@@ -32,7 +33,8 @@ enum CommitPoint {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DurabilityPoint {
     Runners,
-    Root,
+    RootBeforeConfig,
+    RootFinal,
 }
 
 pub(super) fn commit(prepared: PreparedImport) -> Result<ImportOutcome, ImportError> {
@@ -61,15 +63,17 @@ where
     S: FnMut(DurabilityPoint, &File) -> io::Result<()>,
 {
     let root = prepared.locked_root()?;
-    let runners = match prepared.disposition() {
+    validate_original_state(&prepared, None, None)?;
+    let (runners, credentials) = match prepared.disposition() {
         TargetDisposition::AlreadyImported => {
             let runners = open_runners_directory(root, false).map_err(|_| {
                 ImportError::WriteFailed("runners directory is not safe for import".into())
             })?;
-            validate_runners(&runners)?;
-            sync_directory(DurabilityPoint::Root, root)
+            let credentials = pin_planned_credentials(&prepared, &runners)?;
+            validate_original_state(&prepared, Some(&runners), Some(&credentials))?;
+            sync_directory(DurabilityPoint::RootFinal, root)
                 .map_err(|_| ImportError::WriteFailed("unable to sync chimera root".into()))?;
-            validate_runners(&runners)?;
+            validate_original_state(&prepared, Some(&runners), Some(&credentials))?;
             return Ok(prepared.outcome(ImportStatus::AlreadyImported));
         }
         TargetDisposition::New => {
@@ -79,14 +83,26 @@ where
             let runners = open_runners_directory(root, false).map_err(|_| {
                 ImportError::WriteFailed("runners directory is not safe for import".into())
             })?;
+            let credentials = pin_planned_credentials(&prepared, &runners)?;
+            validate_original_state(&prepared, Some(&runners), Some(&credentials))?;
             sync_directory(DurabilityPoint::Runners, runners.directory())
                 .map_err(|_| ImportError::WriteFailed("unable to sync runners directory".into()))?;
-            validate_runners(&runners)?;
-            runners
+            validate_original_state(&prepared, Some(&runners), Some(&credentials))?;
+            (runners, credentials)
         }
     };
 
-    write_config(&prepared, &runners, &mut checkpoint, &mut sync_directory)?;
+    sync_directory(DurabilityPoint::RootBeforeConfig, root).map_err(|_| {
+        ImportError::WriteFailed("unable to sync chimera root before config".into())
+    })?;
+    validate_original_state(&prepared, Some(&runners), Some(&credentials))?;
+    write_config(
+        &prepared,
+        &runners,
+        &credentials,
+        &mut checkpoint,
+        &mut sync_directory,
+    )?;
     Ok(prepared.outcome(ImportStatus::Imported))
 }
 
@@ -94,28 +110,33 @@ fn publish_credentials<F, S>(
     prepared: &PreparedImport,
     checkpoint: &mut F,
     sync_directory: &mut S,
-) -> Result<RunnersHandle, ImportError>
+) -> Result<(RunnersHandle, PinnedCredentialSet), ImportError>
 where
     F: FnMut(CommitPoint) -> io::Result<()>,
     S: FnMut(DurabilityPoint, &File) -> io::Result<()>,
 {
     let root = prepared.locked_root()?;
     call_checkpoint(checkpoint, CommitPoint::BeforeCreateStaging)?;
+    validate_original_state(prepared, None, None)?;
 
-    let staging_name = path_component(OsStr::new(&format!(".import-{}", Uuid::new_v4())))
+    let staging_label = format!(".import-{}", Uuid::new_v4());
+    let staging_name = path_component(OsStr::new(&staging_label))
         .map_err(|_| ImportError::WriteFailed("staging directory name is invalid".into()))?;
     let (staging, staging_identity, mut staging_cleanup) =
         create_staging_directory(root, &staging_name)
             .map_err(|_| ImportError::WriteFailed("unable to create staging directory".into()))?;
     call_checkpoint(checkpoint, CommitPoint::AfterCreateStaging)?;
+    validate_original_state(prepared, None, None)?;
 
     write_private_json_at(&staging, CREDENTIAL_FILES[0], &prepared.credentials().info)
         .map_err(|_| ImportError::WriteFailed("unable to stage runner credentials".into()))?;
     call_checkpoint(checkpoint, CommitPoint::AfterRunnerJson)?;
+    validate_original_state(prepared, None, None)?;
 
     write_private_json_at(&staging, CREDENTIAL_FILES[1], &prepared.credentials().oauth)
         .map_err(|_| ImportError::WriteFailed("unable to stage runner credentials".into()))?;
     call_checkpoint(checkpoint, CommitPoint::AfterCredentialsJson)?;
+    validate_original_state(prepared, None, None)?;
 
     write_private_json_at(
         &staging,
@@ -124,12 +145,16 @@ where
     )
     .map_err(|_| ImportError::WriteFailed("unable to stage runner credentials".into()))?;
     call_checkpoint(checkpoint, CommitPoint::AfterRsaJson)?;
+    validate_original_state(prepared, None, None)?;
 
     validate_staging(&staging, prepared)?;
+    let staged_credentials =
+        pin_credential_set(root, &staging_label, None, prepared.credentials())?;
     let runners = open_runners_directory(root, true)
         .map_err(|_| ImportError::WriteFailed("runners directory is not safe for import".into()))?;
     call_checkpoint(checkpoint, CommitPoint::AfterStagingValidation)?;
-    validate_runners(&runners)?;
+    validate_original_state(prepared, Some(&runners), None)?;
+    staged_credentials.validate(prepared.credentials())?;
 
     ensure_entry_identity(root, &staging_name, staging_identity)
         .map_err(|_| ImportError::WriteFailed("staging directory changed before publish".into()))?;
@@ -152,7 +177,7 @@ where
         }
     }
 
-    validate_runners(&runners)?;
+    validate_original_state(prepared, Some(&runners), None)?;
     match rename_noreplace_at(root, &staging_name, runners.directory(), &target_name) {
         Ok(()) => staging_cleanup.disarm(),
         Err(error)
@@ -169,13 +194,19 @@ where
             ));
         }
     }
+    let credentials = pin_credential_set(
+        runners.directory(),
+        prepared.name(),
+        Some(staged_credentials.snapshot()),
+        prepared.credentials(),
+    )?;
 
     call_checkpoint(checkpoint, CommitPoint::AfterCredentialPublish)?;
-    validate_runners(&runners)?;
+    validate_original_state(prepared, Some(&runners), Some(&credentials))?;
     sync_directory(DurabilityPoint::Runners, runners.directory())
         .map_err(|_| ImportError::WriteFailed("unable to sync runners directory".into()))?;
-    validate_runners(&runners)?;
-    Ok(runners)
+    validate_original_state(prepared, Some(&runners), Some(&credentials))?;
+    Ok((runners, credentials))
 }
 
 fn create_staging_directory(
@@ -253,6 +284,7 @@ fn open_runners_directory(root: &File, create_missing: bool) -> io::Result<Runne
 fn write_config<F, S>(
     prepared: &PreparedImport,
     runners_handle: &RunnersHandle,
+    credentials: &PinnedCredentialSet,
     checkpoint: &mut F,
     sync_directory: &mut S,
 ) -> Result<(), ImportError>
@@ -261,7 +293,7 @@ where
     S: FnMut(DurabilityPoint, &File) -> io::Result<()>,
 {
     let root = prepared.locked_root()?;
-    validate_runners(runners_handle)?;
+    validate_original_state(prepared, Some(runners_handle), Some(credentials))?;
     let mut runners = prepared.configured_runners().to_vec();
     if !runners.iter().any(|name| name == prepared.name()) {
         runners.push(prepared.name().to_owned());
@@ -294,7 +326,7 @@ where
         .and_then(|()| file.sync_all())
         .map_err(|_| ImportError::WriteFailed("unable to write config temp file".into()))?;
     call_checkpoint(checkpoint, CommitPoint::AfterConfigTempWrite)?;
-    validate_runners(runners_handle)?;
+    validate_original_state(prepared, Some(runners_handle), Some(credentials))?;
 
     call_checkpoint(checkpoint, CommitPoint::BeforeConfigPublish)?;
     ensure_entry_identity(root, &temp_name, identity)
@@ -302,16 +334,116 @@ where
         .map_err(|_| ImportError::WriteFailed("config temp file changed before publish".into()))?;
     let config_name = path_component(OsStr::new("config.toml"))
         .map_err(|_| ImportError::WriteFailed("config file name is invalid".into()))?;
-    validate_runners(runners_handle)?;
-    rename_at(root, &temp_name, root, &config_name)
-        .map_err(|_| ImportError::WriteFailed("unable to publish config.toml".into()))?;
+    validate_original_state(prepared, Some(runners_handle), Some(credentials))?;
+    let publish_result = if prepared.config_was_missing() {
+        rename_noreplace_at(root, &temp_name, root, &config_name)
+    } else {
+        rename_at(root, &temp_name, root, &config_name)
+    };
+    publish_result.map_err(|_| ImportError::WriteFailed("unable to publish config.toml".into()))?;
     temp_cleanup.disarm();
+    let published = PublishedConfig {
+        name: config_name,
+        identity,
+        bytes: serialized.into_bytes(),
+        mode: mode as u32,
+    };
+    validate_published_state(prepared, runners_handle, credentials, &published)?;
     call_checkpoint(checkpoint, CommitPoint::AfterConfigPublish)?;
-    validate_runners(runners_handle)?;
+    validate_published_state(prepared, runners_handle, credentials, &published)?;
 
-    sync_directory(DurabilityPoint::Root, root)
+    sync_directory(DurabilityPoint::RootFinal, root)
         .map_err(|_| ImportError::WriteFailed("unable to sync chimera root".into()))?;
-    validate_runners(runners_handle)
+    validate_published_state(prepared, runners_handle, credentials, &published)
+}
+
+fn pin_planned_credentials(
+    prepared: &PreparedImport,
+    runners: &RunnersHandle,
+) -> Result<PinnedCredentialSet, ImportError> {
+    let snapshot = prepared.credential_snapshot().ok_or_else(|| {
+        ImportError::WriteFailed("adopted runner credential snapshot is missing".into())
+    })?;
+    pin_credential_set(
+        runners.directory(),
+        prepared.name(),
+        Some(snapshot),
+        prepared.credentials(),
+    )
+}
+
+fn validate_namespace_state(
+    prepared: &PreparedImport,
+    runners: Option<&RunnersHandle>,
+    credentials: Option<&PinnedCredentialSet>,
+) -> Result<(), ImportError> {
+    prepared.validate_visible_root()?;
+    if let Some(runners) = runners {
+        validate_runners(runners)?;
+    }
+    if let Some(credentials) = credentials {
+        credentials.validate(prepared.credentials())?;
+    }
+    Ok(())
+}
+
+fn validate_original_state(
+    prepared: &PreparedImport,
+    runners: Option<&RunnersHandle>,
+    credentials: Option<&PinnedCredentialSet>,
+) -> Result<(), ImportError> {
+    validate_namespace_state(prepared, runners, credentials)?;
+    prepared.validate_original_config()
+}
+
+#[derive(Debug)]
+struct PublishedConfig {
+    name: CString,
+    identity: EntryIdentity,
+    bytes: Vec<u8>,
+    mode: u32,
+}
+
+impl PublishedConfig {
+    fn validate(&self, root: &File) -> Result<(), ImportError> {
+        let flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK;
+        let file = open_file_at(root, &self.name, flags, 0).map_err(|_| {
+            ImportError::WriteFailed("published config.toml changed during import".into())
+        })?;
+        ensure_entry_identity(root, &self.name, self.identity)
+            .and_then(|()| ensure_file_identity(&file, self.identity))
+            .map_err(|_| {
+                ImportError::WriteFailed("published config.toml changed during import".into())
+            })?;
+        let opened = read_opened_regular(file).map_err(|_| {
+            ImportError::WriteFailed("published config.toml changed during import".into())
+        })?;
+        let opened_identity = EntryIdentity {
+            device: opened.metadata.dev() as libc::dev_t,
+            inode: opened.metadata.ino() as libc::ino_t,
+        };
+        if opened_identity != self.identity
+            || opened.bytes != self.bytes
+            || opened.metadata.mode() & 0o777 != self.mode
+        {
+            return Err(ImportError::WriteFailed(
+                "published config.toml changed during import".into(),
+            ));
+        }
+        ensure_entry_identity(root, &self.name, self.identity).map_err(|_| {
+            ImportError::WriteFailed("published config.toml changed during import".into())
+        })
+    }
+}
+
+fn validate_published_state(
+    prepared: &PreparedImport,
+    runners: &RunnersHandle,
+    credentials: &PinnedCredentialSet,
+    published: &PublishedConfig,
+) -> Result<(), ImportError> {
+    validate_namespace_state(prepared, Some(runners), Some(credentials))?;
+    published.validate(prepared.locked_root()?)
 }
 
 fn call_checkpoint<F>(checkpoint: &mut F, point: CommitPoint) -> Result<(), ImportError>

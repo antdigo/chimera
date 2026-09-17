@@ -283,6 +283,8 @@ where
 {
     let result = unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) };
     if result == 0 {
+        let directory = open_new_directory_at(parent.as_raw_fd(), name)?;
+        sync_directory(&directory)?;
         sync_parent(parent)?;
         return Ok(true);
     }

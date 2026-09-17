@@ -202,3 +202,42 @@ fn successful_missing_component_creation_requires_parent_sync() {
     assert!(matches!(error, RootLockError::Io(_)));
     assert!(parent.path().join("durable-child").is_dir());
 }
+
+#[test]
+fn restrictive_umask_parent_sync_failure_leaves_retryable_private_component() {
+    const PROBE_ENV: &str = "CHIMERA_STORAGE_RESTRICTIVE_UMASK_PROBE";
+    if std::env::var_os(PROBE_ENV).is_none() {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "storage::storage_test::restrictive_umask_parent_sync_failure_leaves_retryable_private_component",
+            ])
+            .env(PROBE_ENV, "1")
+            .status()
+            .unwrap();
+        assert!(status.success());
+        return;
+    }
+
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let parent = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(parent.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let parent_directory = open_existing_root(parent.path()).unwrap();
+    let name = std::ffi::CString::new("retryable-child").unwrap();
+    unsafe {
+        libc::umask(0o777);
+    }
+
+    let error = create_directory_at_with_sync(&parent_directory, &name, |_| {
+        Err(std::io::Error::other("injected parent sync failure"))
+    })
+    .unwrap_err();
+    let child = parent.path().join("retryable-child");
+
+    assert!(matches!(error, RootLockError::Io(_)));
+    assert_eq!(std::fs::metadata(&child).unwrap().mode() & 0o777, 0o700);
+    let retry = RootLock::acquire(&child).unwrap();
+    assert!(child.join(".chimera.lock").is_file());
+    drop(retry);
+}

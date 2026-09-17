@@ -167,7 +167,7 @@ fn missing_config_remains_missing_during_read_only_gate() {
 
 #[cfg(unix)]
 #[test]
-fn locked_apply_remains_anchored_when_root_path_is_replaced() {
+fn locked_apply_fails_closed_when_visible_root_is_replaced() {
     use std::os::unix::fs::PermissionsExt;
 
     let parent = tempfile::tempdir().unwrap();
@@ -177,32 +177,30 @@ fn locked_apply_remains_anchored_when_root_path_is_replaced() {
     let initial = target::prepare_import(&fixture_path(), "local-runner", &root).unwrap();
     let canonical_root = initial.canonical_root().to_path_buf();
     let lock = RootLock::acquire(&canonical_root).unwrap();
-    let locked_root = lock.try_clone_root().unwrap();
-    let displaced = parent.path().join("locked-root");
-    std::fs::rename(&root, &displaced).unwrap();
-    std::fs::create_dir(&root).unwrap();
-    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
-    std::fs::write(root.join("marker"), b"REPLACEMENT_ROOT").unwrap();
     let prepared = target::prepare_import_locked(
         &fixture_path(),
         "local-runner",
         &canonical_root,
-        locked_root,
+        lock.try_clone_root().unwrap(),
     )
     .unwrap();
+    let displaced = parent.path().join("locked-root");
+    std::fs::rename(&root, &displaced).unwrap();
+    std::fs::create_dir(&root).unwrap();
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let marker = root.join("marker");
+    std::fs::write(&marker, b"REPLACEMENT_ROOT").unwrap();
+    let replacement_before = snapshot(&marker);
 
-    let outcome = commit::commit(prepared).unwrap();
+    let error = match commit::commit(prepared) {
+        Ok(_) => panic!("commit unexpectedly accepted a replaced visible root"),
+        Err(error) => error,
+    };
 
-    assert_eq!(outcome.status, ImportStatus::Imported);
-    assert_eq!(
-        load_config(&displaced.join("config.toml")).unwrap().runners,
-        ["local-runner"]
-    );
-    assert!(displaced.join("runners/local-runner/runner.json").is_file());
-    assert_eq!(
-        std::fs::read(root.join("marker")).unwrap(),
-        b"REPLACEMENT_ROOT"
-    );
+    assert_eq!(error.category(), "write-failed");
+    assert!(snapshot(&marker) == replacement_before);
+    assert!(!displaced.join("config.toml").exists());
+    assert!(!displaced.join("runners").exists());
     assert!(!root.join("config.toml").exists());
     assert!(!root.join("runners").exists());
     drop(lock);
@@ -262,4 +260,112 @@ fn already_imported_rejects_unsafe_runners_without_mutating_state() {
     assert_eq!(error.category(), "write-failed");
     let after: Vec<_> = paths.iter().map(|path| snapshot(path)).collect();
     assert_eq!(after, before);
+}
+
+#[cfg(unix)]
+#[test]
+fn adopted_target_directory_must_already_be_private() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    for configured in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        crate::import::test_support::write_chimera_credentials(root.path(), "local-runner");
+        let target = root.path().join("runners/local-runner");
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let config_path = root.path().join("config.toml");
+        if configured {
+            std::fs::write(&config_path, "runners = [\"local-runner\"]\n").unwrap();
+        }
+        let target_before = std::fs::metadata(&target).unwrap();
+        let credentials_before: Vec<_> = ["runner.json", "credentials.json", "rsa_params.json"]
+            .map(|name| snapshot(&target.join(name)))
+            .into();
+        let config_before = std::fs::read(&config_path).ok();
+
+        let error = match import_official(&fixture_path(), "local-runner", root.path(), false) {
+            Ok(_) => panic!("unsafe adopted target directory was accepted"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.category(), "write-failed");
+        let target_after = std::fs::metadata(&target).unwrap();
+        assert_eq!(target_after.ino(), target_before.ino());
+        assert_eq!(target_after.mode(), target_before.mode());
+        let credentials_after: Vec<_> = ["runner.json", "credentials.json", "rsa_params.json"]
+            .map(|name| snapshot(&target.join(name)))
+            .into();
+        assert!(credentials_after == credentials_before);
+        assert!(std::fs::read(&config_path).ok() == config_before);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn adopted_credential_file_must_already_be_private() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    for configured in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        crate::import::test_support::write_chimera_credentials(root.path(), "local-runner");
+        let credential = root.path().join("runners/local-runner/credentials.json");
+        std::fs::set_permissions(&credential, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let config_path = root.path().join("config.toml");
+        if configured {
+            std::fs::write(&config_path, "runners = [\"local-runner\"]\n").unwrap();
+        }
+        let credential_before = snapshot(&credential);
+        let metadata_before = std::fs::metadata(&credential).unwrap();
+        let config_before = std::fs::read(&config_path).ok();
+
+        let error = match import_official(&fixture_path(), "local-runner", root.path(), false) {
+            Ok(_) => panic!("unsafe adopted credential file was accepted"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.category(), "write-failed");
+        let metadata_after = std::fs::metadata(&credential).unwrap();
+        assert_eq!(metadata_after.ino(), metadata_before.ino());
+        assert_eq!(metadata_after.mode(), metadata_before.mode());
+        assert!(snapshot(&credential) == credential_before);
+        assert!(std::fs::read(&config_path).ok() == config_before);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn unrelated_legacy_runner_modes_do_not_block_a_new_import() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = tempfile::tempdir().unwrap();
+    crate::import::test_support::write_chimera_credentials(root.path(), "legacy");
+    let legacy = root.path().join("runners/legacy");
+    std::fs::set_permissions(&legacy, std::fs::Permissions::from_mode(0o755)).unwrap();
+    for name in ["runner.json", "credentials.json", "rsa_params.json"] {
+        std::fs::set_permissions(legacy.join(name), std::fs::Permissions::from_mode(0o644))
+            .unwrap();
+    }
+    let runner_path = legacy.join("runner.json");
+    let mut runner: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&runner_path).unwrap()).unwrap();
+    runner["gitHubUrl"] = serde_json::json!("https://github.com/example/legacy");
+    std::fs::write(&runner_path, serde_json::to_vec_pretty(&runner).unwrap()).unwrap();
+    std::fs::write(root.path().join("config.toml"), "runners = [\"legacy\"]\n").unwrap();
+
+    let outcome = import_official(&fixture_path(), "local-runner", root.path(), false).unwrap();
+
+    assert_eq!(outcome.status, ImportStatus::Imported);
+    assert_eq!(
+        std::fs::metadata(&legacy).unwrap().permissions().mode() & 0o777,
+        0o755
+    );
+    for name in ["runner.json", "credentials.json", "rsa_params.json"] {
+        assert_eq!(
+            std::fs::metadata(legacy.join(name))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o644
+        );
+    }
 }

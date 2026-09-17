@@ -1,9 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{CStr, CString, OsStr, OsString};
-use std::fs::File;
+use std::fs::{File, Metadata};
 use std::io;
-use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 
 use serde::de::DeserializeOwned;
@@ -20,6 +21,43 @@ use super::{
 const CREDENTIAL_FILES: [&str; 3] = ["runner.json", "credentials.json", "rsa_params.json"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileIdentity {
+    device: u64,
+    inode: u64,
+}
+
+impl FileIdentity {
+    fn from_metadata(metadata: &Metadata) -> Self {
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct CredentialSetSnapshot {
+    directory: FileIdentity,
+    files: [FileIdentity; 3],
+}
+
+#[derive(Debug)]
+struct PinnedCredentialFile {
+    name: CString,
+    file: File,
+    identity: FileIdentity,
+}
+
+#[derive(Debug)]
+pub(super) struct PinnedCredentialSet {
+    parent: File,
+    name: CString,
+    directory: File,
+    snapshot: CredentialSetSnapshot,
+    files: Vec<PinnedCredentialFile>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TargetDisposition {
     New,
     Resume,
@@ -27,10 +65,29 @@ pub(crate) enum TargetDisposition {
 }
 
 #[derive(Debug)]
+enum ConfigSnapshot {
+    Missing,
+    Existing {
+        identity: FileIdentity,
+        bytes: Vec<u8>,
+        mode: u32,
+    },
+}
+
+#[derive(Debug)]
 pub(crate) struct PreservedConfig {
     model: ChimeraConfig,
     document: toml::Table,
-    original_mode: Option<u32>,
+    snapshot: ConfigSnapshot,
+}
+
+impl PreservedConfig {
+    const fn mode(&self) -> Option<u32> {
+        match &self.snapshot {
+            ConfigSnapshot::Missing => None,
+            ConfigSnapshot::Existing { mode, .. } => Some(*mode),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -40,6 +97,7 @@ pub(crate) struct PreparedImport {
     paths: ChimeraPaths,
     config: PreservedConfig,
     disposition: TargetDisposition,
+    credential_snapshot: Option<CredentialSetSnapshot>,
     locked_root: Option<File>,
 }
 
@@ -77,13 +135,29 @@ impl PreparedImport {
     }
 
     pub(super) const fn config_mode(&self) -> Option<u32> {
-        self.config.original_mode
+        self.config.mode()
+    }
+
+    pub(super) const fn config_was_missing(&self) -> bool {
+        matches!(&self.config.snapshot, ConfigSnapshot::Missing)
+    }
+
+    pub(super) const fn credential_snapshot(&self) -> Option<&CredentialSetSnapshot> {
+        self.credential_snapshot.as_ref()
     }
 
     pub(super) fn locked_root(&self) -> Result<&File, ImportError> {
         self.locked_root.as_ref().ok_or_else(|| {
             ImportError::WriteFailed("import commit is missing the locked root descriptor".into())
         })
+    }
+
+    pub(super) fn validate_visible_root(&self) -> Result<(), ImportError> {
+        verify_opened_root_matches_path(self.locked_root()?, &self.paths.root)
+    }
+
+    pub(super) fn validate_original_config(&self) -> Result<(), ImportError> {
+        self.config.snapshot.validate(self.locked_root()?)
     }
 }
 
@@ -133,6 +207,13 @@ fn prepare_with_root(
     opened_root: Option<File>,
     retain_locked_root: bool,
 ) -> Result<PreparedImport, ImportError> {
+    if retain_locked_root {
+        let root = opened_root.as_ref().ok_or_else(|| {
+            ImportError::WriteFailed("import commit is missing the locked root descriptor".into())
+        })?;
+        verify_opened_root_matches_path(root, &paths.root)?;
+    }
+
     let target = paths.runner_dir(name);
     if registration.canonical_source.starts_with(&target)
         || target.starts_with(&registration.canonical_source)
@@ -151,6 +232,19 @@ fn prepare_with_root(
     };
     validate_config_entries(name, &config, &existing)?;
     let disposition = classify_disposition(name, &registration, &config, &existing)?;
+    let credential_snapshot = match disposition {
+        TargetDisposition::New => None,
+        TargetDisposition::Resume | TargetDisposition::AlreadyImported => {
+            let root = opened_root.as_ref().ok_or_else(|| {
+                ImportError::WriteFailed("unable to pin adopted runner credentials".into())
+            })?;
+            let runners = open_directory_at(root, OsStr::new("runners")).map_err(|_| {
+                ImportError::WriteFailed("unable to pin adopted runner credentials".into())
+            })?;
+            let pinned = pin_credential_set(&runners, name, None, &registration.credentials)?;
+            Some(pinned.snapshot.clone())
+        }
+    };
 
     Ok(PreparedImport {
         name: name.to_owned(),
@@ -158,6 +252,7 @@ fn prepare_with_root(
         paths,
         config,
         disposition,
+        credential_snapshot,
         locked_root: if retain_locked_root {
             opened_root
         } else {
@@ -239,16 +334,18 @@ fn canonicalize_allow_missing(path: &Path) -> Result<PathBuf, ImportError> {
 }
 
 fn verify_opened_root_matches_path(root: &File, path: &Path) -> Result<(), ImportError> {
-    use std::os::unix::fs::MetadataExt;
-
     let opened = root
         .metadata()
         .map_err(|_| ImportError::WriteFailed("unable to inspect opened target root".into()))?;
-    let resolved = std::fs::metadata(path)
-        .map_err(|_| ImportError::WriteFailed("target root changed while planning".into()))?;
-    if !resolved.is_dir() || opened.dev() != resolved.dev() || opened.ino() != resolved.ino() {
+    let resolved = open_existing_root(path).map_err(|_| {
+        ImportError::WriteFailed("visible target root changed during import".into())
+    })?;
+    let resolved = resolved.metadata().map_err(|_| {
+        ImportError::WriteFailed("visible target root changed during import".into())
+    })?;
+    if FileIdentity::from_metadata(&opened) != FileIdentity::from_metadata(&resolved) {
         return Err(ImportError::WriteFailed(
-            "target root changed while planning".into(),
+            "visible target root changed during import".into(),
         ));
     }
     Ok(())
@@ -272,19 +369,23 @@ fn load_preserved_config(root: &File) -> Result<PreservedConfig, ImportError> {
 }
 
 fn preserved_config_from_opened(opened: OpenedRegularFile) -> Result<PreservedConfig, ImportError> {
-    use std::os::unix::fs::PermissionsExt;
-
     let text = std::str::from_utf8(&opened.bytes)
         .map_err(|_| ImportError::WriteFailed("unable to parse existing config.toml".into()))?;
     let model = toml::from_str(text)
         .map_err(|_| ImportError::WriteFailed("unable to parse existing config.toml".into()))?;
     let document = toml::from_str(text)
         .map_err(|_| ImportError::WriteFailed("unable to parse existing config.toml".into()))?;
+    let identity = FileIdentity::from_metadata(&opened.metadata);
+    let mode = opened.metadata.mode() & 0o777;
 
     Ok(PreservedConfig {
         model,
         document,
-        original_mode: Some(opened.metadata.permissions().mode() & 0o777),
+        snapshot: ConfigSnapshot::Existing {
+            identity,
+            bytes: opened.bytes,
+            mode,
+        },
     })
 }
 
@@ -297,8 +398,171 @@ fn default_preserved_config() -> Result<PreservedConfig, ImportError> {
     Ok(PreservedConfig {
         model,
         document,
-        original_mode: None,
+        snapshot: ConfigSnapshot::Missing,
     })
+}
+
+impl ConfigSnapshot {
+    fn validate(&self, root: &File) -> Result<(), ImportError> {
+        match self {
+            Self::Missing => match open_regular_at(root, OsStr::new("config.toml")) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+                Ok(_) | Err(_) => Err(ImportError::WriteFailed(
+                    "config.toml changed during import".into(),
+                )),
+            },
+            Self::Existing {
+                identity,
+                bytes,
+                mode,
+            } => {
+                let file = open_regular_at(root, OsStr::new("config.toml")).map_err(|_| {
+                    ImportError::WriteFailed("config.toml changed during import".into())
+                })?;
+                let opened = read_opened_regular(file).map_err(|_| {
+                    ImportError::WriteFailed("config.toml changed during import".into())
+                })?;
+                if FileIdentity::from_metadata(&opened.metadata) != *identity
+                    || opened.bytes != *bytes
+                    || opened.metadata.mode() & 0o777 != *mode
+                {
+                    return Err(ImportError::WriteFailed(
+                        "config.toml changed during import".into(),
+                    ));
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+pub(super) fn pin_credential_set(
+    runners: &File,
+    name: &str,
+    expected_snapshot: Option<&CredentialSetSnapshot>,
+    expected_credentials: &RunnerCredentials,
+) -> Result<PinnedCredentialSet, ImportError> {
+    let name = path_component(OsStr::new(name))
+        .map_err(|_| ImportError::WriteFailed("unable to pin adopted runner credentials".into()))?;
+    let directory = open_directory_at(runners, OsStr::from_bytes(name.as_bytes()))
+        .map_err(|_| ImportError::WriteFailed("unable to pin adopted runner credentials".into()))?;
+    validate_private_owned_directory(&directory).map_err(|_| {
+        ImportError::WriteFailed("adopted runner credentials are not private owned storage".into())
+    })?;
+    let directory_identity = file_identity(&directory)
+        .map_err(|_| ImportError::WriteFailed("unable to pin adopted runner credentials".into()))?;
+    ensure_entry_identity(runners, &name, directory_identity).map_err(|_| {
+        ImportError::WriteFailed("adopted runner credentials changed during import".into())
+    })?;
+    validate_exact_credential_entries(&directory).map_err(|_| {
+        ImportError::WriteFailed("adopted runner credential set is incomplete or unsafe".into())
+    })?;
+
+    let mut files = Vec::with_capacity(CREDENTIAL_FILES.len());
+    let mut identities = Vec::with_capacity(CREDENTIAL_FILES.len());
+    for file_name in CREDENTIAL_FILES {
+        let component = path_component(OsStr::new(file_name)).map_err(|_| {
+            ImportError::WriteFailed("unable to pin adopted runner credentials".into())
+        })?;
+        let file =
+            open_regular_at(&directory, OsStr::from_bytes(component.as_bytes())).map_err(|_| {
+                ImportError::WriteFailed("unable to pin adopted runner credentials".into())
+            })?;
+        validate_private_owned_regular_file(&file).map_err(|_| {
+            ImportError::WriteFailed(
+                "adopted runner credentials are not private owned storage".into(),
+            )
+        })?;
+        let identity = file_identity(&file).map_err(|_| {
+            ImportError::WriteFailed("unable to pin adopted runner credentials".into())
+        })?;
+        ensure_entry_identity(&directory, &component, identity).map_err(|_| {
+            ImportError::WriteFailed("adopted runner credentials changed during import".into())
+        })?;
+        identities.push(identity);
+        files.push(PinnedCredentialFile {
+            name: component,
+            file,
+            identity,
+        });
+    }
+    let files_identity: [FileIdentity; 3] = identities
+        .try_into()
+        .map_err(|_| ImportError::WriteFailed("unable to pin adopted runner credentials".into()))?;
+    let snapshot = CredentialSetSnapshot {
+        directory: directory_identity,
+        files: files_identity,
+    };
+    if expected_snapshot.is_some_and(|expected| expected != &snapshot) {
+        return Err(ImportError::WriteFailed(
+            "adopted runner credentials changed during import".into(),
+        ));
+    }
+
+    let pinned = PinnedCredentialSet {
+        parent: runners.try_clone().map_err(|_| {
+            ImportError::WriteFailed("unable to pin adopted runner credentials".into())
+        })?,
+        name,
+        directory,
+        snapshot,
+        files,
+    };
+    pinned.validate(expected_credentials)?;
+    Ok(pinned)
+}
+
+impl PinnedCredentialSet {
+    pub(super) const fn snapshot(&self) -> &CredentialSetSnapshot {
+        &self.snapshot
+    }
+
+    pub(super) fn validate(
+        &self,
+        expected_credentials: &RunnerCredentials,
+    ) -> Result<(), ImportError> {
+        self.validate_namespace()?;
+        let loaded = crate::config::load_runner_credentials_from_directory(&self.directory)
+            .map_err(|_| {
+                ImportError::WriteFailed("adopted runner credential validation failed".into())
+            })?;
+        if loaded != *expected_credentials {
+            return Err(ImportError::WriteFailed(
+                "adopted runner credentials changed during import".into(),
+            ));
+        }
+        self.validate_namespace()
+    }
+
+    fn validate_namespace(&self) -> Result<(), ImportError> {
+        ensure_entry_identity(&self.parent, &self.name, self.snapshot.directory)
+            .and_then(|()| ensure_file_identity(&self.directory, self.snapshot.directory))
+            .and_then(|()| validate_private_owned_directory(&self.directory))
+            .and_then(|()| validate_exact_credential_entries(&self.directory))
+            .map_err(|_| {
+                ImportError::WriteFailed("adopted runner credentials changed during import".into())
+            })?;
+
+        for (index, file) in self.files.iter().enumerate() {
+            let expected = self.snapshot.files.get(index).copied().ok_or_else(|| {
+                ImportError::WriteFailed("adopted runner credential set is incomplete".into())
+            })?;
+            if expected != file.identity {
+                return Err(ImportError::WriteFailed(
+                    "adopted runner credentials changed during import".into(),
+                ));
+            }
+            ensure_entry_identity(&self.directory, &file.name, expected)
+                .and_then(|()| ensure_file_identity(&file.file, expected))
+                .and_then(|()| validate_private_owned_regular_file(&file.file))
+                .map_err(|_| {
+                    ImportError::WriteFailed(
+                        "adopted runner credentials changed during import".into(),
+                    )
+                })?;
+        }
+        Ok(())
+    }
 }
 
 fn inspect_existing_credentials(
@@ -402,6 +666,80 @@ fn open_at(parent: &File, name: &OsStr, flags: i32) -> io::Result<File> {
     Ok(unsafe { File::from_raw_fd(fd) })
 }
 
+fn file_identity(file: &File) -> io::Result<FileIdentity> {
+    file.metadata()
+        .map(|metadata| FileIdentity::from_metadata(&metadata))
+}
+
+fn entry_identity(parent: &File, name: &CStr) -> io::Result<FileIdentity> {
+    let flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK;
+    let entry = open_at(parent, OsStr::from_bytes(name.to_bytes()), flags)?;
+    file_identity(&entry)
+}
+
+fn ensure_file_identity(file: &File, expected: FileIdentity) -> io::Result<()> {
+    if file_identity(file)? == expected {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "opened entry identity changed",
+        ))
+    }
+}
+
+fn ensure_entry_identity(parent: &File, name: &CStr, expected: FileIdentity) -> io::Result<()> {
+    if entry_identity(parent, name)? == expected {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "directory entry identity changed",
+        ))
+    }
+}
+
+fn validate_private_owned_directory(directory: &File) -> io::Result<()> {
+    let metadata = directory.metadata()?;
+    if metadata.is_dir() && metadata.uid() == effective_uid() && metadata.mode() & 0o777 == 0o700 {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "directory is not private owned storage",
+        ))
+    }
+}
+
+fn validate_private_owned_regular_file(file: &File) -> io::Result<()> {
+    let metadata = file.metadata()?;
+    if metadata.is_file() && metadata.uid() == effective_uid() && metadata.mode() & 0o777 == 0o600 {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "file is not private owned storage",
+        ))
+    }
+}
+
+fn validate_exact_credential_entries(directory: &File) -> io::Result<()> {
+    let actual: BTreeSet<_> = read_directory_names(directory)?.into_iter().collect();
+    let expected: BTreeSet<_> = CREDENTIAL_FILES.into_iter().map(OsString::from).collect();
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "credential directory contains an unexpected entry set",
+        ))
+    }
+}
+
+fn effective_uid() -> u32 {
+    unsafe { libc::geteuid() }
+}
+
 fn path_component(name: &OsStr) -> io::Result<CString> {
     let bytes = name.as_bytes();
     if bytes.is_empty() || bytes == b"." || bytes == b".." || bytes.contains(&b'/') {
@@ -415,8 +753,18 @@ fn path_component(name: &OsStr) -> io::Result<CString> {
 }
 
 fn read_directory_names(directory: &File) -> io::Result<Vec<OsString>> {
-    let duplicate = directory.try_clone()?;
-    let fd = duplicate.into_raw_fd();
+    let current = CString::new(".")
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid current directory"))?;
+    let fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            current.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
     let stream = unsafe { libc::fdopendir(fd) };
     if stream.is_null() {
         let error = io::Error::last_os_error();

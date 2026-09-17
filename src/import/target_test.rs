@@ -239,7 +239,7 @@ fn preserves_unknown_config_settings_and_original_mode() {
         prepared.config.document["future"]["enabled"].as_bool(),
         Some(true)
     );
-    assert_eq!(prepared.config.original_mode, Some(0o640));
+    assert_eq!(prepared.config.mode(), Some(0o640));
     assert_eq!(
         std::fs::metadata(config_path).unwrap().mode() & 0o777,
         0o640
@@ -579,5 +579,43 @@ fn config_bytes_and_mode_come_from_same_open_descriptor() {
 
     assert!(preserved.model.runners.is_empty());
     assert_eq!(preserved.document["marker"].as_str(), Some("original"));
-    assert_eq!(preserved.original_mode, Some(0o600));
+    assert_eq!(preserved.mode(), Some(0o600));
+}
+
+#[test]
+fn percent_encoded_alias_cannot_bypass_existing_identity_conflict() {
+    let source = copy_fixture();
+    mutate_json(source.path(), ".runner", |runner| {
+        runner["gitHubUrl"] = json!("https://github.com/%65xample/repository");
+    });
+    let root = tempfile::tempdir().unwrap();
+    write_chimera_credentials(root.path(), "canonical");
+    write_config(root.path(), "runners = [\"canonical\"]\n");
+    let before = snapshot_tree(root.path());
+
+    let error = match prepare_import(source.path(), "alias", root.path()) {
+        Ok(_) => panic!("percent-encoded repository alias was accepted"),
+        Err(error) => error,
+    };
+
+    assert_error_category(&error, "unsupported-registration");
+    assert!(snapshot_tree(root.path()) == before);
+}
+
+#[test]
+fn adopted_credential_set_rejects_extra_leaf_without_mutation() {
+    let root = tempfile::tempdir().unwrap();
+    write_chimera_credentials(root.path(), "local");
+    let extra = root.path().join("runners/local/extra.json");
+    std::fs::write(&extra, b"synthetic-extra-entry").unwrap();
+    write_config(root.path(), "runners = [\"local\"]\n");
+    let before = snapshot_tree(root.path());
+
+    let error = match prepare_import(&fixture_path(), "local", root.path()) {
+        Ok(_) => panic!("adopted credential set with an extra leaf was accepted"),
+        Err(error) => error,
+    };
+
+    assert_error_category(&error, "write-failed");
+    assert!(snapshot_tree(root.path()) == before);
 }
