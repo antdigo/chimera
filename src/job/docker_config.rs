@@ -176,7 +176,7 @@ impl JobResourceRoot {
     }
 
     fn create_with_id(&self, attempt_id: Uuid) -> Result<JobDockerConfig, JobDockerConfigError> {
-        validate_private_directory(&self.canonical_path)?;
+        validate_bound_private_directory(&self.canonical_path, self.identity)?;
         let attempt_dir = self.canonical_path.join(attempt_id.simple().to_string());
         match create_private_dir(&attempt_dir, "creating job attempt directory") {
             Ok(()) => {}
@@ -375,9 +375,26 @@ fn create_private_dir(path: &Path, operation: &'static str) -> Result<(), JobDoc
         .map_err(|source| io_error("setting private directory permissions", path, source))
 }
 
+fn validate_bound_private_directory(
+    path: &Path,
+    expected_identity: DirectoryIdentity,
+) -> Result<(), JobDockerConfigError> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|source| io_error("reading directory metadata", path, source))?;
+    validate_private_directory_metadata(path, &metadata)?;
+    validate_bound_directory(path, expected_identity, &metadata)
+}
+
 fn validate_private_directory(path: &Path) -> Result<(), JobDockerConfigError> {
     let metadata = fs::symlink_metadata(path)
         .map_err(|source| io_error("reading directory metadata", path, source))?;
+    validate_private_directory_metadata(path, &metadata)
+}
+
+fn validate_private_directory_metadata(
+    path: &Path,
+    metadata: &fs::Metadata,
+) -> Result<(), JobDockerConfigError> {
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
         return Err(JobDockerConfigError::UnsafeRoot {
             path: path.to_path_buf(),

@@ -132,6 +132,45 @@ fn cleanup_is_idempotent_and_keeps_neighbor() {
 }
 
 #[test]
+fn creation_refuses_replacement_root_before_mutation() {
+    let (temp, root) = prepared_root();
+    let original_root = root.path().to_path_buf();
+    let moved_root = temp.path().join("moved-job-resources");
+    std::fs::rename(&original_root, &moved_root).unwrap();
+    std::fs::create_dir(&original_root).unwrap();
+    std::fs::set_permissions(&original_root, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let attempt_id = Uuid::nil();
+    let attempt_name = attempt_id.simple().to_string();
+
+    let error = root.create_with_id(attempt_id).unwrap_err();
+
+    assert!(matches!(error, JobDockerConfigError::UnsafeEntry { .. }));
+    assert!(!original_root.join(&attempt_name).exists());
+    assert!(!moved_root.join(&attempt_name).exists());
+}
+
+#[test]
+fn creation_refuses_ancestor_symlink_before_mutation() {
+    let temp = TempDir::new().unwrap();
+    let original_parent = temp.path().join("resource-parent");
+    std::fs::create_dir(&original_parent).unwrap();
+    let root_path = original_parent.join("job-resources");
+    let root = JobResourceRoot::prepare(&root_path).unwrap();
+    let moved_parent = temp.path().join("moved-resource-parent");
+    std::fs::rename(&original_parent, &moved_parent).unwrap();
+    std::os::unix::fs::symlink(&moved_parent, &original_parent).unwrap();
+    let attempt_id = Uuid::from_u128(1);
+    let attempt_name = attempt_id.simple().to_string();
+    let moved_root = moved_parent.join("job-resources");
+
+    let error = root.create_with_id(attempt_id).unwrap_err();
+
+    assert!(matches!(error, JobDockerConfigError::UnsafeEntry { .. }));
+    assert!(!root_path.join(&attempt_name).exists());
+    assert!(!moved_root.join(&attempt_name).exists());
+}
+
+#[test]
 fn cleanup_refuses_moved_root_replaced_by_symlink() {
     let (temp, root) = prepared_root();
     let original_root = root.path().to_path_buf();

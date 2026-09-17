@@ -156,6 +156,105 @@ fn pid_lock_holder_child() {
 }
 
 #[test]
+fn fresh_pid_file_race_has_single_owner_and_valid_pid() {
+    let temp = TempDir::new().unwrap();
+    let path = temp.path().join("chimera.pid");
+    let control = temp.path().join("control");
+    std::fs::create_dir(&control).unwrap();
+    let mut creator = TestChild::spawn(
+        "daemon::daemon_test::fresh_pid_file_race_child",
+        &path,
+        &control,
+        "creator",
+    );
+
+    wait_for_signal(&control, "creator.opened");
+    let mut contender = TestChild::spawn(
+        "daemon::daemon_test::fresh_pid_file_race_child",
+        &path,
+        &control,
+        "contender",
+    );
+    wait_for_signal(&control, "contender.locked");
+    wait_for_signal(&control, "creator.result");
+    wait_for_signal(&control, "contender.result");
+
+    let creator_result = std::fs::read_to_string(control.join("creator.result")).unwrap();
+    let contender_result = std::fs::read_to_string(control.join("contender.result")).unwrap();
+    let results = [&creator_result, &contender_result];
+    assert_eq!(
+        results
+            .iter()
+            .filter(|result| result.starts_with("acquired:"))
+            .count(),
+        1
+    );
+    assert!(
+        results
+            .iter()
+            .any(|result| result.starts_with("rejected:chimera daemon already running"))
+    );
+
+    let owner_pid = results
+        .iter()
+        .find_map(|result| result.strip_prefix("acquired:"))
+        .unwrap();
+    let published_pid = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(published_pid, owner_pid);
+    assert!(published_pid.parse::<u32>().is_ok());
+
+    std::fs::write(control.join("release"), []).unwrap();
+    assert!(creator.wait().success());
+    assert!(contender.wait().success());
+    assert!(!path.exists());
+}
+
+#[test]
+fn fresh_pid_file_race_child() {
+    let Some(path) = std::env::var_os("CHIMERA_PID_LOCK_TEST_PATH") else {
+        return;
+    };
+    let control =
+        std::path::PathBuf::from(std::env::var_os("CHIMERA_PID_LOCK_TEST_CONTROL").unwrap());
+    let id = std::env::var("CHIMERA_PID_LOCK_TEST_ID").unwrap();
+
+    let result = PidLock::acquire_with_hooks(
+        Path::new(&path),
+        || {
+            std::fs::write(control.join(format!("{id}.opened")), []).unwrap();
+            if id == "creator" {
+                wait_for_signal(&control, "contender.locked");
+            }
+        },
+        || {
+            std::fs::write(control.join(format!("{id}.locked")), []).unwrap();
+            if id == "contender" {
+                wait_for_signal(&control, "creator.result");
+            }
+        },
+    );
+
+    match result {
+        Ok(lock) => {
+            std::fs::write(
+                control.join(format!("{id}.result")),
+                format!("acquired:{}", std::process::id()),
+            )
+            .unwrap();
+            wait_for_signal(&control, "release");
+            drop(lock);
+        }
+        Err(error) => {
+            std::fs::write(
+                control.join(format!("{id}.result")),
+                format!("rejected:{error}"),
+            )
+            .unwrap();
+        }
+    }
+}
+
+#[test]
 fn concurrent_stale_lock_reclamation_has_single_owner() {
     let temp = TempDir::new().unwrap();
     let path = temp.path().join("chimera.pid");

@@ -28,22 +28,36 @@ pub struct PidLock {
 
 impl PidLock {
     pub fn acquire(path: &Path) -> Result<Self> {
+        Self::acquire_with_hooks(path, || {}, || {})
+    }
+
+    fn acquire_with_hooks<AfterOpen, AfterLock>(
+        path: &Path,
+        after_open: AfterOpen,
+        after_lock: AfterLock,
+    ) -> Result<Self>
+    where
+        AfterOpen: FnOnce(),
+        AfterLock: FnOnce(),
+    {
         use std::io::{Read, Seek, SeekFrom, Write};
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
-        let (mut file, was_created) = open_pid_lock_file(path)?;
+        let mut file = open_pid_lock_file(path)?;
+        after_open();
         claim_pid_lock(&file, path)?;
         let metadata = file
             .metadata()
             .context("reading acquired PID lock metadata")?;
         verify_pid_lock_path(path, metadata.dev(), metadata.ino())?;
+        after_lock();
 
-        if !was_created {
-            file.seek(SeekFrom::Start(0))
-                .with_context(|| format!("seeking PID file {}", path.display()))?;
-            let mut content = String::new();
-            file.read_to_string(&mut content)
-                .with_context(|| format!("reading PID file {}", path.display()))?;
+        file.seek(SeekFrom::Start(0))
+            .with_context(|| format!("seeking PID file {}", path.display()))?;
+        let mut content = String::new();
+        file.read_to_string(&mut content)
+            .with_context(|| format!("reading PID file {}", path.display()))?;
+        if !content.is_empty() {
             let pid: u32 = content
                 .trim()
                 .parse()
@@ -73,7 +87,7 @@ impl PidLock {
     }
 }
 
-fn open_pid_lock_file(path: &Path) -> Result<(std::fs::File, bool)> {
+fn open_pid_lock_file(path: &Path) -> Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
 
     let nofollow_nonblocking = libc::O_NOFOLLOW | libc::O_NONBLOCK;
@@ -85,7 +99,7 @@ fn open_pid_lock_file(path: &Path) -> Result<(std::fs::File, bool)> {
         .custom_flags(nofollow_nonblocking)
         .open(path)
     {
-        Ok(file) => Ok((file, true)),
+        Ok(file) => Ok(file),
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
             let metadata = std::fs::symlink_metadata(path)
                 .with_context(|| format!("reading PID file metadata {}", path.display()))?;
@@ -111,7 +125,7 @@ fn open_pid_lock_file(path: &Path) -> Result<(std::fs::File, bool)> {
             if !metadata.is_file() {
                 bail!("unsafe PID lock path: {}", path.display());
             }
-            Ok((file, false))
+            Ok(file)
         }
         Err(error) => Err(error).with_context(|| format!("creating PID file {}", path.display())),
     }

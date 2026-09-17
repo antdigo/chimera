@@ -320,6 +320,18 @@ async fn run_nested_action(
         }
     }
 
+    let environment = step_map
+        .get(ykey("env"))
+        .and_then(serde_yaml::Value::as_mapping)
+        .map(|env_map| {
+            env_map
+                .iter()
+                .filter_map(|(key, value)| {
+                    Some((key.as_str()?.to_string(), value.as_str()?.to_string()))
+                })
+                .collect()
+        });
+
     let nested_step = Step {
         id: format!("composite_{}", uuid::Uuid::new_v4()),
         display_name: uses.to_string(),
@@ -333,7 +345,7 @@ async fn run_nested_action(
         timeout_in_minutes: Some(timeout.as_secs() / 60),
         continue_on_error: false,
         order: 0,
-        environment: None,
+        environment,
         context_name: None,
     };
 
