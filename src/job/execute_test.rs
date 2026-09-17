@@ -226,6 +226,27 @@ fn matching_override_is_allowed() {
     assert_eq!(env.get(DOCKER_CONFIG_ENV), Some(&value));
 }
 
+fn make_action_step(id: &str, context_name: &str) -> Step {
+    Step {
+        id: id.into(),
+        display_name: context_name.into(),
+        reference: StepReference {
+            name: "local-action".into(),
+            kind: StepReferenceKind::Repository,
+            repository_type: Some("self".into()),
+            path: Some("local-action".into()),
+            ..Default::default()
+        },
+        inputs: HashMap::new(),
+        condition: None,
+        timeout_in_minutes: None,
+        continue_on_error: false,
+        order: 1,
+        environment: None,
+        context_name: Some(context_name.into()),
+    }
+}
+
 #[tokio::test]
 async fn echo_step_stdout_captured() {
     let (_tmp, ws, client, _mock) = setup_execute().await;
@@ -466,6 +487,7 @@ async fn continue_on_error_works() {
     let (_resources, docker_config) = test_docker_config();
     let base_env = host_base_env(&docker_config);
     let action_cache = ActionCache::new(tmp.path().join("actions"), reqwest::Client::new());
+    let docker_action_builder = crate::docker::build::DockerActionBuilder::new();
     let node_runtimes = crate::node::NodeRuntimes::single("node".into());
     let execution = JobExecutionContext::new(&docker_config, None, &node_runtimes);
 
@@ -476,6 +498,8 @@ async fn continue_on_error_works() {
         &base_env,
         "test-runner",
         &action_cache,
+        &docker_action_builder,
+        None,
         "fake-token",
         CancellationToken::new(),
         &execution,
@@ -527,6 +551,7 @@ async fn failure_stops_remaining_steps() {
     let (_resources, docker_config) = test_docker_config();
     let base_env = host_base_env(&docker_config);
     let action_cache = ActionCache::new(tmp.path().join("actions"), reqwest::Client::new());
+    let docker_action_builder = crate::docker::build::DockerActionBuilder::new();
     let node_runtimes = crate::node::NodeRuntimes::single("node".into());
     let execution = JobExecutionContext::new(&docker_config, None, &node_runtimes);
 
@@ -537,6 +562,8 @@ async fn failure_stops_remaining_steps() {
         &base_env,
         "test-runner",
         &action_cache,
+        &docker_action_builder,
+        None,
         "fake-token",
         CancellationToken::new(),
         &execution,
@@ -581,6 +608,7 @@ async fn secrets_from_context_data_resolved() {
     let (_resources, docker_config) = test_docker_config();
     let base_env = host_base_env(&docker_config);
     let action_cache = ActionCache::new(tmp.path().join("actions"), reqwest::Client::new());
+    let docker_action_builder = crate::docker::build::DockerActionBuilder::new();
     let node_runtimes = crate::node::NodeRuntimes::single("node".into());
     let execution = JobExecutionContext::new(&docker_config, None, &node_runtimes);
 
@@ -591,6 +619,8 @@ async fn secrets_from_context_data_resolved() {
         &base_env,
         "test-runner",
         &action_cache,
+        &docker_action_builder,
+        None,
         "fake-token",
         CancellationToken::new(),
         &execution,
@@ -642,6 +672,7 @@ async fn cancel_token_returns_cancelled_between_steps() {
     let (_resources, docker_config) = test_docker_config();
     let base_env = host_base_env(&docker_config);
     let action_cache = ActionCache::new(tmp.path().join("actions"), reqwest::Client::new());
+    let docker_action_builder = crate::docker::build::DockerActionBuilder::new();
     let node_runtimes = crate::node::NodeRuntimes::single("node".into());
     let execution = JobExecutionContext::new(&docker_config, None, &node_runtimes);
 
@@ -656,6 +687,8 @@ async fn cancel_token_returns_cancelled_between_steps() {
         &base_env,
         "test-runner",
         &action_cache,
+        &docker_action_builder,
+        None,
         "fake-token",
         cancel_token,
         &execution,
@@ -900,6 +933,261 @@ fn step_is_script_detection() {
         context_name: None,
     };
     assert!(!action_step.is_script());
+}
+
+#[tokio::test]
+async fn pre_collection_retains_directory_for_action_without_pre() {
+    let tmp = tempfile::tempdir().unwrap();
+    let workspace = tmp.path().join("workspace");
+    let action_dir = workspace.join("local-action");
+    std::fs::create_dir_all(&action_dir).unwrap();
+    std::fs::write(
+        action_dir.join("action.yml"),
+        "name: local\nruns:\n  using: node20\n  main: index.js\n",
+    )
+    .unwrap();
+    let step = Step {
+        id: "action".into(),
+        display_name: "Local action".into(),
+        reference: StepReference {
+            name: "local-action".into(),
+            kind: StepReferenceKind::Repository,
+            repository_type: Some("self".into()),
+            path: Some("local-action".into()),
+            ..Default::default()
+        },
+        inputs: HashMap::new(),
+        condition: None,
+        timeout_in_minutes: None,
+        continue_on_error: false,
+        order: 1,
+        environment: None,
+        context_name: Some("action".into()),
+    };
+    let cache = ActionCache::new(tmp.path().join("cache"), reqwest::Client::new());
+
+    let collected = collect_pre_step(&step, &cache, &workspace, "fake-token")
+        .await
+        .expect("pre collection must propagate no error")
+        .expect("pre collection must retain the trusted directory");
+
+    assert!(collected.pre_step.is_none());
+    assert_eq!(
+        collected.action_dir.path(),
+        action_dir.canonicalize().unwrap()
+    );
+}
+
+#[tokio::test]
+async fn collection_error_pre_propagates_action_resolution_failure() {
+    let tmp = tempfile::tempdir().unwrap();
+    let workspace = tmp.path().join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let mut step = make_action_step("action", "action");
+    step.reference.path = None;
+    let cache = ActionCache::new(tmp.path().join("cache"), reqwest::Client::new());
+
+    let error = match collect_pre_step(&step, &cache, &workspace, "fake-token").await {
+        Err(error) => error,
+        Ok(_) => panic!("action resolution failure must propagate"),
+    };
+
+    assert!(
+        error
+            .to_string()
+            .contains("local action reference missing path"),
+        "{error:#}"
+    );
+}
+
+#[tokio::test]
+async fn collection_error_pre_propagates_missing_metadata() {
+    let tmp = tempfile::tempdir().unwrap();
+    let workspace = tmp.path().join("workspace");
+    std::fs::create_dir_all(workspace.join("local-action")).unwrap();
+    let step = make_action_step("action", "action");
+    let cache = ActionCache::new(tmp.path().join("cache"), reqwest::Client::new());
+
+    let error = match collect_pre_step(&step, &cache, &workspace, "fake-token").await {
+        Err(error) => error,
+        Ok(_) => panic!("metadata failure must propagate"),
+    };
+
+    assert!(error.to_string().contains("no action.yml"), "{error:#}");
+}
+
+#[tokio::test]
+async fn collection_error_pre_propagates_directory_resolution_failure() {
+    let tmp = tempfile::tempdir().unwrap();
+    let workspace = tmp.path().join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let step = make_action_step("action", "action");
+    let cache = ActionCache::new(tmp.path().join("cache"), reqwest::Client::new());
+
+    let error = match collect_pre_step(&step, &cache, &workspace, "fake-token").await {
+        Err(error) => error,
+        Ok(_) => panic!("trusted directory resolution failure must propagate"),
+    };
+
+    assert!(
+        error.to_string().contains("resolving action directory"),
+        "{error:#}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn collection_error_post_propagates_metadata_capability_failure() {
+    use std::os::unix::fs::symlink;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let workspace = tmp.path().join("workspace");
+    let action_dir = workspace.join("local-action");
+    std::fs::create_dir_all(&action_dir).unwrap();
+    std::fs::write(
+        action_dir.join("action.yml"),
+        "name: local\nruns:\n  using: node20\n  main: index.js\n",
+    )
+    .unwrap();
+    let outside = tmp.path().join("outside.yml");
+    std::fs::write(
+        &outside,
+        "name: canary\nruns:\n  using: node20\n  main: canary.js\n",
+    )
+    .unwrap();
+    let step = make_action_step("action", "action");
+    let cache = ActionCache::new(tmp.path().join("cache"), reqwest::Client::new());
+    let trusted = cache
+        .get_action(&resolve_action(&step).unwrap(), &workspace, "fake-token")
+        .await
+        .unwrap();
+    std::fs::remove_file(action_dir.join("action.yml")).unwrap();
+    symlink(&outside, action_dir.join("action.yml")).unwrap();
+
+    let error = collect_post_step(&step, &trusted).unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("action metadata must be a regular file"),
+        "{error:#}"
+    );
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+#[tokio::test]
+async fn collection_error_post_propagates_directory_identity_failure() {
+    let tmp = tempfile::tempdir().unwrap();
+    let workspace = tmp.path().join("workspace");
+    let action_dir = workspace.join("local-action");
+    std::fs::create_dir_all(&action_dir).unwrap();
+    std::fs::write(
+        action_dir.join("action.yml"),
+        "name: local\nruns:\n  using: node20\n  main: index.js\n  post: cleanup.js\n",
+    )
+    .unwrap();
+    let step = make_action_step("action", "action");
+    let cache = ActionCache::new(tmp.path().join("cache"), reqwest::Client::new());
+    let trusted = cache
+        .get_action(&resolve_action(&step).unwrap(), &workspace, "fake-token")
+        .await
+        .unwrap();
+
+    std::fs::rename(&workspace, tmp.path().join("original-workspace")).unwrap();
+    std::fs::create_dir_all(&action_dir).unwrap();
+    std::fs::write(
+        action_dir.join("action.yml"),
+        "name: replacement\nruns:\n  using: node20\n  main: canary.js\n  post: canary-cleanup.js\n",
+    )
+    .unwrap();
+
+    let error = collect_post_step(&step, &trusted).unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("action directory changed after it was resolved"),
+        "{error:#}"
+    );
+}
+
+#[test]
+fn action_lifecycle_suffix_bearing_identifiers_stay_main() {
+    let state = JobState::new(
+        Arc::new(RwLock::new(Vec::new())),
+        HashMap::new(),
+        serde_json::json!({}),
+    );
+    let pre_suffix = make_action_step("opaque-pre", "foo_pre");
+    let post_suffix = make_action_step("opaque-post", "foo_post");
+
+    assert_eq!(state.action_instance_key(&pre_suffix), "opaque-pre");
+    assert_eq!(state.action_step_phase(&pre_suffix), ActionStepPhase::Main);
+    assert_eq!(state.action_instance_key(&post_suffix), "opaque-post");
+    assert_eq!(state.action_step_phase(&post_suffix), ActionStepPhase::Main);
+}
+
+#[test]
+fn action_lifecycle_colliding_identifiers_keep_distinct_capabilities() {
+    let tmp = tempfile::tempdir().unwrap();
+    let first_dir = tmp.path().join("first");
+    let second_dir = tmp.path().join("second");
+    std::fs::create_dir_all(&first_dir).unwrap();
+    std::fs::create_dir_all(&second_dir).unwrap();
+    let first = TrustedActionDirectory::resolve(&first_dir, Path::new(".")).unwrap();
+    let second = TrustedActionDirectory::resolve(&second_dir, Path::new(".")).unwrap();
+    let plain = make_action_step("opaque-plain", "foo");
+    let suffix = make_action_step("opaque-suffix", "foo_pre");
+    let mut state = JobState::new(
+        Arc::new(RwLock::new(Vec::new())),
+        HashMap::new(),
+        serde_json::json!({}),
+    );
+
+    let plain_key = state.action_instance_key(&plain).to_string();
+    let suffix_key = state.action_instance_key(&suffix).to_string();
+    state
+        .trusted_action_directories
+        .insert(plain_key.clone(), first);
+    state
+        .trusted_action_directories
+        .insert(suffix_key.clone(), second);
+
+    assert_ne!(plain_key, suffix_key);
+    assert_eq!(
+        state.trusted_action_directories[&plain_key].path(),
+        first_dir.canonicalize().unwrap()
+    );
+    assert_eq!(
+        state.trusted_action_directories[&suffix_key].path(),
+        second_dir.canonicalize().unwrap()
+    );
+}
+
+#[test]
+fn action_lifecycle_synthetic_steps_share_explicit_instance() {
+    let mut state = JobState::new(
+        Arc::new(RwLock::new(Vec::new())),
+        HashMap::new(),
+        serde_json::json!({}),
+    );
+    let main = make_action_step("opaque-main", "foo_pre");
+    let synthetic_pre = make_action_step("synthetic-pre", "foo_pre_pre");
+    let synthetic_post = make_action_step("synthetic-post", "foo_pre_post");
+
+    state.link_action_step(&synthetic_pre, &main, ActionStepPhase::Pre);
+    state.link_action_step(&synthetic_post, &main, ActionStepPhase::Post);
+
+    assert_eq!(state.action_instance_key(&synthetic_pre), "opaque-main");
+    assert_eq!(
+        state.action_step_phase(&synthetic_pre),
+        ActionStepPhase::Pre
+    );
+    assert_eq!(state.action_instance_key(&synthetic_post), "opaque-main");
+    assert_eq!(
+        state.action_step_phase(&synthetic_post),
+        ActionStepPhase::Post
+    );
 }
 
 #[test]

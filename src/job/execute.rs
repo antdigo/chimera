@@ -14,7 +14,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use super::JobClient;
-use super::action::{ActionCache, load_action_metadata, resolve_action};
+use super::action::{ActionCache, TrustedActionDirectory, load_action_metadata, resolve_action};
 use super::client::{JobConclusion, ResultsConclusion, ResultsStatus, ResultsStep};
 use super::expression::ExprContext;
 use super::live_feed::FeedSender;
@@ -22,6 +22,7 @@ use super::logs::{JobLogger, LogLine, LogSender, StepLogger};
 use super::schema::{JobManifest, Step};
 use super::timeline::{TimelineLogRef, TimelineRecord, TimelineResult, TimelineState};
 use super::workspace::Workspace;
+use crate::docker::build::{BuiltDockerImage, DockerActionBuilder, DockerBuildScope, RegistryAuth};
 use crate::docker::output::OutputProcessor;
 use crate::docker::resources::JobDockerResources;
 use crate::job::docker_config::{DOCKER_CONFIG_ENV, JobDockerConfig, JobDockerConfigError};
@@ -78,6 +79,28 @@ pub struct StepOutcome {
     pub conclusion: String,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ActionStepPhase {
+    Main,
+    Pre,
+    Post,
+}
+
+impl ActionStepPhase {
+    fn entry_point(self) -> &'static str {
+        match self {
+            Self::Main => "main",
+            Self::Pre => "pre",
+            Self::Post => "post",
+        }
+    }
+}
+
+struct ActionStepContext {
+    instance_key: String,
+    phase: ActionStepPhase,
+}
+
 pub struct JobState {
     pub env: HashMap<String, String>,
     pub path_prepends: Vec<String>,
@@ -90,6 +113,9 @@ pub struct JobState {
     pub step_outputs: HashMap<String, HashMap<String, String>>,
     /// Per-step outcome/conclusion for `steps.<id>.outcome` / `steps.<id>.conclusion`.
     pub step_outcomes: HashMap<String, StepOutcome>,
+    pub docker_action_images: HashMap<String, BuiltDockerImage>,
+    trusted_action_directories: HashMap<String, TrustedActionDirectory>,
+    action_step_contexts: HashMap<String, ActionStepContext>,
     /// Secret variables (name → value) for `secrets.<name>` expression resolution.
     pub secrets: HashMap<String, String>,
     /// Context data from the job manifest (needs, matrix, job, etc.).
@@ -122,12 +148,45 @@ impl JobState {
             action_states: HashMap::new(),
             step_outputs: HashMap::new(),
             step_outcomes: HashMap::new(),
+            docker_action_images: HashMap::new(),
+            trusted_action_directories: HashMap::new(),
+            action_step_contexts: HashMap::new(),
             secrets,
             context_data,
             host_workspace: None,
             default_working_directory: None,
             debug_enabled,
         }
+    }
+
+    pub(crate) fn action_instance_key<'a>(&'a self, step: &'a Step) -> &'a str {
+        self.action_step_contexts
+            .get(&step.id)
+            .map(|context| context.instance_key.as_str())
+            .unwrap_or(&step.id)
+    }
+
+    pub(crate) fn action_step_phase(&self, step: &Step) -> ActionStepPhase {
+        self.action_step_contexts
+            .get(&step.id)
+            .map(|context| context.phase)
+            .unwrap_or(ActionStepPhase::Main)
+    }
+
+    fn link_action_step(
+        &mut self,
+        synthetic_step: &Step,
+        original_step: &Step,
+        phase: ActionStepPhase,
+    ) {
+        let instance_key = self.action_instance_key(original_step).to_string();
+        self.action_step_contexts.insert(
+            synthetic_step.id.clone(),
+            ActionStepContext {
+                instance_key,
+                phase,
+            },
+        );
     }
 }
 
@@ -680,11 +739,28 @@ pub async fn run_all_steps(
     base_env: &HashMap<String, String>,
     runner_name: &str,
     action_cache: &ActionCache,
+    docker_action_builder: &DockerActionBuilder,
+    registry_auth: Option<&RegistryAuth>,
     access_token: &str,
     cancel_token: CancellationToken,
     execution: &JobExecutionContext<'_>,
     feed_sender: Option<&FeedSender>,
 ) -> Result<(JobConclusion, HashMap<String, String>)> {
+    let server = manifest
+        .context_data
+        .get("github")
+        .and_then(|github| github.get("server_url"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("https://github.com");
+    let github_scope = match manifest.repository() {
+        Ok(repository) => format!("{server}/{repository}"),
+        Err(_) => format!(
+            "{server}/unknown/{}/{}",
+            manifest.plan.plan_id, manifest.plan.job_id
+        ),
+    };
+    let docker_build_scope = DockerBuildScope::new(runner_name, github_scope);
+
     let masks = collect_secret_masks(manifest);
     let mut secrets: HashMap<String, String> = manifest
         .variables
@@ -759,22 +835,32 @@ pub async fn run_all_steps(
     // before all main steps, in forward order (matching manifest order).
     let mut pre_steps = Vec::new();
     for (idx, step) in manifest.steps.iter().enumerate() {
-        if let Some((orig_step, pre_if)) =
-            collect_pre_step(step, action_cache, workspace.workspace_dir(), access_token).await
-        {
-            let ctx_name = orig_step
-                .context_name
-                .clone()
-                .unwrap_or_else(|| orig_step.id.clone());
-            pre_steps.push(Step {
-                id: uuid::Uuid::new_v4().to_string(),
-                display_name: format!("Pre {}", orig_step.display_name),
-                context_name: Some(format!("{ctx_name}_pre")),
-                order: idx as u32,
-                condition: Some(pre_if.unwrap_or_else(|| "always()".to_string())),
-                ..orig_step
-            });
-        }
+        let Some(collected) =
+            collect_pre_step(step, action_cache, workspace.workspace_dir(), access_token).await?
+        else {
+            continue;
+        };
+        job_state
+            .trusted_action_directories
+            .insert(step.id.clone(), collected.action_dir);
+
+        let Some((orig_step, pre_if)) = collected.pre_step else {
+            continue;
+        };
+        let ctx_name = orig_step
+            .context_name
+            .clone()
+            .unwrap_or_else(|| orig_step.id.clone());
+        let pre_step = Step {
+            id: uuid::Uuid::new_v4().to_string(),
+            display_name: format!("Pre {}", orig_step.display_name),
+            context_name: Some(format!("{ctx_name}_pre")),
+            order: idx as u32,
+            condition: Some(pre_if.unwrap_or_else(|| "always()".to_string())),
+            ..orig_step.clone()
+        };
+        job_state.link_action_step(&pre_step, &orig_step, ActionStepPhase::Pre);
+        pre_steps.push(pre_step);
     }
 
     let pre_step_count = pre_steps.len();
@@ -852,6 +938,9 @@ pub async fn run_all_steps(
                 logger.sender(),
                 runner_name,
                 action_cache,
+                docker_action_builder,
+                &docker_build_scope,
+                registry_auth,
                 access_token,
                 &cancel_token,
                 execution,
@@ -990,6 +1079,9 @@ pub async fn run_all_steps(
             logger.sender(),
             runner_name,
             action_cache,
+            docker_action_builder,
+            &docker_build_scope,
+            registry_auth,
             access_token,
             &cancel_token,
             execution,
@@ -1039,9 +1131,13 @@ pub async fn run_all_steps(
         // Clear the files so the next step starts fresh
         workspace.clear_step_files();
 
-        // If this action has a `post` entry point, schedule it for later
-        if let Some(post_info) =
-            collect_post_step(step, action_cache, workspace.workspace_dir(), access_token).await
+        // If this action has a `post` entry point, schedule it for later.
+        let action_key = job_state.action_instance_key(step).to_string();
+        if let Some(action_dir) = job_state
+            .trusted_action_directories
+            .get(&action_key)
+            .cloned()
+            && let Some(post_info) = collect_post_step(step, &action_dir)?
         {
             pending_post_steps.push(post_info);
         }
@@ -1097,7 +1193,7 @@ pub async fn run_all_steps(
                 .context_name
                 .clone()
                 .unwrap_or_else(|| orig_step.id.clone());
-            post_steps.push(Step {
+            let post_step = Step {
                 id: uuid::Uuid::new_v4().to_string(),
                 display_name: format!("Post {}", orig_step.display_name),
                 context_name: Some(format!("{ctx_name}_post")),
@@ -1105,8 +1201,10 @@ pub async fn run_all_steps(
                 // Default post-if is always() (not success()), so post steps
                 // run even when the job failed (e.g. to save partial caches).
                 condition: Some(post_if.unwrap_or_else(|| "always()".to_string())),
-                ..orig_step
-            });
+                ..orig_step.clone()
+            };
+            job_state.link_action_step(&post_step, &orig_step, ActionStepPhase::Post);
+            post_steps.push(post_step);
         }
 
         for ps in &post_steps {
@@ -1178,6 +1276,9 @@ pub async fn run_all_steps(
                 logger.sender(),
                 runner_name,
                 action_cache,
+                docker_action_builder,
+                &docker_build_scope,
+                registry_auth,
                 access_token,
                 &cancel_token,
                 execution,
@@ -1303,6 +1404,9 @@ async fn execute_step(
     log_sender: &LogSender,
     runner_name: &str,
     action_cache: &ActionCache,
+    docker_action_builder: &DockerActionBuilder,
+    docker_build_scope: &DockerBuildScope,
+    registry_auth: Option<&RegistryAuth>,
     access_token: &str,
     cancel_token: &CancellationToken,
     execution: &JobExecutionContext<'_>,
@@ -1319,6 +1423,9 @@ async fn execute_step(
         has_docker,
         "executing step"
     );
+
+    let timeout = Duration::from_secs(step.timeout_in_minutes.unwrap_or(360) * 60);
+    let deadline = tokio::time::Instant::now() + timeout;
 
     let result = if step.is_script() {
         // Script steps: container mode if docker_resources has a job container, else host
@@ -1356,7 +1463,11 @@ async fn execute_step(
             base_env,
             log_sender,
             action_cache,
+            docker_action_builder,
+            docker_build_scope,
+            registry_auth,
             access_token,
+            deadline,
             cancel_token,
             execution,
         )
@@ -1383,7 +1494,11 @@ async fn run_action_step(
     base_env: &HashMap<String, String>,
     log_sender: &LogSender,
     action_cache: &ActionCache,
+    docker_action_builder: &DockerActionBuilder,
+    docker_build_scope: &DockerBuildScope,
+    registry_auth: Option<&RegistryAuth>,
     access_token: &str,
+    deadline: tokio::time::Instant,
     cancel_token: &CancellationToken,
     execution: &JobExecutionContext<'_>,
 ) -> Result<StepResult> {
@@ -1400,21 +1515,36 @@ async fn run_action_step(
             workspace,
             base_env,
             log_sender,
+            deadline,
             cancel_token,
             execution,
         )
         .await;
     }
 
-    let action_dir = action_cache
-        .get_action(&source, workspace.workspace_dir(), access_token)
-        .await?;
+    let action_key = job_state.action_instance_key(step).to_string();
+    let action_dir = if let Some(action_dir) = job_state
+        .trusted_action_directories
+        .get(&action_key)
+        .cloned()
+    {
+        action_dir
+    } else {
+        let action_dir = action_cache
+            .get_action(&source, workspace.workspace_dir(), access_token)
+            .await?;
+        job_state
+            .trusted_action_directories
+            .insert(action_key, action_dir.clone());
+        action_dir
+    };
     let metadata = load_action_metadata(&action_dir)?;
 
     if metadata.runs.is_node() {
-        let entry_point = detect_entry_point(step);
+        action_dir.validate_path_identity()?;
+        let entry_point = job_state.action_step_phase(step).entry_point();
         super::action::node::run_node_action(
-            &action_dir,
+            action_dir.path(),
             &metadata,
             entry_point,
             step,
@@ -1427,6 +1557,7 @@ async fn run_action_step(
         )
         .await
     } else if metadata.runs.is_composite() {
+        action_dir.validate_path_identity()?;
         super::action::composite::run_composite_action(
             &action_dir,
             &metadata,
@@ -1436,14 +1567,18 @@ async fn run_action_step(
             base_env,
             log_sender,
             action_cache,
+            docker_action_builder,
+            docker_build_scope,
+            registry_auth,
             access_token,
             0,
+            deadline,
             cancel_token,
             execution,
         )
         .await
     } else if metadata.runs.is_docker() {
-        let entry_point = detect_entry_point(step);
+        let entry_point = job_state.action_step_phase(step).entry_point();
         super::action::docker::run_docker_metadata_action(
             &action_dir,
             &metadata,
@@ -1453,6 +1588,10 @@ async fn run_action_step(
             workspace,
             base_env,
             log_sender,
+            docker_action_builder,
+            docker_build_scope,
+            registry_auth,
+            deadline,
             cancel_token,
             execution,
         )
@@ -1462,84 +1601,56 @@ async fn run_action_step(
     }
 }
 
-/// Detect whether this is a pre, main, or post step based on context_name.
-fn detect_entry_point(step: &Step) -> &str {
-    if let Some(ctx) = &step.context_name {
-        if ctx.ends_with("_pre") || ctx.contains("_pre_") {
-            return "pre";
-        }
-        if ctx.ends_with("_post") || ctx.contains("_post_") {
-            return "post";
-        }
-    }
-    "main"
-}
-
 /// Check if an action step has a `post` entry point, returning the cloned
 /// step and its `post-if` condition for deferred execution.
-async fn collect_post_step(
+fn collect_post_step(
     step: &Step,
-    action_cache: &ActionCache,
-    workspace_dir: &Path,
-    access_token: &str,
-) -> Option<(Step, Option<String>)> {
+    action_dir: &TrustedActionDirectory,
+) -> Result<Option<(Step, Option<String>)>> {
     if step.is_script() {
-        return None;
+        return Ok(None);
     }
 
-    use super::action::resolve::ActionSource;
-    let source = resolve_action(step).ok()?;
-
-    // Inline docker://image actions don't have action.yml metadata
-    if matches!(source, ActionSource::Docker { .. }) {
-        return None;
-    }
-
-    let action_dir = action_cache
-        .get_action(&source, workspace_dir, access_token)
-        .await
-        .ok()?;
-    let metadata = load_action_metadata(&action_dir).ok()?;
-
+    let metadata = load_action_metadata(action_dir)?;
     let has_post = metadata.runs.post.is_some() || metadata.runs.post_entrypoint.is_some();
-    if has_post {
-        Some((step.clone(), metadata.runs.post_if.clone()))
-    } else {
-        None
-    }
+    Ok(has_post.then(|| (step.clone(), metadata.runs.post_if.clone())))
 }
 
-/// Check if an action step has a `pre` entry point, returning the cloned
-/// step and its `pre-if` condition for execution before the main steps.
+struct CollectedAction {
+    action_dir: TrustedActionDirectory,
+    pre_step: Option<(Step, Option<String>)>,
+}
+
+/// Resolve an action during pre-step collection and retain its trusted directory
+/// even when it has no `pre` entry point.
 async fn collect_pre_step(
     step: &Step,
     action_cache: &ActionCache,
     workspace_dir: &Path,
     access_token: &str,
-) -> Option<(Step, Option<String>)> {
+) -> Result<Option<CollectedAction>> {
     if step.is_script() {
-        return None;
+        return Ok(None);
     }
 
     use super::action::resolve::ActionSource;
-    let source = resolve_action(step).ok()?;
+    let source = resolve_action(step)?;
 
     if matches!(source, ActionSource::Docker { .. }) {
-        return None;
+        return Ok(None);
     }
 
     let action_dir = action_cache
         .get_action(&source, workspace_dir, access_token)
-        .await
-        .ok()?;
-    let metadata = load_action_metadata(&action_dir).ok()?;
-
+        .await?;
+    let metadata = load_action_metadata(&action_dir)?;
     let has_pre = metadata.runs.pre.is_some() || metadata.runs.pre_entrypoint.is_some();
-    if has_pre {
-        Some((step.clone(), metadata.runs.pre_if.clone()))
-    } else {
-        None
-    }
+    let pre_step = has_pre.then(|| (step.clone(), metadata.runs.pre_if.clone()));
+
+    Ok(Some(CollectedAction {
+        action_dir,
+        pre_step,
+    }))
 }
 
 async fn report_step_started(

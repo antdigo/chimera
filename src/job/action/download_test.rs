@@ -1,17 +1,17 @@
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use super::*;
 
-fn make_test_tarball(files: &[(&str, &str)]) -> Vec<u8> {
+fn make_test_tarball(files: &[(&str, &str, u32)]) -> Vec<u8> {
     let mut builder = tar::Builder::new(Vec::new());
 
-    for (path, content) in files {
+    for (path, content, mode) in files {
         // Add a prefix component to simulate GitHub's tarball format
         let full_path = format!("owner-repo-abc123/{path}");
         let mut header = tar::Header::new_gnu();
         header.set_size(content.len() as u64);
-        header.set_mode(0o644);
+        header.set_mode(*mode);
         header.set_cksum();
         builder
             .append_data(&mut header, &full_path, content.as_bytes())
@@ -29,7 +29,7 @@ fn make_test_tarball(files: &[(&str, &str)]) -> Vec<u8> {
 async fn cache_hit_skips_download() {
     let tmp = tempfile::tempdir().unwrap();
     let cache_dir = tmp.path().join("actions");
-    let action_dir = cache_dir.join("actions/checkout/v4");
+    let action_dir = remote_cache_path(&cache_dir, "actions", "checkout", "v4");
     std::fs::create_dir_all(&action_dir).unwrap();
     std::fs::write(action_dir.join("action.yml"), "name: checkout").unwrap();
 
@@ -45,8 +45,8 @@ async fn cache_hit_skips_download() {
         .get_action(&source, tmp.path(), "fake-token")
         .await
         .unwrap();
-    assert_eq!(result, action_dir);
-    assert!(result.join("action.yml").exists());
+    assert_eq!(result.path(), action_dir.canonicalize().unwrap());
+    assert!(result.path().join("action.yml").exists());
 }
 
 #[tokio::test]
@@ -57,8 +57,9 @@ async fn tarball_extraction() {
         (
             "action.yml",
             "name: test-action\nruns:\n  using: node20\n  main: index.js\n",
+            0o644,
         ),
-        ("index.js", "console.log('hello');\n"),
+        ("index.js", "console.log('hello');\n", 0o644),
     ]);
 
     wiremock::Mock::given(wiremock::matchers::method("GET"))
@@ -113,11 +114,115 @@ async fn tarball_extraction() {
     assert!(content.contains("console.log"));
 }
 
+/// Mode a freshly created regular file gets under the current umask, measured
+/// in `directory` so assertions stay stable regardless of the host umask.
+#[cfg(unix)]
+fn baseline_file_mode(directory: &Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+
+    let reference = directory.join("chimera-mode-baseline");
+    std::fs::write(&reference, b"").unwrap();
+    let mode = std::fs::metadata(&reference).unwrap().permissions().mode();
+    std::fs::remove_file(&reference).unwrap();
+    mode
+}
+
+#[cfg(unix)]
+fn extracted_file_mode(directory: &Path, name: &str) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::metadata(directory.join(name))
+        .unwrap()
+        .permissions()
+        .mode()
+}
+
+#[cfg(unix)]
+fn extract_to_temp_dir(tarball: &[u8]) -> tempfile::TempDir {
+    let tmp = tempfile::tempdir().unwrap();
+    let dest = tmp.path().join("extracted");
+    std::fs::create_dir_all(&dest).unwrap();
+    extract_tarball(tarball, &dest).unwrap();
+    tmp
+}
+
+#[cfg(unix)]
+#[test]
+fn tarball_extraction_preserves_executable_bits() {
+    let tmp = extract_to_temp_dir(&make_test_tarball(&[
+        ("run.sh", "#!/bin/sh\n", 0o755),
+        ("owner-only.sh", "#!/bin/sh\n", 0o711),
+    ]));
+    let dest = tmp.path().join("extracted");
+
+    let baseline = baseline_file_mode(&dest);
+    for name in ["run.sh", "owner-only.sh"] {
+        assert_eq!(
+            extracted_file_mode(&dest, name),
+            (baseline & !0o111) | 0o111,
+            "{name}: exec bits must come from the header, read/write bits from the umask"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn tarball_extraction_drops_special_and_extra_write_bits() {
+    let tmp = extract_to_temp_dir(&make_test_tarball(&[
+        ("setuid.sh", "#!/bin/sh\n", 0o4755),
+        ("setgid.sh", "#!/bin/sh\n", 0o2755),
+        ("sticky.sh", "#!/bin/sh\n", 0o1777),
+        ("world-writable.sh", "#!/bin/sh\n", 0o777),
+    ]));
+    let dest = tmp.path().join("extracted");
+
+    let baseline = baseline_file_mode(&dest);
+    for name in ["setuid.sh", "setgid.sh", "sticky.sh", "world-writable.sh"] {
+        let mode = extracted_file_mode(&dest, name);
+        assert_eq!(
+            mode & 0o7000,
+            0,
+            "{name}: setuid/setgid/sticky bits must not carry over"
+        );
+        assert_eq!(
+            mode & 0o111,
+            0o111,
+            "{name}: executable bits must survive extraction"
+        );
+        assert_eq!(
+            mode & !0o111,
+            baseline & !0o111,
+            "{name}: read/write bits must stay umask-derived"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn tarball_extraction_keeps_non_executable_files_non_executable() {
+    let tmp = extract_to_temp_dir(&make_test_tarball(&[
+        ("plain.txt", "data\n", 0o644),
+        ("shared.txt", "data\n", 0o666),
+        ("no-permissions.txt", "data\n", 0o000),
+    ]));
+    let dest = tmp.path().join("extracted");
+
+    let baseline = baseline_file_mode(&dest);
+    for name in ["plain.txt", "shared.txt", "no-permissions.txt"] {
+        assert_eq!(
+            extracted_file_mode(&dest, name),
+            baseline,
+            "{name}: header read/write bits must not leak into the extracted file"
+        );
+    }
+}
+
 #[tokio::test]
-async fn local_path_returns_workspace_join() {
+async fn local_path_resolves_inside_workspace() {
     let tmp = tempfile::tempdir().unwrap();
     let workspace = tmp.path().join("workspace");
-    std::fs::create_dir_all(&workspace).unwrap();
+    let action_dir = workspace.join(".github/actions/my-action");
+    std::fs::create_dir_all(&action_dir).unwrap();
 
     let cache = ActionCache::new(tmp.path().join("actions"), reqwest::Client::new());
     let source = ActionSource::Local {
@@ -128,7 +233,68 @@ async fn local_path_returns_workspace_join() {
         .get_action(&source, &workspace, "fake-token")
         .await
         .unwrap();
-    assert_eq!(result, workspace.join(".github/actions/my-action"));
+    assert_eq!(result.path(), action_dir.canonicalize().unwrap());
+}
+
+#[tokio::test]
+async fn local_action_parent_traversal_is_rejected() {
+    let tmp = tempfile::tempdir().unwrap();
+    let workspace = tmp.path().join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let cache = ActionCache::new(tmp.path().join("actions"), reqwest::Client::new());
+    let source = ActionSource::Local {
+        path: PathBuf::from("../outside"),
+    };
+
+    let error = cache
+        .get_action(&source, &workspace, "fake-token")
+        .await
+        .unwrap_err();
+
+    assert_eq!(
+        error.to_string(),
+        "action path must stay inside its source root"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn local_action_symlink_escape_is_rejected() {
+    use std::os::unix::fs::symlink;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let workspace = tmp.path().join("workspace");
+    let outside = tmp.path().join("outside");
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+    symlink(&outside, workspace.join("linked-action")).unwrap();
+    let cache = ActionCache::new(tmp.path().join("actions"), reqwest::Client::new());
+    let source = ActionSource::Local {
+        path: PathBuf::from("linked-action"),
+    };
+
+    let error = cache
+        .get_action(&source, &workspace, "fake-token")
+        .await
+        .unwrap_err();
+
+    assert_eq!(
+        error.to_string(),
+        "action path must stay inside its source root"
+    );
+}
+
+#[test]
+fn remote_cache_path_hashes_path_like_refs() {
+    let root = Path::new("/runner/actions");
+    let escaped = remote_cache_path(root, "owner", "repo", "../../outside");
+    let branch = remote_cache_path(root, "owner", "repo", "refs/heads/main");
+    let expected_parent = root.join("remote-v1");
+
+    assert_eq!(escaped.parent(), Some(expected_parent.as_path()));
+    assert_eq!(branch.parent(), Some(expected_parent.as_path()));
+    assert_ne!(escaped, branch);
+    assert_eq!(escaped.file_name().unwrap().len(), 64);
 }
 
 /// Build a tarball with unsafe path entries (bypassing tar crate's safety checks).
@@ -217,5 +383,141 @@ async fn docker_action_returns_error() {
             .unwrap_err()
             .to_string()
             .contains("should be handled before get_action")
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn cloned_trusted_directory_reads_original_root_after_root_replacement() {
+    let tmp = tempfile::tempdir().unwrap();
+    let workspace = tmp.path().join("workspace");
+    let action_dir = workspace.join("actions/test");
+    std::fs::create_dir_all(&action_dir).unwrap();
+    std::fs::write(action_dir.join("sentinel"), "original").unwrap();
+    let expected_path = action_dir.canonicalize().unwrap();
+    let cache = ActionCache::new(tmp.path().join("cache"), reqwest::Client::new());
+    let source = ActionSource::Local {
+        path: "actions/test".into(),
+    };
+    let trusted = cache
+        .get_action(&source, &workspace, "fake-token")
+        .await
+        .unwrap();
+    assert_eq!(trusted.path(), expected_path);
+    let cloned = trusted.clone();
+
+    std::fs::rename(&workspace, tmp.path().join("original-workspace")).unwrap();
+    std::fs::create_dir_all(&action_dir).unwrap();
+    std::fs::write(action_dir.join("sentinel"), "replacement-canary").unwrap();
+    drop(trusted);
+
+    let contents = cloned
+        .read_optional_regular_file("sentinel")
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(String::from_utf8(contents).unwrap(), "original");
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+#[tokio::test]
+async fn identity_validation_fails_closed_after_source_root_replacement() {
+    let tmp = tempfile::tempdir().unwrap();
+    let workspace = tmp.path().join("workspace");
+    let action_dir = workspace.join("actions/test");
+    std::fs::create_dir_all(&action_dir).unwrap();
+    std::fs::write(action_dir.join("sentinel"), "original").unwrap();
+    let cache = ActionCache::new(tmp.path().join("cache"), reqwest::Client::new());
+    let source = ActionSource::Local {
+        path: "actions/test".into(),
+    };
+    let trusted = cache
+        .get_action(&source, &workspace, "fake-token")
+        .await
+        .unwrap();
+
+    std::fs::rename(&workspace, tmp.path().join("original-workspace")).unwrap();
+    std::fs::create_dir_all(&action_dir).unwrap();
+    std::fs::write(action_dir.join("sentinel"), "replacement-canary").unwrap();
+
+    let error = trusted.validate_path_identity().unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("action directory changed after it was resolved"),
+        "{error:#}"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn cloned_trusted_directory_reads_original_root_after_symlink_root_replacement() {
+    use std::os::unix::fs::symlink;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let workspace = tmp.path().join("workspace");
+    let action_dir = workspace.join("actions/test");
+    std::fs::create_dir_all(&action_dir).unwrap();
+    std::fs::write(action_dir.join("sentinel"), "original").unwrap();
+    let cache = ActionCache::new(tmp.path().join("cache"), reqwest::Client::new());
+    let source = ActionSource::Local {
+        path: "actions/test".into(),
+    };
+    let trusted = cache
+        .get_action(&source, &workspace, "fake-token")
+        .await
+        .unwrap();
+    let cloned = trusted.clone();
+
+    std::fs::rename(&workspace, tmp.path().join("original-workspace")).unwrap();
+    let replacement = tmp.path().join("replacement-workspace");
+    let replacement_action = replacement.join("actions/test");
+    std::fs::create_dir_all(&replacement_action).unwrap();
+    std::fs::write(replacement_action.join("sentinel"), "replacement-canary").unwrap();
+    symlink(&replacement, &workspace).unwrap();
+    drop(trusted);
+
+    let contents = cloned
+        .read_optional_regular_file("sentinel")
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(String::from_utf8(contents).unwrap(), "original");
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+#[tokio::test]
+async fn identity_validation_fails_closed_after_symlink_root_replacement() {
+    use std::os::unix::fs::symlink;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let workspace = tmp.path().join("workspace");
+    let action_dir = workspace.join("actions/test");
+    std::fs::create_dir_all(&action_dir).unwrap();
+    std::fs::write(action_dir.join("sentinel"), "original").unwrap();
+    let cache = ActionCache::new(tmp.path().join("cache"), reqwest::Client::new());
+    let source = ActionSource::Local {
+        path: "actions/test".into(),
+    };
+    let trusted = cache
+        .get_action(&source, &workspace, "fake-token")
+        .await
+        .unwrap();
+
+    std::fs::rename(&workspace, tmp.path().join("original-workspace")).unwrap();
+    let replacement = tmp.path().join("replacement-workspace");
+    let replacement_action = replacement.join("actions/test");
+    std::fs::create_dir_all(&replacement_action).unwrap();
+    std::fs::write(replacement_action.join("sentinel"), "replacement-canary").unwrap();
+    symlink(&replacement, &workspace).unwrap();
+
+    let error = trusted.validate_path_identity().unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("action directory changed after it was resolved"),
+        "{error:#}"
     );
 }

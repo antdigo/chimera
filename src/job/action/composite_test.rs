@@ -4,7 +4,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 use super::*;
-use crate::job::action::download::ActionCache;
+use crate::job::action::download::{ActionCache, TrustedActionDirectory};
 use crate::job::action::metadata::{ActionInput, ActionMetadata, ActionRuns};
 use crate::job::docker_config::{DOCKER_CONFIG_ENV, JobResourceRoot};
 use crate::job::execute::{JobExecutionContext, JobState, StepConclusion};
@@ -91,6 +91,8 @@ async fn nested_script_steps_execute() {
     let ws = make_test_workspace(&tmp);
     let action_dir = tmp.path().join("action");
     std::fs::create_dir_all(&action_dir).unwrap();
+    let action_dir =
+        TrustedActionDirectory::resolve(&action_dir, std::path::Path::new(".")).unwrap();
 
     let metadata = make_composite_metadata(
         r#"
@@ -110,6 +112,10 @@ async fn nested_script_steps_execute() {
     let masks = Arc::new(RwLock::new(Vec::new()));
     let logger = StepLogger::results_for_test(masks);
     let cache = ActionCache::new(tmp.path().join("cache"), reqwest::Client::new());
+    let docker_action_builder = crate::docker::build::DockerActionBuilder::new();
+    let docker_build_scope =
+        crate::docker::build::DockerBuildScope::new("test-runner", "https://github.com/owner/repo");
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(360 * 60);
     let docker_config = test_docker_config(&tmp);
     let base_env = HashMap::from([(
         DOCKER_CONFIG_ENV.to_string(),
@@ -127,8 +133,12 @@ async fn nested_script_steps_execute() {
         &base_env,
         logger.sender(),
         &cache,
+        &docker_action_builder,
+        &docker_build_scope,
+        None,
         "fake-token",
         0,
+        deadline,
         &CancellationToken::new(),
         &execution,
     )
@@ -144,6 +154,8 @@ async fn failure_propagates() {
     let ws = make_test_workspace(&tmp);
     let action_dir = tmp.path().join("action");
     std::fs::create_dir_all(&action_dir).unwrap();
+    let action_dir =
+        TrustedActionDirectory::resolve(&action_dir, std::path::Path::new(".")).unwrap();
 
     let metadata = make_composite_metadata(
         r#"
@@ -163,6 +175,10 @@ async fn failure_propagates() {
     let masks = Arc::new(RwLock::new(Vec::new()));
     let logger = StepLogger::results_for_test(masks);
     let cache = ActionCache::new(tmp.path().join("cache"), reqwest::Client::new());
+    let docker_action_builder = crate::docker::build::DockerActionBuilder::new();
+    let docker_build_scope =
+        crate::docker::build::DockerBuildScope::new("test-runner", "https://github.com/owner/repo");
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(360 * 60);
     let docker_config = test_docker_config(&tmp);
     let base_env = HashMap::from([(
         DOCKER_CONFIG_ENV.to_string(),
@@ -180,8 +196,12 @@ async fn failure_propagates() {
         &base_env,
         logger.sender(),
         &cache,
+        &docker_action_builder,
+        &docker_build_scope,
+        None,
         "fake-token",
         0,
+        deadline,
         &CancellationToken::new(),
         &execution,
     )
@@ -197,6 +217,8 @@ async fn inputs_available_as_env() {
     let ws = make_test_workspace(&tmp);
     let action_dir = tmp.path().join("action");
     std::fs::create_dir_all(&action_dir).unwrap();
+    let action_dir =
+        TrustedActionDirectory::resolve(&action_dir, std::path::Path::new(".")).unwrap();
 
     let mut metadata = make_composite_metadata(
         r#"
@@ -219,6 +241,10 @@ async fn inputs_available_as_env() {
     let masks = Arc::new(RwLock::new(Vec::new()));
     let logger = StepLogger::results_for_test(masks);
     let cache = ActionCache::new(tmp.path().join("cache"), reqwest::Client::new());
+    let docker_action_builder = crate::docker::build::DockerActionBuilder::new();
+    let docker_build_scope =
+        crate::docker::build::DockerBuildScope::new("test-runner", "https://github.com/owner/repo");
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(360 * 60);
     let docker_config = test_docker_config(&tmp);
     let base_env = HashMap::from([(
         DOCKER_CONFIG_ENV.to_string(),
@@ -236,8 +262,12 @@ async fn inputs_available_as_env() {
         &base_env,
         logger.sender(),
         &cache,
+        &docker_action_builder,
+        &docker_build_scope,
+        None,
         "fake-token",
         0,
+        deadline,
         &CancellationToken::new(),
         &execution,
     )
@@ -271,6 +301,12 @@ async fn nested_host_script_rejects_mismatched_docker_config_before_spawn() {
     );
     let logger = StepLogger::results_for_test(Arc::new(RwLock::new(Vec::new())));
     let cache = ActionCache::new(tmp.path().join("cache"), reqwest::Client::new());
+    let action_dir =
+        TrustedActionDirectory::resolve(&action_dir, std::path::Path::new(".")).unwrap();
+    let docker_action_builder = crate::docker::build::DockerActionBuilder::new();
+    let docker_build_scope =
+        crate::docker::build::DockerBuildScope::new("test-runner", "https://github.com/owner/repo");
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(360 * 60);
     let docker_config = test_docker_config(&tmp);
     let base_env = HashMap::from([(
         DOCKER_CONFIG_ENV.to_string(),
@@ -288,8 +324,12 @@ async fn nested_host_script_rejects_mismatched_docker_config_before_spawn() {
         &base_env,
         logger.sender(),
         &cache,
+        &docker_action_builder,
+        &docker_build_scope,
+        None,
         "fake-token",
         0,
+        deadline,
         &CancellationToken::new(),
         &execution,
     )
@@ -322,6 +362,12 @@ async fn nested_host_script_allows_matching_docker_config() {
     );
     let logger = StepLogger::results_for_test(Arc::new(RwLock::new(Vec::new())));
     let cache = ActionCache::new(tmp.path().join("cache"), reqwest::Client::new());
+    let action_dir =
+        TrustedActionDirectory::resolve(&action_dir, std::path::Path::new(".")).unwrap();
+    let docker_action_builder = crate::docker::build::DockerActionBuilder::new();
+    let docker_build_scope =
+        crate::docker::build::DockerBuildScope::new("test-runner", "https://github.com/owner/repo");
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(360 * 60);
     let docker_config = test_docker_config(&tmp);
     let docker_config_path = docker_config.directory().to_string_lossy().into_owned();
     let base_env = HashMap::from([
@@ -340,8 +386,12 @@ async fn nested_host_script_allows_matching_docker_config() {
         &base_env,
         logger.sender(),
         &cache,
+        &docker_action_builder,
+        &docker_build_scope,
+        None,
         "fake-token",
         0,
+        deadline,
         &CancellationToken::new(),
         &execution,
     )
@@ -373,6 +423,12 @@ async fn nested_local_node_rejects_mismatched_docker_config_before_spawn() {
     );
     let logger = StepLogger::results_for_test(Arc::new(RwLock::new(Vec::new())));
     let cache = ActionCache::new(tmp.path().join("cache"), reqwest::Client::new());
+    let action_dir =
+        TrustedActionDirectory::resolve(&action_dir, std::path::Path::new(".")).unwrap();
+    let docker_action_builder = crate::docker::build::DockerActionBuilder::new();
+    let docker_build_scope =
+        crate::docker::build::DockerBuildScope::new("test-runner", "https://github.com/owner/repo");
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(360 * 60);
     let docker_config = test_docker_config(&tmp);
     let base_env = HashMap::from([
         (
@@ -396,8 +452,12 @@ async fn nested_local_node_rejects_mismatched_docker_config_before_spawn() {
         &base_env,
         logger.sender(),
         &cache,
+        &docker_action_builder,
+        &docker_build_scope,
+        None,
         "fake-token",
         0,
+        deadline,
         &CancellationToken::new(),
         &execution,
     )
@@ -436,6 +496,12 @@ test "$DOCKER_CONFIG" = "$EXPECTED_CONFIG"
     );
     let logger = StepLogger::results_for_test(Arc::new(RwLock::new(Vec::new())));
     let cache = ActionCache::new(tmp.path().join("cache"), reqwest::Client::new());
+    let action_dir =
+        TrustedActionDirectory::resolve(&action_dir, std::path::Path::new(".")).unwrap();
+    let docker_action_builder = crate::docker::build::DockerActionBuilder::new();
+    let docker_build_scope =
+        crate::docker::build::DockerBuildScope::new("test-runner", "https://github.com/owner/repo");
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(360 * 60);
     let docker_config = test_docker_config(&tmp);
     let docker_config_path = docker_config.directory().to_string_lossy().into_owned();
     let base_env = HashMap::from([
@@ -458,8 +524,12 @@ test "$DOCKER_CONFIG" = "$EXPECTED_CONFIG"
         &base_env,
         logger.sender(),
         &cache,
+        &docker_action_builder,
+        &docker_build_scope,
+        None,
         "fake-token",
         0,
+        deadline,
         &CancellationToken::new(),
         &execution,
     )
@@ -476,6 +546,8 @@ async fn recursion_depth_limit() {
     let ws = make_test_workspace(&tmp);
     let action_dir = tmp.path().join("action");
     std::fs::create_dir_all(&action_dir).unwrap();
+    let action_dir =
+        TrustedActionDirectory::resolve(&action_dir, std::path::Path::new(".")).unwrap();
 
     let metadata = make_composite_metadata(
         r#"
@@ -493,6 +565,10 @@ async fn recursion_depth_limit() {
     let masks = Arc::new(RwLock::new(Vec::new()));
     let logger = StepLogger::results_for_test(masks);
     let cache = ActionCache::new(tmp.path().join("cache"), reqwest::Client::new());
+    let docker_action_builder = crate::docker::build::DockerActionBuilder::new();
+    let docker_build_scope =
+        crate::docker::build::DockerBuildScope::new("test-runner", "https://github.com/owner/repo");
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(360 * 60);
     let docker_config = test_docker_config(&tmp);
     let base_env = HashMap::from([(
         DOCKER_CONFIG_ENV.to_string(),
@@ -510,8 +586,12 @@ async fn recursion_depth_limit() {
         &base_env,
         logger.sender(),
         &cache,
+        &docker_action_builder,
+        &docker_build_scope,
+        None,
         "fake-token",
         10, // Already at limit
+        deadline,
         &CancellationToken::new(),
         &execution,
     )

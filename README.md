@@ -120,7 +120,7 @@ an exact stale attempt directory.
 ## Supported features
 
 - Host and container step execution (`run:`, `container:`, `services:`)
-- All action types: Node.js, Docker, composite
+- All action types: Node.js, [Docker](docs/dockerfile-actions.md), composite
 - `${{ }}` expressions, including status/string functions and the documented GitHub/runner/job/steps/needs/matrix/vars contexts
 - All workflow commands (`set-output`, `set-env`, `add-mask`, `save-state`, etc.)
 - Step conditions, timeouts, `continue-on-error`, cancellation

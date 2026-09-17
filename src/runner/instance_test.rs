@@ -79,6 +79,7 @@ fn make_runner() -> (TempDir, Runner) {
         state: None,
         job_resources,
         cache_port: 9999,
+        docker_action_builder: Arc::new(crate::docker::build::DockerActionBuilder::new()),
     };
 
     (temp, runner)

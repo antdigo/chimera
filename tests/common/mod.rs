@@ -6,6 +6,7 @@ pub mod pinned_action;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use chimera::docker::build::{DockerActionBuilder, RegistryAuth};
 use chimera::docker::client as docker_client;
 use chimera::docker::container::{JobContainerSpec, ServiceContainerSpec};
 use chimera::docker::resources::{JobDockerResources, SetupParams};
@@ -38,6 +39,7 @@ pub struct TestEnv {
     pub tmp: tempfile::TempDir,
     pub job_resources: JobResourceRoot,
     actions_dir: std::path::PathBuf,
+    docker_action_builder: Arc<DockerActionBuilder>,
 }
 
 impl TestEnv {
@@ -74,6 +76,7 @@ impl TestEnv {
             mock_server,
             tmp,
             job_resources,
+            docker_action_builder: Arc::new(DockerActionBuilder::new()),
             actions_dir,
         }
     }
@@ -108,6 +111,18 @@ impl TestEnv {
         cancel_token: CancellationToken,
         node_runtimes: &chimera::node::NodeRuntimes,
     ) -> anyhow::Result<ObservedRun> {
+        self.run_observed_with_options(manifest, cancel_token, node_runtimes, "fake-token", None)
+            .await
+    }
+
+    async fn run_observed_with_options(
+        &self,
+        manifest: &JobManifest,
+        cancel_token: CancellationToken,
+        node_runtimes: &chimera::node::NodeRuntimes,
+        access_token: &str,
+        registry_auth: Option<&RegistryAuth>,
+    ) -> anyhow::Result<ObservedRun> {
         let mut docker_config = self.job_resources.create_docker_config()?;
         let docker_config_dir = docker_config.directory().to_path_buf();
         let attempt_dir = docker_config.attempt_dir().to_path_buf();
@@ -124,7 +139,9 @@ impl TestEnv {
                         &base_env,
                         "test-runner",
                         &action_cache,
-                        "fake-token",
+                        self.docker_action_builder.as_ref(),
+                        registry_auth,
+                        access_token,
                         cancel_token,
                         &execution,
                         None,
@@ -163,6 +180,71 @@ impl TestEnv {
         Ok((observed.conclusion, observed.outputs))
     }
 
+    pub async fn run_with_cancel(
+        &self,
+        manifest: &JobManifest,
+        cancel_token: CancellationToken,
+    ) -> anyhow::Result<(JobConclusion, HashMap<String, String>)> {
+        let observed = self
+            .run_observed_with_options(
+                manifest,
+                cancel_token,
+                &chimera::node::NodeRuntimes::single("node".into()),
+                "fake-token",
+                None,
+            )
+            .await?;
+        Ok((observed.conclusion, observed.outputs))
+    }
+
+    pub async fn run_with_access_token(
+        &self,
+        manifest: &JobManifest,
+        access_token: &str,
+    ) -> anyhow::Result<(JobConclusion, HashMap<String, String>)> {
+        let observed = self
+            .run_observed_with_options(
+                manifest,
+                CancellationToken::new(),
+                &chimera::node::NodeRuntimes::single("node".into()),
+                access_token,
+                None,
+            )
+            .await?;
+        Ok((observed.conclusion, observed.outputs))
+    }
+
+    pub async fn run_with_registry_auth(
+        &self,
+        manifest: &JobManifest,
+        registry_auth: &RegistryAuth,
+    ) -> anyhow::Result<(JobConclusion, HashMap<String, String>)> {
+        let observed = self
+            .run_observed_with_options(
+                manifest,
+                CancellationToken::new(),
+                &chimera::node::NodeRuntimes::single("node".into()),
+                "fake-token",
+                Some(registry_auth),
+            )
+            .await?;
+        Ok((observed.conclusion, observed.outputs))
+    }
+
+    pub async fn uploaded_log_text(&self) -> String {
+        self.mock_server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|request| {
+                request.method.as_str() == "POST" && request.url.path().contains("/logs/")
+            })
+            .map(|request| String::from_utf8_lossy(&request.body).into_owned())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     /// Run a manifest in container mode with Docker resources.
     pub async fn run_with_docker(
         &self,
@@ -183,6 +265,8 @@ impl TestEnv {
             &base_env,
             "test-runner",
             &action_cache,
+            self.docker_action_builder.as_ref(),
+            None,
             "fake-token",
             CancellationToken::new(),
             &execution,
@@ -290,6 +374,30 @@ async fn create_job_client(mock_server: &MockServer) -> Arc<JobClient> {
 }
 
 // ─── Manifest / Step builders ────────────────────────────────────────
+
+pub fn local_action_step(
+    id: &str,
+    path: &str,
+    inputs: HashMap<String, String>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "id": id,
+        "displayName": format!("Run {path}"),
+        "reference": {
+            "name": "",
+            "type": "repository",
+            "repositoryType": "self",
+            "path": path
+        },
+        "inputs": inputs,
+        "condition": null,
+        "timeoutInMinutes": null,
+        "continueOnError": false,
+        "order": 1,
+        "environment": null,
+        "contextName": id
+    })
+}
 
 pub fn manifest_with_steps(steps: Vec<serde_json::Value>, server_url: &str) -> JobManifest {
     manifest_with_steps_and_context(steps, server_url, serde_json::json!({}))

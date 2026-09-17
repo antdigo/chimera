@@ -70,6 +70,35 @@ fn remap_to_container_path_works() {
     );
 }
 
+#[test]
+fn job_container_bind_mounts_make_only_actions_read_only() {
+    let params = SetupParams {
+        runner_name: "runner",
+        job_id: "job",
+        job_container: None,
+        services: &[],
+        workspace_host_path: Path::new("/host/workspace"),
+        workflow_files_host_path: Path::new("/host/workflow"),
+        runner_temp_host_path: Path::new("/host/tmp"),
+        actions_host_path: Path::new("/host/actions"),
+        tool_cache_host_path: Path::new("/host/tool-cache"),
+        externals_dir: Path::new("/host/externals"),
+    };
+
+    let binds = job_container_bind_mounts(&params);
+
+    assert_eq!(
+        binds,
+        vec![
+            "/host/workspace:/github/workspace",
+            "/host/workflow:/github/workflow",
+            "/host/tmp:/github/tmp",
+            "/host/actions:/github/actions:ro",
+            "/host/tool-cache:/github/tool-cache",
+        ]
+    );
+}
+
 /// Integration test: requires Docker daemon.
 /// Uses a unique job ID per run to avoid network name collisions.
 #[tokio::test]

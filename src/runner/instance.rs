@@ -10,6 +10,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::config::{ChimeraPaths, RunnerCredentials, rsa_params_to_private_key};
 use crate::daemon::{DaemonState, JobInfo, RunnerPhase};
+use crate::docker::build::DockerActionBuilder;
 use crate::docker::resources::{JobDockerResources, SetupParams};
 use crate::github::RUNNER_VERSION;
 use crate::github::auth::TokenManager;
@@ -129,6 +130,7 @@ pub struct Runner {
     pub(super) state: Option<Arc<DaemonState>>,
     pub(super) job_resources: JobResourceRoot,
     pub(super) cache_port: u16,
+    pub(super) docker_action_builder: Arc<DockerActionBuilder>,
 }
 
 impl Runner {
@@ -139,6 +141,7 @@ impl Runner {
         state: Arc<DaemonState>,
         job_resources: JobResourceRoot,
         cache_port: u16,
+        docker_action_builder: Arc<DockerActionBuilder>,
     ) -> Self {
         Self {
             name,
@@ -147,6 +150,7 @@ impl Runner {
             state: Some(state),
             job_resources,
             cache_port,
+            docker_action_builder,
         }
     }
 
@@ -645,6 +649,9 @@ impl Runner {
             &base_env,
             &self.name,
             &action_cache,
+            self.docker_action_builder.as_ref(),
+            // CHM-03 will provide job-owned registry auth; never inherit process credentials.
+            None,
             &github_token,
             cancel_token.clone(),
             &execution,

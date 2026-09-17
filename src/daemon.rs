@@ -404,6 +404,7 @@ impl Daemon {
         let cache_port = cache_addr.port();
 
         let state = Arc::new(DaemonState::new(&self.config.runners));
+        let docker_action_builder = Arc::new(crate::docker::build::DockerActionBuilder::new());
 
         let mut join_set = JoinSet::new();
         let mut started = 0usize;
@@ -425,6 +426,7 @@ impl Daemon {
                 Arc::clone(&state),
                 job_resources.clone(),
                 cache_port,
+                Arc::clone(&docker_action_builder),
             );
 
             let rx = shutdown_rx.clone();
