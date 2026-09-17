@@ -319,7 +319,7 @@ pub fn manifest_with_results_endpoint(
     )
 }
 
-fn manifest_with_variables(
+pub fn manifest_with_variables(
     steps: Vec<serde_json::Value>,
     server_url: &str,
     context_data: serde_json::Value,
@@ -386,4 +386,24 @@ pub fn script_step_env(id: &str, script: &str, env: HashMap<String, String>) -> 
     let mut step = script_step(id, script);
     step["environment"] = serde_json::to_value(env).unwrap();
     step
+}
+
+pub fn repository_action_step(id: &str, path: &str) -> serde_json::Value {
+    serde_json::json!({
+        "id": id,
+        "displayName": format!("Run: {id}"),
+        "reference": {
+            "name": "",
+            "type": "repository",
+            "repositoryType": "self",
+            "path": path
+        },
+        "inputs": {},
+        "condition": null,
+        "timeoutInMinutes": null,
+        "continueOnError": false,
+        "order": 1,
+        "environment": null,
+        "contextName": id
+    })
 }

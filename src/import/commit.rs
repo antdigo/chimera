@@ -329,18 +329,20 @@ where
 
     let temp_name = path_component(OsStr::new(&format!(".config.toml.{}.tmp", Uuid::new_v4())))
         .map_err(|_| ImportError::WriteFailed("config temp file name is invalid".into()))?;
-    let mode = prepared.config_mode().unwrap_or(0o600) as libc::mode_t;
+    // `config_mode` and `PublishedConfig` speak `u32` (matching
+    // `MetadataExt::mode`); the open/chmod syscalls take the platform `mode_t`.
+    let mode = prepared.config_mode().unwrap_or(0o600);
     let cleanup_parent = root
         .try_clone()
         .map_err(|_| ImportError::WriteFailed("unable to retain config temp parent".into()))?;
     let flags = libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC;
-    let mut file = open_file_at(root, &temp_name, flags, mode)
+    let mut file = open_file_at(root, &temp_name, flags, mode as libc::mode_t)
         .map_err(|_| ImportError::WriteFailed("unable to create config temp file".into()))?;
     let identity = file_identity(&file)
         .map_err(|_| ImportError::WriteFailed("unable to inspect config temp file".into()))?;
     let mut temp_cleanup =
         CleanupGuard::new(cleanup_parent, &temp_name, identity, CleanupKind::File);
-    set_file_mode(&file, mode)
+    set_file_mode(&file, mode as libc::mode_t)
         .map_err(|_| ImportError::WriteFailed("unable to secure config temp file".into()))?;
     file.write_all(serialized.as_bytes())
         .and_then(|()| file.sync_all())
@@ -355,7 +357,7 @@ where
         &file,
         identity,
         serialized.as_bytes(),
-        mode as u32,
+        mode,
     )?;
     let config_name = path_component(OsStr::new("config.toml"))
         .map_err(|_| ImportError::WriteFailed("config file name is invalid".into()))?;
@@ -371,7 +373,7 @@ where
         name: config_name,
         identity,
         bytes: serialized.into_bytes(),
-        mode: mode as u32,
+        mode,
     };
     validate_published_state(prepared, runners_handle, credentials, &published)?;
     call_checkpoint(checkpoint, CommitPoint::AfterConfigPublish)?;
@@ -625,7 +627,7 @@ fn set_file_mode(file: &File, mode: libc::mode_t) -> io::Result<()> {
 
 fn validate_private_directory(directory: &File, require_exact_mode: bool) -> io::Result<()> {
     let stat = stat_fd(directory)?;
-    let mode = stat.st_mode as u32;
+    let mode = stat.st_mode;
     let mode_is_safe = if require_exact_mode {
         mode & 0o777 == 0o700
     } else {
@@ -642,10 +644,7 @@ fn validate_private_directory(directory: &File, require_exact_mode: bool) -> io:
 
 fn validate_private_regular_file(file: &File) -> io::Result<()> {
     let stat = stat_fd(file)?;
-    if !is_regular_file(&stat)
-        || stat.st_uid != effective_uid()
-        || stat.st_mode as u32 & 0o777 != 0o600
-    {
+    if !is_regular_file(&stat) || stat.st_uid != effective_uid() || stat.st_mode & 0o777 != 0o600 {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "file is not private owned storage",
@@ -806,11 +805,11 @@ fn effective_uid() -> libc::uid_t {
 }
 
 fn is_directory(stat: &libc::stat) -> bool {
-    stat.st_mode as u32 & libc::S_IFMT as u32 == libc::S_IFDIR as u32
+    stat.st_mode & libc::S_IFMT == libc::S_IFDIR
 }
 
 fn is_regular_file(stat: &libc::stat) -> bool {
-    stat.st_mode as u32 & libc::S_IFMT as u32 == libc::S_IFREG as u32
+    stat.st_mode & libc::S_IFMT == libc::S_IFREG
 }
 
 fn unlink_at(parent: &File, name: &CStr, flags: i32) -> io::Result<()> {

@@ -372,6 +372,81 @@ if (major !== '24') {
     assert_eq!(conclusion, JobConclusion::Succeeded);
 }
 
+#[tokio::test]
+#[ignore]
+async fn container_action_receives_self_hosted_runner_context() {
+    let env = TestEnv::setup().await;
+    let action_dir = env
+        .workspace
+        .workspace_dir()
+        .join(".github/actions/runner-context-probe");
+    std::fs::create_dir_all(&action_dir).unwrap();
+    std::fs::write(
+        action_dir.join("action.yml"),
+        "name: 'Runner context probe'\nruns:\n  using: 'node24'\n  main: 'index.js'\n",
+    )
+    .unwrap();
+    std::fs::write(
+        action_dir.join("index.js"),
+        r#"
+const fs = require('fs');
+const path = require('path');
+if (process.env.RUNNER_CONTEXT_ENVIRONMENT !== 'self-hosted') {
+  process.exit(1);
+}
+if (process.env.RUNNER_CONTEXT_LABELS !== 'self-hosted') {
+  process.exit(1);
+}
+fs.writeFileSync(
+  path.join(process.env.GITHUB_WORKSPACE, 'runner-context-docker'),
+  'docker'
+);
+"#,
+    )
+    .unwrap();
+
+    let job_spec = JobContainerSpec {
+        image: "ubuntu:latest".into(),
+        environment: HashMap::new(),
+        ports: vec![],
+        volumes: vec![],
+        options: None,
+        credentials: None,
+    };
+    let mut resources = setup_docker(&env.tmp, &env.workspace, Some(&job_spec), &[]).await;
+    let mut action = repository_action_step(
+        "runner_context_probe",
+        ".github/actions/runner-context-probe",
+    );
+    action["environment"] = serde_json::json!({
+        "RUNNER_CONTEXT_ENVIRONMENT": "${{ runner.environment }}",
+        "RUNNER_CONTEXT_LABELS": "${{ join(runner.labels, ',') }}",
+        "RUNNER_ENVIRONMENT": "github-hosted",
+        "RUNNER_LABELS": "sandbox-prod"
+    });
+    let manifest = manifest_with_variables(
+        vec![action],
+        &env.mock_server.uri(),
+        serde_json::json!({}),
+        serde_json::json!({
+            "RUNNER_ENVIRONMENT": { "value": "github-hosted", "isSecret": false },
+            "RUNNER_LABELS": { "value": "sandbox-prod", "isSecret": false }
+        }),
+    );
+
+    let result = env.run_with_docker(&manifest, &resources).await;
+    resources.cleanup().await;
+    let (conclusion, _) = result.unwrap();
+
+    assert_eq!(conclusion, JobConclusion::Succeeded);
+    assert!(
+        env.workspace
+            .workspace_dir()
+            .join("runner-context-docker")
+            .is_file()
+    );
+}
+
 /// `working-directory` has to be honoured inside the job container too, where the
 /// workspace lives at /github/workspace rather than its host path.
 #[tokio::test]
