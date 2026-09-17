@@ -8,6 +8,18 @@ previous ignored, Docker-mutating commands were denied before execution. They we
 not retried. Validation of those two cases requires an authorized Docker-capable
 host.
 
+## Documentation correction: Task 7 fix round 1
+
+The operator and README wording now describes the enforced boundary precisely:
+conflicting job-, step-, and `GITHUB_ENV`-level `DOCKER_CONFIG` values are rejected
+before the affected host spawn, but an already-running same-UID process can alter
+its own environment or use `docker --config`. The stale recovery procedure now
+requires a recursive cgroup-v2 membership inspection, real non-symlink `0700`
+daemon-owned root and exact attempt directories, canonical exact-path checks, and
+stop/no-delete/no-restart on missing, unavailable, or uncertain evidence. The
+README also provides a rootless systemd drop-in that sets `DOCKER_HOST`,
+`XDG_RUNTIME_DIR`, and `PATH` without setting daemon-level `DOCKER_CONFIG`.
+
 | ID | Evidence and status |
 |---|---|
 | C-01 | Passed: `tests/job_docker_config_test.rs::concurrent_jobs_use_distinct_configs` |

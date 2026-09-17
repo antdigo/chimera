@@ -83,15 +83,17 @@ shutdown_timeout_secs = 300
 
 For each acquired job, Chimera creates
 `<root>/job-resources/<local-attempt-uuid>/docker/config.json`. Host steps receive
-that generated directory as `DOCKER_CONFIG`; the value is reserved and a workflow
-may repeat it but cannot redirect it. Chimera does not copy credentials, named
+that generated directory as `DOCKER_CONFIG`. Chimera rejects conflicting job-,
+step-, and `GITHUB_ENV`-level values before the affected host spawn, while allowing
+a workflow to repeat the generated value. It does not copy credentials, named
 contexts, credential helpers, or CLI plugins from `~/.docker` or an inherited
 daemon `DOCKER_CONFIG`.
 
-Chimera refuses startup when stale `job-resources` exist rather than deleting them
-automatically. This prevents accidental credential loss, but it is not tenant or
-same-UID process isolation. Follow the [operator recovery procedure](docs/job-docker-config.md)
-before removing an exact stale attempt directory.
+This is not tenant or same-UID process isolation: an already-running same-UID host
+process can change its own environment or invoke `docker --config`. Chimera refuses
+startup when stale `job-resources` exist rather than deleting them automatically.
+Follow the [operator recovery procedure](docs/job-docker-config.md) before removing
+an exact stale attempt directory.
 
 ## Supported features
 
@@ -133,6 +135,24 @@ Environment=RUST_LOG=info
 [Install]
 WantedBy=multi-user.target
 EOF
+```
+
+### Rootless Docker service environment
+
+For a rootless Docker daemon, add a service drop-in with the daemon user's actual
+numeric UID. Replace every `<numeric-uid>` placeholder before applying it, and
+adjust `PATH` if Docker is installed elsewhere:
+
+```bash
+sudo systemctl edit chimera.service
+```
+
+```ini
+[Service]
+Environment=DOCKER_HOST=unix:///run/user/<numeric-uid>/docker.sock
+Environment=XDG_RUNTIME_DIR=/run/user/<numeric-uid>
+Environment=PATH=/home/chimera/.local/bin:/usr/local/bin:/usr/bin:/bin
+# Do not set DOCKER_CONFIG here.
 ```
 
 Then enable and start it:
