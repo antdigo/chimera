@@ -203,6 +203,8 @@ pub async fn register(
         let context = format!("acquiring root storage lock: {error}");
         anyhow::Error::new(error).context(context)
     })?;
+    let config_path = root.join("config.toml");
+    let mut config = load_config_if_exists(&config_path)?.unwrap_or_default();
     let target = GitHubTarget::parse(url)?;
     let client = reqwest::Client::builder()
         .user_agent(format!("chimera/{RUNNER_VERSION}"))
@@ -250,9 +252,6 @@ pub async fn register(
     let runners_dir = root.join("runners");
     save_runner_credentials(&runners_dir, name, &creds).context("saving runner credentials")?;
 
-    let config_path = root.join("config.toml");
-    let mut config = load_config_if_exists(&config_path)?.unwrap_or_default();
-
     if !config.runners.contains(&name.to_string()) {
         config.runners.push(name.to_string());
     }
@@ -272,6 +271,8 @@ pub async fn unregister(name: &str, root: &Path) -> Result<()> {
         let context = format!("acquiring root storage lock: {error}");
         anyhow::Error::new(error).context(context)
     })?;
+    let config_path = root.join("config.toml");
+    let config = load_config_if_exists(&config_path)?;
     let runners_dir = root.join("runners");
     let runner_dir = runners_dir.join(name);
 
@@ -282,8 +283,7 @@ pub async fn unregister(name: &str, root: &Path) -> Result<()> {
     std::fs::remove_dir_all(&runner_dir)
         .with_context(|| format!("removing runner directory {}", runner_dir.display()))?;
 
-    let config_path = root.join("config.toml");
-    if let Some(mut config) = load_config_if_exists(&config_path)? {
+    if let Some(mut config) = config {
         config.runners.retain(|runner| runner != name);
         save_config(&config_path, &config)?;
     }
