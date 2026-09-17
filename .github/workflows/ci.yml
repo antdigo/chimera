@@ -44,6 +44,14 @@ jobs:
       - name: Fetch crates for the offline container suite
         run: cargo fetch --locked
 
+      # ubuntu-24.04 restricts unprivileged user namespaces through AppArmor,
+      # which kills the nested rootless daemon's rootlesskit with
+      # "fork/exec /proc/self/exe: operation not permitted" even inside a
+      # privileged container. The runner VM is ephemeral, so relaxing the
+      # restriction is contained to this job.
+      - name: Allow the nested rootless daemon to create user namespaces
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
       - name: Run Docker integration tests against a rootless daemon
         run: |
           set -Eeuo pipefail
