@@ -13,7 +13,8 @@ use crate::storage::{RootLockError, open_existing_root};
 
 use super::source::{read_official_registration, runner_identity};
 use super::{
-    ImportError, OpenedRegularFile, RunnerIdentity, ValidatedRegistration, read_opened_regular,
+    ImportError, ImportOutcome, ImportStatus, OpenedRegularFile, RunnerIdentity,
+    ValidatedRegistration, read_opened_regular,
 };
 
 const CREDENTIAL_FILES: [&str; 3] = ["runner.json", "credentials.json", "rsa_params.json"];
@@ -39,6 +40,48 @@ pub(crate) struct PreparedImport {
     paths: ChimeraPaths,
     config: PreservedConfig,
     disposition: TargetDisposition,
+}
+
+impl PreparedImport {
+    pub(super) fn outcome(&self, status: ImportStatus) -> ImportOutcome {
+        ImportOutcome {
+            status,
+            local_name: self.name.clone(),
+            agent_id: self.registration.credentials.info.agent_id,
+        }
+    }
+
+    pub(super) fn canonical_root(&self) -> &Path {
+        &self.paths.root
+    }
+
+    pub(super) const fn disposition(&self) -> TargetDisposition {
+        self.disposition
+    }
+
+    pub(super) fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub(super) fn credentials(&self) -> &RunnerCredentials {
+        &self.registration.credentials
+    }
+
+    pub(super) const fn paths(&self) -> &ChimeraPaths {
+        &self.paths
+    }
+
+    pub(super) fn configured_runners(&self) -> &[String] {
+        &self.config.model.runners
+    }
+
+    pub(super) const fn config_document(&self) -> &toml::Table {
+        &self.config.document
+    }
+
+    pub(super) const fn config_mode(&self) -> Option<u32> {
+        self.config.original_mode
+    }
 }
 
 pub(crate) fn prepare_import(

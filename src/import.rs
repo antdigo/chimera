@@ -1,9 +1,12 @@
+use std::fmt::{Display, Formatter};
 use std::fs::{File, Metadata};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use crate::config::RunnerCredentials;
+use crate::storage::{RootLock, RootLockError};
 
+mod commit;
 mod source;
 mod target;
 
@@ -83,6 +86,78 @@ impl ImportError {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImportStatus {
+    Eligible,
+    Imported,
+    AlreadyImported,
+}
+
+impl ImportStatus {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Eligible => "eligible",
+            Self::Imported => "imported",
+            Self::AlreadyImported => "already-imported",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportOutcome {
+    pub status: ImportStatus,
+    pub local_name: String,
+    pub agent_id: u64,
+}
+
+impl Display for ImportOutcome {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "{}: local-name={}, agent-id={}; offline validation only",
+            self.status.as_str(),
+            self.local_name,
+            self.agent_id
+        )
+    }
+}
+
+fn map_root_lock_error(error: RootLockError) -> ImportError {
+    match error {
+        RootLockError::Busy => {
+            ImportError::TargetBusy("chimera root is locked by another writer".into())
+        }
+        RootLockError::UnsafeRoot(_) | RootLockError::Io(_) => {
+            ImportError::WriteFailed("unable to acquire chimera root lock".into())
+        }
+    }
+}
+
+pub fn import_official(
+    source: &Path,
+    name: &str,
+    root: &Path,
+    dry_run: bool,
+) -> Result<ImportOutcome, ImportError> {
+    let initial = target::prepare_import(source, name, root)?;
+    if dry_run {
+        return Ok(initial.outcome(ImportStatus::Eligible));
+    }
+
+    let canonical_root = initial.canonical_root().to_path_buf();
+    let _lock = RootLock::acquire(&canonical_root).map_err(map_root_lock_error)?;
+    let prepared = target::prepare_import(source, name, &canonical_root)?;
+
+    match prepared.disposition() {
+        target::TargetDisposition::AlreadyImported => {
+            Ok(prepared.outcome(ImportStatus::AlreadyImported))
+        }
+        target::TargetDisposition::New | target::TargetDisposition::Resume => {
+            commit::commit(prepared)
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RunnerIdentity {
     scope: String,
@@ -99,3 +174,7 @@ pub(crate) struct ValidatedRegistration {
 
 #[cfg(test)]
 pub(crate) mod test_support;
+
+#[cfg(test)]
+#[path = "import_test.rs"]
+mod import_test;
