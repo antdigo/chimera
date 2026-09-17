@@ -9,26 +9,42 @@ use common::*;
 use tokio_util::sync::CancellationToken;
 
 async fn wait_for_exact_uploaded_log(env: &TestEnv, expected: &str) {
-    tokio::time::timeout(Duration::from_secs(30), async {
+    let mut last_seen = String::new();
+    let found = tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             let uploaded = env.uploaded_log_text().await;
             if uploaded.lines().any(|line| {
                 line.split_once(' ')
                     .is_some_and(|(_, content)| content == expected)
             }) {
-                return;
+                return true;
             }
+            last_seen = uploaded;
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
     })
     .await
-    .unwrap_or_else(|_| panic!("timed out waiting for exact uploaded log: {expected}"));
+    .unwrap_or(false);
+    if !found {
+        let requests: Vec<String> = env
+            .mock_server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|request| format!("{} {}", request.method, request.url.path()))
+            .collect();
+        panic!(
+            "timed out waiting for exact uploaded log: {expected}; uploaded logs:\n{last_seen}\nreceived requests:\n{}",
+            requests.join("\n")
+        );
+    }
 }
 
 #[tokio::test]
 #[ignore]
 async fn dockerfile_action_builds_and_propagates_exit_code() {
-    let env = TestEnv::setup().await;
+    let mut env = TestEnv::setup().await;
     let action = env
         .workspace
         .workspace_dir()
@@ -57,17 +73,23 @@ async fn dockerfile_action_builds_and_propagates_exit_code() {
         )],
         &env.mock_server.uri(),
     );
+    env.configure_from_manifest(&manifest);
 
     let (conclusion, outputs) = env.run(&manifest).await.unwrap();
+    let logs = env.uploaded_log_text().await;
 
-    assert_eq!(conclusion, JobConclusion::Succeeded);
+    assert_eq!(
+        conclusion,
+        JobConclusion::Succeeded,
+        "uploaded logs:\n{logs}"
+    );
     assert_eq!(outputs.get("result").map(String::as_str), Some("ok"));
 }
 
 #[tokio::test]
 #[ignore]
 async fn successfully_built_dockerfile_action_propagates_nonzero_exit_code() {
-    let env = TestEnv::setup().await;
+    let mut env = TestEnv::setup().await;
     let action = env
         .workspace
         .workspace_dir()
@@ -96,6 +118,7 @@ async fn successfully_built_dockerfile_action_propagates_nonzero_exit_code() {
         )],
         &env.mock_server.uri(),
     );
+    env.configure_from_manifest(&manifest);
 
     let (conclusion, _) = env.run(&manifest).await.unwrap();
     let logs = env.uploaded_log_text().await;
@@ -105,15 +128,19 @@ async fn successfully_built_dockerfile_action_propagates_nonzero_exit_code() {
         env.workspace
             .workspace_dir()
             .join("nonzero-entrypoint-ran")
-            .exists()
+            .exists(),
+        "entrypoint marker missing; uploaded logs:\n{logs}"
     );
-    assert!(logs.contains("Docker action image is ready"));
+    assert!(
+        logs.contains("Docker action image is ready"),
+        "uploaded logs:\n{logs}"
+    );
 }
 
 #[tokio::test]
 #[ignore]
 async fn subdirectory_dockerfile_uses_action_root_as_context() {
-    let env = TestEnv::setup().await;
+    let mut env = TestEnv::setup().await;
     let action = env
         .workspace
         .workspace_dir()
@@ -143,6 +170,7 @@ async fn subdirectory_dockerfile_uses_action_root_as_context() {
         )],
         &env.mock_server.uri(),
     );
+    env.configure_from_manifest(&manifest);
 
     let (conclusion, _) = env.run(&manifest).await.unwrap();
 
@@ -152,7 +180,7 @@ async fn subdirectory_dockerfile_uses_action_root_as_context() {
 #[tokio::test]
 #[ignore]
 async fn dockerfile_specific_ignore_overrides_root_ignore() {
-    let env = TestEnv::setup().await;
+    let mut env = TestEnv::setup().await;
     let action = env
         .workspace
         .workspace_dir()
@@ -185,6 +213,7 @@ async fn dockerfile_specific_ignore_overrides_root_ignore() {
         )],
         &env.mock_server.uri(),
     );
+    env.configure_from_manifest(&manifest);
 
     let (conclusion, _) = env.run(&manifest).await.unwrap();
 
@@ -197,7 +226,7 @@ async fn dockerfile_specific_ignore_overrides_root_ignore() {
 async fn context_symlink_escape_fails_before_action_container_starts() {
     use std::os::unix::fs::symlink;
 
-    let env = TestEnv::setup().await;
+    let mut env = TestEnv::setup().await;
     let action = env
         .workspace
         .workspace_dir()
@@ -225,6 +254,7 @@ async fn context_symlink_escape_fails_before_action_container_starts() {
         )],
         &env.mock_server.uri(),
     );
+    env.configure_from_manifest(&manifest);
 
     let (conclusion, _) = env.run(&manifest).await.unwrap();
     let logs = env.uploaded_log_text().await;
@@ -238,7 +268,7 @@ async fn context_symlink_escape_fails_before_action_container_starts() {
 #[tokio::test]
 #[ignore]
 async fn synthetic_secrets_stay_out_of_context_and_logs() {
-    let env = TestEnv::setup().await;
+    let mut env = TestEnv::setup().await;
     let action = env.workspace.workspace_dir().join(".github/actions/canary");
     std::fs::create_dir_all(&action).unwrap();
     std::fs::write(
@@ -273,6 +303,7 @@ async fn synthetic_secrets_stay_out_of_context_and_logs() {
         )],
         &env.mock_server.uri(),
     );
+    env.configure_from_manifest(&manifest);
 
     let (conclusion, _) = env.run_with_registry_auth(&manifest, &auth).await.unwrap();
     let logs = env.uploaded_log_text().await;
@@ -285,7 +316,7 @@ async fn synthetic_secrets_stay_out_of_context_and_logs() {
 #[tokio::test]
 #[ignore]
 async fn changed_context_rebuilds_while_unchanged_context_hits_cache() {
-    let env = TestEnv::setup().await;
+    let mut env = TestEnv::setup().await;
     let action = env
         .workspace
         .workspace_dir()
@@ -310,6 +341,7 @@ async fn changed_context_rebuilds_while_unchanged_context_hits_cache() {
         )],
         &env.mock_server.uri(),
     );
+    env.configure_from_manifest(&manifest);
 
     assert_eq!(
         env.run(&manifest).await.unwrap().0,
@@ -336,7 +368,7 @@ async fn changed_context_rebuilds_while_unchanged_context_hits_cache() {
 #[tokio::test]
 #[ignore]
 async fn cancelled_build_does_not_start_action_and_same_key_retries() {
-    let env = TestEnv::setup().await;
+    let mut env = TestEnv::setup().await;
     let action = env
         .workspace
         .workspace_dir()
@@ -367,6 +399,7 @@ async fn cancelled_build_does_not_start_action_and_same_key_retries() {
         )],
         &env.mock_server.uri(),
     );
+    env.configure_from_manifest(&manifest);
     let cancel_token = CancellationToken::new();
 
     let run = env.run_with_cancel(&manifest, cancel_token.clone());
@@ -409,7 +442,7 @@ async fn cancelled_build_does_not_start_action_and_same_key_retries() {
 #[tokio::test]
 #[ignore]
 async fn timed_out_action_does_not_start_entrypoint_and_same_key_retries() {
-    let env = TestEnv::setup().await;
+    let mut env = TestEnv::setup().await;
     let action = env
         .workspace
         .workspace_dir()
@@ -436,6 +469,7 @@ async fn timed_out_action_does_not_start_entrypoint_and_same_key_retries() {
         local_action_step("timeout", ".github/actions/timed-out-build", HashMap::new());
     timed_out_step["timeoutInMinutes"] = serde_json::json!(1);
     let timed_out_manifest = manifest_with_steps(vec![timed_out_step], &env.mock_server.uri());
+    env.configure_from_manifest(&timed_out_manifest);
 
     let run = env.run(&timed_out_manifest);
     let wait_for_build_process = wait_for_exact_uploaded_log(&env, &build_marker);
@@ -482,7 +516,7 @@ async fn timed_out_action_does_not_start_entrypoint_and_same_key_retries() {
 #[tokio::test]
 #[ignore]
 async fn failed_build_does_not_start_action_entrypoint() {
-    let env = TestEnv::setup().await;
+    let mut env = TestEnv::setup().await;
     let action = env
         .workspace
         .workspace_dir()
@@ -511,6 +545,7 @@ async fn failed_build_does_not_start_action_entrypoint() {
         )],
         &env.mock_server.uri(),
     );
+    env.configure_from_manifest(&manifest);
 
     let (conclusion, _) = env.run(&manifest).await.unwrap();
     let logs = env.uploaded_log_text().await;
@@ -523,7 +558,7 @@ async fn failed_build_does_not_start_action_entrypoint() {
 #[tokio::test]
 #[ignore]
 async fn dockerfile_action_reuses_image_for_pre_main_post() {
-    let env = TestEnv::setup().await;
+    let mut env = TestEnv::setup().await;
     let action = env.workspace.workspace_dir().join(".github/actions/phases");
     std::fs::create_dir_all(&action).unwrap();
     std::fs::write(
@@ -573,6 +608,7 @@ runs:
         )],
         &env.mock_server.uri(),
     );
+    env.configure_from_manifest(&manifest);
 
     let (conclusion, outputs) = env.run(&manifest).await.unwrap();
     let logs = env.uploaded_log_text().await;
@@ -583,7 +619,11 @@ runs:
         std::fs::read_to_string(env.workspace.workspace_dir().join("phases")).unwrap(),
         "pre\nmain\npost\n"
     );
-    assert_eq!(logs.matches("Docker action image is ready").count(), 1);
+    assert_eq!(
+        logs.matches("Docker action image is ready").count(),
+        1,
+        "uploaded logs:\n{logs}"
+    );
     assert_eq!(
         logs.matches("Reusing Docker action image for this job")
             .count(),
@@ -594,7 +634,7 @@ runs:
 #[tokio::test]
 #[ignore]
 async fn prebuilt_metadata_and_inline_docker_actions_still_run() {
-    let env = TestEnv::setup().await;
+    let mut env = TestEnv::setup().await;
     let action = env
         .workspace
         .workspace_dir()
@@ -639,6 +679,7 @@ runs:
         ],
         &env.mock_server.uri(),
     );
+    env.configure_from_manifest(&manifest);
 
     let (conclusion, outputs) = env.run(&manifest).await.unwrap();
     let logs = env.uploaded_log_text().await;
