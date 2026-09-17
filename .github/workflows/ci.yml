@@ -42,7 +42,13 @@ jobs:
         run: cargo test
 
       - name: Fetch crates for the offline container suite
-        run: cargo fetch --locked
+        run: |
+          cargo fetch --locked
+          # Crate tarballs carry upstream file modes and some crates (fnv
+          # 1.0.7) ship 0640 files; the in-container suite runs as uid 1000
+          # while the cache belongs to the runner user, so make the
+          # read-only registry bind readable for that uid.
+          chmod -R a+rX ~/.cargo/registry/src
 
       # ubuntu-24.04 restricts unprivileged user namespaces through AppArmor,
       # which kills the nested rootless daemon's rootlesskit with
