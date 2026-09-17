@@ -168,6 +168,10 @@ pub fn extract_public_action(bytes: &[u8], destination: &Path) -> Result<()> {
 
     for entry in archive.entries()? {
         let mut entry = entry?;
+        let entry_type = entry.header().entry_type();
+        if entry_type.is_pax_global_extensions() {
+            continue;
+        }
         let archive_path = entry.path()?.into_owned();
         if archive_path.is_absolute()
             || archive_path.components().any(|component| {
@@ -194,12 +198,14 @@ pub fn extract_public_action(bytes: &[u8], destination: &Path) -> Result<()> {
         }
 
         let relative: PathBuf = components.collect();
-        let entry_type = entry.header().entry_type();
         if relative.as_os_str().is_empty() {
             if entry_type.is_dir() {
                 continue;
             }
-            bail!("public action archive prefix is not a directory");
+            bail!(
+                "public action archive prefix is not a directory: {} ({entry_type:?})",
+                archive_path.display()
+            );
         }
         if relative.is_absolute()
             || relative.components().any(|component| {

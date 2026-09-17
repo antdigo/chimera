@@ -35,6 +35,29 @@ fn archive_with_file(path: &str, contents: &[u8], mode: u32) -> Vec<u8> {
     archive.into_inner().unwrap().finish().unwrap()
 }
 
+fn archive_with_global_pax_header(path: &str, contents: &[u8]) -> Vec<u8> {
+    let encoder = GzEncoder::new(Vec::new(), Compression::default());
+    let mut archive = Builder::new(encoder);
+
+    let mut pax_header = Header::new_gnu();
+    pax_header.set_path("pax_global_header").unwrap();
+    pax_header.set_entry_type(EntryType::XGlobalHeader);
+    pax_header.set_mode(0o644);
+    pax_header.set_size(0);
+    pax_header.set_cksum();
+    archive.append(&pax_header, std::io::empty()).unwrap();
+
+    let mut file_header = Header::new_gnu();
+    file_header.set_path(path).unwrap();
+    file_header.set_entry_type(EntryType::Regular);
+    file_header.set_mode(0o644);
+    file_header.set_size(contents.len() as u64);
+    file_header.set_cksum();
+    archive.append(&file_header, contents).unwrap();
+
+    archive.into_inner().unwrap().finish().unwrap()
+}
+
 fn archive_with_raw_path(path: &[u8], contents: &[u8]) -> Vec<u8> {
     assert!(path.len() < 100);
     let encoder = GzEncoder::new(Vec::new(), Compression::default());
@@ -91,6 +114,20 @@ fn pinned_action_extraction_preserves_executable_mode() {
         .mode()
         & 0o777;
     assert_eq!(mode, 0o755);
+}
+
+#[test]
+fn pinned_action_extraction_accepts_global_pax_metadata() {
+    let archive =
+        archive_with_global_pax_header("owner-repo-sha/action.yml", b"name: global pax probe\n");
+    let destination = tempfile::tempdir().unwrap();
+
+    extract_public_action(&archive, destination.path()).unwrap();
+
+    assert_eq!(
+        std::fs::read(destination.path().join("action.yml")).unwrap(),
+        b"name: global pax probe\n"
+    );
 }
 
 #[test]
@@ -1137,6 +1174,15 @@ async fn pinned_buildx_flow_uses_job_config_and_original_socket() {
         vec![probe, setup, record_builder, login, build, pull],
         &env.mock_server.uri(),
         serde_json::json!({
+            "github": {
+                "repository": "chimera/buildx-probe",
+                "repository_owner": "chimera",
+                "ref": "refs/heads/main",
+                "sha": "0123456789abcdef0123456789abcdef01234567",
+                "server_url": "https://github.com",
+                "api_url": "https://api.github.com",
+                "graphql_url": "https://api.github.com/graphql"
+            },
             "secrets": { "REGISTRY_PASSWORD": ALICE_PASSWORD }
         }),
     );

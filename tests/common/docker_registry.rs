@@ -279,7 +279,7 @@ pub async fn docker_output(
         .args(args)
         .env("DOCKER_CONFIG", docker_config)
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .kill_on_drop(true);
     if stdin.is_some() {
         command.stdin(Stdio::piped());
@@ -304,8 +304,10 @@ pub async fn docker_output(
     .context("Docker CLI test command timed out")??;
     if !output.status.success() {
         bail!(
-            "Docker CLI test command failed with status {}",
-            output.status
+            "Docker CLI test command `docker {}` failed with status {}: {}",
+            args.join(" "),
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
         );
     }
     String::from_utf8(output.stdout).context("Docker CLI output was not UTF-8")
