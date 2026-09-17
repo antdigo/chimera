@@ -130,17 +130,19 @@ jobs:
 
           # C-10 requires BuildKit as an already-local immutable image and
           # never lets Buildx download it; preload it into the nested daemon.
-          # Digest references do not survive a docker save/load round-trip
-          # (the loaded image keeps no RepoTags or RepoDigests), so resolve
-          # the image ID on the host daemon and carry only that through.
-          BUILDKIT_IMAGE_ID="$(docker image inspect --format '{{.Id}}' "$BUILDKIT_REFERENCE")"
-          test -n "$BUILDKIT_IMAGE_ID"
-          docker save --output /tmp/chimera-buildkit.tar "$BUILDKIT_IMAGE_ID"
+          # Neither digest references nor the host daemon's image ID survive
+          # a docker save/load round-trip: the loaded image keeps no
+          # RepoTags or RepoDigests, and daemons with different image stores
+          # assign different IDs to the same content. The ID the nested
+          # daemon itself reports on load is the only stable handle.
+          docker save --output /tmp/chimera-buildkit.tar "$BUILDKIT_REFERENCE"
           docker cp /tmp/chimera-buildkit.tar "$DIND_NAME":/tmp/chimera-buildkit.tar
           docker exec --user root "$DIND_NAME" chown 1000:1000 /tmp/chimera-buildkit.tar
-          docker exec \
+          load_output="$(docker exec \
             -e DOCKER_HOST=unix:///run/user/1000/docker.sock \
-            "$DIND_NAME" docker load --input /tmp/chimera-buildkit.tar
+            "$DIND_NAME" docker load --input /tmp/chimera-buildkit.tar)"
+          BUILDKIT_IMAGE_ID="$(printf '%s\n' "$load_output" | sed -n 's/^Loaded image ID: //p')"
+          test -n "$BUILDKIT_IMAGE_ID"
           docker exec \
             -e DOCKER_HOST=unix:///run/user/1000/docker.sock \
             "$DIND_NAME" docker image inspect --format '{{.Id}}' "$BUILDKIT_IMAGE_ID"
