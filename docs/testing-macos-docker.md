@@ -369,12 +369,19 @@ done
 This is the command that satisfies the repository's Docker verification gate:
 
 ```bash
-run_in_chimera_test_container cargo test --offline -- --ignored
+run_in_chimera_test_container cargo test --offline -- --ignored --test-threads=2
 ```
 
 `--offline` applies to Cargo only. The first full run may still download the
 existing tag-based Docker test images listed in the security section. C-10 may
 also download its three action archives at the exact SHA pins.
+
+`--test-threads=2` is a macOS-only accommodation: the nested rootless daemon
+builds `linux/amd64` images through QEMU emulation on the arm64 Docker Desktop
+VM, and running every Engine test concurrently makes the daemon fail otherwise
+passing builds with engine-side errors. CI's native amd64 runners need no such
+limit. Individual tests always pass in isolation; do not "fix" the suite by
+weakening assertions.
 
 ## 7. Verify test cleanup
 
