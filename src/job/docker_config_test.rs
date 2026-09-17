@@ -132,6 +132,50 @@ fn cleanup_is_idempotent_and_keeps_neighbor() {
 }
 
 #[test]
+fn cleanup_refuses_moved_root_replaced_by_symlink() {
+    let (temp, root) = prepared_root();
+    let original_root = root.path().to_path_buf();
+    let mut config = root.create_docker_config().unwrap();
+    let attempt_name = config.attempt_dir().file_name().unwrap().to_owned();
+    let moved_root = temp.path().join("moved-job-resources");
+    std::fs::rename(&original_root, &moved_root).unwrap();
+    std::os::unix::fs::symlink(&moved_root, &original_root).unwrap();
+
+    let error = config.cleanup().unwrap_err();
+
+    assert!(matches!(error, JobDockerConfigError::UnsafeEntry { .. }));
+    assert!(
+        std::fs::symlink_metadata(&original_root)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert!(moved_root.join(attempt_name).exists());
+}
+
+#[test]
+fn cleanup_refuses_replacement_attempt_at_same_path() {
+    let (temp, root) = prepared_root();
+    let mut config = root.create_docker_config().unwrap();
+    let attempt_path = config.attempt_dir().to_path_buf();
+    let moved_attempt = temp.path().join("moved-attempt");
+    std::fs::rename(&attempt_path, &moved_attempt).unwrap();
+    std::fs::create_dir(&attempt_path).unwrap();
+    std::fs::set_permissions(&attempt_path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let replacement_marker = attempt_path.join("replacement-marker");
+    std::fs::write(&replacement_marker, "replacement").unwrap();
+
+    let error = config.cleanup().unwrap_err();
+
+    assert!(matches!(error, JobDockerConfigError::UnsafeEntry { .. }));
+    assert!(moved_attempt.join("docker/config.json").exists());
+    assert_eq!(
+        std::fs::read_to_string(replacement_marker).unwrap(),
+        "replacement"
+    );
+}
+
+#[test]
 fn cleanup_refuses_config_symlink_without_touching_target() {
     let (_temp, root) = prepared_root();
     let mut config = root.create_docker_config().unwrap();

@@ -1,3 +1,6 @@
+use std::os::unix::ffi::OsStringExt;
+use std::os::unix::fs::PermissionsExt;
+
 use super::*;
 use crate::github::auth::TokenManager;
 use crate::job::action::ActionCache;
@@ -141,6 +144,11 @@ fn host_base_env(config: &JobDockerConfig) -> HashMap<String, String> {
         DOCKER_CONFIG_ENV.to_string(),
         config.directory().to_string_lossy().into_owned(),
     )])
+}
+
+fn write_executable(path: &std::path::Path) {
+    std::fs::write(path, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
 }
 
 #[test]
@@ -700,6 +708,84 @@ async fn cancel_token_kills_running_process() {
     assert_eq!(result.conclusion, StepConclusion::Cancelled);
 
     drop(logger);
+}
+
+#[test]
+fn host_command_rejects_default_docker_credential_helpers_on_effective_path() {
+    for helper in ["docker-credential-pass", "docker-credential-secretservice"] {
+        let temp = tempfile::tempdir().unwrap();
+        let root = JobResourceRoot::prepare(&temp.path().join("job-resources")).unwrap();
+        let config = root.create_docker_config().unwrap();
+        let bin = temp.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        write_executable(&bin.join(helper));
+        let mut env = host_base_env(&config);
+        env.insert("PATH".into(), bin.to_string_lossy().into_owned());
+
+        let error = host_command("/usr/bin/true", &[], &env, temp.path(), &config).unwrap_err();
+
+        assert!(error.to_string().contains("reserved-host-capability"));
+        assert!(error.to_string().contains(helper));
+    }
+}
+
+#[test]
+fn host_command_allows_non_executable_default_credential_helper() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = JobResourceRoot::prepare(&temp.path().join("job-resources")).unwrap();
+    let config = root.create_docker_config().unwrap();
+    let bin = temp.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let helper = bin.join("docker-credential-pass");
+    std::fs::write(&helper, "not executable").unwrap();
+    std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let mut env = host_base_env(&config);
+    env.insert("PATH".into(), bin.to_string_lossy().into_owned());
+
+    host_command("/usr/bin/true", &[], &env, temp.path(), &config).unwrap();
+}
+
+#[test]
+fn host_command_prefers_step_path_and_falls_back_to_non_utf8_inherited_path() {
+    let temp = tempfile::tempdir().unwrap();
+    let helper_dir = temp.path().join("helper-bin");
+    std::fs::create_dir(&helper_dir).unwrap();
+    write_executable(&helper_dir.join("docker-credential-pass"));
+    let safe_dir = temp.path().join("safe-bin");
+    std::fs::create_dir(&safe_dir).unwrap();
+    let mut inherited_path = std::ffi::OsString::from_vec(b"/missing-\xff:".to_vec());
+    inherited_path.push(&helper_dir);
+
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "job::execute::execute_test::host_command_path_precedence_child",
+            "--nocapture",
+        ])
+        .env("PATH", inherited_path)
+        .env("CHIMERA_EFFECTIVE_PATH_CHILD", &safe_dir)
+        .status()
+        .unwrap();
+
+    assert!(status.success());
+}
+
+#[test]
+fn host_command_path_precedence_child() {
+    let Some(safe_dir) = std::env::var_os("CHIMERA_EFFECTIVE_PATH_CHILD") else {
+        return;
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let root = JobResourceRoot::prepare(&temp.path().join("job-resources")).unwrap();
+    let config = root.create_docker_config().unwrap();
+    let mut explicit = host_base_env(&config);
+    explicit.insert("PATH".into(), safe_dir.to_string_lossy().into_owned());
+
+    host_command("/usr/bin/true", &[], &explicit, temp.path(), &config).unwrap();
+
+    let inherited = host_base_env(&config);
+    let error = host_command("/usr/bin/true", &[], &inherited, temp.path(), &config).unwrap_err();
+    assert!(error.to_string().contains("docker-credential-pass"));
 }
 
 #[test]

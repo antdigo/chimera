@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::ffi::OsStr;
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -23,7 +24,7 @@ use super::timeline::{TimelineLogRef, TimelineRecord, TimelineResult, TimelineSt
 use super::workspace::Workspace;
 use crate::docker::output::OutputProcessor;
 use crate::docker::resources::JobDockerResources;
-use crate::job::docker_config::{DOCKER_CONFIG_ENV, JobDockerConfig};
+use crate::job::docker_config::{DOCKER_CONFIG_ENV, JobDockerConfig, JobDockerConfigError};
 use crate::node::NodeRuntimes;
 use crate::utils::{format_results_timestamp, format_timeline_timestamp};
 
@@ -429,6 +430,47 @@ pub async fn run_container_step(
     result
 }
 
+const IMPLICIT_DOCKER_CREDENTIAL_HELPERS: [&str; 2] =
+    ["docker-credential-pass", "docker-credential-secretservice"];
+
+fn validate_host_docker_capabilities(
+    env: &HashMap<String, String>,
+    working_dir: &Path,
+) -> Result<(), JobDockerConfigError> {
+    let inherited_path = env
+        .get("PATH")
+        .is_none()
+        .then(|| std::env::var_os("PATH"))
+        .flatten();
+    let effective_path = env
+        .get("PATH")
+        .map(|path| OsStr::new(path.as_str()))
+        .or(inherited_path.as_deref());
+    let Some(effective_path) = effective_path else {
+        return Ok(());
+    };
+
+    for helper in IMPLICIT_DOCKER_CREDENTIAL_HELPERS {
+        for entry in std::env::split_paths(effective_path) {
+            let directory = if entry.as_os_str().is_empty() {
+                working_dir.to_path_buf()
+            } else if entry.is_absolute() {
+                entry
+            } else {
+                working_dir.join(entry)
+            };
+            let candidate = directory.join(helper);
+            let Ok(metadata) = std::fs::metadata(candidate) else {
+                continue;
+            };
+            if !metadata.is_dir() && metadata.permissions().mode() & 0o111 != 0 {
+                return Err(JobDockerConfigError::ImplicitCredentialStore { helper });
+            }
+        }
+    }
+    Ok(())
+}
+
 fn host_command(
     program: &str,
     args: &[&OsStr],
@@ -440,6 +482,7 @@ fn host_command(
         .get(DOCKER_CONFIG_ENV)
         .context("host step is missing runner-owned DOCKER_CONFIG")?;
     docker_config.validate_override(configured, "host spawn")?;
+    validate_host_docker_capabilities(env, working_dir)?;
 
     let mut command = Command::new(program);
     command

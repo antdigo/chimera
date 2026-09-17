@@ -89,7 +89,10 @@ impl AuthenticatedRegistry {
         )
         .await;
         if let Err(error) = start_result {
-            let _ = docker_cleanup(&["rm", "-f", "--", &container_name], &setup_docker_config);
+            let _ = docker_cleanup(
+                &registry_container_cleanup_args(&container_name),
+                &setup_docker_config,
+            );
             return Err(error);
         }
 
@@ -225,7 +228,7 @@ impl Drop for AuthenticatedRegistry {
         }
 
         if let Err(error) = docker_cleanup(
-            &["rm", "-f", "--", &self.container_name],
+            &registry_container_cleanup_args(&self.container_name),
             &self.setup_docker_config,
         ) {
             eprintln!(
@@ -234,6 +237,10 @@ impl Drop for AuthenticatedRegistry {
             );
         }
     }
+}
+
+pub fn registry_container_cleanup_args(container_name: &str) -> [&str; 5] {
+    ["rm", "--force", "--volumes", "--", container_name]
 }
 
 pub fn docker_cleanup(args: &[&str], docker_config: &Path) -> Result<()> {

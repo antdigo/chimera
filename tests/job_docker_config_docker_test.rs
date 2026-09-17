@@ -3,7 +3,9 @@ mod common;
 use std::collections::HashMap;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 
+use anyhow::{Context, Result, bail};
 use chimera::job::client::JobConclusion;
 use chimera::job::docker_config::JobResourceRoot;
 use chimera::job::schema::JobManifest;
@@ -18,6 +20,7 @@ use tokio_util::sync::CancellationToken;
 const SETUP_BUILDX_SHA: &str = "d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5";
 const LOGIN_SHA: &str = "650006c6eb7dba73a995cc03b0b2d7f5ca915bee";
 const BUILD_PUSH_SHA: &str = "f9f3042f7e2789586610d6e8b85c8f03e5195baf";
+const BUILDKIT_IMAGE_ID_ENV: &str = "CHIMERA_TEST_BUILDKIT_IMAGE_ID";
 
 fn archive_with_file(path: &str, contents: &[u8], mode: u32) -> Vec<u8> {
     let encoder = GzEncoder::new(Vec::new(), Compression::default());
@@ -159,6 +162,575 @@ async fn pinned_action_installer_rejects_unsafe_cache_coordinates_before_downloa
 
     assert!(error.to_string().contains("unsafe action owner"));
     assert_eq!(std::fs::read_dir(actions.path()).unwrap().count(), 0);
+}
+
+const VALID_BUILDKIT_IMAGE_ID: &str =
+    "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const VALID_CONTAINER_ID: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+#[test]
+fn buildkit_image_id_accepts_an_immutable_sha256_id() {
+    assert_eq!(
+        parse_buildkit_image_id(VALID_BUILDKIT_IMAGE_ID).unwrap(),
+        VALID_BUILDKIT_IMAGE_ID
+    );
+}
+
+#[test]
+fn buildkit_image_id_rejects_tags_and_malformed_digests() {
+    for value in [
+        "moby/buildkit:latest",
+        "sha256:abcd",
+        "sha512:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "sha256:gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg",
+    ] {
+        assert!(parse_buildkit_image_id(value).is_err(), "accepted {value}");
+    }
+}
+
+#[test]
+fn local_image_inspection_must_match_the_requested_id() {
+    assert!(
+        validate_local_image_id(
+            VALID_BUILDKIT_IMAGE_ID,
+            &format!("{VALID_BUILDKIT_IMAGE_ID}\n")
+        )
+        .is_ok()
+    );
+    assert!(
+        validate_local_image_id(
+            VALID_BUILDKIT_IMAGE_ID,
+            "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n",
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn docker_container_id_parser_requires_one_full_id() {
+    assert_eq!(
+        parse_container_id(&format!("{VALID_CONTAINER_ID}\n")).unwrap(),
+        VALID_CONTAINER_ID
+    );
+    assert!(parse_container_id("abcd\n").is_err());
+    assert!(parse_container_id(&format!("{VALID_CONTAINER_ID}\n{VALID_CONTAINER_ID}\n")).is_err());
+}
+
+#[test]
+fn exact_resource_listing_reports_an_empty_result_as_absent() {
+    assert!(!exact_resource_is_present("\n", VALID_CONTAINER_ID).unwrap());
+}
+
+#[test]
+fn exact_resource_listing_reports_the_expected_result_as_present() {
+    assert!(
+        exact_resource_is_present(&format!("{VALID_CONTAINER_ID}\n"), VALID_CONTAINER_ID).unwrap()
+    );
+}
+
+#[test]
+fn exact_resource_listing_rejects_an_unexpected_result() {
+    assert!(exact_resource_is_present("unexpected\n", VALID_CONTAINER_ID).is_err());
+}
+
+#[test]
+fn offline_action_environment_allows_only_loopback_http() {
+    let environment = offline_action_environment();
+
+    for key in [
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+    ] {
+        assert_eq!(environment[key], "http://127.0.0.1:1");
+    }
+    assert_eq!(environment["NO_PROXY"], "127.0.0.1,localhost");
+    assert_eq!(environment["no_proxy"], "127.0.0.1,localhost");
+}
+
+#[test]
+fn explicit_builder_name_derives_exact_owned_resource_names() {
+    let resources = BuildxOwnedResources::new("chimera-buildx-test".into());
+
+    assert_eq!(resources.builder_name, "chimera-buildx-test");
+    assert_eq!(
+        resources.container_name,
+        "buildx_buildkit_chimera-buildx-test0"
+    );
+    assert_eq!(
+        resources.state_volume_name,
+        "buildx_buildkit_chimera-buildx-test0_state"
+    );
+}
+
+#[test]
+fn buildx_setup_inputs_pin_local_artifacts_without_a_version_request() {
+    let inputs = buildx_setup_inputs(
+        "chimera-buildx-test",
+        VALID_BUILDKIT_IMAGE_ID,
+        "127.0.0.1:5000",
+    );
+
+    assert_eq!(inputs["name"], "chimera-buildx-test");
+    assert_eq!(inputs["cache-binary"], "false");
+    assert!(!inputs.contains_key("version"));
+    assert_eq!(
+        inputs["driver-opts"],
+        format!("network=host\nimage={VALID_BUILDKIT_IMAGE_ID}")
+    );
+    assert_eq!(
+        inputs["buildkitd-config-inline"],
+        "[registry.\"127.0.0.1:5000\"]\n  http = true\n  insecure = true\n"
+    );
+}
+
+#[test]
+fn rootless_environment_requires_explicit_nonempty_values() {
+    for (docker_host, runtime_dir) in [
+        (None, Some("/run/user/1501")),
+        (Some(""), Some("/run/user/1501")),
+        (Some("unix:///run/user/1501/docker.sock"), None),
+        (Some("unix:///run/user/1501/docker.sock"), Some("")),
+    ] {
+        assert!(
+            validate_rootless_environment(docker_host, runtime_dir).is_err(),
+            "accepted DOCKER_HOST={docker_host:?}, XDG_RUNTIME_DIR={runtime_dir:?}"
+        );
+    }
+}
+
+#[test]
+fn rootless_environment_rejects_malformed_or_incoherent_endpoints() {
+    for docker_host in [
+        "tcp://127.0.0.1:2375",
+        "unix://relative/docker.sock",
+        "unix:///run/user/1501/other.sock",
+        "unix:///run/user/1502/docker.sock",
+    ] {
+        assert!(
+            validate_rootless_environment(Some(docker_host), Some("/run/user/1501")).is_err(),
+            "accepted {docker_host}"
+        );
+    }
+}
+
+#[test]
+fn rootless_environment_accepts_matching_unix_socket() {
+    let environment = validate_rootless_environment(
+        Some("unix:///run/user/1501/docker.sock"),
+        Some("/run/user/1501"),
+    )
+    .unwrap();
+
+    assert_eq!(environment.docker_host, "unix:///run/user/1501/docker.sock");
+    assert_eq!(environment.xdg_runtime_dir, "/run/user/1501");
+}
+
+#[test]
+fn daemon_security_options_require_valid_rootless_marker() {
+    for output in [
+        "",
+        "{}",
+        r#"["name=seccomp,profile=builtin"]"#,
+        r#"["rootless"]"#,
+    ] {
+        assert!(
+            validate_rootless_security_options(output).is_err(),
+            "accepted {output:?}"
+        );
+    }
+
+    validate_rootless_security_options(
+        r#"["name=seccomp,profile=builtin","name=rootless","name=cgroupns"]"#,
+    )
+    .unwrap();
+}
+
+#[test]
+fn registry_cleanup_removes_only_exact_container_with_volumes() {
+    assert_eq!(
+        registry_container_cleanup_args("chimera-registry-test"),
+        ["rm", "--force", "--volumes", "--", "chimera-registry-test"]
+    );
+}
+
+fn timeline_record_update(name: &str, state: u8, result: Option<u8>) -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({
+        "value": [{
+            "id": uuid::Uuid::new_v4().to_string(),
+            "state": state,
+            "result": result,
+            "name": name,
+        }],
+        "count": 1,
+    }))
+    .unwrap()
+}
+
+#[test]
+fn pinned_post_records_accept_each_expected_success_once() {
+    let expected = vec![
+        "Post Run setup@pin".to_string(),
+        "Post Run login@pin".to_string(),
+        "Post Run build@pin".to_string(),
+    ];
+    let mut updates = expected
+        .iter()
+        .map(|name| timeline_record_update(name, 2, Some(0)))
+        .collect::<Vec<_>>();
+    updates.push(timeline_record_update("Run unrelated main", 2, Some(2)));
+
+    validate_successful_post_records(&updates, &expected).unwrap();
+}
+
+#[test]
+fn pinned_post_records_reject_missing_or_incomplete_expected_post() {
+    let expected = vec![
+        "Post Run setup@pin".to_string(),
+        "Post Run login@pin".to_string(),
+    ];
+    let updates = vec![
+        timeline_record_update(&expected[0], 2, Some(0)),
+        timeline_record_update(&expected[1], 1, None),
+    ];
+
+    assert!(validate_successful_post_records(&updates, &expected).is_err());
+}
+
+#[test]
+fn pinned_post_records_reject_failed_cancelled_or_skipped_post() {
+    let expected = vec!["Post Run action@pin".to_string()];
+
+    for result in [2, 3, 4] {
+        let updates = vec![timeline_record_update(&expected[0], 2, Some(result))];
+        assert!(
+            validate_successful_post_records(&updates, &expected).is_err(),
+            "accepted timeline result {result}"
+        );
+    }
+}
+
+#[test]
+fn pinned_post_records_reject_duplicate_or_unrelated_post() {
+    let expected = vec!["Post Run action@pin".to_string()];
+    let duplicate = vec![
+        timeline_record_update(&expected[0], 2, Some(0)),
+        timeline_record_update(&expected[0], 2, Some(0)),
+    ];
+    let unrelated = vec![
+        timeline_record_update(&expected[0], 2, Some(0)),
+        timeline_record_update("Post Run unrelated@pin", 2, Some(0)),
+    ];
+
+    assert!(validate_successful_post_records(&duplicate, &expected).is_err());
+    assert!(validate_successful_post_records(&unrelated, &expected).is_err());
+}
+
+#[tokio::test]
+async fn configured_client_reports_local_action_post_completion() {
+    let mut env = TestEnv::setup().await;
+    let action_path = ".github/actions/timeline-post-probe";
+    let action_dir = env.workspace.workspace_dir().join(action_path);
+    std::fs::create_dir_all(&action_dir).unwrap();
+    std::fs::write(
+        action_dir.join("action.yml"),
+        "name: timeline-post-probe\nruns:\n  using: node20\n  main: main.js\n  post: post.js\n  post-if: always()\n",
+    )
+    .unwrap();
+    std::fs::write(action_dir.join("main.js"), "").unwrap();
+    std::fs::write(action_dir.join("post.js"), "").unwrap();
+    let manifest = manifest_with_steps(
+        vec![serde_json::json!({
+            "id": "timeline-post-probe",
+            "displayName": format!("Run {action_path}"),
+            "reference": {
+                "name": "",
+                "type": "repository",
+                "repositoryType": "self",
+                "path": action_path
+            },
+            "inputs": {},
+            "condition": null,
+            "timeoutInMinutes": null,
+            "continueOnError": false,
+            "order": 1,
+            "environment": null,
+            "contextName": "timeline-post-probe"
+        })],
+        &env.mock_server.uri(),
+    );
+    let timeline = spy_on_timeline_updates(&env.mock_server).await;
+    env.configure_from_manifest(&manifest);
+
+    let observed = env
+        .run_observed(&manifest, CancellationToken::new())
+        .await
+        .unwrap();
+
+    assert_eq!(observed.conclusion, JobConclusion::Succeeded);
+    validate_successful_post_records(
+        &timeline.updates.lock().unwrap(),
+        &[format!("Post Run {action_path}")],
+    )
+    .unwrap();
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct RootlessDockerEnvironment {
+    docker_host: String,
+    xdg_runtime_dir: String,
+}
+
+fn validate_rootless_environment(
+    docker_host: Option<&str>,
+    xdg_runtime_dir: Option<&str>,
+) -> Result<RootlessDockerEnvironment> {
+    let docker_host = docker_host
+        .filter(|value| !value.is_empty())
+        .context("DOCKER_HOST must be set explicitly to a non-empty rootless Unix endpoint")?;
+    let xdg_runtime_dir = xdg_runtime_dir
+        .filter(|value| !value.is_empty())
+        .context("XDG_RUNTIME_DIR must be set explicitly for the rootless Docker daemon")?;
+    let runtime_path = Path::new(xdg_runtime_dir);
+    if !runtime_path.is_absolute()
+        || runtime_path.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::CurDir | std::path::Component::ParentDir
+            )
+        })
+    {
+        bail!("XDG_RUNTIME_DIR must be an absolute normalized path");
+    }
+
+    let socket = docker_host
+        .strip_prefix("unix://")
+        .context("DOCKER_HOST must use a Unix endpoint")?;
+    if Path::new(socket) != runtime_path.join("docker.sock") {
+        bail!("DOCKER_HOST must target XDG_RUNTIME_DIR/docker.sock");
+    }
+
+    Ok(RootlessDockerEnvironment {
+        docker_host: docker_host.to_string(),
+        xdg_runtime_dir: xdg_runtime_dir.to_string(),
+    })
+}
+
+fn validate_rootless_security_options(output: &str) -> Result<()> {
+    let options: Vec<String> = serde_json::from_str(output.trim())
+        .context("Docker daemon security options were not a JSON string array")?;
+    if !options.iter().any(|option| option == "name=rootless") {
+        bail!("Docker daemon is not running in rootless mode");
+    }
+    Ok(())
+}
+
+async fn preflight_rootless_docker(docker_config: &Path) -> Result<RootlessDockerEnvironment> {
+    let docker_host = std::env::var("DOCKER_HOST")
+        .context("DOCKER_HOST must be explicitly available as UTF-8 for C-10")?;
+    let xdg_runtime_dir = std::env::var("XDG_RUNTIME_DIR")
+        .context("XDG_RUNTIME_DIR must be explicitly available as UTF-8 for C-10")?;
+    let environment = validate_rootless_environment(Some(&docker_host), Some(&xdg_runtime_dir))?;
+    let security_options = docker_output(
+        &["info", "--format", "{{json .SecurityOptions}}"],
+        docker_config,
+        None,
+    )
+    .await
+    .context("querying Docker daemon rootless security information")?;
+    validate_rootless_security_options(&security_options)?;
+    Ok(environment)
+}
+
+fn validate_successful_post_records(updates: &[Vec<u8>], expected: &[String]) -> Result<()> {
+    let mut completion_counts = HashMap::new();
+    for name in expected {
+        if completion_counts.insert(name.as_str(), 0usize).is_some() {
+            bail!("duplicate expected post record name: {name}");
+        }
+    }
+
+    for update in updates {
+        let body: serde_json::Value =
+            serde_json::from_slice(update).context("timeline update was not valid JSON")?;
+        let records = body
+            .get("value")
+            .and_then(serde_json::Value::as_array)
+            .context("timeline update had no record array")?;
+        for record in records {
+            if record.get("state").and_then(serde_json::Value::as_u64) != Some(2) {
+                continue;
+            }
+            let name = record
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .context("completed timeline record had no name")?;
+            if !name.starts_with("Post ") {
+                continue;
+            }
+            let Some(count) = completion_counts.get_mut(name) else {
+                bail!("unexpected completed post record: {name}");
+            };
+            if record.get("result").and_then(serde_json::Value::as_u64) != Some(0) {
+                bail!("post record did not complete successfully: {name}");
+            }
+            *count += 1;
+            if *count > 1 {
+                bail!("post record completed more than once: {name}");
+            }
+        }
+    }
+
+    for (name, count) in completion_counts {
+        if count != 1 {
+            bail!("post record did not complete exactly once: {name}");
+        }
+    }
+    Ok(())
+}
+
+struct TimelineUpdateSpy {
+    updates: Arc<Mutex<Vec<Vec<u8>>>>,
+}
+
+async fn spy_on_timeline_updates(server: &wiremock::MockServer) -> TimelineUpdateSpy {
+    let updates = Arc::new(Mutex::new(Vec::new()));
+    let sink = updates.clone();
+    wiremock::Mock::given(wiremock::matchers::method("PATCH"))
+        .and(wiremock::matchers::path_regex(
+            r"/_apis/pipelines/workflows/.*/timelines/.*",
+        ))
+        .respond_with(move |request: &wiremock::Request| {
+            sink.lock().unwrap().push(request.body.clone());
+            wiremock::ResponseTemplate::new(200)
+        })
+        .with_priority(1)
+        .mount(server)
+        .await;
+    TimelineUpdateSpy { updates }
+}
+
+fn parse_buildkit_image_id(value: &str) -> Result<&str> {
+    let Some(digest) = value.strip_prefix("sha256:") else {
+        bail!("BuildKit image ID must use sha256");
+    };
+    if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!("BuildKit image ID must contain a 64-character hexadecimal digest");
+    }
+    Ok(value)
+}
+
+fn validate_local_image_id(expected: &str, output: &str) -> Result<()> {
+    let mut lines = output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty());
+    let actual = lines
+        .next()
+        .context("Docker image inspect returned no image ID")?;
+    if lines.next().is_some() {
+        bail!("Docker image inspect returned multiple image IDs");
+    }
+    if actual != expected {
+        bail!("Docker image inspect returned a different image ID");
+    }
+    Ok(())
+}
+
+fn parse_container_id(output: &str) -> Result<String> {
+    let mut lines = output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty());
+    let id = lines
+        .next()
+        .context("Docker inspect returned no container ID")?;
+    if lines.next().is_some()
+        || id.len() != 64
+        || !id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    {
+        bail!("Docker inspect returned an invalid container ID");
+    }
+    Ok(id.to_string())
+}
+
+fn exact_resource_is_present(output: &str, expected: &str) -> Result<bool> {
+    let mut lines = output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty());
+    let Some(actual) = lines.next() else {
+        return Ok(false);
+    };
+    if actual != expected || lines.next().is_some() {
+        bail!("Docker listed an unexpected resource");
+    }
+    Ok(true)
+}
+
+fn offline_action_environment() -> HashMap<String, String> {
+    let dead_proxy = "http://127.0.0.1:1".to_string();
+    HashMap::from([
+        ("HTTP_PROXY".into(), dead_proxy.clone()),
+        ("HTTPS_PROXY".into(), dead_proxy.clone()),
+        ("ALL_PROXY".into(), dead_proxy.clone()),
+        ("http_proxy".into(), dead_proxy.clone()),
+        ("https_proxy".into(), dead_proxy.clone()),
+        ("all_proxy".into(), dead_proxy),
+        ("NO_PROXY".into(), "127.0.0.1,localhost".into()),
+        ("no_proxy".into(), "127.0.0.1,localhost".into()),
+    ])
+}
+
+fn buildx_setup_inputs(
+    builder_name: &str,
+    buildkit_image_id: &str,
+    registry: &str,
+) -> HashMap<String, String> {
+    HashMap::from([
+        ("name".into(), builder_name.into()),
+        ("cache-binary".into(), "false".into()),
+        (
+            "driver-opts".into(),
+            format!("network=host\nimage={buildkit_image_id}"),
+        ),
+        (
+            "buildkitd-config-inline".into(),
+            format!("[registry.\"{registry}\"]\n  http = true\n  insecure = true\n"),
+        ),
+    ])
+}
+
+async fn preflight_local_buildx(docker_config: &Path) -> Result<String> {
+    let configured_image_id = std::env::var(BUILDKIT_IMAGE_ID_ENV)
+        .with_context(|| format!("{BUILDKIT_IMAGE_ID_ENV} must name a local immutable image ID"))?;
+    let buildkit_image_id = parse_buildkit_image_id(&configured_image_id)?.to_string();
+
+    docker_output(&["buildx", "version"], docker_config, None)
+        .await
+        .context("the local Docker CLI has no working Buildx plugin")?;
+    let inspected = docker_output(
+        &[
+            "image",
+            "inspect",
+            "--format",
+            "{{.Id}}",
+            "--",
+            &buildkit_image_id,
+        ],
+        docker_config,
+        None,
+    )
+    .await
+    .context("the configured immutable BuildKit image is not local")?;
+    validate_local_image_id(&buildkit_image_id, &inspected)?;
+
+    Ok(buildkit_image_id)
 }
 
 fn registry_login_manifest(
@@ -326,6 +898,7 @@ fn remote_action_step(
     name: &str,
     sha: &str,
     inputs: HashMap<String, String>,
+    environment: HashMap<String, String>,
     order: u32,
 ) -> serde_json::Value {
     serde_json::json!({
@@ -341,22 +914,41 @@ fn remote_action_step(
         "timeoutInMinutes": 15,
         "continueOnError": false,
         "order": order,
-        "environment": null,
+        "environment": environment,
         "contextName": id
     })
 }
 
-struct BuildxBuilderCleanup {
-    builder_name_file: std::path::PathBuf,
+#[derive(Clone, Debug)]
+struct BuildxOwnedResources {
+    builder_name: String,
+    container_name: String,
+    state_volume_name: String,
+}
+
+impl BuildxOwnedResources {
+    fn new(builder_name: String) -> Self {
+        let container_name = format!("buildx_buildkit_{builder_name}0");
+        let state_volume_name = format!("{container_name}_state");
+        Self {
+            builder_name,
+            container_name,
+            state_volume_name,
+        }
+    }
+}
+
+struct BuildxResourcesCleanup {
+    resources: BuildxOwnedResources,
     docker_config: tempfile::TempDir,
 }
 
-impl BuildxBuilderCleanup {
-    fn new(builder_name_file: std::path::PathBuf) -> Self {
+impl BuildxResourcesCleanup {
+    fn new(resources: BuildxOwnedResources) -> Self {
         let docker_config = tempfile::tempdir().unwrap();
         std::fs::write(docker_config.path().join("config.json"), "{}").unwrap();
         Self {
-            builder_name_file,
+            resources,
             docker_config,
         }
     }
@@ -366,27 +958,49 @@ impl BuildxBuilderCleanup {
     }
 }
 
-impl Drop for BuildxBuilderCleanup {
+impl Drop for BuildxResourcesCleanup {
     fn drop(&mut self) {
-        let Ok(builder_name) = std::fs::read_to_string(&self.builder_name_file) else {
-            return;
-        };
-        let builder_name = builder_name.trim();
-        if builder_name.is_empty() {
-            return;
-        }
         let _ = docker_cleanup(
-            &["buildx", "rm", "--force", builder_name],
+            &[
+                "container",
+                "rm",
+                "--force",
+                "--",
+                &self.resources.container_name,
+            ],
+            self.docker_config.path(),
+        );
+        let _ = docker_cleanup(
+            &[
+                "volume",
+                "rm",
+                "--force",
+                "--",
+                &self.resources.state_volume_name,
+            ],
             self.docker_config.path(),
         );
     }
 }
 
 #[tokio::test]
-#[ignore = "requires Docker, Buildx, and the explicitly pinned public actions"]
+#[ignore = "requires Docker, local Buildx/BuildKit, and the explicitly pinned public actions"]
 async fn pinned_buildx_flow_uses_job_config_and_original_socket() {
+    let preflight_config = tempfile::tempdir().unwrap();
+    std::fs::write(preflight_config.path().join("config.json"), "{}").unwrap();
+    let rootless_environment = preflight_rootless_docker(preflight_config.path())
+        .await
+        .unwrap();
+    let buildkit_image_id = preflight_local_buildx(preflight_config.path())
+        .await
+        .unwrap();
+
     let registry = AuthenticatedRegistry::start().await.unwrap();
-    let env = TestEnv::setup().await;
+    let mut env = TestEnv::setup().await;
+    let timeline = spy_on_timeline_updates(&env.mock_server).await;
+    let resources =
+        BuildxOwnedResources::new(format!("chimera-buildx-{}", uuid::Uuid::new_v4().simple()));
+    let buildx_cleanup = BuildxResourcesCleanup::new(resources.clone());
     std::fs::write(
         env.workspace.workspace_dir().join("Dockerfile"),
         "FROM scratch\nCOPY marker /marker\n",
@@ -397,6 +1011,7 @@ async fn pinned_buildx_flow_uses_job_config_and_original_socket() {
         "synthetic-buildx-probe\n",
     )
     .unwrap();
+
     install_pinned_action(
         env.actions_dir(),
         "docker",
@@ -426,11 +1041,11 @@ async fn pinned_buildx_flow_uses_job_config_and_original_socket() {
     let expected = HashMap::from([
         (
             "EXPECTED_DOCKER_HOST".into(),
-            std::env::var("DOCKER_HOST").unwrap_or_default(),
+            rootless_environment.docker_host,
         ),
         (
             "EXPECTED_XDG_RUNTIME_DIR".into(),
-            std::env::var("XDG_RUNTIME_DIR").unwrap_or_default(),
+            rootless_environment.xdg_runtime_dir,
         ),
         (
             "EXPECTED_PATH".into(),
@@ -447,27 +1062,45 @@ async fn pinned_buildx_flow_uses_job_config_and_original_socket() {
         "#,
         expected,
     );
+    let action_environment = offline_action_environment();
     let setup = remote_action_step(
         "buildx",
         "docker/setup-buildx-action",
         SETUP_BUILDX_SHA,
-        HashMap::from([
-            ("driver-opts".into(), "network=host".into()),
-            (
-                "buildkitd-config-inline".into(),
-                format!(
-                    "[registry.\"{}\"]\n  http = true\n  insecure = true\n",
-                    registry.address()
-                ),
-            ),
-        ]),
+        buildx_setup_inputs(
+            &resources.builder_name,
+            &buildkit_image_id,
+            registry.address(),
+        ),
+        action_environment.clone(),
         2,
     );
-    let builder_name_file = env.workspace.workspace_dir().join("buildx-builder-name");
-    let builder_cleanup = BuildxBuilderCleanup::new(builder_name_file.clone());
-    let mut record_builder = script_step(
+    let builder_name_file = env.tmp.path().join("observed-buildx-builder-name");
+    let builder_container_id_file = env.tmp.path().join("observed-buildx-container-id");
+    let mut record_builder = script_step_env(
         "record-builder",
-        r#"printf '%s' '${{ steps.buildx.outputs.name }}' > buildx-builder-name"#,
+        r#"
+            printf '%s' '${{ steps.buildx.outputs.name }}' > "$BUILDER_NAME_FILE"
+            docker container inspect --format '{{.Id}}' "$BUILDER_CONTAINER" > "$BUILDER_CONTAINER_ID_FILE"
+            test "$(docker container inspect --format '{{.Image}}' "$BUILDER_CONTAINER")" = "$BUILDKIT_IMAGE_ID"
+            docker volume inspect "$BUILDER_STATE_VOLUME" >/dev/null
+        "#,
+        HashMap::from([
+            (
+                "BUILDER_NAME_FILE".into(),
+                builder_name_file.to_string_lossy().into_owned(),
+            ),
+            (
+                "BUILDER_CONTAINER_ID_FILE".into(),
+                builder_container_id_file.to_string_lossy().into_owned(),
+            ),
+            ("BUILDER_CONTAINER".into(), resources.container_name.clone()),
+            (
+                "BUILDER_STATE_VOLUME".into(),
+                resources.state_volume_name.clone(),
+            ),
+            ("BUILDKIT_IMAGE_ID".into(), buildkit_image_id.clone()),
+        ]),
     );
     record_builder["order"] = serde_json::json!(3);
     let login = remote_action_step(
@@ -479,6 +1112,7 @@ async fn pinned_buildx_flow_uses_job_config_and_original_socket() {
             ("username".into(), ALICE_USER.into()),
             ("password".into(), "${{ secrets.REGISTRY_PASSWORD }}".into()),
         ]),
+        action_environment.clone(),
         4,
     );
     let build = remote_action_step(
@@ -492,13 +1126,12 @@ async fn pinned_buildx_flow_uses_job_config_and_original_socket() {
             ("provenance".into(), "false".into()),
             ("tags".into(), tag.clone()),
         ]),
+        action_environment,
         5,
     );
-    let mut pull = script_step_env(
-        "pull",
-        "docker pull \"$IMAGE\"",
-        HashMap::from([("IMAGE".into(), tag.clone())]),
-    );
+    let mut pull_environment = offline_action_environment();
+    pull_environment.insert("IMAGE".into(), tag.clone());
+    let mut pull = script_step_env("pull", "docker pull \"$IMAGE\"", pull_environment);
     pull["order"] = serde_json::json!(6);
     let manifest = manifest_with_steps_and_context(
         vec![probe, setup, record_builder, login, build, pull],
@@ -507,6 +1140,7 @@ async fn pinned_buildx_flow_uses_job_config_and_original_socket() {
             "secrets": { "REGISTRY_PASSWORD": ALICE_PASSWORD }
         }),
     );
+    env.configure_from_manifest(&manifest);
 
     let observed = env
         .run_observed(&manifest, CancellationToken::new())
@@ -515,18 +1149,52 @@ async fn pinned_buildx_flow_uses_job_config_and_original_socket() {
 
     assert_eq!(observed.conclusion, JobConclusion::Succeeded);
     assert!(!observed.attempt_dir.exists());
-    let builder_name = std::fs::read_to_string(builder_name_file).unwrap();
-    let builder_name = builder_name.trim();
-    assert!(!builder_name.is_empty());
-    let inspect = docker_output(
-        &["buildx", "inspect", builder_name],
-        builder_cleanup.docker_config(),
+    let expected_posts = vec![
+        format!("Post Run docker/build-push-action@{BUILD_PUSH_SHA}"),
+        format!("Post Run docker/login-action@{LOGIN_SHA}"),
+        format!("Post Run docker/setup-buildx-action@{SETUP_BUILDX_SHA}"),
+    ];
+    validate_successful_post_records(&timeline.updates.lock().unwrap(), &expected_posts).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(builder_name_file).unwrap(),
+        resources.builder_name
+    );
+    let builder_container_id =
+        parse_container_id(&std::fs::read_to_string(builder_container_id_file).unwrap()).unwrap();
+
+    let container_filter = format!("id={builder_container_id}");
+    let container_listing = docker_output(
+        &[
+            "container",
+            "ls",
+            "--all",
+            "--quiet",
+            "--no-trunc",
+            "--filter",
+            &container_filter,
+        ],
+        buildx_cleanup.docker_config(),
         None,
     )
-    .await;
+    .await
+    .unwrap();
     assert!(
-        inspect.is_err(),
-        "setup-buildx post did not remove its builder"
+        !exact_resource_is_present(&container_listing, &builder_container_id).unwrap(),
+        "setup-buildx post left its exact builder container"
     );
+
+    let volume_filter = format!("name={}", resources.state_volume_name);
+    let volume_listing = docker_output(
+        &["volume", "ls", "--quiet", "--filter", &volume_filter],
+        buildx_cleanup.docker_config(),
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(
+        !exact_resource_is_present(&volume_listing, &resources.state_volume_name).unwrap(),
+        "setup-buildx post left its exact state volume"
+    );
+
     registry.remove_local_image(&tag).await.unwrap();
 }

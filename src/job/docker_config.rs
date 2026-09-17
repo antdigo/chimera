@@ -26,6 +26,9 @@ pub enum JobDockerConfigError {
     ReservedEnvironmentOverride {
         source: &'static str,
     },
+    ImplicitCredentialStore {
+        helper: &'static str,
+    },
     Io {
         operation: &'static str,
         path: PathBuf,
@@ -61,12 +64,16 @@ impl std::fmt::Display for JobDockerConfigError {
             ),
             Self::UnsafeEntry { path } => write!(
                 formatter,
-                "unsafe-job-resource-path: refusing symlink or special file: {}",
+                "unsafe-job-resource-path: refusing replaced, symlink, or special file: {}",
                 path.display()
             ),
             Self::ReservedEnvironmentOverride { source } => write!(
                 formatter,
                 "reserved-environment-variable: DOCKER_CONFIG cannot be changed by {source}"
+            ),
+            Self::ImplicitCredentialStore { helper } => write!(
+                formatter,
+                "reserved-host-capability: implicit Docker credential helper {helper} is not supported in host step PATH"
             ),
             Self::Io {
                 operation, path, ..
@@ -103,16 +110,25 @@ impl std::error::Error for JobDockerConfigError {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DirectoryIdentity {
+    device: u64,
+    inode: u64,
+}
+
 #[derive(Debug, Clone)]
 pub struct JobResourceRoot {
     canonical_path: PathBuf,
+    identity: DirectoryIdentity,
 }
 
 #[derive(Debug)]
 pub struct JobDockerConfig {
     root: PathBuf,
+    root_identity: DirectoryIdentity,
     attempt_id: Uuid,
     attempt_dir: PathBuf,
+    attempt_identity: DirectoryIdentity,
     config_dir: PathBuf,
     config_file: PathBuf,
     cleaned: bool,
@@ -144,7 +160,11 @@ impl JobResourceRoot {
             });
         }
 
-        Ok(Self { canonical_path })
+        let identity = directory_identity(&canonical_path, "reading job resource root identity")?;
+        Ok(Self {
+            canonical_path,
+            identity,
+        })
     }
 
     pub fn path(&self) -> &Path {
@@ -171,6 +191,8 @@ impl JobResourceRoot {
         let config_dir = attempt_dir.join("docker");
         let config_file = config_dir.join("config.json");
         let creation = (|| {
+            let attempt_identity =
+                directory_identity(&attempt_dir, "reading job attempt directory identity")?;
             create_private_dir(&config_dir, "creating Docker config directory")?;
             let mut file = OpenOptions::new()
                 .write(true)
@@ -185,24 +207,29 @@ impl JobResourceRoot {
             fs::set_permissions(&config_file, fs::Permissions::from_mode(0o600)).map_err(
                 |source| io_error("setting Docker config permissions", &config_file, source),
             )?;
-            Ok(())
+            Ok(attempt_identity)
         })();
 
-        if let Err(create) = creation {
-            return match fs::remove_dir_all(&attempt_dir) {
-                Ok(()) => Err(create),
-                Err(cleanup) => Err(JobDockerConfigError::CreationRollback {
-                    path: attempt_dir,
-                    create: Box::new(create),
-                    cleanup,
-                }),
-            };
-        }
+        let attempt_identity = match creation {
+            Ok(identity) => identity,
+            Err(create) => {
+                return match fs::remove_dir_all(&attempt_dir) {
+                    Ok(()) => Err(create),
+                    Err(cleanup) => Err(JobDockerConfigError::CreationRollback {
+                        path: attempt_dir,
+                        create: Box::new(create),
+                        cleanup,
+                    }),
+                };
+            }
+        };
 
         Ok(JobDockerConfig {
             root: self.canonical_path.clone(),
+            root_identity: self.identity,
             attempt_id,
             attempt_dir,
+            attempt_identity,
             config_dir,
             config_file,
             cleaned: false,
@@ -258,7 +285,14 @@ impl JobDockerConfig {
             return Ok(());
         }
 
-        match fs::symlink_metadata(&self.attempt_dir) {
+        let root_metadata =
+            fs::symlink_metadata(&self.root).map_err(|source| JobDockerConfigError::Cleanup {
+                path: self.root.clone(),
+                source,
+            })?;
+        validate_bound_directory(&self.root, self.root_identity, &root_metadata)?;
+
+        let attempt_metadata = match fs::symlink_metadata(&self.attempt_dir) {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 self.cleaned = true;
                 return Ok(());
@@ -269,42 +303,66 @@ impl JobDockerConfig {
                     source,
                 });
             }
-            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
-                return Err(JobDockerConfigError::UnsafeEntry {
-                    path: self.attempt_dir.clone(),
-                });
-            }
-            Ok(_) => {}
-        }
+            Ok(metadata) => metadata,
+        };
+        validate_bound_directory(&self.attempt_dir, self.attempt_identity, &attempt_metadata)?;
 
-        let canonical_root =
-            fs::canonicalize(&self.root).map_err(|source| JobDockerConfigError::Cleanup {
-                path: self.root.clone(),
-                source,
-            })?;
-        let canonical_attempt = fs::canonicalize(&self.attempt_dir).map_err(|source| {
-            JobDockerConfigError::Cleanup {
-                path: self.attempt_dir.clone(),
-                source,
-            }
-        })?;
-        if self.attempt_dir.parent() != Some(self.root.as_path())
-            || canonical_attempt.parent() != Some(canonical_root.as_path())
-            || !canonical_attempt.starts_with(&canonical_root)
-        {
+        if self.attempt_dir.parent() != Some(self.root.as_path()) {
             return Err(JobDockerConfigError::UnsafeEntry {
                 path: self.attempt_dir.clone(),
             });
         }
 
-        validate_removal_tree(&canonical_attempt)?;
-        fs::remove_dir_all(&canonical_attempt).map_err(|source| JobDockerConfigError::Cleanup {
-            path: canonical_attempt.clone(),
+        validate_removal_tree(&self.attempt_dir)?;
+        fs::remove_dir_all(&self.attempt_dir).map_err(|source| JobDockerConfigError::Cleanup {
+            path: self.attempt_dir.clone(),
             source,
         })?;
         self.cleaned = true;
         Ok(())
     }
+}
+
+fn directory_identity(
+    path: &Path,
+    operation: &'static str,
+) -> Result<DirectoryIdentity, JobDockerConfigError> {
+    let metadata =
+        fs::symlink_metadata(path).map_err(|source| io_error(operation, path, source))?;
+    Ok(DirectoryIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
+}
+
+fn validate_bound_directory(
+    path: &Path,
+    expected_identity: DirectoryIdentity,
+    metadata: &fs::Metadata,
+) -> Result<(), JobDockerConfigError> {
+    let actual_identity = DirectoryIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    };
+    if metadata.file_type().is_symlink()
+        || !metadata.is_dir()
+        || actual_identity != expected_identity
+    {
+        return Err(JobDockerConfigError::UnsafeEntry {
+            path: path.to_path_buf(),
+        });
+    }
+
+    let canonical = fs::canonicalize(path).map_err(|source| JobDockerConfigError::Cleanup {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if canonical != path {
+        return Err(JobDockerConfigError::UnsafeEntry {
+            path: path.to_path_buf(),
+        });
+    }
+    Ok(())
 }
 
 fn create_private_dir(path: &Path, operation: &'static str) -> Result<(), JobDockerConfigError> {

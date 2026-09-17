@@ -16,6 +16,21 @@ Docker actions and job containers do not receive or mount this host path. Named
 contexts, credential helpers, CLI plugins, and credentials from `$HOME/.docker`
 are not imported.
 
+## Host `PATH` prerequisite
+
+Docker on Linux may implicitly select `docker-credential-pass` or
+`docker-credential-secretservice` even when `config.json` contains exactly `{}`.
+Those helpers use external stores that are not isolated by separate config directories.
+Chimera therefore checks the effective child `PATH` before every host spawn, including
+workflow changes made between steps, and rejects an executable default helper with a
+`reserved-host-capability` diagnostic. The supported fail-closed configuration is to
+exclude both helpers from the Chimera service and workflow `PATH` until explicit helper
+isolation is available. A non-executable file does not trigger this check.
+
+This pre-spawn check and the cleanup path/inode validation prevent accidental sharing
+and replacement; they do not guarantee safety against an adversarial same-UID process
+racing filesystem or `PATH` changes after validation.
+
 ## `stale-job-resources` recovery
 
 1. Stop the Chimera service and do not restart it while inspection is in progress.
@@ -46,6 +61,6 @@ are not imported.
 
 On Debian/systemd installations using rootless Docker, the service environment must
 pass through `DOCKER_HOST`, `XDG_RUNTIME_DIR`, and `PATH` for the daemon UID. See
-the [rootless systemd drop-in in the README](../README.md#rootless-docker-service-environment).
+the [rootless systemd drop-in in the README](../README.md#rootless-docker-alternative).
 A daemon-level `DOCKER_CONFIG` is not a job configuration and must not be used as a
 fallback: Chimera supplies the generated per-job value only to host steps.

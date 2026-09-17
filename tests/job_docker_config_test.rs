@@ -69,6 +69,93 @@ async fn wait_until(condition: impl Fn() -> bool) -> bool {
     .is_ok()
 }
 
+struct DescendantGuard {
+    pid_file: PathBuf,
+    stopped: bool,
+}
+
+impl DescendantGuard {
+    fn new(pid_file: PathBuf) -> Self {
+        Self {
+            pid_file,
+            stopped: false,
+        }
+    }
+
+    fn pid(&self) -> std::io::Result<i32> {
+        let raw = std::fs::read_to_string(&self.pid_file)?;
+        let pid = raw.trim().parse::<i32>().map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("invalid descendant pid: {error}"),
+            )
+        })?;
+        if pid <= 1 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "descendant pid must be greater than one",
+            ));
+        }
+        Ok(pid)
+    }
+
+    fn is_alive(&self) -> bool {
+        self.pid().is_ok_and(process_is_alive)
+    }
+
+    fn stop(&mut self) -> std::io::Result<()> {
+        if self.stopped {
+            return Ok(());
+        }
+        let pid = self.pid()?;
+        if process_is_alive(pid) {
+            let result = unsafe { libc::kill(pid, libc::SIGKILL) };
+            if result != 0 {
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() != Some(libc::ESRCH) {
+                    return Err(error);
+                }
+            }
+        }
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while process_is_alive(pid) {
+            if std::time::Instant::now() >= deadline {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!("descendant {pid} did not exit"),
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        self.stopped = true;
+        Ok(())
+    }
+}
+
+impl Drop for DescendantGuard {
+    fn drop(&mut self) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        loop {
+            match self.stop() {
+                Ok(()) => return,
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::NotFound
+                        && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(_) => return,
+            }
+        }
+    }
+}
+
+fn process_is_alive(pid: i32) -> bool {
+    let result = unsafe { libc::kill(pid, 0) };
+    result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
 fn attempt_count(root: &Path) -> usize {
     std::fs::read_dir(root).unwrap().count()
 }
@@ -387,6 +474,80 @@ async fn cleanup_runs_for_all_job_outcomes() {
 }
 
 #[tokio::test]
+async fn cancellation_records_descendant_survival_after_owner_cleanup() {
+    let env = TestEnv::setup().await;
+    let workspace_dir = env.workspace.workspace_dir().to_path_buf();
+    let probe = tempfile::tempdir().unwrap();
+    let pid_file = probe.path().join("descendant.pid");
+    let config_file = probe.path().join("descendant-config");
+    let observation_file = probe.path().join("survived-cleanup");
+    let mut descendant = DescendantGuard::new(pid_file.clone());
+    let step = script_step_env(
+        "cancelled-descendant",
+        r#"
+            sh -c '
+                trap "" HUP TERM
+                exec </dev/null >/dev/null 2>&1
+                printf "%s\n" "$$" > "$DESCENDANT_PID_FILE"
+                printf "%s" "$DOCKER_CONFIG" > "$DESCENDANT_CONFIG_FILE"
+                touch "$GITHUB_WORKSPACE/cancel-ready"
+                while [ -d "$DOCKER_CONFIG" ]; do sleep 0.01; done
+                printf "survived-cleanup" > "$DESCENDANT_OBSERVATION_FILE"
+                while :; do :; done
+            ' &
+            wait
+        "#,
+        HashMap::from([
+            (
+                "DESCENDANT_PID_FILE".into(),
+                pid_file.to_string_lossy().into_owned(),
+            ),
+            (
+                "DESCENDANT_CONFIG_FILE".into(),
+                config_file.to_string_lossy().into_owned(),
+            ),
+            (
+                "DESCENDANT_OBSERVATION_FILE".into(),
+                observation_file.to_string_lossy().into_owned(),
+            ),
+        ]),
+    );
+    let manifest = manifest_with_steps(vec![step], &env.mock_server.uri());
+    let cancel = CancellationToken::new();
+    let cancel_for_run = cancel.clone();
+    let run = tokio::spawn(async move {
+        let result = env.run_observed(&manifest, cancel_for_run).await;
+        (env, result)
+    });
+    let ready = wait_until(|| workspace_dir.join("cancel-ready").exists()).await;
+    cancel.cancel();
+
+    let (_env, observed) = tokio::time::timeout(Duration::from_secs(5), run)
+        .await
+        .expect("cancelled descendant probe did not finish")
+        .unwrap();
+    let observed = observed.unwrap();
+
+    assert!(ready, "descendant probe never started");
+    assert_eq!(observed.conclusion, JobConclusion::Cancelled);
+    assert!(
+        !observed.attempt_dir.exists(),
+        "job-owned attempt directory survived cancellation cleanup"
+    );
+    let recorded = wait_until(|| observation_file.exists()).await;
+    assert!(recorded, "descendant did not observe owner cleanup");
+    assert_eq!(
+        Path::new(&std::fs::read_to_string(config_file).unwrap()),
+        observed.docker_config_dir
+    );
+    assert!(
+        descendant.is_alive(),
+        "descendant exited before observation"
+    );
+    descendant.stop().unwrap();
+}
+
+#[tokio::test]
 async fn step_env_override_fails_before_spawn() {
     let mut env = TestEnv::setup().await;
     write_bash_probe(&env.workspace);
@@ -405,6 +566,33 @@ async fn step_env_override_fails_before_spawn() {
     assert_bash_not_started(&env.workspace, "override");
     assert!(!env.workspace.workspace_dir().join("spawned").exists());
     assert_reserved_override_diagnostic(&spy);
+}
+
+#[tokio::test]
+async fn implicit_default_credential_helper_fails_before_spawn() {
+    let mut env = TestEnv::setup().await;
+    let probe_bin = write_bash_probe(&env.workspace);
+    let helper = probe_bin.join("docker-credential-pass");
+    std::fs::write(&helper, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let spy = spy_on_step_logs(&env.mock_server).await;
+    let step = script_step("helper-capability", "touch helper-capability-ran");
+    let manifest = manifest_with_results_endpoint(vec![step], &env.mock_server.uri());
+    env.configure_from_manifest(&manifest);
+
+    let result = env.run(&manifest).await.unwrap();
+
+    assert_eq!(result.0, JobConclusion::Failed);
+    assert_bash_not_started(&env.workspace, "helper-capability");
+    assert!(
+        !env.workspace
+            .workspace_dir()
+            .join("helper-capability-ran")
+            .exists()
+    );
+    let logs = spy.content.lock().unwrap();
+    assert!(logs.contains("reserved-host-capability"));
+    assert!(logs.contains("docker-credential-pass"));
 }
 
 #[tokio::test]
@@ -567,4 +755,13 @@ async fn inherited_daemon_config_child() {
         observed.docker_config_dir,
         std::path::PathBuf::from(daemon_config)
     );
+}
+
+#[test]
+fn rootless_operator_link_targets_existing_readme_heading() {
+    let operator_docs = include_str!("../docs/job-docker-config.md");
+    let readme = include_str!("../README.md");
+
+    assert!(operator_docs.contains("(../README.md#rootless-docker-alternative)"));
+    assert!(readme.contains("### Rootless Docker alternative"));
 }
