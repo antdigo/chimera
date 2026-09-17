@@ -67,8 +67,12 @@ impl RootLock {
     }
 }
 
+pub(crate) fn open_existing_root(root: &Path) -> Result<File, RootLockError> {
+    open_root(root, false)
+}
+
 pub(crate) fn validate_existing_root(root: &Path) -> Result<(), RootLockError> {
-    open_root(root, false).map(drop)
+    open_existing_root(root).map(drop)
 }
 
 fn open_root(root: &Path, create_missing: bool) -> Result<File, RootLockError> {

@@ -1,14 +1,20 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::ffi::OsString;
+use std::ffi::{CStr, CString, OsStr, OsString};
+use std::fs::File;
+use std::io;
+use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Component, Path, PathBuf};
 
 use serde::de::DeserializeOwned;
 
 use crate::config::{ChimeraConfig, ChimeraPaths, RunnerCredentials};
-use crate::storage::validate_existing_root;
+use crate::storage::{RootLockError, open_existing_root};
 
 use super::source::{read_official_registration, runner_identity};
-use super::{ImportError, RunnerIdentity, ValidatedRegistration, read_regular_no_follow};
+use super::{
+    ImportError, OpenedRegularFile, RunnerIdentity, ValidatedRegistration, read_opened_regular,
+};
 
 const CREDENTIAL_FILES: [&str; 3] = ["runner.json", "credentials.json", "rsa_params.json"];
 
@@ -42,9 +48,12 @@ pub(crate) fn prepare_import(
 ) -> Result<PreparedImport, ImportError> {
     validate_local_name(name)?;
     let registration = read_official_registration(source)?;
-    validate_root_if_present(root)?;
+    let opened_root = open_root_if_present(root)?;
 
     let canonical_root = canonicalize_allow_missing(root)?;
+    if let Some(root) = opened_root.as_ref() {
+        verify_opened_root_matches_path(root, &canonical_root)?;
+    }
     let paths = ChimeraPaths::new(canonical_root);
     let target = paths.runner_dir(name);
     if registration.canonical_source.starts_with(&target)
@@ -55,8 +64,13 @@ pub(crate) fn prepare_import(
         ));
     }
 
-    let config = load_preserved_config(&paths.config_file())?;
-    let existing = inspect_existing_credentials(&paths.runners_dir())?;
+    let (config, existing) = match opened_root.as_ref() {
+        Some(root) => (
+            load_preserved_config(root)?,
+            inspect_existing_credentials(root)?,
+        ),
+        None => (default_preserved_config()?, BTreeMap::new()),
+    };
     validate_config_entries(name, &config, &existing)?;
     let disposition = classify_disposition(name, &registration, &config, &existing)?;
 
@@ -83,14 +97,12 @@ fn validate_local_name(name: &str) -> Result<(), ImportError> {
     Ok(())
 }
 
-fn validate_root_if_present(root: &Path) -> Result<(), ImportError> {
-    match std::fs::symlink_metadata(root) {
-        Ok(_) => validate_existing_root(root).map_err(|_| {
-            ImportError::WriteFailed("unable to validate existing target root".into())
-        }),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+fn open_root_if_present(root: &Path) -> Result<Option<File>, ImportError> {
+    match open_existing_root(root) {
+        Ok(root) => Ok(Some(root)),
+        Err(RootLockError::Io(error)) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(_) => Err(ImportError::WriteFailed(
-            "unable to inspect target root".into(),
+            "unable to validate existing target root".into(),
         )),
     }
 }
@@ -108,7 +120,7 @@ fn canonicalize_allow_missing(path: &Path) -> Result<PathBuf, ImportError> {
     loop {
         match std::fs::symlink_metadata(&ancestor) {
             Ok(_) => break,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 let component = ancestor.components().next_back().ok_or_else(|| {
                     ImportError::WriteFailed("unable to resolve target root".into())
                 })?;
@@ -143,29 +155,43 @@ fn canonicalize_allow_missing(path: &Path) -> Result<PathBuf, ImportError> {
     Ok(canonical)
 }
 
-fn load_preserved_config(path: &Path) -> Result<PreservedConfig, ImportError> {
-    use std::os::unix::fs::PermissionsExt;
+fn verify_opened_root_matches_path(root: &File, path: &Path) -> Result<(), ImportError> {
+    use std::os::unix::fs::MetadataExt;
 
-    let metadata = match std::fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+    let opened = root
+        .metadata()
+        .map_err(|_| ImportError::WriteFailed("unable to inspect opened target root".into()))?;
+    let resolved = std::fs::metadata(path)
+        .map_err(|_| ImportError::WriteFailed("target root changed while planning".into()))?;
+    if !resolved.is_dir() || opened.dev() != resolved.dev() || opened.ino() != resolved.ino() {
+        return Err(ImportError::WriteFailed(
+            "target root changed while planning".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn load_preserved_config(root: &File) -> Result<PreservedConfig, ImportError> {
+    let file = match open_regular_at(root, OsStr::new("config.toml")) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
             return default_preserved_config();
         }
         Err(_) => {
             return Err(ImportError::WriteFailed(
-                "unable to inspect existing config.toml".into(),
+                "unable to read existing config.toml".into(),
             ));
         }
     };
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        return Err(ImportError::WriteFailed(
-            "unable to read existing config.toml".into(),
-        ));
-    }
-
-    let bytes = read_regular_no_follow(path)
+    let opened = read_opened_regular(file)
         .map_err(|_| ImportError::WriteFailed("unable to read existing config.toml".into()))?;
-    let text = std::str::from_utf8(&bytes)
+    preserved_config_from_opened(opened)
+}
+
+fn preserved_config_from_opened(opened: OpenedRegularFile) -> Result<PreservedConfig, ImportError> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let text = std::str::from_utf8(&opened.bytes)
         .map_err(|_| ImportError::WriteFailed("unable to parse existing config.toml".into()))?;
     let model = toml::from_str(text)
         .map_err(|_| ImportError::WriteFailed("unable to parse existing config.toml".into()))?;
@@ -175,7 +201,7 @@ fn load_preserved_config(path: &Path) -> Result<PreservedConfig, ImportError> {
     Ok(PreservedConfig {
         model,
         document,
-        original_mode: Some(metadata.permissions().mode() & 0o777),
+        original_mode: Some(opened.metadata.permissions().mode() & 0o777),
     })
 }
 
@@ -193,61 +219,51 @@ fn default_preserved_config() -> Result<PreservedConfig, ImportError> {
 }
 
 fn inspect_existing_credentials(
-    runners_dir: &Path,
+    root: &File,
 ) -> Result<BTreeMap<String, RunnerCredentials>, ImportError> {
-    let metadata = match std::fs::symlink_metadata(runners_dir) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
+    let runners = match open_directory_at(root, OsStr::new("runners")) {
+        Ok(runners) => runners,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
         Err(_) => {
             return Err(ImportError::WriteFailed(
                 "unable to inspect existing runners directory".into(),
             ));
         }
     };
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        return Err(ImportError::WriteFailed(
-            "existing runners path is not a directory".into(),
-        ));
-    }
+    inspect_runners_directory(&runners)
+}
 
-    let entries = std::fs::read_dir(runners_dir).map_err(|_| {
+fn inspect_runners_directory(
+    runners: &File,
+) -> Result<BTreeMap<String, RunnerCredentials>, ImportError> {
+    let names = read_directory_names(runners).map_err(|_| {
         ImportError::WriteFailed("unable to read existing runners directory".into())
     })?;
-    let mut paths = entries
-        .map(|entry| {
-            entry.map(|entry| entry.path()).map_err(|_| {
-                ImportError::WriteFailed("unable to read existing runner entry".into())
-            })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    paths.sort();
-
-    let mut existing = BTreeMap::new();
-    for path in paths {
-        let metadata = std::fs::symlink_metadata(&path).map_err(|_| {
-            ImportError::WriteFailed("unable to inspect existing runner directory".into())
-        })?;
-        if metadata.file_type().is_symlink() || !metadata.is_dir() {
-            return Err(ImportError::WriteFailed(
-                "existing runner entry is not a directory".into(),
-            ));
-        }
-        let name = path
-            .file_name()
-            .and_then(|name| name.to_str())
+    let mut directories = Vec::with_capacity(names.len());
+    for name in names {
+        let display_name = name
+            .to_str()
             .ok_or_else(|| {
                 ImportError::WriteFailed("existing runner name is not valid UTF-8".into())
             })?
             .to_owned();
-        existing.insert(name, read_existing_credentials(&path)?);
+        let directory = open_directory_at(runners, &name).map_err(|_| {
+            ImportError::WriteFailed("unable to inspect existing runner directory".into())
+        })?;
+        directories.push((display_name, directory));
+    }
+
+    let mut existing = BTreeMap::new();
+    for (name, directory) in directories {
+        existing.insert(name, read_existing_credentials(&directory)?);
     }
     Ok(existing)
 }
 
-fn read_existing_credentials(path: &Path) -> Result<RunnerCredentials, ImportError> {
-    let info = parse_existing_json(path, CREDENTIAL_FILES[0])?;
-    let oauth = parse_existing_json(path, CREDENTIAL_FILES[1])?;
-    let rsa_params = parse_existing_json(path, CREDENTIAL_FILES[2])?;
+fn read_existing_credentials(directory: &File) -> Result<RunnerCredentials, ImportError> {
+    let info = parse_existing_json(directory, CREDENTIAL_FILES[0])?;
+    let oauth = parse_existing_json(directory, CREDENTIAL_FILES[1])?;
+    let rsa_params = parse_existing_json(directory, CREDENTIAL_FILES[2])?;
     Ok(RunnerCredentials {
         info,
         oauth,
@@ -256,32 +272,114 @@ fn read_existing_credentials(path: &Path) -> Result<RunnerCredentials, ImportErr
 }
 
 fn parse_existing_json<T: DeserializeOwned>(
-    directory: &Path,
+    directory: &File,
     name: &str,
 ) -> Result<T, ImportError> {
-    let path = directory.join(name);
-    let metadata = std::fs::symlink_metadata(&path).map_err(|_| {
+    let file = open_regular_at(directory, OsStr::new(name)).map_err(|_| {
         ImportError::WriteFailed(format!(
             "unable to read existing runner credential file {name}"
         ))
     })?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        return Err(ImportError::WriteFailed(format!(
-            "unable to read existing runner credential file {name}"
-        )));
-    }
-    let bytes = read_regular_no_follow(&path).map_err(|_| {
+    let opened = read_opened_regular(file).map_err(|_| {
         ImportError::WriteFailed(format!(
             "unable to read existing runner credential file {name}"
         ))
     })?;
-    serde_json::from_slice(&bytes).map_err(|error| {
+    serde_json::from_slice(&opened.bytes).map_err(|error| {
         ImportError::WriteFailed(format!(
             "unable to parse existing {name} at line {} column {}",
             error.line(),
             error.column()
         ))
     })
+}
+
+fn open_directory_at(parent: &File, name: &OsStr) -> io::Result<File> {
+    open_at(
+        parent,
+        name,
+        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
+    )
+}
+
+fn open_regular_at(parent: &File, name: &OsStr) -> io::Result<File> {
+    open_at(
+        parent,
+        name,
+        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
+    )
+}
+
+fn open_at(parent: &File, name: &OsStr, flags: i32) -> io::Result<File> {
+    let name = path_component(name)?;
+    let fd = unsafe { libc::openat(parent.as_raw_fd(), name.as_ptr(), flags) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+fn path_component(name: &OsStr) -> io::Result<CString> {
+    let bytes = name.as_bytes();
+    if bytes.is_empty() || bytes == b"." || bytes == b".." || bytes.contains(&b'/') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "path is not a single component",
+        ));
+    }
+    CString::new(bytes)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains a NUL byte"))
+}
+
+fn read_directory_names(directory: &File) -> io::Result<Vec<OsString>> {
+    let duplicate = directory.try_clone()?;
+    let fd = duplicate.into_raw_fd();
+    let stream = unsafe { libc::fdopendir(fd) };
+    if stream.is_null() {
+        let error = io::Error::last_os_error();
+        let _ = unsafe { libc::close(fd) };
+        return Err(error);
+    }
+    let _stream = DirectoryStream(stream);
+    let mut names = Vec::new();
+
+    loop {
+        set_errno(0);
+        let entry = unsafe { libc::readdir(stream) };
+        if entry.is_null() {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() == Some(0) {
+                break;
+            }
+            return Err(error);
+        }
+
+        let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
+        if name != b"." && name != b".." {
+            names.push(OsString::from_vec(name.to_vec()));
+        }
+    }
+
+    names.sort();
+    Ok(names)
+}
+
+struct DirectoryStream(*mut libc::DIR);
+
+impl Drop for DirectoryStream {
+    fn drop(&mut self) {
+        let _ = unsafe { libc::closedir(self.0) };
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn set_errno(value: i32) {
+    unsafe { *libc::__errno_location() = value };
+}
+
+#[cfg(target_vendor = "apple")]
+fn set_errno(value: i32) {
+    unsafe { *libc::__error() = value };
 }
 
 fn validate_config_entries(

@@ -1,3 +1,4 @@
+use std::fs::{File, Metadata};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
@@ -6,7 +7,28 @@ use crate::config::RunnerCredentials;
 mod source;
 mod target;
 
-pub(crate) fn read_regular_no_follow(path: &Path) -> std::io::Result<Vec<u8>> {
+pub(crate) struct OpenedRegularFile {
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) metadata: Metadata,
+}
+
+pub(crate) fn read_opened_regular(mut file: File) -> std::io::Result<OpenedRegularFile> {
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "credential path is not a regular file",
+        ));
+    }
+
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    Ok(OpenedRegularFile { bytes, metadata })
+}
+
+pub(crate) fn read_regular_no_follow_with_metadata(
+    path: &Path,
+) -> std::io::Result<OpenedRegularFile> {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 
     let before = std::fs::symlink_metadata(path)?;
@@ -17,21 +39,22 @@ pub(crate) fn read_regular_no_follow(path: &Path) -> std::io::Result<Vec<u8>> {
         ));
     }
 
-    let mut file = std::fs::OpenOptions::new()
+    let file = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
         .open(path)?;
-    let after = file.metadata()?;
-    if !after.is_file() || before.dev() != after.dev() || before.ino() != after.ino() {
+    let opened = read_opened_regular(file)?;
+    if before.dev() != opened.metadata.dev() || before.ino() != opened.metadata.ino() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "credential path changed while opening",
         ));
     }
+    Ok(opened)
+}
 
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)?;
-    Ok(bytes)
+pub(crate) fn read_regular_no_follow(path: &Path) -> std::io::Result<Vec<u8>> {
+    read_regular_no_follow_with_metadata(path).map(|opened| opened.bytes)
 }
 
 #[derive(Debug, thiserror::Error)]

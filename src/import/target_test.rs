@@ -1,3 +1,4 @@
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 use serde_json::json;
@@ -466,4 +467,117 @@ fn rejects_malformed_existing_identity_without_exposing_url() {
     assert_error_category(&error, "write-failed");
     assert!(!diagnostic.contains("SECRET_EXISTING_URL"));
     assert_eq!(snapshot_tree(root.path()), before);
+}
+
+#[test]
+fn rejects_canonical_root_substitution_after_open() {
+    let parent = tempfile::tempdir().unwrap();
+    let root = parent.path().join("root");
+    std::fs::create_dir(&root).unwrap();
+    let pinned = crate::storage::open_existing_root(&root).unwrap();
+    let original = parent.path().join("original-root");
+    std::fs::rename(&root, &original).unwrap();
+    std::fs::create_dir(&root).unwrap();
+
+    let canonical = canonicalize_allow_missing(&root).unwrap();
+    let error = verify_opened_root_matches_path(&pinned, &canonical).unwrap_err();
+
+    assert_error_category(&error, "write-failed");
+    assert!(root.is_dir());
+    assert!(original.is_dir());
+}
+
+#[cfg(unix)]
+#[test]
+fn pinned_directory_descriptors_ignore_path_substitution() {
+    use std::os::unix::fs::symlink;
+
+    let root_parent = tempfile::tempdir().unwrap();
+    let root = root_parent.path().join("root");
+    write_config(&root, "runners = []\nmarker = \"original\"\n");
+    write_chimera_credentials(&root, "local");
+    let replacement = root_parent.path().join("replacement");
+    write_config(&replacement, "runners = []\nmarker = \"replacement\"\n");
+    write_chimera_credentials(&replacement, "other");
+    let pinned_root = crate::storage::open_existing_root(&root).unwrap();
+    let displaced_root = root_parent.path().join("displaced-root");
+    std::fs::rename(&root, &displaced_root).unwrap();
+    symlink(&replacement, &root).unwrap();
+    let displaced_before = snapshot_tree(&displaced_root);
+    let replacement_before = snapshot_tree(&replacement);
+
+    let config = load_preserved_config(&pinned_root).unwrap();
+    let existing = inspect_existing_credentials(&pinned_root).unwrap();
+
+    assert_eq!(config.document["marker"].as_str(), Some("original"));
+    assert!(existing.contains_key("local"));
+    assert!(!existing.contains_key("other"));
+    assert_eq!(snapshot_tree(&displaced_root), displaced_before);
+    assert_eq!(snapshot_tree(&replacement), replacement_before);
+
+    let runners_parent = tempfile::tempdir().unwrap();
+    let runners_root = runners_parent.path().join("root");
+    write_chimera_credentials(&runners_root, "local");
+    let runners_replacement = runners_parent.path().join("replacement");
+    write_chimera_credentials(&runners_replacement, "other");
+    let runners_root_fd = crate::storage::open_existing_root(&runners_root).unwrap();
+    let pinned_runners = open_directory_at(&runners_root_fd, OsStr::new("runners")).unwrap();
+    let displaced_runners = runners_root.join("original-runners");
+    std::fs::rename(runners_root.join("runners"), &displaced_runners).unwrap();
+    symlink(
+        runners_replacement.join("runners"),
+        runners_root.join("runners"),
+    )
+    .unwrap();
+
+    let existing = inspect_runners_directory(&pinned_runners).unwrap();
+
+    assert!(existing.contains_key("local"));
+    assert!(!existing.contains_key("other"));
+
+    let runner_parent = tempfile::tempdir().unwrap();
+    let runner_root = runner_parent.path().join("root");
+    write_chimera_credentials(&runner_root, "local");
+    let runner_replacement = runner_parent.path().join("replacement");
+    write_chimera_credentials(&runner_replacement, "other");
+    let runner_root_fd = crate::storage::open_existing_root(&runner_root).unwrap();
+    let runners_fd = open_directory_at(&runner_root_fd, OsStr::new("runners")).unwrap();
+    let pinned_runner = open_directory_at(&runners_fd, OsStr::new("local")).unwrap();
+    let displaced_runner = runner_root.join("runners/original-local");
+    std::fs::rename(runner_root.join("runners/local"), &displaced_runner).unwrap();
+    symlink(
+        runner_replacement.join("runners/other"),
+        runner_root.join("runners/local"),
+    )
+    .unwrap();
+
+    let credentials = read_existing_credentials(&pinned_runner).unwrap();
+
+    assert_eq!(credentials, fixture_credentials());
+}
+
+#[test]
+fn config_bytes_and_mode_come_from_same_open_descriptor() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = tempfile::tempdir().unwrap();
+    let config_path = root.path().join("config.toml");
+    std::fs::write(&config_path, "runners = []\nmarker = \"original\"\n").unwrap();
+    std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let root_fd = crate::storage::open_existing_root(root.path()).unwrap();
+    let original_fd = open_regular_at(&root_fd, OsStr::new("config.toml")).unwrap();
+    std::fs::rename(&config_path, root.path().join("original-config.toml")).unwrap();
+    std::fs::write(
+        &config_path,
+        "runners = [\"replacement\"]\nmarker = \"replacement\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+    let opened = read_opened_regular(original_fd).unwrap();
+    let preserved = preserved_config_from_opened(opened).unwrap();
+
+    assert!(preserved.model.runners.is_empty());
+    assert_eq!(preserved.document["marker"].as_str(), Some("original"));
+    assert_eq!(preserved.original_mode, Some(0o600));
 }
