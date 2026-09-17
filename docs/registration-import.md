@@ -96,8 +96,7 @@ credentials and must not be copied into an operational source directory.
 
 1. Confirm that no job is running, then normally stop one authorized official
    runner.
-2. Run `import-official` with `--dry-run` and check for `eligible` or
-   `already-imported`.
+2. Run `import-official` with `--dry-run` and check for `eligible`.
 3. Run `import-official` without `--dry-run`. Do not run `config.sh remove`,
    `chimera register`, or `chimera unregister`.
 4. Only after separate owner authorization, start Chimera with that one
@@ -119,7 +118,7 @@ credentials and must not be copied into an operational source directory.
 | I-04 | PASS automated | `same_name_or_same_identity_conflict_leaves_target_unchanged` |
 | I-05 | PASS automated | `invalid_inputs_fail_before_publish_and_redact_secrets` + source unit matrix |
 | I-06 | PASS automated | path/symlink/root tests + `second_writer_is_rejected_without_blocking` |
-| I-07 | PASS automated | `fault_matrix_never_exposes_partial_config_and_retry_recovers` |
+| I-07 | PASS automated | `every_commit_checkpoint_is_recoverable_and_preserves_invariants` + focused credential/config revalidation and pre-/post-config durability tests |
 | I-08 | PASS automated | `umask_zero_still_creates_private_credentials` + `restrictive_umask_still_creates_exact_private_modes` |
 | I-09 | NOT RUN — owner authorization required | manual `job → restart → job → rollback` canary |
 
