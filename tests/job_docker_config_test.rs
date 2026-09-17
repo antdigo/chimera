@@ -388,20 +388,23 @@ async fn cleanup_runs_for_all_job_outcomes() {
 
 #[tokio::test]
 async fn step_env_override_fails_before_spawn() {
-    let env = TestEnv::setup().await;
+    let mut env = TestEnv::setup().await;
     write_bash_probe(&env.workspace);
+    let spy = spy_on_step_logs(&env.mock_server).await;
     let step = script_step_env(
         "override",
         "touch spawned",
         HashMap::from([("DOCKER_CONFIG".into(), "/shared/.docker".into())]),
     );
-    let manifest = manifest_with_steps(vec![step], &env.mock_server.uri());
+    let manifest = manifest_with_results_endpoint(vec![step], &env.mock_server.uri());
+    env.configure_from_manifest(&manifest);
 
     let result = env.run(&manifest).await.unwrap();
 
     assert_eq!(result.0, JobConclusion::Failed);
     assert_bash_not_started(&env.workspace, "override");
     assert!(!env.workspace.workspace_dir().join("spawned").exists());
+    assert_reserved_override_diagnostic(&spy);
 }
 
 #[tokio::test]
