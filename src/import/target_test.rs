@@ -299,6 +299,26 @@ fn same_agent_id_in_another_repo_is_not_conflict() {
 }
 
 #[test]
+fn existing_organization_scope_does_not_block_repository_import() {
+    let root = tempfile::tempdir().unwrap();
+    write_chimera_credentials(root.path(), "organization");
+    mutate_json(
+        &root.path().join("runners/organization"),
+        "runner.json",
+        |runner| {
+            runner["gitHubUrl"] = json!("https://github.com/example");
+        },
+    );
+    write_config(root.path(), "runners = [\"organization\"]\n");
+    let before = snapshot_tree(root.path());
+
+    let prepared = prepare_import(&fixture_path(), "repository", root.path()).unwrap();
+
+    assert_eq!(prepared.disposition, TargetDisposition::New);
+    assert!(snapshot_tree(root.path()) == before, "target tree changed");
+}
+
+#[test]
 fn config_name_without_credentials_is_conflict() {
     let root = tempfile::tempdir().unwrap();
     write_config(root.path(), "runners = [\"local\"]\n");

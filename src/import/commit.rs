@@ -1,6 +1,6 @@
 use std::ffi::{CStr, CString, OsStr};
 use std::fs::File;
-use std::io::{self, Write};
+use std::io::{self, Seek, SeekFrom, Write};
 use std::mem::MaybeUninit;
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
@@ -128,22 +128,33 @@ where
     call_checkpoint(checkpoint, CommitPoint::AfterCreateStaging)?;
     validate_original_state(prepared, None, None)?;
 
-    write_private_json_at(&staging, CREDENTIAL_FILES[0], &prepared.credentials().info)
+    let runner_identity =
+        write_private_json_at(&staging, CREDENTIAL_FILES[0], &prepared.credentials().info)
+            .map_err(|_| ImportError::WriteFailed("unable to stage runner credentials".into()))?;
+    staging_cleanup
+        .track_leaf(CREDENTIAL_FILES[0], runner_identity)
         .map_err(|_| ImportError::WriteFailed("unable to stage runner credentials".into()))?;
     call_checkpoint(checkpoint, CommitPoint::AfterRunnerJson)?;
     validate_original_state(prepared, None, None)?;
 
-    write_private_json_at(&staging, CREDENTIAL_FILES[1], &prepared.credentials().oauth)
+    let credentials_identity =
+        write_private_json_at(&staging, CREDENTIAL_FILES[1], &prepared.credentials().oauth)
+            .map_err(|_| ImportError::WriteFailed("unable to stage runner credentials".into()))?;
+    staging_cleanup
+        .track_leaf(CREDENTIAL_FILES[1], credentials_identity)
         .map_err(|_| ImportError::WriteFailed("unable to stage runner credentials".into()))?;
     call_checkpoint(checkpoint, CommitPoint::AfterCredentialsJson)?;
     validate_original_state(prepared, None, None)?;
 
-    write_private_json_at(
+    let rsa_identity = write_private_json_at(
         &staging,
         CREDENTIAL_FILES[2],
         &prepared.credentials().rsa_params,
     )
     .map_err(|_| ImportError::WriteFailed("unable to stage runner credentials".into()))?;
+    staging_cleanup
+        .track_leaf(CREDENTIAL_FILES[2], rsa_identity)
+        .map_err(|_| ImportError::WriteFailed("unable to stage runner credentials".into()))?;
     call_checkpoint(checkpoint, CommitPoint::AfterRsaJson)?;
     validate_original_state(prepared, None, None)?;
 
@@ -225,14 +236,21 @@ fn create_staging_directory(
     Ok((directory, identity, cleanup))
 }
 
-fn write_private_json_at<T: Serialize>(directory: &File, name: &str, value: &T) -> io::Result<()> {
+fn write_private_json_at<T: Serialize>(
+    directory: &File,
+    name: &str,
+    value: &T,
+) -> io::Result<EntryIdentity> {
     let name = path_component(OsStr::new(name))?;
     let flags = libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC;
     let mut file = open_file_at(directory, &name, flags, 0o600)?;
     set_file_mode(&file, 0o600)?;
     serde_json::to_writer_pretty(&mut file, value).map_err(io::Error::other)?;
     file.write_all(b"\n")?;
-    file.sync_all()
+    file.sync_all()?;
+    let identity = file_identity(&file)?;
+    ensure_entry_identity(directory, &name, identity)?;
+    Ok(identity)
 }
 
 fn validate_staging(staging: &File, prepared: &PreparedImport) -> Result<(), ImportError> {
@@ -313,7 +331,7 @@ where
     let cleanup_parent = root
         .try_clone()
         .map_err(|_| ImportError::WriteFailed("unable to retain config temp parent".into()))?;
-    let flags = libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    let flags = libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC;
     let mut file = open_file_at(root, &temp_name, flags, mode)
         .map_err(|_| ImportError::WriteFailed("unable to create config temp file".into()))?;
     let identity = file_identity(&file)
@@ -329,9 +347,14 @@ where
     validate_original_state(prepared, Some(runners_handle), Some(credentials))?;
 
     call_checkpoint(checkpoint, CommitPoint::BeforeConfigPublish)?;
-    ensure_entry_identity(root, &temp_name, identity)
-        .and_then(|()| ensure_file_identity(&file, identity))
-        .map_err(|_| ImportError::WriteFailed("config temp file changed before publish".into()))?;
+    validate_config_temp(
+        root,
+        &temp_name,
+        &file,
+        identity,
+        serialized.as_bytes(),
+        mode as u32,
+    )?;
     let config_name = path_component(OsStr::new("config.toml"))
         .map_err(|_| ImportError::WriteFailed("config file name is invalid".into()))?;
     validate_original_state(prepared, Some(runners_handle), Some(credentials))?;
@@ -355,6 +378,42 @@ where
     sync_directory(DurabilityPoint::RootFinal, root)
         .map_err(|_| ImportError::WriteFailed("unable to sync chimera root".into()))?;
     validate_published_state(prepared, runners_handle, credentials, &published)
+}
+
+fn validate_config_temp(
+    root: &File,
+    name: &CStr,
+    file: &File,
+    expected_identity: EntryIdentity,
+    expected_bytes: &[u8],
+    expected_mode: u32,
+) -> Result<(), ImportError> {
+    let validation = || -> io::Result<()> {
+        ensure_entry_identity(root, name, expected_identity)?;
+        ensure_file_identity(file, expected_identity)?;
+
+        let mut retained = file.try_clone()?;
+        retained.seek(SeekFrom::Start(0))?;
+        let opened = read_opened_regular(retained)?;
+        let opened_identity = EntryIdentity {
+            device: opened.metadata.dev() as libc::dev_t,
+            inode: opened.metadata.ino() as libc::ino_t,
+        };
+        if opened_identity != expected_identity
+            || opened.bytes != expected_bytes
+            || opened.metadata.mode() & 0o777 != expected_mode
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "config temp contents changed",
+            ));
+        }
+
+        ensure_entry_identity(root, name, expected_identity)
+    };
+
+    validation()
+        .map_err(|_| ImportError::WriteFailed("config temp file changed before publish".into()))
 }
 
 fn pin_planned_credentials(
@@ -579,6 +638,20 @@ fn validate_private_directory(directory: &File, require_exact_mode: bool) -> io:
     Ok(())
 }
 
+fn validate_private_regular_file(file: &File) -> io::Result<()> {
+    let stat = stat_fd(file)?;
+    if !is_regular_file(&stat)
+        || stat.st_uid != effective_uid()
+        || stat.st_mode as u32 & 0o777 != 0o600
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "file is not private owned storage",
+        ));
+    }
+    Ok(())
+}
+
 fn open_directory_at(parent: &File, name: &CStr) -> io::Result<File> {
     let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
     open_file_at(parent, name, flags, 0)
@@ -734,6 +807,10 @@ fn is_directory(stat: &libc::stat) -> bool {
     stat.st_mode as u32 & libc::S_IFMT as u32 == libc::S_IFDIR as u32
 }
 
+fn is_regular_file(stat: &libc::stat) -> bool {
+    stat.st_mode as u32 & libc::S_IFMT as u32 == libc::S_IFREG as u32
+}
+
 fn unlink_at(parent: &File, name: &CStr, flags: i32) -> io::Result<()> {
     let result = unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), flags) };
     if result == 0 {
@@ -750,11 +827,18 @@ enum CleanupKind {
 }
 
 #[derive(Debug)]
+struct TrackedLeaf {
+    name: CString,
+    expected: EntryIdentity,
+}
+
+#[derive(Debug)]
 struct CleanupGuard {
     parent: File,
     name: CString,
     expected: EntryIdentity,
     kind: CleanupKind,
+    tracked_leaves: Vec<TrackedLeaf>,
     armed: bool,
 }
 
@@ -765,6 +849,7 @@ impl CleanupGuard {
             name: name.to_owned(),
             expected,
             kind,
+            tracked_leaves: Vec::new(),
             armed: true,
         }
     }
@@ -773,16 +858,31 @@ impl CleanupGuard {
         self.armed = false;
     }
 
+    fn track_leaf(&mut self, name: &str, expected: EntryIdentity) -> io::Result<()> {
+        self.tracked_leaves.push(TrackedLeaf {
+            name: path_component(OsStr::new(name))?,
+            expected,
+        });
+        Ok(())
+    }
+
     fn remove_directory(&self) -> io::Result<()> {
         let directory = open_directory_at(&self.parent, &self.name)?;
+        ensure_entry_identity(&self.parent, &self.name, self.expected)?;
         ensure_file_identity(&directory, self.expected)?;
-        for file_name in CREDENTIAL_FILES {
-            let name = path_component(OsStr::new(file_name))?;
-            if let Err(error) = unlink_at(&directory, &name, 0)
-                && error.kind() != io::ErrorKind::NotFound
-            {
-                return Err(error);
-            }
+        validate_private_directory(&directory, true)?;
+
+        for leaf in &self.tracked_leaves {
+            let flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK;
+            let file = open_file_at(&directory, &leaf.name, flags, 0)?;
+            ensure_entry_identity(&directory, &leaf.name, leaf.expected)?;
+            ensure_file_identity(&file, leaf.expected)?;
+            validate_private_regular_file(&file)?;
+        }
+        ensure_entry_identity(&self.parent, &self.name, self.expected)?;
+
+        for leaf in &self.tracked_leaves {
+            unlink_at(&directory, &leaf.name, 0)?;
         }
         ensure_entry_identity(&self.parent, &self.name, self.expected)?;
         unlink_at(&self.parent, &self.name, libc::AT_REMOVEDIR)

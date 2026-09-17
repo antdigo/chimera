@@ -12,7 +12,7 @@ use serde::de::DeserializeOwned;
 use crate::config::{ChimeraConfig, ChimeraPaths, RunnerCredentials};
 use crate::storage::{RootLockError, open_existing_root};
 
-use super::source::{read_official_registration, runner_identity};
+use super::source::{existing_runner_identity, read_official_registration};
 use super::{
     ImportError, ImportOutcome, ImportStatus, OpenedRegularFile, RunnerIdentity,
     ValidatedRegistration, read_opened_regular,
@@ -878,7 +878,7 @@ fn identity_from_credentials(credentials: &RunnerCredentials) -> Result<RunnerId
     if credentials.info.pool_id == 0 || credentials.info.agent_id == 0 {
         return Err(());
     }
-    runner_identity(
+    existing_runner_identity(
         &credentials.info.git_hub_url,
         credentials.info.pool_id,
         credentials.info.agent_id,

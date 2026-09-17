@@ -824,6 +824,36 @@ fn staging_cleanup_does_not_delete_a_replacement() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn staging_cleanup_preserves_every_entry_when_a_tracked_leaf_is_replaced() {
+    let root = tempfile::tempdir().unwrap();
+    let (_lock, prepared) = prepare_locked_import(&fixture_path(), "local-runner", root.path());
+    let replacement = RefCell::new(None::<(PathBuf, u64)>);
+
+    let result = commit_with_checkpoint(prepared, |point| {
+        if point == CommitPoint::AfterRunnerJson {
+            let staging = staging_path(root.path());
+            let runner = staging.join("runner.json");
+            std::fs::rename(&runner, root.path().join("displaced-runner.json"))?;
+            std::fs::write(&runner, b"REPLACEMENT_RUNNER_JSON")?;
+            replacement.replace(Some((staging, directory_inode(&runner))));
+            return Err(std::io::Error::other("injected staging interruption"));
+        }
+        Ok(())
+    });
+    expect_write_failed(result, "staging leaf replacement");
+
+    let state = replacement.borrow();
+    let (staging, replacement_inode) = state.as_ref().unwrap();
+    assert!(staging.is_dir());
+    let runner = staging.join("runner.json");
+    assert!(runner.is_file());
+    assert_eq!(directory_inode(&runner), *replacement_inode);
+    assert!(std::fs::read(&runner).unwrap() == b"REPLACEMENT_RUNNER_JSON");
+    assert!(root.path().join("displaced-runner.json").is_file());
+}
+
 #[test]
 fn replaced_config_temp_is_neither_published_nor_deleted() {
     let root = tempfile::tempdir().unwrap();
@@ -892,6 +922,76 @@ fn config_temp_cleanup_does_not_delete_a_replacement_before_publish() {
 
 #[cfg(unix)]
 #[test]
+fn mutated_config_temp_is_not_published_when_config_was_missing() {
+    let root = tempfile::tempdir().unwrap();
+    let (_lock, prepared) = prepare_locked_import(&fixture_path(), "local-runner", root.path());
+
+    let result = commit_with_checkpoint(prepared, |point| {
+        if point == CommitPoint::BeforeConfigPublish {
+            let temp = import_artifacts(root.path())
+                .into_iter()
+                .find(|path| {
+                    path.file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.starts_with(".config.toml."))
+                })
+                .ok_or_else(|| std::io::Error::other("config temp is missing"))?;
+            let inode = directory_inode(&temp);
+            std::fs::write(&temp, b"SENSITIVE_CONFIG_TEMP_CONTENT")?;
+            assert_eq!(directory_inode(&temp), inode);
+        }
+        Ok(())
+    });
+    let error = expect_write_failed(result, "same-inode config temp content mutation");
+
+    assert!(!root.path().join("config.toml").exists());
+    assert!(matches!(
+        error,
+        ImportError::WriteFailed(ref message)
+            if message == "config temp file changed before publish"
+                && !message.contains("SENSITIVE_CONFIG_TEMP_CONTENT")
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn mutated_config_temp_mode_does_not_replace_existing_config() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = tempfile::tempdir().unwrap();
+    let config_path = root.path().join("config.toml");
+    std::fs::write(&config_path, "runners = []\nmarker = \"original\"\n").unwrap();
+    std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o640)).unwrap();
+    let original = snapshot(&config_path);
+    let (_lock, prepared) = prepare_locked_import(&fixture_path(), "local-runner", root.path());
+
+    let result = commit_with_checkpoint(prepared, |point| {
+        if point == CommitPoint::BeforeConfigPublish {
+            let temp = import_artifacts(root.path())
+                .into_iter()
+                .find(|path| {
+                    path.file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.starts_with(".config.toml."))
+                })
+                .ok_or_else(|| std::io::Error::other("config temp is missing"))?;
+            let inode = directory_inode(&temp);
+            std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o600))?;
+            assert_eq!(directory_inode(&temp), inode);
+        }
+        Ok(())
+    });
+    let error = expect_write_failed(result, "same-inode config temp mode mutation");
+
+    assert!(snapshot(&config_path) == original);
+    assert!(matches!(
+        error,
+        ImportError::WriteFailed(ref message) if message == "config temp file changed before publish"
+    ));
+}
+
+#[cfg(unix)]
+#[test]
 fn failed_runners_durability_barrier_recovers_without_rewriting_credentials() {
     let root = tempfile::tempdir().unwrap();
     let (lock, prepared) = prepare_locked_import(&fixture_path(), "local-runner", root.path());
@@ -930,20 +1030,23 @@ fn failed_runners_durability_barrier_recovers_without_rewriting_credentials() {
 fn failed_root_durability_barrier_recovers_without_rewriting_state() {
     let root = tempfile::tempdir().unwrap();
     let (lock, prepared) = prepare_locked_import(&fixture_path(), "local-runner", root.path());
+    let reached_root_final = Cell::new(false);
 
     let error = commit_with_checkpoint_and_sync(
         prepared,
         |_| Ok(()),
         |point, directory| {
             if point == DurabilityPoint::RootFinal {
+                reached_root_final.set(true);
                 Err(std::io::Error::other("injected root sync failure"))
             } else {
-                directory.sync_all()
+                open_syncable_directory(directory)?.sync_all()
             }
         },
     )
     .unwrap_err();
 
+    assert!(reached_root_final.get(), "RootFinal was not reached");
     assert_eq!(error.category(), "write-failed");
     let credentials_before = credential_snapshot(root.path(), "local-runner");
     let config_before = snapshot(&root.path().join("config.toml"));

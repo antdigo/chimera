@@ -231,6 +231,29 @@ pub(super) fn runner_identity(
     pool_id: u64,
     agent_id: u64,
 ) -> Result<RunnerIdentity, ImportError> {
+    github_identity(git_hub_url, pool_id, agent_id, false)
+}
+
+pub(super) fn existing_runner_identity(
+    git_hub_url: &str,
+    pool_id: u64,
+    agent_id: u64,
+) -> Result<RunnerIdentity, ImportError> {
+    github_identity(git_hub_url, pool_id, agent_id, true)
+}
+
+fn github_identity(
+    git_hub_url: &str,
+    pool_id: u64,
+    agent_id: u64,
+    allow_organization_scope: bool,
+) -> Result<RunnerIdentity, ImportError> {
+    if git_hub_url.contains('%') {
+        return Err(ImportError::UnsupportedRegistration(
+            "repository scope is not supported".into(),
+        ));
+    }
+
     let url = Url::parse(git_hub_url).map_err(|_| {
         ImportError::UnsupportedRegistration("repository scope is not supported".into())
     })?;
@@ -243,6 +266,8 @@ pub(super) fn runner_identity(
         .unwrap_or_default()
         .split('/')
         .collect();
+    let valid_segment_count =
+        path_segments.len() == 2 || (allow_organization_scope && path_segments.len() == 1);
 
     if url.scheme() != "https"
         || !host_is_github
@@ -251,7 +276,7 @@ pub(super) fn runner_identity(
         || url.query().is_some()
         || url.fragment().is_some()
         || url.path().contains('%')
-        || path_segments.len() != 2
+        || !valid_segment_count
         || path_segments.iter().any(|segment| segment.is_empty())
     {
         return Err(ImportError::UnsupportedRegistration(
@@ -259,12 +284,13 @@ pub(super) fn runner_identity(
         ));
     }
 
+    let normalized_path = path_segments
+        .iter()
+        .map(|segment| segment.to_ascii_lowercase())
+        .collect::<Vec<_>>()
+        .join("/");
     Ok(RunnerIdentity {
-        scope: format!(
-            "github.com/{}/{}",
-            path_segments[0].to_ascii_lowercase(),
-            path_segments[1].to_ascii_lowercase()
-        ),
+        scope: format!("github.com/{normalized_path}"),
         pool_id,
         agent_id,
     })

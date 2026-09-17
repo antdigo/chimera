@@ -525,6 +525,8 @@ fn rejects_percent_encoded_repository_scope_aliases() {
         "https://github.com/example/repo%73itory",
         "https://github.com/example%2Frepository/alias",
         "https://github.com/example/%2e%2e",
+        "https://github.com/example/%2e/repository",
+        "https://github.com/other/%2e%2e/example/repository",
     ] {
         let source = copy_fixture();
         set_runner_value(source.path(), "gitHubUrl", json!(repository_url));
