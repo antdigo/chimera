@@ -130,16 +130,20 @@ jobs:
 
           # C-10 requires BuildKit as an already-local immutable image and
           # never lets Buildx download it; preload it into the nested daemon.
-          docker save --output /tmp/chimera-buildkit.tar "$BUILDKIT_REFERENCE"
+          # Digest references do not survive a docker save/load round-trip
+          # (the loaded image keeps no RepoTags or RepoDigests), so resolve
+          # the image ID on the host daemon and carry only that through.
+          BUILDKIT_IMAGE_ID="$(docker image inspect --format '{{.Id}}' "$BUILDKIT_REFERENCE")"
+          test -n "$BUILDKIT_IMAGE_ID"
+          docker save --output /tmp/chimera-buildkit.tar "$BUILDKIT_IMAGE_ID"
           docker cp /tmp/chimera-buildkit.tar "$DIND_NAME":/tmp/chimera-buildkit.tar
           docker exec --user root "$DIND_NAME" chown 1000:1000 /tmp/chimera-buildkit.tar
           docker exec \
             -e DOCKER_HOST=unix:///run/user/1000/docker.sock \
             "$DIND_NAME" docker load --input /tmp/chimera-buildkit.tar
-          BUILDKIT_IMAGE_ID="$(docker exec \
+          docker exec \
             -e DOCKER_HOST=unix:///run/user/1000/docker.sock \
-            "$DIND_NAME" docker image inspect --format '{{.Id}}' "$BUILDKIT_REFERENCE")"
-          test -n "$BUILDKIT_IMAGE_ID"
+            "$DIND_NAME" docker image inspect --format '{{.Id}}' "$BUILDKIT_IMAGE_ID"
 
           # The suite runs in the daemon's network namespace so the test
           # registry's 127.0.0.1 port publishing and BuildKit share one
