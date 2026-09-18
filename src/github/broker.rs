@@ -15,6 +15,11 @@ use super::auth::TokenManager;
 const BROKER_PROTOCOL_VERSION: &str = "3.0.0";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
+// The official runner's message-queue connection uses a 60s send timeout, and
+// the broker answers an idle long-poll with 202 shortly before that. A client
+// timeout shorter than the broker's hold window aborts every idle cycle.
+const POLL_TIMEOUT: Duration = Duration::from_secs(60);
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum MessageType {
     RunnerJobRequest,
@@ -140,6 +145,7 @@ pub struct BrokerClient {
     server_url: String,
     session_id: String,
     token_manager: Arc<TokenManager>,
+    poll_timeout: Duration,
 }
 
 impl BrokerClient {
@@ -155,7 +161,14 @@ impl BrokerClient {
             server_url,
             session_id,
             token_manager,
+            poll_timeout: POLL_TIMEOUT,
         }
+    }
+
+    /// Override the long-poll timeout (used by tests to shorten poll cycles).
+    pub fn with_poll_timeout(mut self, poll_timeout: Duration) -> Self {
+        self.poll_timeout = poll_timeout;
+        self
     }
 
     /// Create a new broker session and return a connected client.
@@ -224,6 +237,7 @@ impl BrokerClient {
             server_url: server_url.to_string(),
             session_id: session.session_id,
             token_manager,
+            poll_timeout: POLL_TIMEOUT,
         })
     }
 
@@ -266,17 +280,19 @@ impl BrokerClient {
             .client
             .get(&url)
             .bearer_auth(&token)
-            .timeout(Duration::from_secs(55))
+            .timeout(self.poll_timeout)
             .send()
             .await
             .map_err(|e| {
-                if e.is_timeout() {
+                // A timeout on an already-established request means the broker
+                // held the idle long-poll past our window — a normal cycle. A
+                // timeout while still connecting is a real failure.
+                if e.is_timeout() && !e.is_connect() {
                     BrokerError::Timeout
                 } else {
                     BrokerError::Connection(e.to_string())
                 }
-            })
-            .context("sending poll request")?;
+            })?;
 
         let status = resp.status();
         debug!(status = %status, "poll response");

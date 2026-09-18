@@ -184,6 +184,10 @@ impl Runner {
 
         let client = reqwest::Client::builder()
             .user_agent(format!("chimera/{RUNNER_VERSION}"))
+            // Bound connection setup well below the 60s long-poll deadline so
+            // a stalled connect surfaces as a connection error (warn + backoff)
+            // instead of expiring as a quiet long-poll timeout.
+            .connect_timeout(Duration::from_secs(30))
             .build()
             .context("building HTTP client")?;
 
@@ -695,6 +699,10 @@ impl Runner {
         let mut backoff = Duration::from_secs(1);
         let max_backoff = Duration::from_secs(30);
         let mut poisoned_rx = self.job_resources.poisoned_receiver();
+        // Set when the previous iteration handled a 401 by refreshing the
+        // token. A 401 on the very next poll means the fresh token is also
+        // rejected (e.g. the registration was revoked) and must not loop.
+        let mut token_just_refreshed = false;
 
         loop {
             self.job_resources.ensure_healthy()?;
@@ -717,6 +725,9 @@ impl Runner {
 
             match poll_result {
                 Ok(Some(msg)) => {
+                    // Any successful poll proves the token still works.
+                    token_just_refreshed = false;
+
                     if msg.message_type != MessageType::RunnerJobRequest {
                         debug!(
                             message_id = msg.message_id,
@@ -746,34 +757,36 @@ impl Runner {
                 }
                 Ok(None) => {
                     backoff = Duration::from_secs(1);
+                    token_just_refreshed = false;
                     continue;
                 }
                 Err(e) => {
+                    // The broker holding an idle long-poll open past the client
+                    // timeout is a normal empty cycle, not a failure: repoll
+                    // immediately without warning or backoff.
+                    if e.downcast_ref::<BrokerError>()
+                        .is_some_and(|be| matches!(be, BrokerError::Timeout))
+                    {
+                        debug!("long-poll window expired without a message");
+                        backoff = Duration::from_secs(1);
+                        token_just_refreshed = false;
+                        continue;
+                    }
+
                     if e.downcast_ref::<BrokerError>()
                         .is_some_and(|be| matches!(be, BrokerError::Unauthorized))
                     {
+                        if token_just_refreshed {
+                            warn!("still unauthorized after token refresh");
+                            return Err(e);
+                        }
                         warn!("got 401, refreshing token");
                         broker.token_manager().invalidate().await;
-                        let retry = tokio::select! {
-                            result = broker.poll_message() => result,
-                            _ = shutdown_rx.changed() => {
-                                info!("shutdown signal received during token retry");
-                                return Ok(None);
-                            }
-                            _ = poisoned_rx.changed() => {
-                                self.job_resources.ensure_healthy()?;
-                                continue;
-                            }
-                        };
-                        match retry {
-                            Ok(result) => return Ok(result),
-                            Err(retry_err) => {
-                                warn!(error = %retry_err, "retry after token refresh also failed");
-                                return Err(retry_err);
-                            }
-                        }
+                        token_just_refreshed = true;
+                        continue;
                     }
 
+                    token_just_refreshed = false;
                     warn!(error = %e, backoff_secs = backoff.as_secs(), "poll error, backing off");
 
                     tokio::select! {

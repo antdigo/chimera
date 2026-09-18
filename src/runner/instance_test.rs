@@ -267,6 +267,110 @@ async fn poll_loop_backoff_on_error() {
 }
 
 #[tokio::test]
+async fn poll_loop_repolls_immediately_after_long_poll_timeout() {
+    let (mock_server, tm, shutdown_tx) = setup().await;
+
+    // First poll never completes within the (shortened) client timeout —
+    // the broker holds the long-poll window open past it.
+    Mock::given(method("GET"))
+        .and(path("/message"))
+        .respond_with(ResponseTemplate::new(202).set_delay(Duration::from_secs(5)))
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/message"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "messageId": 7,
+            "messageType": "RunnerJobRequest",
+            "body": "{\"runner_request_id\": \"abc123\"}"
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let broker = BrokerClient::new(
+        reqwest::Client::new(),
+        mock_server.uri(),
+        "session-123".into(),
+        tm,
+    )
+    .with_poll_timeout(Duration::from_millis(300));
+
+    let (_temp, runner) = make_runner();
+    let mut rx = shutdown_tx.subscribe();
+    let poll = runner.poll_loop(&broker, &mut rx);
+
+    // With backoff the job would arrive after 300ms timeout + 1s sleep > 1.2s;
+    // an immediate repoll returns it within one poll cycle.
+    let result = tokio::time::timeout(Duration::from_millis(900), poll)
+        .await
+        .expect("job should be picked up without backoff after a long-poll timeout")
+        .unwrap()
+        .expect("should return job message");
+    assert_eq!(result.message_id, 7);
+}
+
+#[tokio::test]
+async fn poll_loop_long_poll_timeout_resets_backoff() {
+    let (mock_server, tm, shutdown_tx) = setup().await;
+
+    Mock::given(method("GET"))
+        .and(path("/message"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("error"))
+        .up_to_n_times(2)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/message"))
+        .respond_with(ResponseTemplate::new(202).set_delay(Duration::from_secs(5)))
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/message"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("error"))
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/message"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "messageId": 8,
+            "messageType": "RunnerJobRequest",
+            "body": "{\"runner_request_id\": \"abc123\"}"
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let broker = BrokerClient::new(
+        reqwest::Client::new(),
+        mock_server.uri(),
+        "session-123".into(),
+        tm,
+    )
+    .with_poll_timeout(Duration::from_millis(300));
+
+    let (_temp, runner) = make_runner();
+    let mut rx = shutdown_tx.subscribe();
+    let poll = runner.poll_loop(&broker, &mut rx);
+
+    // Two genuine failures grow the backoff to 2s; the idle timeout in
+    // between must reset it, so the third failure sleeps 1s and the job
+    // arrives in ~4.4s. If the timeout did not reset the backoff, the sleep
+    // would be 4s and the job would arrive after ~7.4s.
+    let result = tokio::time::timeout(Duration::from_millis(5500), poll)
+        .await
+        .expect("backoff should reset across a long-poll timeout")
+        .unwrap()
+        .expect("should return job message");
+    assert_eq!(result.message_id, 8);
+}
+
+#[tokio::test]
 async fn poll_loop_refreshes_token_on_401() {
     let (mock_server, tm, shutdown_tx) = setup().await;
 
@@ -280,6 +384,17 @@ async fn poll_loop_refreshes_token_on_401() {
     Mock::given(method("GET"))
         .and(path("/message"))
         .respond_with(ResponseTemplate::new(202))
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/message"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "messageId": 11,
+            "messageType": "RunnerJobRequest",
+            "body": "{\"runner_request_id\": \"abc123\"}"
+        })))
         .mount(&mock_server)
         .await;
 
@@ -293,7 +408,133 @@ async fn poll_loop_refreshes_token_on_401() {
     let (_temp, runner) = make_runner();
     let mut rx = shutdown_tx.subscribe();
     let result = runner.poll_loop(&broker, &mut rx).await.unwrap();
-    assert!(result.is_none());
+    let msg = result.expect("empty poll after 401 refresh must keep polling, not exit");
+    assert_eq!(msg.message_id, 11);
+}
+
+#[tokio::test]
+async fn poll_loop_401_refresh_then_timeout_still_returns_job() {
+    let (mock_server, tm, shutdown_tx) = setup().await;
+
+    Mock::given(method("GET"))
+        .and(path("/message"))
+        .respond_with(ResponseTemplate::new(401))
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/message"))
+        .respond_with(ResponseTemplate::new(202).set_delay(Duration::from_secs(5)))
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/message"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "messageId": 12,
+            "messageType": "RunnerJobRequest",
+            "body": "{\"runner_request_id\": \"abc123\"}"
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let broker = BrokerClient::new(
+        reqwest::Client::new(),
+        mock_server.uri(),
+        "session-123".into(),
+        tm,
+    )
+    .with_poll_timeout(Duration::from_millis(300));
+
+    let (_temp, runner) = make_runner();
+    let mut rx = shutdown_tx.subscribe();
+    let result = runner.poll_loop(&broker, &mut rx).await.unwrap();
+    let msg = result.expect("long-poll timeout after 401 refresh must keep polling, not exit");
+    assert_eq!(msg.message_id, 12);
+}
+
+#[tokio::test]
+async fn poll_loop_persistent_401_returns_error() {
+    let (mock_server, tm, shutdown_tx) = setup().await;
+
+    Mock::given(method("GET"))
+        .and(path("/message"))
+        .respond_with(ResponseTemplate::new(401))
+        .mount(&mock_server)
+        .await;
+
+    let broker = BrokerClient::new(
+        reqwest::Client::new(),
+        mock_server.uri(),
+        "session-123".into(),
+        tm,
+    );
+
+    let (_temp, runner) = make_runner();
+    let mut rx = shutdown_tx.subscribe();
+    let result = runner.poll_loop(&broker, &mut rx).await;
+    assert!(
+        result.is_err(),
+        "401 persisting after a token refresh should surface as an error"
+    );
+}
+
+#[tokio::test]
+async fn poll_loop_401_after_control_message_refreshes_again() {
+    let (mock_server, tm, shutdown_tx) = setup().await;
+
+    Mock::given(method("GET"))
+        .and(path("/message"))
+        .respond_with(ResponseTemplate::new(401))
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/message"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "messageId": 5,
+            "messageType": "AgentRefresh",
+            "body": null
+        })))
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/message"))
+        .respond_with(ResponseTemplate::new(401))
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/message"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "messageId": 13,
+            "messageType": "RunnerJobRequest",
+            "body": "{\"runner_request_id\": \"abc123\"}"
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let broker = BrokerClient::new(
+        reqwest::Client::new(),
+        mock_server.uri(),
+        "session-123".into(),
+        tm,
+    );
+
+    let (_temp, runner) = make_runner();
+    let mut rx = shutdown_tx.subscribe();
+    let result = runner.poll_loop(&broker, &mut rx).await.unwrap();
+    // A successful control-message poll proves the refreshed token works, so
+    // a later 401 is a new expiry and must be refreshed, not treated as
+    // "still unauthorized".
+    let msg = result.expect("401 after a successful poll should refresh again, not exit");
+    assert_eq!(msg.message_id, 13);
 }
 
 fn finish_manifest_value(server_url: &str) -> serde_json::Value {

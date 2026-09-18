@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use super::*;
 use crate::github::auth::TokenManager;
 use wiremock::matchers::{body_partial_json, header, method, path, query_param};
@@ -237,5 +239,74 @@ async fn poll_401_returns_error() {
         err.downcast_ref::<BrokerError>()
             .is_some_and(|be| matches!(be, BrokerError::Unauthorized)),
         "expected BrokerError::Unauthorized, got: {err}"
+    );
+}
+
+#[tokio::test]
+async fn poll_timeout_classified_as_broker_timeout() {
+    let (mock_server, tm) = setup().await;
+
+    Mock::given(method("GET"))
+        .and(path("/message"))
+        .respond_with(ResponseTemplate::new(202).set_delay(Duration::from_secs(5)))
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+
+    let client = make_client(&mock_server.uri(), tm).with_poll_timeout(Duration::from_millis(300));
+    let result = client.poll_message().await;
+    let err = result.err().expect("client timeout should be an error");
+    assert!(
+        err.downcast_ref::<BrokerError>()
+            .is_some_and(|be| matches!(be, BrokerError::Timeout)),
+        "expected BrokerError::Timeout, got: {err}"
+    );
+    assert!(
+        err.to_string().contains("poll timeout"),
+        "error display should name the timeout, not mask it: {err}"
+    );
+}
+
+#[tokio::test]
+async fn poll_connect_timeout_classified_as_connection_error() {
+    // The mock server only serves the token endpoint the TokenManager hits.
+    let (_mock_server, tm) = setup().await;
+
+    // A local listener that accepts the TCP connection but never speaks
+    // TLS: the handshake stalls until the connect timeout fires, without
+    // depending on external routing or proxy configuration.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        let conn = listener.accept().unwrap();
+        std::thread::sleep(Duration::from_secs(10));
+        drop(conn);
+    });
+
+    // The production client configures a connect timeout shorter than the
+    // poll deadline; a stalled connect must surface as a connection error
+    // (warn + backoff), never as a quiet long-poll timeout.
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_millis(500))
+        .no_proxy()
+        .build()
+        .unwrap();
+    let broker = BrokerClient::new(
+        client,
+        format!("https://{addr}"),
+        "session-123".into(),
+        tm.clone(),
+    )
+    .with_poll_timeout(Duration::from_secs(60));
+
+    // Warm the token cache so the poll itself is the only HTTP request left.
+    tm.get_token().await.unwrap();
+
+    let result = broker.poll_message().await;
+    let err = result.err().expect("stalled connect should be an error");
+    assert!(
+        err.downcast_ref::<BrokerError>()
+            .is_some_and(|be| matches!(be, BrokerError::Connection(_))),
+        "expected BrokerError::Connection, got: {err}"
     );
 }
