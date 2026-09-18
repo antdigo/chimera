@@ -82,7 +82,7 @@ async fn v1_registration_via_pipelines() {
         extra: serde_json::Value::Object(serde_json::Map::new()),
     };
 
-    let private_key = RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).unwrap();
+    let private_key = crate::testing::test_private_key();
     let result = register_v1(
         &reqwest::Client::new(),
         &auth,

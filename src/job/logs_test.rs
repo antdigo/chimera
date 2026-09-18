@@ -3,7 +3,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use super::*;
 use crate::github::auth::TokenManager;
 use crate::utils::format_log_timestamp;
-use rsa::RsaPrivateKey;
 use wiremock::matchers::{header, method, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -19,7 +18,7 @@ async fn setup_log_server() -> (MockServer, Arc<JobClient>) {
         .mount(&mock_server)
         .await;
 
-    let private_key = RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).unwrap();
+    let private_key = crate::testing::test_private_key();
     let tm = Arc::new(TokenManager::new(
         reqwest::Client::new(),
         format!("{}/oauth2/token", mock_server.uri()),

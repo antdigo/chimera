@@ -1,7 +1,6 @@
 use super::*;
 use crate::github::auth::TokenManager;
 use crate::job::timeline;
-use rsa::RsaPrivateKey;
 use wiremock::matchers::{body_json, header, method, path, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -17,7 +16,7 @@ async fn setup() -> (MockServer, Arc<TokenManager>) {
         .mount(&mock_server)
         .await;
 
-    let private_key = RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).unwrap();
+    let private_key = crate::testing::test_private_key();
     let tm = Arc::new(TokenManager::new(
         reqwest::Client::new(),
         format!("{}/oauth2/token", mock_server.uri()),

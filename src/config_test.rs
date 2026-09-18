@@ -2,7 +2,7 @@ use super::*;
 use tempfile::TempDir;
 
 fn test_credentials() -> RunnerCredentials {
-    let key = RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).unwrap();
+    let key = crate::testing::test_private_key();
     let rsa_params = private_key_to_rsa_params(&key).unwrap();
 
     RunnerCredentials {
@@ -27,7 +27,7 @@ fn test_credentials() -> RunnerCredentials {
 
 #[test]
 fn rsa_key_roundtrip() {
-    let key = RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).unwrap();
+    let key = crate::testing::test_private_key();
 
     let params = private_key_to_rsa_params(&key).unwrap();
     let reconstructed = rsa_params_to_private_key(&params).unwrap();
@@ -41,7 +41,7 @@ fn rsa_key_roundtrip() {
 fn rsa_validation_rejects_inconsistent_derived_parameters() {
     type FieldSelector = fn(&mut RsaParameters) -> &mut String;
 
-    let key = RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).unwrap();
+    let key = crate::testing::test_private_key();
     let params = private_key_to_rsa_params(&key).unwrap();
 
     let corruptions: [(&str, FieldSelector); 3] = [
@@ -203,7 +203,7 @@ fn missing_credentials_file_errors() {
 
 #[test]
 fn public_key_xml_format() {
-    let key = RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).unwrap();
+    let key = crate::testing::test_private_key();
     let xml = public_key_to_xml(&key);
 
     assert!(xml.starts_with("<RSAKeyValue>"));
@@ -220,7 +220,7 @@ fn jwt_signing_survives_key_roundtrip() {
     use sha2::Sha256;
 
     // Generate key, save params, reconstruct (same as register -> start flow)
-    let original_key = RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).unwrap();
+    let original_key = crate::testing::test_private_key();
     let params = private_key_to_rsa_params(&original_key).unwrap();
     let reconstructed = rsa_params_to_private_key(&params).unwrap();
 
