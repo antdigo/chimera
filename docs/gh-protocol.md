@@ -333,7 +333,10 @@ Response:
 ```
 
 **Notes**:
-- `status: 0` means Online (1 = Offline).
+- `status: 0` is the default `TaskAgentStatus` value — the official runner
+  leaves the agent status unset when creating a session (`TaskAgentStatus`:
+  Offline=1, Online=2, Busy=3) and reports its actual status via the message
+  poll's `status` parameter instead.
 - Persistent registrations created by `chimera register` and accepted by
   `import-official` create non-ephemeral broker sessions; registration deletion
   is never performed on session disconnect.
@@ -363,7 +366,7 @@ The runner uses **long polling** to wait for jobs from the broker.
 ```
 GET {broker_url}/message
     ?sessionId={session_id}
-    &status=Online
+    &status={Online|Busy}
     &runnerVersion=3.0.0
     &disableUpdate=true
 Authorization: Bearer {oauth_token}
@@ -372,6 +375,26 @@ Timeout: 55s (client-side)
 
 **Note**: The `runnerVersion` query parameter is `3.0.0` (the broker protocol
 version), NOT the runner version `2.329.0` used elsewhere.
+
+**The `status` parameter is the agent status reported to the broker**
+(`TaskAgentStatus`: Offline=1, Online=2, Busy=3) and must track the runner's
+actual state:
+
+- `Online` — idle, waiting for a job.
+- `Busy` — a job is executing.
+
+The official runner polls with one status at a time and switches to `Busy` for
+the whole duration of a job (switching back to `Online` when it finishes),
+aborting any in-flight long-poll so the next poll carries the new status
+immediately; its job dispatcher is designed around the server not sending
+another job while one is still running.
+
+The broker's routing internals are not public, but its behavior is consistent
+with status-driven delivery: polling as `Online` while a job executes is how
+issue #18 lost its cancellation — the `JobCancellation` never reached the
+runner, the job ran to completion reporting `succeeded`, and GitHub reconciled
+the run to `cancelled` server-side. Match the official runner's status
+transitions.
 
 The server holds the connection for up to ~50 seconds before responding with 202.
 
@@ -1419,7 +1442,7 @@ host and Docker bridge networks.
 | V1 register | POST | `{tenant}/_apis/distributedtask/pools/1/agents?api-version=6.0-preview` | Bearer (temp OAuth) |
 | Create session | POST | `{broker}/session` | Bearer (OAuth) |
 | Delete session | DELETE | `{broker}/session` | Bearer (OAuth) |
-| Poll message | GET | `{broker}/message?sessionId=...&status=Online&runnerVersion=3.0.0&disableUpdate=true` | Bearer (OAuth) |
+| Poll message | GET | `{broker}/message?sessionId=...&status={Online\|Busy}&runnerVersion=3.0.0&disableUpdate=true` | Bearer (OAuth) |
 | Acknowledge | POST | `{broker}/acknowledge?sessionId=...&runnerVersion=3.0.0&status=Online&disableUpdate=true` | Bearer (OAuth) |
 | Acquire job | POST | `{run_service}/acquirejob` | Bearer (OAuth) |
 | Renew job | POST | `{run_service}/renewjob` | Bearer (job token) |

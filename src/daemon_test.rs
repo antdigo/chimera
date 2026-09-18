@@ -113,10 +113,10 @@ fn wait_for_result(control: &Path, name: &str) -> String {
     let path = control.join(name);
     let deadline = Instant::now() + LOCK_TEST_TIMEOUT;
     loop {
-        if let Ok(content) = std::fs::read_to_string(&path) {
-            if !content.is_empty() {
-                return content;
-            }
+        if let Ok(content) = std::fs::read_to_string(&path)
+            && !content.is_empty()
+        {
+            return content;
         }
         assert!(
             Instant::now() < deadline,

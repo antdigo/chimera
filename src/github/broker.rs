@@ -59,6 +59,27 @@ pub struct BrokerMessage {
     pub body: Option<String>,
 }
 
+/// Agent status reported to the broker on every poll (TaskAgentStatus in the
+/// official protocol: Offline=1, Online=2, Busy=3). The official runner
+/// reports Busy for the whole duration of a job and Online while idle, and
+/// delivery appears to follow the reported status: polling as Online while
+/// a job executes is how issue #18 lost its cancellation — the message never
+/// reached the runner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentStatus {
+    Online,
+    Busy,
+}
+
+impl AgentStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Online => "Online",
+            Self::Busy => "Busy",
+        }
+    }
+}
+
 #[derive(Deserialize)]
 struct JobRequestBody {
     runner_request_id: String,
@@ -262,7 +283,7 @@ impl BrokerClient {
     }
 
     /// Single poll request. Returns Some(message) on 200, None on 202.
-    pub async fn poll_message(&self) -> Result<Option<BrokerMessage>> {
+    pub async fn poll_message(&self, status: AgentStatus) -> Result<Option<BrokerMessage>> {
         let token = self
             .token_manager
             .get_token()
@@ -270,9 +291,10 @@ impl BrokerClient {
             .context("getting token for poll")?;
 
         let url = format!(
-            "{}/message?sessionId={}&status=Online&runnerVersion={}&disableUpdate=true",
+            "{}/message?sessionId={}&status={}&runnerVersion={}&disableUpdate=true",
             self.server_url.trim_end_matches('/'),
             self.session_id,
+            status.as_str(),
             BROKER_PROTOCOL_VERSION,
         );
 

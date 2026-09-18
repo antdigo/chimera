@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use tempfile::TempDir;
 use tokio::sync::watch;
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use crate::config::ChimeraPaths;
@@ -91,6 +91,7 @@ async fn poll_loop_returns_job_request() {
 
     Mock::given(method("GET"))
         .and(path("/message"))
+        .and(query_param("status", "Online"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "messageId": 99,
             "messageType": "RunnerJobRequest",
@@ -109,7 +110,12 @@ async fn poll_loop_returns_job_request() {
 
     let (_temp, runner) = make_runner();
     let mut rx = shutdown_tx.subscribe();
-    let result = runner.poll_loop(&broker, &mut rx).await.unwrap();
+    // Bounded so a status regression (poll sent as Busy, mock answers 404,
+    // poll_loop backs off and retries forever) fails fast instead of hanging.
+    let result = tokio::time::timeout(Duration::from_secs(30), runner.poll_loop(&broker, &mut rx))
+        .await
+        .expect("poll_loop should return within 30s")
+        .unwrap();
     let msg = result.expect("should return job message");
     assert_eq!(msg.message_id, 99);
     assert_eq!(msg.message_type, MessageType::RunnerJobRequest);
