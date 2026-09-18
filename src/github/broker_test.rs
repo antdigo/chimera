@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use super::*;
 use crate::github::auth::TokenManager;
 use wiremock::matchers::{body_partial_json, header, method, path, query_param};
@@ -237,5 +239,30 @@ async fn poll_401_returns_error() {
         err.downcast_ref::<BrokerError>()
             .is_some_and(|be| matches!(be, BrokerError::Unauthorized)),
         "expected BrokerError::Unauthorized, got: {err}"
+    );
+}
+
+#[tokio::test]
+async fn poll_timeout_classified_as_broker_timeout() {
+    let (mock_server, tm) = setup().await;
+
+    Mock::given(method("GET"))
+        .and(path("/message"))
+        .respond_with(ResponseTemplate::new(202).set_delay(Duration::from_secs(5)))
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+
+    let client = make_client(&mock_server.uri(), tm).with_poll_timeout(Duration::from_millis(300));
+    let result = client.poll_message().await;
+    let err = result.err().expect("client timeout should be an error");
+    assert!(
+        err.downcast_ref::<BrokerError>()
+            .is_some_and(|be| matches!(be, BrokerError::Timeout)),
+        "expected BrokerError::Timeout, got: {err}"
+    );
+    assert!(
+        err.to_string().contains("poll timeout"),
+        "error display should name the timeout, not mask it: {err}"
     );
 }

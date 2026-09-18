@@ -749,6 +749,17 @@ impl Runner {
                     continue;
                 }
                 Err(e) => {
+                    // The broker holding an idle long-poll open past the client
+                    // timeout is a normal empty cycle, not a failure: repoll
+                    // immediately without warning or backoff.
+                    if e.downcast_ref::<BrokerError>()
+                        .is_some_and(|be| matches!(be, BrokerError::Timeout))
+                    {
+                        debug!("long-poll window expired without a message");
+                        backoff = Duration::from_secs(1);
+                        continue;
+                    }
+
                     if e.downcast_ref::<BrokerError>()
                         .is_some_and(|be| matches!(be, BrokerError::Unauthorized))
                     {

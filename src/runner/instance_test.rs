@@ -267,6 +267,102 @@ async fn poll_loop_backoff_on_error() {
 }
 
 #[tokio::test]
+async fn poll_loop_repolls_immediately_after_long_poll_timeout() {
+    let (mock_server, tm, shutdown_tx) = setup().await;
+
+    // First poll never completes within the (shortened) client timeout —
+    // the broker holds the long-poll window open past it.
+    Mock::given(method("GET"))
+        .and(path("/message"))
+        .respond_with(ResponseTemplate::new(202).set_delay(Duration::from_secs(5)))
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/message"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "messageId": 7,
+            "messageType": "RunnerJobRequest",
+            "body": "{\"runner_request_id\": \"abc123\"}"
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let broker = BrokerClient::new(
+        reqwest::Client::new(),
+        mock_server.uri(),
+        "session-123".into(),
+        tm,
+    )
+    .with_poll_timeout(Duration::from_millis(300));
+
+    let (_temp, runner) = make_runner();
+    let mut rx = shutdown_tx.subscribe();
+    let poll = runner.poll_loop(&broker, &mut rx);
+
+    // With backoff the job would arrive after 300ms timeout + 1s sleep > 1.2s;
+    // an immediate repoll returns it within one poll cycle.
+    let result = tokio::time::timeout(Duration::from_millis(900), poll)
+        .await
+        .expect("job should be picked up without backoff after a long-poll timeout")
+        .unwrap()
+        .expect("should return job message");
+    assert_eq!(result.message_id, 7);
+}
+
+#[tokio::test]
+async fn poll_loop_long_poll_timeout_resets_backoff() {
+    let (mock_server, tm, shutdown_tx) = setup().await;
+
+    Mock::given(method("GET"))
+        .and(path("/message"))
+        .respond_with(ResponseTemplate::new(202).set_delay(Duration::from_secs(5)))
+        .up_to_n_times(2)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/message"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("error"))
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/message"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "messageId": 8,
+            "messageType": "RunnerJobRequest",
+            "body": "{\"runner_request_id\": \"abc123\"}"
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let broker = BrokerClient::new(
+        reqwest::Client::new(),
+        mock_server.uri(),
+        "session-123".into(),
+        tm,
+    )
+    .with_poll_timeout(Duration::from_millis(300));
+
+    let (_temp, runner) = make_runner();
+    let mut rx = shutdown_tx.subscribe();
+    let poll = runner.poll_loop(&broker, &mut rx);
+
+    // Two idle timeouts must not grow the backoff: the genuine 500 afterwards
+    // sleeps 1s, so the job arrives in ~1.7s. If timeouts were counted as
+    // errors the sleep would be 4s and the job would arrive after ~7.5s.
+    let result = tokio::time::timeout(Duration::from_millis(2500), poll)
+        .await
+        .expect("backoff should stay reset across long-poll timeouts")
+        .unwrap()
+        .expect("should return job message");
+    assert_eq!(result.message_id, 8);
+}
+
+#[tokio::test]
 async fn poll_loop_refreshes_token_on_401() {
     let (mock_server, tm, shutdown_tx) = setup().await;
 
