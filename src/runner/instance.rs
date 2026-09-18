@@ -729,10 +729,10 @@ impl Runner {
                     token_just_refreshed = false;
 
                     if msg.message_type != MessageType::RunnerJobRequest {
-                        debug!(
+                        info!(
                             message_id = msg.message_id,
                             message_type = %msg.message_type,
-                            "received control message, skipping"
+                            "received control message while idle, skipping"
                         );
                         // Control messages (JobCancellation, BrokerMigration, etc)
                         // are ephemeral — don't try to delete them. Brief pause to
