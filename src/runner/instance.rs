@@ -725,6 +725,9 @@ impl Runner {
 
             match poll_result {
                 Ok(Some(msg)) => {
+                    // Any successful poll proves the token still works.
+                    token_just_refreshed = false;
+
                     if msg.message_type != MessageType::RunnerJobRequest {
                         debug!(
                             message_id = msg.message_id,

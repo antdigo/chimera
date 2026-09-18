@@ -481,6 +481,62 @@ async fn poll_loop_persistent_401_returns_error() {
     );
 }
 
+#[tokio::test]
+async fn poll_loop_401_after_control_message_refreshes_again() {
+    let (mock_server, tm, shutdown_tx) = setup().await;
+
+    Mock::given(method("GET"))
+        .and(path("/message"))
+        .respond_with(ResponseTemplate::new(401))
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/message"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "messageId": 5,
+            "messageType": "AgentRefresh",
+            "body": null
+        })))
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/message"))
+        .respond_with(ResponseTemplate::new(401))
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/message"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "messageId": 13,
+            "messageType": "RunnerJobRequest",
+            "body": "{\"runner_request_id\": \"abc123\"}"
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let broker = BrokerClient::new(
+        reqwest::Client::new(),
+        mock_server.uri(),
+        "session-123".into(),
+        tm,
+    );
+
+    let (_temp, runner) = make_runner();
+    let mut rx = shutdown_tx.subscribe();
+    let result = runner.poll_loop(&broker, &mut rx).await.unwrap();
+    // A successful control-message poll proves the refreshed token works, so
+    // a later 401 is a new expiry and must be refreshed, not treated as
+    // "still unauthorized".
+    let msg = result.expect("401 after a successful poll should refresh again, not exit");
+    assert_eq!(msg.message_id, 13);
+}
+
 fn finish_manifest_value(server_url: &str) -> serde_json::Value {
     serde_json::json!({
         "plan": { "planId": "plan", "jobId": "job", "timelineId": "timeline" },

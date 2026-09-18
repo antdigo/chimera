@@ -272,22 +272,35 @@ async fn poll_connect_timeout_classified_as_connection_error() {
     // The mock server only serves the token endpoint the TokenManager hits.
     let (_mock_server, tm) = setup().await;
 
+    // A local listener that accepts the TCP connection but never speaks
+    // TLS: the handshake stalls until the connect timeout fires, without
+    // depending on external routing or proxy configuration.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        let conn = listener.accept().unwrap();
+        std::thread::sleep(Duration::from_secs(10));
+        drop(conn);
+    });
+
     // The production client configures a connect timeout shorter than the
     // poll deadline; a stalled connect must surface as a connection error
     // (warn + backoff), never as a quiet long-poll timeout.
     let client = reqwest::Client::builder()
         .connect_timeout(Duration::from_millis(500))
+        .no_proxy()
         .build()
         .unwrap();
     let broker = BrokerClient::new(
         client,
-        // TEST-NET-1 address: never routable, so the TCP connect stalls
-        // until the connect timeout fires instead of failing fast.
-        "http://192.0.2.1:9".into(),
+        format!("https://{addr}"),
         "session-123".into(),
-        tm,
+        tm.clone(),
     )
     .with_poll_timeout(Duration::from_secs(60));
+
+    // Warm the token cache so the poll itself is the only HTTP request left.
+    tm.get_token().await.unwrap();
 
     let result = broker.poll_message().await;
     let err = result.err().expect("stalled connect should be an error");
