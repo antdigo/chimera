@@ -225,7 +225,10 @@ fn accepts_fips_required_and_explicitly_non_fips_registrations() {
 
         let registration = read_official_registration(source.path()).unwrap();
 
-        assert_eq!(registration.credentials.oauth, expected.oauth, "value {value}");
+        assert_eq!(
+            registration.credentials.oauth, expected.oauth,
+            "value {value}"
+        );
     }
 }
 
