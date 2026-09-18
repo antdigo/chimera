@@ -2,14 +2,16 @@
 
 This report covers Dockerfile-based action execution only. It does not approve
 production rollout, GHCR push, deploy, webhook or poll stages. All numbers
-below were observed on branch commits up to and including `83ccee4`.
+below were observed on branch commits up to and including `d032859` (the
+final commit only adjusts the fd-drift comparison in the Linux leak
+regression; every number below was observed on the tree it belongs to).
 
 ## Observed commands (macOS host, aarch64 Docker Desktop)
 
 - `cargo build`: PASS.
 - `cargo clippy --all-targets -- -D warnings`: PASS — zero warnings.
 - `cargo fmt -- --check`: PASS.
-- `cargo test`: PASS — 893 passed, 0 failed, 43 ignored (the ignored set is
+- `cargo test`: PASS — 900 passed, 0 failed, 44 ignored (the ignored set is
   the Docker Engine suite below).
 - `cargo test --features acceptance-tests --test dockerfile_actions_test --no-run`:
   PASS — acceptance binary compiled; no acceptance test was executed.
@@ -20,11 +22,17 @@ Nested Docker 29.8.1 rootless daemon, containerd v2.3.5, classic image store
 (`--feature containerd-snapshotter=false`), arm64 VM building `linux/amd64`
 through QEMU:
 
-- `docker::build::build_test` (lib): 16/16 PASS — includes the D-06 pair
+- `docker::build::build_test` (lib): PASS as part of the 17/17 ignored lib
+  set — includes the D-06 pair
   (`cancelling_build_stops_engine_work_and_never_publishes_image`,
-  `timed_out_build_returns_bounded_and_never_publishes_image`), which now prove
-  engine liveness through a marker the RUN step streams and prove stoppage by
-  the absence of the internal tag after a window exceeding natural completion.
+  `timed_out_build_returns_bounded_and_never_publishes_image`), which prove
+  engine liveness through the intermediate container the BuilderV1 stream
+  reports (` ---> Running in <id>` plus a bounded poll to the inspected
+  running state) and prove stoppage by the container leaving the running
+  state inside a window that closes before the `RUN sleep 30` could finish
+  naturally, with every observation bounded by that same deadline. The
+  cache-defeating nonce lives inside the RUN instruction, so a daemon with a
+  cached layer cannot satisfy the pair.
 - `docker::exec`, `docker::resources`: PASS.
 - `job::action::docker::docker_test` (lib): PASS — including both
   `engine_action_contents_come_from_pinned_context_after_{root,symlink_root}_replacement`
@@ -44,10 +52,10 @@ through QEMU:
 |---|---|---|
 | D-01 | `dockerfile_action_builds_and_propagates_exit_code`, `successfully_built_dockerfile_action_propagates_nonzero_exit_code` on Engine | PASS |
 | D-02 | `subdirectory_dockerfile_uses_action_root_as_context` on Engine | PASS |
-| D-03 | ignore rules + `context_symlink_escape_fails_before_action_container_starts` on Engine; build-context unit suite 26/26 | PASS |
+| D-03 | ignore rules + `context_symlink_escape_fails_before_action_container_starts` on Engine; build-context unit suite 29/29 (30 on Linux) | PASS |
 | D-04 | `changed_context_rebuilds_while_unchanged_context_hits_cache` on Engine | PASS |
 | D-05 | `concurrent_same_context_builds_once` on Engine; build-cache unit suite 14/14 | PASS |
-| D-06 | Engine cancellation/timeout pair with streamed-marker liveness proof and post-window publication-absence proof; executor-level cancel/timeout + same-key retry | PASS |
+| D-06 | Engine cancellation/timeout pair proving intermediate-container liveness and stoppage inside a deadline-bounded observation window; nonce embedded in the RUN instruction defeats layer cache; executor-level cancel/timeout + same-key retry | PASS |
 | D-07 | `missing_cached_image_is_rebuilt`, `same_daemon_reuse_skips_present_image_and_rebuilds_missing_image` on Engine | PASS |
 | D-08 | `dockerfile_action_reuses_image_for_pre_main_post` on Engine (one build, per-phase reuse, inputs/args/env/state) | PASS |
 | D-09 | `prebuilt_metadata_and_inline_docker_actions_still_run` on Engine | PASS |
@@ -72,6 +80,19 @@ through QEMU:
    branch capture tests PASS (`b680c3a`).
 6. D-06 proves real Engine work stoppage (`5eb3677` + marker-based rework in
    `134199d`).
+7. Final fable-tier review, round 2 (`b0112cf`): preparation budget threaded
+   through the Linux traversal wrapper (a Linux-only compile break invisible
+   on macOS), the `.dockerignore` read itself, its rule-parsing loop and
+   Linux directory-name enumeration; interruption sentinels recognized along
+   the full error-cause chain instead of the outermost message; D-06
+   observation windows bounded by the deadline that closes the proof, with
+   the initial liveness proof as a bounded poll (BuilderV1 emits
+   "Running in" before Start).
+8. Final review, round 3 (`48476cf`): Linux directory enumeration holds its
+   `DIR*` in a drop guard so budget interruptions cannot leak the stream
+   (Linux fd-count regression included), and both D-06 helpers re-check the
+   deadline after the bounded inspect resolves, rejecting observations a
+   late tokio resume could deliver after the window.
 
 ## Design adjudications recorded during acceptance
 
