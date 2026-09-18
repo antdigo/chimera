@@ -217,18 +217,21 @@ fn cancelled_enumeration_does_not_leak_directory_streams() {
         cancel_token,
     );
 
-    let open_fds_before = std::fs::read_dir("/proc/self/fd").unwrap().count();
     let root = trusted.clone_directory_descriptor().unwrap();
+
+    let open_fds_before = std::fs::read_dir("/proc/self/fd").unwrap().count();
     for _ in 0..64 {
         assert!(read_directory_names(&root, &budget).is_err());
     }
-    let leaked = std::fs::read_dir("/proc/self/fd").unwrap().count() - open_fds_before;
+    let open_fds_after = std::fs::read_dir("/proc/self/fd").unwrap().count();
 
     // Parallel tests in this binary open and close their own descriptors, so
-    // a small drift is possible; a real leak adds one stream per iteration.
+    // the drift is signed and may legitimately be negative; a real leak adds
+    // one stream per iteration.
+    let drift = open_fds_after as i64 - open_fds_before as i64;
     assert!(
-        leaked < 32,
-        "cancelled enumerations must close their directory streams, leaked {leaked} fds over 64 runs"
+        drift < 32,
+        "cancelled enumerations must close their directory streams, fd drift {drift} over 64 runs"
     );
 }
 
