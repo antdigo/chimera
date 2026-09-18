@@ -39,8 +39,9 @@ It writes these corresponding files under the local Chimera runner storage:
 - `rsa_params.json`
 
 The supported OAuth metadata keys are `clientId` and `authorizationUrl`, both
-required, plus optional `requireFipsCryptography` with a boolean value
-(`true` and `false` are both accepted). `enableAuthMigrationByDefault=false`
+required, plus optional `requireFipsCryptography` with a boolean string value
+(`"true"`/`"false"`, case-insensitive; both meanings are accepted).
+`enableAuthMigrationByDefault=false`
 is recognized as inactive. A value of `true`, any `authorizationUrlV2`
 entry, and migration sibling files are rejected. Any other OAuth metadata
 key is rejected.

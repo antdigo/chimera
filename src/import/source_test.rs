@@ -174,6 +174,19 @@ fn rejects_csharp_pascal_case_rsa_field_names() {
 }
 
 #[test]
+fn rejects_unknown_rsa_fields_alongside_valid_ones() {
+    for extra_key in ["D", "e", "SECRET_EXTRA_RSA_FIELD"] {
+        let source = copy_fixture();
+        mutate_json(source.path(), ".credentials_rsaparams", |rsa| {
+            rsa[extra_key] = json!("c2VjcmV0");
+        });
+
+        let diagnostic = assert_category(source.path(), "invalid-source");
+        assert!(!diagnostic.contains("c2VjcmV0"), "extra key {extra_key}");
+    }
+}
+
+#[test]
 fn rejects_zero_agent_or_pool_id() {
     for field in ["agentId", "poolId"] {
         let source = copy_fixture();

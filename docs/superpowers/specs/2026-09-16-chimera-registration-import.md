@@ -96,6 +96,15 @@ chimera import-official --source <official-runner-dir> --name <local-name> --roo
 6. Сохранить исходные значения без изменения серверной регистрации. Labels
    сохраняются серверно: importer не пытается переустановить их по defaults.
 
+> **Поправка от 2026-09-18 (issue #11):** пункт 4 в части FIPS-required отменён
+> (superseded). В официальном runner `requireFipsCryptography` управляет только
+> выбором подписи client assertion — RSASSA-PSS (PS256) при флаге,
+> RSASSA-PKCS1-v1_5 без него (`VssSigningCredentials.Create`, runner 2.337.0);
+> Chimera подписывает PS256 безусловно, поэтому такие регистрации принимаются.
+> Это алгоритмическая совместимость, а не обещание CMVP-validated cryptography.
+> Требования пункта 4 про auth migration, ephemeral/JIT и legacy-only, а также
+> online-canary gate (I-09) остаются в силе.
+
 Окончательный список поддержанных auth metadata фиксируется в тестах и документации
 форка до приёмки; найденный новый вариант не расширяет scope автоматически.
 
