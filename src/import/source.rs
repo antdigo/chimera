@@ -328,12 +328,12 @@ fn validate_oauth(
         ));
     }
 
-    if let Some(fips) = credentials.data.get("requireFipsCryptography")
-        && parse_bool(fips, "requireFipsCryptography")?
-    {
-        return Err(ImportError::UnsupportedRegistration(
-            "FIPS credential mode is not supported".into(),
-        ));
+    // FIPS-required registrations are supported: chimera signs the token
+    // exchange with RSASSA-PSS (PS256) unconditionally, which is exactly the
+    // signature scheme the official runner switches to when this flag is set
+    // (VssSigningCredentials.Create). Only the value's shape is validated.
+    if let Some(fips) = credentials.data.get("requireFipsCryptography") {
+        parse_bool(fips, "requireFipsCryptography")?;
     }
     if let Some(migration) = credentials.data.get("enableAuthMigrationByDefault")
         && parse_bool(migration, "enableAuthMigrationByDefault")?

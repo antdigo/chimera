@@ -339,6 +339,21 @@ fn dry_run_accepts_utf8_bom_prefix_in_official_files() {
 }
 
 #[test]
+fn dry_run_accepts_fips_required_registration() {
+    let source = copy_fixture();
+    rewrite_json(&source.path().join(".credentials"), |credentials| {
+        credentials["data"]["requireFipsCryptography"] = Value::String("true".into());
+    });
+    let parent = tempfile::tempdir().unwrap();
+    let root = parent.path().join("missing-root");
+
+    let output = run_import(source.path(), "fips-runner", &root, true);
+
+    assert_success_output(&output, "eligible", "fips-runner", source.path());
+    assert!(!root.exists());
+}
+
+#[test]
 fn repeat_reports_already_imported_without_duplicate_or_rewrite() {
     let parent = tempfile::tempdir().unwrap();
     let root = parent.path().join("chimera");

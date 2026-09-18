@@ -203,15 +203,21 @@ fn rejects_non_oauth_and_unknown_auth_metadata_without_echoing_values() {
 }
 
 #[test]
-fn rejects_fips_required_and_auth_migration_without_echoing_values() {
-    let fips_required = copy_fixture();
-    set_auth_value(
-        fips_required.path(),
-        "requireFipsCryptography",
-        json!("True"),
-    );
-    assert_category(fips_required.path(), "unsupported-registration");
+fn accepts_fips_required_and_explicitly_non_fips_registrations() {
+    let expected = fixture_credentials();
 
+    for value in ["True", "true", "False", "false"] {
+        let source = copy_fixture();
+        set_auth_value(source.path(), "requireFipsCryptography", json!(value));
+
+        let registration = read_official_registration(source.path()).unwrap();
+
+        assert_eq!(registration.credentials.oauth, expected.oauth, "value {value}");
+    }
+}
+
+#[test]
+fn rejects_auth_migration_without_echoing_values() {
     let migration_enabled = copy_fixture();
     set_auth_value(
         migration_enabled.path(),
