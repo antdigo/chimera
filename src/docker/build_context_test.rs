@@ -180,6 +180,26 @@ fn root_dockerignore_filters_files_but_keeps_dockerfile() {
     );
 }
 
+/// The executor keeps one trusted directory capability across a job's
+/// pre/main/post steps, so the same descriptor is traversed repeatedly.
+/// Every clone shares one readdir offset: a traversal that does not rewind
+/// observes an empty directory the second time (Linux-only code path).
+#[cfg(target_os = "linux")]
+#[test]
+fn repeated_traversals_of_one_capability_see_the_full_directory() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("Dockerfile"), "FROM scratch\n").unwrap();
+    std::fs::write(tmp.path().join("sentinel"), "original").unwrap();
+    let trusted = trusted_action(tmp.path());
+
+    for _ in 0..3 {
+        let context = prepare_build_context(&trusted, "Dockerfile").unwrap();
+        let paths = archive_paths(&context.archive);
+        assert!(paths.contains(&"Dockerfile".to_string()));
+        assert!(paths.contains(&"sentinel".to_string()));
+    }
+}
+
 #[test]
 fn root_dockerignore_with_bom_and_escaped_hash_excludes_literal_hash_file() {
     let tmp = tempfile::tempdir().unwrap();

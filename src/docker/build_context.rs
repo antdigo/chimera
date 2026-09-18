@@ -1009,6 +1009,15 @@ fn read_directory_names(directory: &fs::File) -> Result<Vec<OsString>> {
         return Err(std::io::Error::last_os_error())
             .context("duplicating Docker build context directory descriptor");
     }
+    // Every clone of the trusted directory descriptor shares one file offset:
+    // an earlier traversal of the same action (e.g. the pre-entrypoint step)
+    // leaves it at EOF, and without a rewind this enumeration would silently
+    // observe an empty directory.
+    if unsafe { libc::lseek(duplicate, 0, libc::SEEK_SET) } < 0 {
+        let error = std::io::Error::last_os_error();
+        unsafe { libc::close(duplicate) };
+        return Err(error).context("rewinding Docker build context directory");
+    }
     // `fdopendir` owns the duplicate descriptor and `closedir` below closes it.
     let stream = unsafe { libc::fdopendir(duplicate) };
     if stream.is_null() {
