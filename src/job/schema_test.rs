@@ -171,3 +171,18 @@ fn deserialize_container_registry_step() {
     assert_eq!(step.reference.kind, StepReferenceKind::ContainerRegistry);
     assert_eq!(step.reference.image.as_deref(), Some("node:18"));
 }
+
+#[test]
+fn github_token_variable_name_is_case_insensitive() {
+    // The official Variables dictionary is OrdinalIgnoreCase, so the system
+    // token variable resolves under any spelling.
+    let json = r#"{
+        "plan": { "planId": "p", "jobId": "j", "timelineId": "t" },
+        "steps": [],
+        "variables": { "System.GitHub.Token": { "value": "ghs_token", "isSecret": true } },
+        "resources": { "endpoints": [] },
+        "contextData": {}
+    }"#;
+    let manifest: JobManifest = serde_json::from_str(json).unwrap();
+    assert_eq!(manifest.github_token(), Some("ghs_token"));
+}

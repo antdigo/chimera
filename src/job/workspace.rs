@@ -168,7 +168,7 @@ impl Workspace {
     pub fn read_output_file(&self) -> Result<HashMap<String, String>> {
         let content = std::fs::read_to_string(&self.output_file)
             .with_context(|| format!("reading output file {}", self.output_file.display()))?;
-        parse_env_file(&content)
+        parse_context_file(&content)
     }
 
     /// Read GITHUB_STATE file (same format as GITHUB_ENV).
@@ -176,7 +176,7 @@ impl Workspace {
     pub fn read_state_file(&self) -> Result<HashMap<String, String>> {
         let content = std::fs::read_to_string(&self.state_file)
             .with_context(|| format!("reading state file {}", self.state_file.display()))?;
-        parse_env_file(&content)
+        parse_context_file(&content)
     }
 
     /// Clear per-step files between steps so each step starts with empty files.
@@ -240,7 +240,23 @@ fn cleanup_partial_workspace(runner_work: &Path, runner_temp: &Path) -> Result<(
 }
 
 fn parse_env_file(content: &str) -> Result<HashMap<String, String>> {
+    // Env names are case-sensitive on Linux, so a plain collect is correct.
+    Ok(parse_file_entries(content).into_iter().collect())
+}
+
+/// Parse an outputs/state file: same line format as the env file, but keys
+/// land in case-insensitive context dictionaries officially, so a later
+/// entry replaces an earlier one that differs only by case.
+fn parse_context_file(content: &str) -> Result<HashMap<String, String>> {
     let mut result = HashMap::new();
+    for (key, value) in parse_file_entries(content) {
+        crate::utils::insert_case_insensitive(&mut result, key, value);
+    }
+    Ok(result)
+}
+
+fn parse_file_entries(content: &str) -> Vec<(String, String)> {
+    let mut entries = Vec::new();
     let mut lines = content.lines().peekable();
 
     while let Some(line) = lines.next() {
@@ -259,15 +275,15 @@ fn parse_env_file(content: &str) -> Result<HashMap<String, String>> {
                 }
                 value_lines.push(heredoc_line);
             }
-            result.insert(key.to_string(), value_lines.join("\n"));
+            entries.push((key.to_string(), value_lines.join("\n")));
         } else if let Some(eq_pos) = line.find('=') {
             let key = &line[..eq_pos];
             let value = &line[eq_pos + 1..];
-            result.insert(key.to_string(), value.to_string());
+            entries.push((key.to_string(), value.to_string()));
         }
     }
 
-    Ok(result)
+    entries
 }
 
 #[cfg(test)]

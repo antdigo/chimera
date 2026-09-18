@@ -87,6 +87,34 @@ fn read_path_file_one_per_line() {
 }
 
 #[test]
+fn read_output_file_case_duplicates_last_write_wins() {
+    let (_tmp, ws) = make_workspace();
+    std::fs::write(ws.output_file(), "version=old\nVERSION=new\n").unwrap();
+
+    let outputs = ws.read_output_file().unwrap();
+    // Outputs live in an OrdinalIgnoreCase dictionary in the official runner:
+    // the second write replaces the first (preserving the stored casing), so
+    // only one entry survives and any spelling resolves to the last value.
+    assert_eq!(outputs.len(), 1);
+    assert_eq!(outputs["version"], "new");
+    assert_eq!(
+        crate::utils::find_case_insensitive(&outputs, "VERSION").unwrap(),
+        "new"
+    );
+}
+
+#[test]
+fn read_env_file_case_duplicates_stay_distinct() {
+    let (_tmp, ws) = make_workspace();
+    std::fs::write(ws.env_file(), "version=old\nVERSION=new\n").unwrap();
+
+    let env = ws.read_env_file().unwrap();
+    // The env file must stay case-sensitive, mirroring the Linux environment.
+    assert_eq!(env["version"], "old");
+    assert_eq!(env["VERSION"], "new");
+}
+
+#[test]
 fn write_event_file_writes_json() {
     let (_tmp, ws) = make_workspace();
 

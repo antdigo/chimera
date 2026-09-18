@@ -85,14 +85,11 @@ impl OutputProcessor {
             .path_prepends
             .extend(self.path_buf.lock().await.drain(..));
         for (k, v) in self.output_buf.lock().await.drain(..) {
-            job_state.outputs.insert(k, v);
+            crate::utils::insert_case_insensitive(&mut job_state.outputs, k, v);
         }
         for (k, v) in self.state_buf.lock().await.drain(..) {
-            job_state
-                .action_states
-                .entry(String::new())
-                .or_default()
-                .insert(k, v);
+            let entry = job_state.action_states.entry(String::new()).or_default();
+            crate::utils::insert_case_insensitive(entry, k, v);
         }
     }
 }

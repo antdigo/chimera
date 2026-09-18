@@ -165,6 +165,29 @@ async fn output_file_sets_step_output() {
 }
 
 #[tokio::test]
+async fn output_keys_differing_only_in_case_last_write_wins() {
+    let env = TestEnv::setup().await;
+    let manifest = manifest_with_steps(
+        vec![
+            script_step(
+                "s1",
+                "echo 'version=old' >> \"$GITHUB_OUTPUT\"\necho 'VERSION=new' >> \"$GITHUB_OUTPUT\"",
+            ),
+            script_step(
+                "s2",
+                r#"
+                test "${{ steps.s1.outputs.VERSION }}" = "new" || exit 1
+                test "${{ steps.s1.outputs.version }}" = "new" || exit 1
+                "#,
+            ),
+        ],
+        &env.mock_server.uri(),
+    );
+    let (conclusion, _) = env.run(&manifest).await.unwrap();
+    assert_eq!(conclusion, JobConclusion::Succeeded);
+}
+
+#[tokio::test]
 async fn output_file_heredoc_multiline() {
     let env = TestEnv::setup().await;
     let manifest = manifest_with_steps(
