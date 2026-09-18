@@ -52,11 +52,14 @@ manifest's variables. If present, use Twirp. If absent, fall back to VSS.
 | **OAuth token** | JWT exchange with stored RSA key | Runner-level ops (session, polling, acquire) |
 | **Job access token** | Embedded in job manifest | Job-level ops (logs, timeline, completion) |
 
-**Runner version**: The runner reports itself as `2.329.0` (constant `RUNNER_VERSION`).
-The broker rejects runners with outdated versions — bumping this may be necessary
-when GitHub ships breaking changes. The same version string is used everywhere
-the wire protocol carries a runner version (session body, poll and acknowledge
-query params); there is no separate "broker protocol version".
+**Runner version**: The runner reports itself as `2.337.0` (constant `RUNNER_VERSION`).
+GitHub enforces a rolling deprecation: a self-hosted runner stops receiving
+jobs once a release newer than its version is more than 30 days old, so the
+constant must name a current actions/runner release — the `runner-version` CI
+workflow (`scripts/ci/check-runner-version.sh`) fails a week before the wall.
+The same version string is used everywhere the wire protocol carries a runner
+version (session body, poll and acknowledge query params); there is no
+separate "broker protocol version".
 
 ---
 
@@ -72,7 +75,7 @@ Exchange the registration token for a temporary tenant credential.
 ```
 POST https://api.github.com/actions/runner-registration
 Authorization: RemoteAuth {registration_token}
-User-Agent: chimera/2.329.0
+User-Agent: chimera/2.337.0
 Content-Type: application/json
 
 {
@@ -109,7 +112,7 @@ Content-Type: application/json
   "url": "https://github.com/{owner}/{repo}",
   "group_id": 1,
   "name": "chimera-0",
-  "version": "2.329.0",
+  "version": "2.337.0",
   "updates_disabled": true,
   "ephemeral": false,
   "labels": [
@@ -149,7 +152,7 @@ Content-Type: application/json
 
 {
   "name": "chimera-0",
-  "version": "2.329.0",
+  "version": "2.337.0",
   "osDescription": "Linux X64",
   "enabled": true,
   "status": 0,
@@ -317,7 +320,7 @@ Timeout: 30s
   "agent": {
     "id": 12345,
     "name": "chimera-0",
-    "version": "2.329.0",
+    "version": "2.337.0",
     "osDescription": "linux aarch64",
     "ephemeral": false,
     "status": 0
@@ -368,7 +371,7 @@ The runner uses **long polling** to wait for jobs from the broker.
 GET {broker_url}/message
     ?sessionId={session_id}
     &status={Online|Busy}
-    &runnerVersion=2.329.0
+    &runnerVersion=2.337.0
     &os=Linux
     &architecture=X64
     &disableUpdate=true
@@ -378,7 +381,7 @@ Timeout: 60s (client-side)
 ```
 
 **Note**: The `runnerVersion` query parameter is the runner package version
-(`2.329.0`), the same string sent in the session-creation body. The `os` and
+(`2.337.0`), the same string sent in the session-creation body. The `os` and
 `architecture` parameters use the official runner's `VarUtil` spellings
 (`Linux`/`macOS`/`Windows`, `X86`/`X64`/`ARM`/`ARM64`).
 
@@ -460,7 +463,7 @@ After receiving a `RunnerJobRequest`, acknowledge it to prevent redelivery:
 POST {broker_url}/acknowledge
     ?sessionId={session_id}
     &status=Online
-    &runnerVersion=2.329.0
+    &runnerVersion=2.337.0
     &os=Linux
     &architecture=X64
 Authorization: Bearer {oauth_token}
@@ -1546,12 +1549,16 @@ based on its own cancellation tracking.
 
 ### Version numbers matter
 
-- `RUNNER_VERSION` (`2.329.0`) is the single version string used in
+- `RUNNER_VERSION` (`2.337.0`) is the single version string used in
   session/registration bodies **and** the `runnerVersion` query parameter on
   poll/acknowledge requests.
 - There is no separate broker protocol version. Sending an invented version
   (chimera once sent `3.0.0`) claims to be a future runner and may trip
   unknown version-keyed server behavior.
+- The version carries a 30-day freshness policy (#27): polls from runners
+  behind it fail with `403 RunnerVersionTooOld`. The `runner-version` CI
+  workflow fails seven days before the wall; bumping is a one-constant change
+  plus the example literals in this document.
 
 ### Legacy VSS log upload is `Content-Type: application/octet-stream`
 
