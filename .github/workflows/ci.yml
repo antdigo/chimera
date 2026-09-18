@@ -158,12 +158,15 @@ jobs:
           key: docker-target-v1-${{ hashFiles('Cargo.lock') }}-${{ hashFiles('scripts/ci/docker-suite.sh') }}
           restore-keys: docker-target-v1-
 
+      # Only container-mode suites (engine) download the node runtimes, but
+      # every shard restores them; an ungated save would let an empty
+      # shard-first finisher poison the entry under this exact key.
       - name: Restore the shared test externals cache
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: .tmp/ci-test-externals
-          key: test-externals-v1-${{ hashFiles('src/node.rs') }}
-          restore-keys: test-externals-v1-
+          key: test-externals-v2-${{ hashFiles('src/node.rs') }}
+          restore-keys: test-externals-v2-
 
       # Pull the pinned images while the caches above restore; docker-suite.sh
       # re-checks them and the daemon dedupes concurrent digest pulls.
@@ -186,3 +189,12 @@ jobs:
           export TEST_FILTERS="${{ matrix.test-filters }}"
           export SHARD_NAME="${{ matrix.name }}"
           scripts/ci/docker-suite.sh
+
+      # The engine suite always runs setup_docker, so its externals dir is the
+      # populated one; saving from any other shard would archive an empty dir.
+      - name: Save the shared test externals cache
+        if: matrix.name == 'engine'
+        uses: actions/cache/save@v4
+        with:
+          path: .tmp/ci-test-externals
+          key: test-externals-v2-${{ hashFiles('src/node.rs') }}

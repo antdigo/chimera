@@ -98,11 +98,18 @@ docker run --rm --user root --entrypoint chown \
 # Docker config tests (C-10) fail closed on. The classic image store keeps
 # BuilderV1 builds (and their streamed progress) working; the containerd
 # store cannot export them.
+#
+# The externals bind is nested inside the tmp volume on purpose: the daemon
+# resolves bind-mount sources (e.g. <externals>:/github/externals for node
+# actions in container jobs) in ITS OWN namespace, so it must see the same
+# directory the test container downloads runtimes into — otherwise the job
+# container gets an empty /github/externals and every node action in it fails.
 docker run -d --privileged --name "$DIND_NAME" \
   -e DOCKER_TLS_CERTDIR= \
   -e XDG_RUNTIME_DIR=/run/user/1000 \
   -v "$RUNTIME_VOLUME":/run/user/1000 \
   -v "$TMP_VOLUME":/chimera-tmp \
+  -v "$EXTERNALS_BIND":/chimera-tmp/chimera-test-externals \
   "$DIND_IMAGE" \
   --feature containerd-snapshotter=false
 
