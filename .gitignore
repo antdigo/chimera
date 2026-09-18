@@ -23,3 +23,6 @@ Thumbs.db
 
 # macOS Docker test scratch (docs/testing-macos-docker.md)
 /.tmp/
+
+# Python bytecode from the gate unit tests
+__pycache__/
