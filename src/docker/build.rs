@@ -327,7 +327,7 @@ async fn build_archive(
             observer(info);
         }
         let info = item
-            .map_err(|error| DockerActionBuildFailure(Box::new(error)))
+            .map_err(|error| DockerActionBuildFailure(engine_error_source(error)))
             .map_err(anyhow::Error::new)?;
         if let Some(engine_error) = info.error {
             return Err(
@@ -379,6 +379,17 @@ async fn send_build_progress(log_sender: &LogSender, info: BuildInfo, internal_t
 #[derive(Debug, thiserror::Error)]
 #[error("Docker action image build failed")]
 struct DockerActionBuildFailure(#[source] Box<dyn std::error::Error + Send + Sync>);
+
+/// bollard's stream error keeps the daemon's message in a plain String field
+/// that the error's own `source()` never exposes, so the text is lifted out
+/// explicitly; every other error variant already carries its details in the
+/// Display and is wrapped as-is.
+fn engine_error_source(error: DockerError) -> Box<dyn std::error::Error + Send + Sync> {
+    match error {
+        DockerError::DockerStreamError { error: text } => Box::new(std::io::Error::other(text)),
+        other => Box::new(other),
+    }
+}
 
 fn format_build_progress(info: BuildInfo, internal_tag: &str) -> Vec<String> {
     if let Some(stream) = info.stream {

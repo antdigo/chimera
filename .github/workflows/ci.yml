@@ -158,7 +158,10 @@ jobs:
 
           # The suite runs in the daemon's network namespace so the test
           # registry's 127.0.0.1 port publishing and BuildKit share one
-          # loopback interface with the tests themselves.
+          # loopback interface with the tests themselves. BuilderV1 builds
+          # flake when many tests drive the single nested daemon in
+          # parallel, so the ignored suite is bounded to two threads (the
+          # same limit the macOS gate runbook §6 established).
           docker run --rm \
             --user 1000:1000 \
             --network "container:$DIND_NAME" \
@@ -181,7 +184,7 @@ jobs:
             -e XDG_RUNTIME_DIR=/run/user/1000 \
             -e CHIMERA_TEST_BUILDKIT_IMAGE_ID="$BUILDKIT_IMAGE_ID" \
             "$RUST_IMAGE" \
-            cargo test --offline -- --ignored
+            cargo test --offline -- --ignored --test-threads=2
 
       - name: Clean up CI Docker resources
         if: always()

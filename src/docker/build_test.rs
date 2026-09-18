@@ -550,6 +550,29 @@ fn build_failure_keeps_the_engine_error_in_the_cause_chain() {
     );
 }
 
+/// bollard keeps the daemon's stream message in a String field its own
+/// `source()` never exposes, so the text has to be lifted out explicitly.
+#[test]
+fn stream_error_text_is_lifted_into_the_cause_chain() {
+    let error = anyhow::Error::new(DockerActionBuildFailure(engine_error_source(
+        DockerError::DockerStreamError {
+            error: "image platform mismatch detail".to_string(),
+        },
+    )));
+
+    assert_eq!(error.to_string(), "Docker action image build failed");
+    let causes = error
+        .chain()
+        .map(|cause| cause.to_string())
+        .collect::<Vec<_>>();
+    assert!(
+        causes
+            .iter()
+            .any(|cause| cause.contains("platform mismatch detail")),
+        "stream text lost from the cause chain: {causes:?}"
+    );
+}
+
 async fn test_build(
     builder: &DockerActionBuilder,
     docker: &Docker,
