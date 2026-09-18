@@ -1,4 +1,3 @@
-use std::io;
 use std::path::Path;
 
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
@@ -254,12 +253,39 @@ fn rejects_auth_migration_without_echoing_values() {
     let empty_migration_url = copy_fixture();
     set_auth_value(empty_migration_url.path(), "authorizationUrlV2", json!(""));
     assert_category(empty_migration_url.path(), "unsupported-registration");
+}
 
-    for sibling in [".runner_migrated", ".credentials_migrated"] {
+// GitHub's fleet-wide config migration leaves `.runner_migrated` /
+// `.credentials_migrated` markers next to the active files. Canary evidence
+// (2026-09-18): the markers are post-migration snapshots — `.runner_migrated`
+// byte-identical to the active `.runner` — and marked registrations run on
+// chimera unmodified. `.credentials_migrated` had zero live occurrences, so
+// it gets the same content-based treatment by decision, not by evidence.
+#[test]
+fn accepts_completed_migration_markers_without_changing_result() {
+    let expected = fixture_credentials();
+
+    for (marker, origin) in [
+        (".runner_migrated", ".runner"),
+        (".credentials_migrated", ".credentials"),
+    ] {
         let source = copy_fixture();
-        std::fs::write(source.path().join(sibling), []).unwrap();
-        assert_category(source.path(), "unsupported-registration");
+        std::fs::copy(source.path().join(origin), source.path().join(marker)).unwrap();
+
+        let registration = read_official_registration(source.path()).unwrap();
+
+        assert_eq!(registration.credentials, expected, "marker {marker}");
     }
+
+    // Marker content is never inspected; only the three required files are read.
+    let source = copy_fixture();
+    for marker in [".runner_migrated", ".credentials_migrated"] {
+        std::fs::write(source.path().join(marker), []).unwrap();
+    }
+
+    let registration = read_official_registration(source.path()).unwrap();
+
+    assert_eq!(registration.credentials, expected);
 }
 
 #[test]
@@ -623,23 +649,4 @@ fn rejects_percent_encoded_repository_scope_aliases() {
 
         assert_category(source.path(), "unsupported-registration");
     }
-}
-
-#[test]
-fn migration_marker_metadata_classification_fails_closed() {
-    let marker = Path::new("marker-name");
-
-    assert!(migration_marker_exists_with(marker, |_| Ok(())).unwrap());
-    assert!(
-        !migration_marker_exists_with(marker, |_| Err(io::Error::from(io::ErrorKind::NotFound)))
-            .unwrap()
-    );
-    let error = migration_marker_exists_with(marker, |_| {
-        Err(io::Error::other("SECRET_MARKER_METADATA_FAILURE"))
-    })
-    .unwrap_err();
-    let diagnostic = error.to_string();
-
-    assert_eq!(error.category(), "invalid-source");
-    assert!(!diagnostic.contains("SECRET_MARKER_METADATA_FAILURE"));
 }

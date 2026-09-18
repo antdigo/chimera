@@ -42,9 +42,11 @@ The supported OAuth metadata keys are `clientId` and `authorizationUrl`, both
 required, plus optional `requireFipsCryptography` with a boolean string value
 (`"true"`/`"false"`, case-insensitive; both meanings are accepted).
 `enableAuthMigrationByDefault=false`
-is recognized as inactive. A value of `true`, any `authorizationUrlV2`
-entry, and migration sibling files are rejected. Any other OAuth metadata
-key is rejected.
+is recognized as inactive. A value of `true` and any `authorizationUrlV2`
+entry are rejected. Any other OAuth metadata key is rejected.
+Completed-migration marker files (`.runner_migrated`, `.credentials_migrated`)
+are ignored: they are post-migration snapshots left by GitHub's fleet-wide
+config migration, and the import decision is made from file content.
 
 Chimera signs the token-exchange client assertion with RSASSA-PSS (PS256)
 regardless of this flag — the same signature scheme the official runner

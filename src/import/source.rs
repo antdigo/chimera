@@ -123,7 +123,7 @@ pub(crate) fn read_official_registration(
     let identity = runner_identity(&runner.git_hub_url, runner.pool_id, runner.agent_id)?;
     validate_actions_url(&runner.server_url, true)?;
     validate_actions_url(&runner.server_url_v2, false)?;
-    let oauth = validate_oauth(&credentials, &canonical_source)?;
+    let oauth = validate_oauth(&credentials)?;
     let rsa_params = validate_and_canonicalize_rsa(rsa)?;
 
     let _ignored_provenance_settings = (
@@ -295,10 +295,7 @@ fn github_identity(
     })
 }
 
-fn validate_oauth(
-    credentials: &OfficialCredentialData,
-    source: &Path,
-) -> Result<OAuthCredentials, ImportError> {
+fn validate_oauth(credentials: &OfficialCredentialData) -> Result<OAuthCredentials, ImportError> {
     if credentials.scheme != "OAuth" {
         return Err(ImportError::UnsupportedRegistration(
             "credential scheme is not supported".into(),
@@ -335,6 +332,11 @@ fn validate_oauth(
     if let Some(fips) = credentials.data.get("requireFipsCryptography") {
         parse_bool(fips, "requireFipsCryptography")?;
     }
+    // Completed-migration marker files (`.runner_migrated` /
+    // `.credentials_migrated`) are deliberately ignored: they are
+    // post-migration snapshots left by GitHub's fleet-wide config migration,
+    // byte-identical to the active files (canary 2026-09-18: 202/205
+    // registrations). Unsupported auth states are detected from content only.
     if let Some(migration) = credentials.data.get("enableAuthMigrationByDefault")
         && parse_bool(migration, "enableAuthMigrationByDefault")?
     {
@@ -343,13 +345,6 @@ fn validate_oauth(
         ));
     }
     if credentials.data.contains_key("authorizationUrlV2") {
-        return Err(ImportError::UnsupportedRegistration(
-            "credential auth migration is not supported".into(),
-        ));
-    }
-    if migration_marker_exists(source, ".runner_migrated")?
-        || migration_marker_exists(source, ".credentials_migrated")?
-    {
         return Err(ImportError::UnsupportedRegistration(
             "credential auth migration is not supported".into(),
         ));
@@ -374,25 +369,6 @@ fn parse_bool(value: &str, field: &str) -> Result<bool, ImportError> {
     Err(ImportError::InvalidSource(format!(
         "{field} must be a boolean string"
     )))
-}
-
-fn migration_marker_exists(source: &Path, name: &str) -> Result<bool, ImportError> {
-    migration_marker_exists_with(&source.join(name), |path| {
-        std::fs::symlink_metadata(path).map(drop)
-    })
-}
-
-fn migration_marker_exists_with<F>(path: &Path, inspect: F) -> Result<bool, ImportError>
-where
-    F: FnOnce(&Path) -> std::io::Result<()>,
-{
-    match inspect(path) {
-        Ok(()) => Ok(true),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(_) => Err(ImportError::InvalidSource(
-            "unable to inspect credential migration marker".into(),
-        )),
-    }
 }
 
 fn validate_actions_url(value: &str, require_non_root_path: bool) -> Result<(), ImportError> {
