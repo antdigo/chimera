@@ -9,7 +9,6 @@ use crate::job::docker_config::{
     DOCKER_CONFIG_ENV, JobDockerConfig, JobDockerConfigError, JobResourceRoot,
 };
 use crate::job::schema::{StepReference, StepReferenceKind};
-use rsa::RsaPrivateKey;
 use tokio_util::sync::CancellationToken;
 use wiremock::matchers::{method, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -63,7 +62,7 @@ async fn setup_execute() -> (tempfile::TempDir, Workspace, Arc<JobClient>, MockS
         .mount(&mock_server)
         .await;
 
-    let private_key = RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).unwrap();
+    let private_key = crate::testing::test_private_key();
     let tm = Arc::new(TokenManager::new(
         reqwest::Client::new(),
         format!("{}/oauth2/token", mock_server.uri()),

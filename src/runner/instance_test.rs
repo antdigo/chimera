@@ -26,7 +26,7 @@ async fn setup() -> (MockServer, Arc<TokenManager>, watch::Sender<bool>) {
         .mount(&mock_server)
         .await;
 
-    let private_key = rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).unwrap();
+    let private_key = crate::testing::test_private_key();
 
     let tm = Arc::new(TokenManager::new(
         reqwest::Client::new(),
@@ -325,7 +325,7 @@ fn finish_manifest(server_url: &str) -> JobManifest {
 }
 
 async fn finish_client(server: &MockServer) -> Arc<JobClient> {
-    let private_key = rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).unwrap();
+    let private_key = crate::testing::test_private_key();
     let token_manager = Arc::new(TokenManager::new(
         reqwest::Client::new(),
         format!("{}/oauth2/token", server.uri()),

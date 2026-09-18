@@ -356,8 +356,17 @@ async fn mount_default_mocks(server: &MockServer) {
         .await;
 }
 
+/// One RSA keygen per test binary: 2048-bit generation costs up to a second on
+/// CI hardware, and the mock OAuth endpoints accept any token, so tests never
+/// need distinct keys. Each caller gets a clone, keeping key state private.
+fn test_private_key() -> rsa::RsaPrivateKey {
+    static KEY: std::sync::OnceLock<rsa::RsaPrivateKey> = std::sync::OnceLock::new();
+    KEY.get_or_init(|| rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).unwrap())
+        .clone()
+}
+
 async fn create_job_client(mock_server: &MockServer) -> Arc<JobClient> {
-    let private_key = rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).unwrap();
+    let private_key = test_private_key();
     let tm = Arc::new(TokenManager::new(
         reqwest::Client::new(),
         format!("{}/oauth2/token", mock_server.uri()),

@@ -4,7 +4,7 @@ use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 fn test_private_key() -> RsaPrivateKey {
-    RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).unwrap()
+    crate::testing::test_private_key()
 }
 
 #[test]
