@@ -1089,6 +1089,39 @@ fn open_at_raw(parent: &fs::File, name: &OsStr, flags: libc::c_int) -> std::io::
     Ok(unsafe { fs::File::from_raw_fd(descriptor) })
 }
 
+/// Owns a `DIR*` produced by `fdopendir` so early exits (budget
+/// interruptions, readdir errors) cannot leak the descriptor and the stream
+/// allocation.
+#[cfg(target_os = "linux")]
+struct DirStreamGuard(*mut libc::DIR);
+
+#[cfg(target_os = "linux")]
+impl DirStreamGuard {
+    fn get(&self) -> *mut libc::DIR {
+        self.0
+    }
+
+    /// Closes the stream on the success path, reporting `closedir` failures.
+    fn close(mut self) -> Result<()> {
+        let stream = std::mem::replace(&mut self.0, std::ptr::null_mut());
+        std::mem::forget(self);
+        if unsafe { libc::closedir(stream) } != 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("closing Docker build context directory");
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for DirStreamGuard {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe { libc::closedir(self.0) };
+        }
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn read_directory_names(directory: &fs::File, budget: &PreparationBudget) -> Result<Vec<OsString>> {
     let duplicate = unsafe { libc::dup(directory.as_raw_fd()) };
@@ -1105,13 +1138,16 @@ fn read_directory_names(directory: &fs::File, budget: &PreparationBudget) -> Res
         unsafe { libc::close(duplicate) };
         return Err(error).context("rewinding Docker build context directory");
     }
-    // `fdopendir` owns the duplicate descriptor and `closedir` below closes it.
+    // `fdopendir` owns the duplicate descriptor, so every exit path after this
+    // point must run `closedir` — including budget interruptions, which is why
+    // the stream is held by a guard until the final explicit close.
     let stream = unsafe { libc::fdopendir(duplicate) };
     if stream.is_null() {
         unsafe { libc::close(duplicate) };
         return Err(std::io::Error::last_os_error())
             .context("reading Docker build context directory");
     }
+    let stream = DirStreamGuard(stream);
 
     let mut names = Vec::new();
     loop {
@@ -1119,11 +1155,10 @@ fn read_directory_names(directory: &fs::File, budget: &PreparationBudget) -> Res
         // name list after the budget has already fired.
         budget.check()?;
         unsafe { *libc::__errno_location() = 0 };
-        let entry = unsafe { libc::readdir(stream) };
+        let entry = unsafe { libc::readdir(stream.get()) };
         if entry.is_null() {
             let error = std::io::Error::last_os_error();
             if error.raw_os_error().is_some_and(|code| code != 0) {
-                unsafe { libc::closedir(stream) };
                 return Err(error).context("reading Docker build context directory");
             }
             break;
@@ -1133,10 +1168,7 @@ fn read_directory_names(directory: &fs::File, budget: &PreparationBudget) -> Res
             names.push(OsString::from_vec(name.to_vec()));
         }
     }
-    if unsafe { libc::closedir(stream) } != 0 {
-        return Err(std::io::Error::last_os_error())
-            .context("closing Docker build context directory");
-    }
+    stream.close()?;
     names.sort();
     Ok(names)
 }

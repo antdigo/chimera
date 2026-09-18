@@ -403,6 +403,13 @@ async fn wait_until_container_running(
         let remaining = deadline.saturating_duration_since(Instant::now());
         let observation =
             tokio::time::timeout(remaining, docker.inspect_container(container_id, None)).await;
+        // Tokio's timeout polls the inner future first: when both the response
+        // and the timer are ready, the resumed task can still receive an
+        // answer produced after the window, so re-check the deadline before
+        // interpreting the observation.
+        if Instant::now() >= deadline {
+            return false;
+        }
         let Ok(observation) = observation else {
             return false;
         };
@@ -439,6 +446,11 @@ async fn wait_until_container_not_running(
         let remaining = deadline.saturating_duration_since(Instant::now());
         let observation =
             tokio::time::timeout(remaining, docker.inspect_container(container_id, None)).await;
+        // Same late-resume rule as the running helper: a stopped observation
+        // delivered after the window must not count as an Engine-side stop.
+        if Instant::now() >= deadline {
+            return false;
+        }
         let observation = match observation {
             Ok(observation) => observation,
             Err(_stalled_past_the_window) => return false,

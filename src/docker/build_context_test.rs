@@ -200,6 +200,38 @@ fn repeated_traversals_of_one_capability_see_the_full_directory() {
     }
 }
 
+/// A budget interruption fires after `fdopendir` has taken ownership of the
+/// duplicate descriptor; that exit must still close the stream, or repeated
+/// cancelled preparations bleed descriptors in a long-running daemon.
+#[cfg(target_os = "linux")]
+#[test]
+fn cancelled_enumeration_does_not_leak_directory_streams() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("Dockerfile"), "FROM scratch\n").unwrap();
+    let trusted = trusted_action(tmp.path());
+
+    let cancel_token = tokio_util::sync::CancellationToken::new();
+    cancel_token.cancel();
+    let budget = PreparationBudget::new(
+        std::time::Instant::now() + std::time::Duration::from_secs(600),
+        cancel_token,
+    );
+
+    let open_fds_before = std::fs::read_dir("/proc/self/fd").unwrap().count();
+    let root = trusted.clone_directory_descriptor().unwrap();
+    for _ in 0..64 {
+        assert!(read_directory_names(&root, &budget).is_err());
+    }
+    let leaked = std::fs::read_dir("/proc/self/fd").unwrap().count() - open_fds_before;
+
+    // Parallel tests in this binary open and close their own descriptors, so
+    // a small drift is possible; a real leak adds one stream per iteration.
+    assert!(
+        leaked < 32,
+        "cancelled enumerations must close their directory streams, leaked {leaked} fds over 64 runs"
+    );
+}
+
 /// Preparation runs on a blocking worker that outlives an abandoned
 /// `spawn_blocking` handle: it must stop itself once the step's budget has
 /// fired, instead of packing an arbitrarily large context forever.
