@@ -609,3 +609,17 @@ async fn deadline_wins_when_the_wrapped_future_is_ready() {
 
     assert!(matches!(outcome, BudgetOutcome::TimedOut));
 }
+
+#[tokio::test]
+async fn just_expired_deadline_wins_when_the_wrapped_future_is_ready() {
+    let cancel = CancellationToken::new();
+
+    // A deadline that expired microseconds ago still sits Pending in the
+    // millisecond-granular timer wheel, so the wrapped future's completion is
+    // polled while the sleep branch has not fired — the wakeup race that let
+    // a Docker connect error outrank the expired deadline (#12). The variant
+    // above cannot catch this: its long-expired timer fires on the first poll.
+    let outcome = within_budget(Instant::now(), &cancel, async { "ready" }).await;
+
+    assert!(matches!(outcome, BudgetOutcome::TimedOut));
+}
