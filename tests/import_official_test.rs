@@ -130,7 +130,7 @@ fn assert_source_credentials_redacted(output: &Output, source: &Path) {
         output,
         json_string(&credentials["data"], "authorizationUrl"),
     );
-    for field in ["D", "DP", "DQ", "Exponent", "InverseQ", "Modulus", "P", "Q"] {
+    for field in ["d", "dp", "dq", "exponent", "inverseQ", "modulus", "p", "q"] {
         assert_redacted(output, json_string(&rsa, field));
     }
 }
@@ -290,7 +290,7 @@ fn imports_fixture_and_chimera_loader_preserves_every_field() {
         &loaded.rsa_params.p,
         &loaded.rsa_params.q,
     ];
-    let official_components = ["D", "DP", "DQ", "Exponent", "InverseQ", "Modulus", "P", "Q"];
+    let official_components = ["d", "dp", "dq", "exponent", "inverseQ", "modulus", "p", "q"];
     for (imported, field) in imported_components.into_iter().zip(official_components) {
         assert!(
             BASE64.decode(imported).unwrap()
@@ -302,13 +302,13 @@ fn imports_fixture_and_chimera_loader_preserves_every_field() {
     assert!(
         private_key.n().to_bytes_be()
             == BASE64
-                .decode(json_string(&official_rsa, "Modulus"))
+                .decode(json_string(&official_rsa, "modulus"))
                 .unwrap()
     );
     assert!(
         private_key.e().to_bytes_be()
             == BASE64
-                .decode(json_string(&official_rsa, "Exponent"))
+                .decode(json_string(&official_rsa, "exponent"))
                 .unwrap()
     );
 }
@@ -406,12 +406,12 @@ fn invalid_inputs_fail_before_publish_and_redact_secrets() {
         }),
         ("malformed-base64", "invalid-source", |source, secret| {
             rewrite_json(&source.join(".credentials_rsaparams"), |rsa| {
-                rsa["D"] = Value::String(secret.into());
+                rsa["d"] = Value::String(secret.into());
             });
         }),
         ("malformed-rsa", "invalid-source", |source, secret| {
             rewrite_json(&source.join(".credentials_rsaparams"), |rsa| {
-                rsa["D"] = Value::String(BASE64.encode(secret));
+                rsa["d"] = Value::String(BASE64.encode(secret));
             });
         }),
         (
@@ -444,7 +444,7 @@ fn invalid_inputs_fail_before_publish_and_redact_secrets() {
         let injected_rsa_value = (label == "malformed-rsa").then(|| {
             json_string(
                 &read_json(&source.path().join(".credentials_rsaparams")),
-                "D",
+                "d",
             )
             .to_owned()
         });

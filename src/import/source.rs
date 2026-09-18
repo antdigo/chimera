@@ -93,24 +93,20 @@ where
     deserializer.deserialize_map(UniqueStringMapVisitor)
 }
 
+// Field names follow the official runner's serialized format (Newtonsoft
+// camelCase, verified against runner 2.337.0), not the C# `RSAParameters`
+// property names — hence `inverseQ` with its capital Q.
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct OfficialRsaParameters {
-    #[serde(rename = "D")]
     d: String,
-    #[serde(rename = "DP")]
     dp: String,
-    #[serde(rename = "DQ")]
     dq: String,
-    #[serde(rename = "Exponent")]
     exponent: String,
-    #[serde(rename = "InverseQ")]
+    #[serde(rename = "inverseQ")]
     inverse_q: String,
-    #[serde(rename = "Modulus")]
     modulus: String,
-    #[serde(rename = "P")]
     p: String,
-    #[serde(rename = "Q")]
     q: String,
 }
 

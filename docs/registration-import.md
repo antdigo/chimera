@@ -48,6 +48,25 @@ The following non-auth `.runner` fields are known and accepted, but are not
 migrated: `poolName`, `skipSessionRecover`, `disableUpdate`,
 `monitorSocketAddress`, `useRunnerAdminFlow`, and `IsHostedServer=true`.
 
+### `.credentials_rsaparams` field names
+
+The official runner serializes this file as pretty-printed UTF-8 with a BOM,
+containing exactly these string (Base64) keys: `d`, `dp`, `dq`, `exponent`,
+`inverseQ`, `modulus`, `p`, `q`. The names come from the runner's JSON
+serializer (Newtonsoft camelCase through the VSS SDK settings behind
+`IOUtil.SaveObject`, verified in runner 2.337.0), not from the C#
+`RSAParameters` property names — do not "correct" the casing back to
+PascalCase. Any other key, including the PascalCase variants (`D`, `DP`, …),
+is rejected as `invalid-source`.
+
+### Fixture rule for formats we do not own
+
+The static fixture for these files must be transcribed from a real captured
+sample — file set, field names, casing, encoding — with the key material
+replaced by synthetic values. Authoring fixtures from source-language type
+definitions makes the implementation and the fixture share the same wrong
+assumption, which no test can then catch.
+
 An eligible source has all of the following:
 
 - Positive pool and agent IDs, and nonempty agent and work-folder names.
