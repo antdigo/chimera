@@ -20,6 +20,13 @@ pub(crate) fn mutate_json(source: &Path, name: &str, mutate: impl FnOnce(&mut se
     std::fs::write(path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
 }
 
+pub(crate) fn prepend_utf8_bom(source: &Path, name: &str) {
+    let path = source.join(name);
+    let mut bytes = b"\xEF\xBB\xBF".to_vec();
+    bytes.extend_from_slice(&std::fs::read(&path).unwrap());
+    std::fs::write(&path, bytes).unwrap();
+}
+
 pub(crate) fn fixture_credentials() -> crate::config::RunnerCredentials {
     crate::import::source::read_official_registration(&fixture_path())
         .unwrap()

@@ -6,9 +6,13 @@ use rsa::traits::PublicKeyParts;
 use serde_json::json;
 
 use crate::config::rsa_params_to_private_key;
-use crate::import::test_support::{copy_fixture, fixture_credentials, fixture_path, mutate_json};
+use crate::import::test_support::{
+    copy_fixture, fixture_credentials, fixture_path, mutate_json, prepend_utf8_bom,
+};
 
 use super::*;
+
+const OFFICIAL_SOURCE_FILES: [&str; 3] = [".runner", ".credentials", ".credentials_rsaparams"];
 
 fn assert_category(source: &Path, category: &str) -> String {
     let error = match read_official_registration(source) {
@@ -70,6 +74,42 @@ fn reads_supported_v2_registration_without_changing_identity() {
     let key = rsa_params_to_private_key(&registration.credentials.rsa_params).unwrap();
     assert_eq!(key.n().to_bytes_be(), [0x0c, 0xa1]);
     assert_eq!(key.e().to_bytes_be(), [0x11]);
+}
+
+#[test]
+fn reads_registration_with_utf8_bom_prefix_on_each_source_file() {
+    let expected = fixture_credentials();
+
+    for name in OFFICIAL_SOURCE_FILES {
+        let source = copy_fixture();
+        prepend_utf8_bom(source.path(), name);
+
+        let registration = read_official_registration(source.path()).unwrap();
+
+        assert_eq!(registration.credentials, expected, "BOM in {name}");
+    }
+}
+
+#[test]
+fn reads_registration_with_utf8_bom_prefix_on_all_source_files() {
+    let expected = fixture_credentials();
+    let source = copy_fixture();
+    for name in OFFICIAL_SOURCE_FILES {
+        prepend_utf8_bom(source.path(), name);
+    }
+
+    let registration = read_official_registration(source.path()).unwrap();
+
+    assert_eq!(registration.credentials, expected);
+}
+
+#[test]
+fn rejects_malformed_json_behind_utf8_bom_prefix() {
+    let source = copy_fixture();
+    prepend_utf8_bom(source.path(), ".runner");
+    std::fs::write(source.path().join(".credentials"), b"\xEF\xBB\xBF{").unwrap();
+
+    assert_category(source.path(), "invalid-source");
 }
 
 #[test]

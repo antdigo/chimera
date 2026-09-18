@@ -48,6 +48,13 @@ fn copy_fixture() -> TempDir {
     destination
 }
 
+fn prepend_utf8_bom(source: &Path, name: &str) {
+    let path = source.join(name);
+    let mut bytes = b"\xEF\xBB\xBF".to_vec();
+    bytes.extend_from_slice(&fs::read(&path).unwrap());
+    fs::write(&path, bytes).unwrap();
+}
+
 fn import_command(source: &Path, name: &str, root: &Path, dry_run: bool) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_chimera"));
     command
@@ -138,7 +145,8 @@ fn snapshot(path: &Path) -> FileSnapshot {
 }
 
 fn read_json(path: &Path) -> Value {
-    serde_json::from_slice(&fs::read(path).unwrap()).unwrap()
+    let bytes = fs::read(path).unwrap();
+    serde_json::from_slice(bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(&bytes)).unwrap()
 }
 
 fn rewrite_json(path: &Path, change: impl FnOnce(&mut Value)) {
@@ -312,6 +320,21 @@ fn dry_run_is_offline_and_does_not_create_new_root() {
     let output = run_import(&fixture_path(), "dry-runner", &root, true);
 
     assert_success_output(&output, "eligible", "dry-runner", &fixture_path());
+    assert!(!root.exists());
+}
+
+#[test]
+fn dry_run_accepts_utf8_bom_prefix_in_official_files() {
+    let source = copy_fixture();
+    for name in OFFICIAL_FILES {
+        prepend_utf8_bom(source.path(), name);
+    }
+    let parent = tempfile::tempdir().unwrap();
+    let root = parent.path().join("missing-root");
+
+    let output = run_import(source.path(), "bom-runner", &root, true);
+
+    assert_success_output(&output, "eligible", "bom-runner", source.path());
     assert!(!root.exists());
 }
 
