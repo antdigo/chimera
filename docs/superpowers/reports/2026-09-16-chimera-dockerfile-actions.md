@@ -2,16 +2,14 @@
 
 This report covers Dockerfile-based action execution only. It does not approve
 production rollout, GHCR push, deploy, webhook or poll stages. All numbers
-below were observed on branch commits up to and including `d032859` (the
-final commit only adjusts the fd-drift comparison in the Linux leak
-regression; every number below was observed on the tree it belongs to).
+below were observed on branch commits up to and including `6718a34`.
 
 ## Observed commands (macOS host, aarch64 Docker Desktop)
 
 - `cargo build`: PASS.
 - `cargo clippy --all-targets -- -D warnings`: PASS — zero warnings.
 - `cargo fmt -- --check`: PASS.
-- `cargo test`: PASS — 900 passed, 0 failed, 44 ignored (the ignored set is
+- `cargo test`: PASS — 901 passed, 0 failed, 44 ignored (the ignored set is
   the Docker Engine suite below).
 - `cargo test --features acceptance-tests --test dockerfile_actions_test --no-run`:
   PASS — acceptance binary compiled; no acceptance test was executed.
@@ -40,13 +38,14 @@ through QEMU:
 - `tests/composite_test.rs`: 1/1 PASS. `tests/docker_test.rs`: 12/12 PASS.
 - `tests/dockerfile_actions_test.rs`: 12/12 PASS (D-01…D-09, D-11 at
   executor level, real builds, pre/main/post reuse, cancel/timeout + retry).
-- `tests/job_docker_config_docker_test.rs`: 3/4 — the pre-existing C-10
-  `pinned_buildx_flow_uses_job_config_and_original_socket` fails with
-  `HTTP 401 Unauthorized` because the harness downloads the pinned public
-  actions from api.github.com with the fake job token. Added by main's
-  `1e2d228` (per-job Docker credentials) and never executed before: the
-  fork's last CI run predates it (2026-08-26, v0.1.3), and no earlier macOS
-  gate reached that binary. Not addressed in this branch (CHM-03 lineage).
+- `tests/job_docker_config_docker_test.rs`: 4/4 PASS — including C-10
+  `pinned_buildx_flow_uses_job_config_and_original_socket`, which first
+  executed in these gates and failed with a fake-token 401. Root cause was
+  the harness: it prefilled pinned actions into an `owner/repo/sha`
+  directory while `get_action` resolves remote actions by a content-hash
+  path, so every lookup missed and the runner hit api.github.com with the
+  fake job token (`a5aa15b`: prefill now goes through
+  `ActionCache::install_tarball`, the production layout).
 
 | ID | Evidence | Result |
 |---|---|---|
@@ -93,6 +92,11 @@ through QEMU:
    (Linux fd-count regression included), and both D-06 helpers re-check the
    deadline after the bounded inspect resolves, rejecting observations a
    late tokio resume could deliver after the window.
+9. PR CI hardening (`d9e3e61`, `a5aa15b`, `6718a34`): clippy satisfied on
+   the Linux cfg branches (invisible on macOS; now verified on both
+   platforms), the C-10 harness prefill fixed through the production cache
+   layout, and the Engine's own build error text (e.g. a base-image platform
+   mismatch) preserved in the cause chain behind the stable job-log message.
 
 ## Design adjudications recorded during acceptance
 
@@ -120,5 +124,3 @@ through QEMU:
   forbidden.
 - Upstream masking and broader post/cancellation semantics remain separate
   gates.
-- Pre-existing (main lineage, first executed here): the C-10 buildx flow test
-  downloads pinned public actions with a fake token and fails with 401.
