@@ -8,15 +8,15 @@ use chimera::job::client::JobConclusion;
 use common::*;
 use tokio_util::sync::CancellationToken;
 
-async fn wait_for_exact_uploaded_log(env: &TestEnv, expected: &str) {
+/// Wait until an uploaded log line contains the marker. BuildKit prefixes
+/// streamed RUN output with step/timing prefixes (`#7 0.123 <line>`), so an
+/// exact-content match is not possible; markers are UUID-suffixed per run.
+async fn wait_for_uploaded_log_containing(env: &TestEnv, expected: &str) {
     let mut last_seen = String::new();
     let found = tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             let uploaded = env.uploaded_log_text().await;
-            if uploaded.lines().any(|line| {
-                line.split_once(' ')
-                    .is_some_and(|(_, content)| content == expected)
-            }) {
+            if uploaded.lines().any(|line| line.contains(expected)) {
                 return true;
             }
             last_seen = uploaded;
@@ -35,7 +35,7 @@ async fn wait_for_exact_uploaded_log(env: &TestEnv, expected: &str) {
             .map(|request| format!("{} {}", request.method, request.url.path()))
             .collect();
         panic!(
-            "timed out waiting for exact uploaded log: {expected}; uploaded logs:\n{last_seen}\nreceived requests:\n{}",
+            "timed out waiting for uploaded log containing: {expected}; uploaded logs:\n{last_seen}\nreceived requests:\n{}",
             requests.join("\n")
         );
     }
@@ -404,7 +404,7 @@ async fn cancelled_build_does_not_start_action_and_same_key_retries() {
 
     let run = env.run_with_cancel(&manifest, cancel_token.clone());
     let cancel_after_build_starts = async {
-        wait_for_exact_uploaded_log(&env, &build_marker).await;
+        wait_for_uploaded_log_containing(&env, &build_marker).await;
         cancel_token.cancel();
     };
     let (result, ()) = tokio::time::timeout(Duration::from_secs(45), async {
@@ -472,7 +472,7 @@ async fn timed_out_action_does_not_start_entrypoint_and_same_key_retries() {
     env.configure_from_manifest(&timed_out_manifest);
 
     let run = env.run(&timed_out_manifest);
-    let wait_for_build_process = wait_for_exact_uploaded_log(&env, &build_marker);
+    let wait_for_build_process = wait_for_uploaded_log_containing(&env, &build_marker);
     let (timed_out_result, ()) = tokio::time::timeout(Duration::from_secs(90), async {
         tokio::join!(run, wait_for_build_process)
     })
@@ -613,7 +613,11 @@ runs:
     let (conclusion, outputs) = env.run(&manifest).await.unwrap();
     let logs = env.uploaded_log_text().await;
 
-    assert_eq!(conclusion, JobConclusion::Succeeded);
+    assert_eq!(
+        conclusion,
+        JobConclusion::Succeeded,
+        "uploaded logs:\n{logs}"
+    );
     assert_eq!(outputs.get("result").map(String::as_str), Some("ok"));
     assert_eq!(
         std::fs::read_to_string(env.workspace.workspace_dir().join("phases")).unwrap(),

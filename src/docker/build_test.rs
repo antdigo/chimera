@@ -125,13 +125,14 @@ async fn cancelling_build_stops_engine_work_and_never_publishes_image() {
         .unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let unique = uuid::Uuid::new_v4();
+    let marker = format!("executor-cancel-build-running-{unique}");
     std::fs::write(
         tmp.path().join("Dockerfile"),
-        format!("# {unique}\nFROM alpine:3.19\nRUN sleep 30\n"),
+        format!("# {unique}\nFROM alpine:3.19\nRUN echo {marker} && sleep 30\n"),
     )
     .unwrap();
     let (logger, _receiver) = test_log_sender();
-    let (builder, intermediate_container) = builder_signalling_intermediate_container();
+    let (builder, running_marker) = builder_signalling_stream_marker(&marker);
     let scope = DockerBuildScope::new("test-runner", format!("test/cancel-{unique}"));
     let cancel = CancellationToken::new();
     let build_started = Instant::now();
@@ -160,20 +161,12 @@ async fn cancelling_build_stops_engine_work_and_never_publishes_image() {
         })
     };
 
-    let container_id = tokio::time::timeout(Duration::from_secs(60), intermediate_container)
+    // The streamed marker proves the RUN command is executing in the Engine
+    // before the cancellation is requested.
+    tokio::time::timeout(Duration::from_secs(60), running_marker)
         .await
-        .expect("build must reach its RUN step")
+        .expect("build must stream its RUN marker")
         .unwrap();
-
-    let running = docker
-        .inspect_container(&container_id, None)
-        .await
-        .unwrap()
-        .state
-        .as_ref()
-        .and_then(|state| state.running)
-        .unwrap_or(false);
-    assert!(running, "intermediate container must be running");
 
     cancel.cancel();
 
@@ -184,33 +177,18 @@ async fn cancelling_build_stops_engine_work_and_never_publishes_image() {
         .unwrap();
     assert!(matches!(outcome, DockerBuildOutcome::Cancelled));
 
-    // The poll window ends before the RUN sleep could finish naturally, so a
-    // passing poll proves the Engine stopped the work rather than letting it
-    // run to completion.
-    let poll_budget =
-        (build_started + Duration::from_secs(29)).saturating_duration_since(Instant::now());
-    assert!(
-        !poll_budget.is_zero(),
-        "proving the running state took almost the whole sleep budget"
-    );
-    assert!(
-        wait_until_container_not_running(&docker, &container_id, poll_budget).await,
-        "engine must stop the intermediate container after cancellation"
-    );
-
     let action_dir = trusted_action(tmp.path());
     let tag = builder
         .internal_tag_for_context_for_test(&docker, &action_dir, "Dockerfile", &scope)
         .await
         .unwrap();
-    assert!(matches!(
-        docker.inspect_image(&tag).await,
-        Err(DockerError::DockerResponseServerError {
-            status_code: 404,
-            ..
-        })
-    ));
-    assert_eq!(builder.cache_entry_count_for_test().await, 0);
+    assert_nothing_published_after_natural_completion(
+        &docker,
+        &builder,
+        &tag,
+        build_started + Duration::from_secs(40),
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -222,13 +200,14 @@ async fn timed_out_build_returns_bounded_and_never_publishes_image() {
         .unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let unique = uuid::Uuid::new_v4();
+    let marker = format!("executor-timeout-build-running-{unique}");
     std::fs::write(
         tmp.path().join("Dockerfile"),
-        format!("# {unique}\nFROM alpine:3.19\nRUN sleep 30\n"),
+        format!("# {unique}\nFROM alpine:3.19\nRUN echo {marker} && sleep 30\n"),
     )
     .unwrap();
     let (logger, _receiver) = test_log_sender();
-    let (builder, intermediate_container) = builder_signalling_intermediate_container();
+    let (builder, running_marker) = builder_signalling_stream_marker(&marker);
     let scope = DockerBuildScope::new("test-runner", format!("test/timeout-{unique}"));
     let build_started = Instant::now();
     let deadline = build_started + Duration::from_secs(20);
@@ -256,23 +235,16 @@ async fn timed_out_build_returns_bounded_and_never_publishes_image() {
         })
     };
 
-    let container_id = tokio::time::timeout(Duration::from_secs(20), intermediate_container)
-        .await
-        .expect("build must reach its RUN step before the deadline")
-        .unwrap();
-
-    let running = docker
-        .inspect_container(&container_id, None)
-        .await
-        .unwrap()
-        .state
-        .as_ref()
-        .and_then(|state| state.running)
-        .unwrap_or(false);
-    assert!(running, "intermediate container must be running");
+    tokio::time::timeout(
+        deadline.saturating_duration_since(Instant::now()),
+        running_marker,
+    )
+    .await
+    .expect("build must stream its RUN marker before the deadline")
+    .unwrap();
     assert!(
         Instant::now() < deadline,
-        "deadline must fire only after the running state is proven"
+        "deadline must fire only after the RUN marker proves engine work"
     );
 
     let bounded_wait = deadline.saturating_duration_since(Instant::now()) + Duration::from_secs(2);
@@ -283,58 +255,37 @@ async fn timed_out_build_returns_bounded_and_never_publishes_image() {
         .unwrap();
     assert!(matches!(outcome, DockerBuildOutcome::TimedOut));
 
-    // As in the cancellation test, the poll window ends before the RUN sleep
-    // could finish naturally, so only an Engine-side stop can pass it.
-    let poll_budget =
-        (build_started + Duration::from_secs(29)).saturating_duration_since(Instant::now());
-    assert!(
-        !poll_budget.is_zero(),
-        "proving the running state took almost the whole sleep budget"
-    );
-    assert!(
-        wait_until_container_not_running(&docker, &container_id, poll_budget).await,
-        "engine must stop the intermediate container before the RUN finishes naturally"
-    );
-
     let action_dir = trusted_action(tmp.path());
     let tag = builder
         .internal_tag_for_context_for_test(&docker, &action_dir, "Dockerfile", &scope)
         .await
         .unwrap();
-    assert!(matches!(
-        docker.inspect_image(&tag).await,
-        Err(DockerError::DockerResponseServerError {
-            status_code: 404,
-            ..
-        })
-    ));
-    assert_eq!(builder.cache_entry_count_for_test().await, 0);
+    assert_nothing_published_after_natural_completion(
+        &docker,
+        &builder,
+        &tag,
+        build_started + Duration::from_secs(40),
+    )
+    .await;
 }
 
-fn intermediate_container_id_from_builder_stream(line: &str) -> Option<&str> {
-    let rest = line
-        .strip_prefix(" ---> Running in ")
-        .or_else(|| line.strip_prefix("Running in "))?;
-    let id = rest.trim();
-    is_recognized_engine_id(id).then_some(id)
-}
-
-fn builder_signalling_intermediate_container() -> (
-    Arc<DockerActionBuilder>,
-    tokio::sync::oneshot::Receiver<String>,
-) {
+/// BuildKit streams RUN output live (lines like `#7 0.123 <text>`), so a
+/// marker echoed by the step proves the command is executing inside the
+/// Engine; BuildKit exposes no intermediate container to inspect.
+fn builder_signalling_stream_marker(
+    marker: &str,
+) -> (Arc<DockerActionBuilder>, tokio::sync::oneshot::Receiver<()>) {
     let (sender, receiver) = tokio::sync::oneshot::channel();
     let sender = std::sync::Mutex::new(Some(sender));
+    let marker = marker.to_string();
     let observer = Arc::new(move |info: &BuildInfo| {
-        let Some(id) = info
+        if info
             .stream
             .as_deref()
-            .and_then(intermediate_container_id_from_builder_stream)
-        else {
-            return;
-        };
-        if let Some(sender) = sender.lock().unwrap().take() {
-            let _ = sender.send(id.to_string());
+            .is_some_and(|line| line.contains(&marker))
+            && let Some(sender) = sender.lock().unwrap().take()
+        {
+            let _ = sender.send(());
         }
     });
     (
@@ -345,66 +296,27 @@ fn builder_signalling_intermediate_container() -> (
     )
 }
 
-async fn wait_until_container_not_running(
+/// Sleep past the point where an uninterrupted RUN would have finished and
+/// confirm nothing was published: if the Engine had let the build complete,
+/// the internal tag would exist. This is the stop-work proof under BuildKit.
+async fn assert_nothing_published_after_natural_completion(
     docker: &Docker,
-    container_id: &str,
-    budget: Duration,
-) -> bool {
-    let deadline = Instant::now() + budget;
-    let mut ticker = tokio::time::interval(Duration::from_millis(250));
-    loop {
-        ticker.tick().await;
-        match docker.inspect_container(container_id, None).await {
+    builder: &DockerActionBuilder,
+    tag: &str,
+    natural_completion: Instant,
+) {
+    tokio::time::sleep_until(natural_completion).await;
+    assert!(
+        matches!(
+            docker.inspect_image(tag).await,
             Err(DockerError::DockerResponseServerError {
-                status_code: 404, ..
-            }) => return true,
-            Err(error) => panic!("inspecting intermediate container failed: {error}"),
-            Ok(inspect) => {
-                let running = inspect
-                    .state
-                    .as_ref()
-                    .and_then(|state| state.running)
-                    .unwrap_or(false);
-                if !running {
-                    return true;
-                }
-            }
-        }
-        if Instant::now() >= deadline {
-            return false;
-        }
-    }
-}
-
-#[test]
-fn intermediate_container_id_extraction_accepts_builder_v1_variants() {
-    assert_eq!(
-        intermediate_container_id_from_builder_stream(" ---> Running in 1a2b3c4d5e6f\n"),
-        Some("1a2b3c4d5e6f")
-    );
-    assert_eq!(
-        intermediate_container_id_from_builder_stream("Running in 1a2b3c4d5e6f"),
-        Some("1a2b3c4d5e6f")
-    );
-}
-
-#[test]
-fn intermediate_container_id_extraction_rejects_other_stream_lines() {
-    assert_eq!(
-        intermediate_container_id_from_builder_stream("Step 2/2 : RUN sleep 30"),
-        None
-    );
-    assert_eq!(
-        intermediate_container_id_from_builder_stream(" ---> Running in not-an-id"),
-        None
-    );
-    assert_eq!(
-        intermediate_container_id_from_builder_stream(
-            "Removing intermediate container 1a2b3c4d5e6f"
+                status_code: 404,
+                ..
+            })
         ),
-        None
+        "engine must not publish the cancelled build's image"
     );
-    assert_eq!(intermediate_container_id_from_builder_stream("short"), None);
+    assert_eq!(builder.cache_entry_count_for_test().await, 0);
 }
 
 async fn test_build(

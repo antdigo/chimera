@@ -227,8 +227,15 @@ docker run -d \
   -e XDG_RUNTIME_DIR=/run/user/1000 \
   -v "$DIND_RUNTIME_VOLUME:/run/user/1000" \
   -v "$DIND_TMP_VOLUME:/chimera-tmp" \
-  "$DIND_IMAGE"
+  "$DIND_IMAGE" \
+  --feature containerd-snapshotter=false
 ```
+
+`--feature containerd-snapshotter=false` selects the classic image store:
+the Dockerfile-action build adapter uses the classic BuilderV1 `/build` path
+(for streamed progress through the masking pipeline), which the containerd
+image store cannot export — on it, builds fail with
+`NotFound: content digest ...`.
 
 `--privileged` applies only to the outer test container. The daemon inside it
 must still report the rootless security marker required by C-10. Wait up to one

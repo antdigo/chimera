@@ -105,13 +105,16 @@ jobs:
             "$DIND_IMAGE" -R 1000:1000 /run/user/1000 /chimera-tmp /cargo /cargo-target
 
           # The nested daemon must report the rootless security marker the
-          # per-job Docker config tests (C-10) fail closed on.
+          # per-job Docker config tests (C-10) fail closed on. The classic
+          # image store keeps BuilderV1 builds (and their streamed progress)
+          # working; the containerd store cannot export them.
           docker run -d --privileged --name "$DIND_NAME" \
             -e DOCKER_TLS_CERTDIR= \
             -e XDG_RUNTIME_DIR=/run/user/1000 \
             -v "$RUNTIME_VOLUME":/run/user/1000 \
             -v "$TMP_VOLUME":/chimera-tmp \
-            "$DIND_IMAGE"
+            "$DIND_IMAGE" \
+            --feature containerd-snapshotter=false
 
           security_options=""
           for _ in $(seq 1 60); do

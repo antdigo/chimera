@@ -265,6 +265,11 @@ async fn build_archive(
             ("io.chimera.action-cache".to_string(), "v1".to_string()),
             ("io.chimera.action-key".to_string(), cache_key.fingerprint()),
         ]),
+        // BuilderV1 streams build progress through the response, which the
+        // job's masking pipeline requires. Engines running the containerd
+        // image store cannot export V1 builds (documented limitation); the
+        // BuildKit REST path drops progress text entirely and is not a
+        // substitute.
         version: BuilderVersion::BuilderV1,
         ..Default::default()
     };
