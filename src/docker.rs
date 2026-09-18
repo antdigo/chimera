@@ -1,3 +1,6 @@
+pub mod build;
+pub(crate) mod build_cache;
+pub(crate) mod build_context;
 pub mod client;
 pub mod container;
 pub mod exec;

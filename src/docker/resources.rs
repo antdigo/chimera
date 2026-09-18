@@ -35,6 +35,31 @@ pub struct SetupParams<'a> {
     pub externals_dir: &'a Path,
 }
 
+fn job_container_bind_mounts(params: &SetupParams<'_>) -> Vec<String> {
+    vec![
+        format!(
+            "{}:/github/workspace",
+            params.workspace_host_path.to_string_lossy()
+        ),
+        format!(
+            "{}:/github/workflow",
+            params.workflow_files_host_path.to_string_lossy()
+        ),
+        format!(
+            "{}:/github/tmp",
+            params.runner_temp_host_path.to_string_lossy()
+        ),
+        format!(
+            "{}:/github/actions:ro",
+            params.actions_host_path.to_string_lossy()
+        ),
+        format!(
+            "{}:/github/tool-cache",
+            params.tool_cache_host_path.to_string_lossy()
+        ),
+    ]
+}
+
 /// Owns all Docker resources for a single job and guarantees cleanup.
 pub struct JobDockerResources {
     docker: Docker,
@@ -213,34 +238,7 @@ impl JobDockerResources {
             }
 
             let container_name = format!("chimera-{}-{}-job", params.runner_name, params.job_id);
-            let workspace_mount = format!(
-                "{}:/github/workspace",
-                params.workspace_host_path.to_string_lossy()
-            );
-            let workflow_mount = format!(
-                "{}:/github/workflow",
-                params.workflow_files_host_path.to_string_lossy()
-            );
-            let temp_mount = format!(
-                "{}:/github/tmp",
-                params.runner_temp_host_path.to_string_lossy()
-            );
-            let actions_mount = format!(
-                "{}:/github/actions",
-                params.actions_host_path.to_string_lossy()
-            );
-            let tool_cache_mount = format!(
-                "{}:/github/tool-cache",
-                params.tool_cache_host_path.to_string_lossy()
-            );
-
-            let mut binds = vec![
-                workspace_mount,
-                workflow_mount,
-                temp_mount,
-                actions_mount,
-                tool_cache_mount,
-            ];
+            let mut binds = job_container_bind_mounts(params);
 
             // Ensure the Linux node binaries are available and mount them into the
             // container. The official runner ships these in externals/; we download

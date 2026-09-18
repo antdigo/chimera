@@ -1,9 +1,329 @@
 use std::collections::HashMap;
+use std::io::{self, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use super::*;
 use crate::job::action::metadata::{ActionInput, ActionRuns, ActionRuntime};
-use crate::job::docker_config::DOCKER_CONFIG_ENV;
+use crate::job::docker_config::{DOCKER_CONFIG_ENV, JobResourceRoot};
+use crate::job::logs::LogSender;
 use crate::job::schema::{StepReference, StepReferenceKind};
+use crate::job::workspace::Workspace;
+
+struct TraceWriter(Arc<Mutex<Vec<u8>>>);
+
+impl Write for TraceWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn lifecycle_budget_state_reports_active_cancelled_and_timed_out() {
+    let active = CancellationToken::new();
+    assert_eq!(
+        lifecycle_budget_state(Instant::now() + Duration::from_secs(60), &active),
+        LifecycleBudgetState::Active
+    );
+
+    let cancelled = CancellationToken::new();
+    cancelled.cancel();
+    assert_eq!(
+        lifecycle_budget_state(Instant::now() - Duration::from_secs(1), &cancelled),
+        LifecycleBudgetState::Cancelled
+    );
+
+    assert_eq!(
+        lifecycle_budget_state(
+            Instant::now() - Duration::from_secs(1),
+            &CancellationToken::new()
+        ),
+        LifecycleBudgetState::TimedOut
+    );
+}
+
+#[test]
+fn action_container_names_are_unique_and_docker_safe() {
+    let left = unique_action_container_name();
+    let right = unique_action_container_name();
+
+    assert_ne!(left, right);
+    for name in [left, right] {
+        assert!(name.starts_with("chimera-docker-action-"));
+        assert!(
+            name.bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        );
+    }
+}
+
+#[test]
+fn action_image_reference_preserves_registry_ports_and_defaults_tag() {
+    assert_eq!(
+        split_action_image_reference("registry.example:5000/owner/image:v1"),
+        ("registry.example:5000/owner/image", "v1")
+    );
+    assert_eq!(
+        split_action_image_reference("registry.example:5000/owner/image"),
+        ("registry.example:5000/owner/image", "latest")
+    );
+}
+
+#[tokio::test]
+async fn lifecycle_budget_does_not_poll_operation_after_cancellation() {
+    let polled = Arc::new(AtomicBool::new(false));
+    let polled_by_operation = Arc::clone(&polled);
+    let cancel = CancellationToken::new();
+    cancel.cancel();
+
+    let outcome = within_lifecycle_budget(
+        Instant::now() - Duration::from_secs(1),
+        &cancel,
+        async move {
+            polled_by_operation.store(true, Ordering::SeqCst);
+        },
+    )
+    .await;
+
+    assert!(matches!(outcome, BudgetOutcome::Cancelled));
+    assert!(!polled.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn lifecycle_budget_does_not_poll_operation_after_deadline() {
+    let polled = Arc::new(AtomicBool::new(false));
+    let polled_by_operation = Arc::clone(&polled);
+
+    let outcome = within_lifecycle_budget(
+        Instant::now() - Duration::from_secs(1),
+        &CancellationToken::new(),
+        async move {
+            polled_by_operation.store(true, Ordering::SeqCst);
+        },
+    )
+    .await;
+
+    assert!(matches!(outcome, BudgetOutcome::TimedOut));
+    assert!(!polled.load(Ordering::SeqCst));
+}
+
+#[derive(Clone, Copy)]
+enum EngineTestLaunchPath {
+    FullLifecycle,
+    ReadyImage,
+}
+
+async fn run_engine_test_container(
+    docker: &Docker,
+    image: &str,
+    container_name: &str,
+    cancel_token: &CancellationToken,
+    launch_path: EngineTestLaunchPath,
+) -> Result<StepResult> {
+    let tmp = tempfile::tempdir().unwrap();
+    let workspace = Workspace::create(
+        &tmp.path().join("work"),
+        &tmp.path().join("tmp"),
+        &tmp.path().join("tool-cache"),
+        "test-runner",
+        "owner/repo",
+    )
+    .unwrap();
+    let masks = Arc::new(tokio::sync::RwLock::new(Vec::new()));
+    let (log_tx, _log_rx) = tokio::sync::mpsc::channel(32);
+    let log_sender = LogSender::new_for_test(log_tx, Arc::clone(&masks));
+    let mut job_state = JobState::new(masks, HashMap::new(), serde_json::json!({}));
+    let env = HashMap::new();
+    let args = vec!["-c".to_string(), "sleep 30".to_string()];
+    let params = RunDockerParams {
+        docker,
+        image,
+        pull_if_missing: false,
+        deadline: Instant::now() + Duration::from_secs(30),
+        entrypoint: Some("/bin/sh"),
+        args: &args,
+        env: &env,
+        job_state: &mut job_state,
+        workspace: &workspace,
+        log_sender: &log_sender,
+        cancel_token,
+        docker_resources: None,
+    };
+
+    match launch_path {
+        EngineTestLaunchPath::FullLifecycle => {
+            run_docker_container_with_name(params, container_name).await
+        }
+        EngineTestLaunchPath::ReadyImage => {
+            launch_ready_action_container(params, container_name).await
+        }
+    }
+}
+
+async fn assert_engine_container_absent(docker: &Docker, container_name: &str) {
+    assert!(matches!(
+        docker.inspect_container(container_name, None).await,
+        Err(bollard::errors::Error::DockerResponseServerError {
+            status_code: 404,
+            ..
+        })
+    ));
+}
+
+#[tokio::test]
+#[ignore]
+async fn cancellation_immediately_before_create_does_not_create_container() {
+    let docker = crate::docker::client::connect(None).unwrap();
+    crate::docker::client::ensure_image(&docker, "alpine:3.19", None)
+        .await
+        .unwrap();
+    let container_name = format!(
+        "chimera-test-before-create-{}",
+        uuid::Uuid::new_v4().simple()
+    );
+    let cancel = CancellationToken::new();
+    cancel.cancel();
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(4),
+        run_engine_test_container(
+            &docker,
+            "alpine:3.19",
+            &container_name,
+            &cancel,
+            EngineTestLaunchPath::ReadyImage,
+        ),
+    )
+    .await
+    .expect("pre-create cancellation and cleanup must be bounded")
+    .unwrap();
+
+    assert_eq!(result.conclusion, StepConclusion::Cancelled);
+    assert_engine_container_absent(&docker, &container_name).await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn cancellation_at_engine_create_event_removes_container() {
+    let docker = crate::docker::client::connect(None).unwrap();
+    crate::docker::client::ensure_image(&docker, "alpine:3.19", None)
+        .await
+        .unwrap();
+    let container_name = format!(
+        "chimera-test-create-event-{}",
+        uuid::Uuid::new_v4().simple()
+    );
+    let cancel = CancellationToken::new();
+    let cancel_on_event = cancel.clone();
+    let event_docker = docker.clone();
+    let event_container_name = container_name.clone();
+    let event_task = tokio::spawn(async move {
+        let mut events = event_docker.events(Some(bollard::system::EventsOptions {
+            since: None,
+            until: None,
+            filters: HashMap::from([
+                ("type".to_string(), vec!["container".to_string()]),
+                ("container".to_string(), vec![event_container_name.clone()]),
+                (
+                    "event".to_string(),
+                    vec!["create".to_string(), "start".to_string()],
+                ),
+            ]),
+        }));
+        let event = tokio::time::timeout(Duration::from_secs(10), events.next())
+            .await
+            .expect("Docker create/start event must arrive")
+            .expect("Docker event stream ended")
+            .unwrap();
+        assert!(matches!(event.action.as_deref(), Some("create" | "start")));
+        cancel_on_event.cancel();
+    });
+    tokio::task::yield_now().await;
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(15),
+        run_engine_test_container(
+            &docker,
+            "alpine:3.19",
+            &container_name,
+            &cancel,
+            EngineTestLaunchPath::ReadyImage,
+        ),
+    )
+    .await
+    .expect("create/start cancellation and cleanup must be bounded")
+    .unwrap();
+    event_task.await.unwrap();
+
+    assert_eq!(result.conclusion, StepConclusion::Cancelled);
+    assert_engine_container_absent(&docker, &container_name).await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn cancellation_after_build_publication_does_not_launch_container() {
+    let docker = crate::docker::client::connect(None).unwrap();
+    crate::docker::client::ensure_image(&docker, "alpine:3.19", None)
+        .await
+        .unwrap();
+    let action = tempfile::tempdir().unwrap();
+    std::fs::write(
+        action.path().join("Dockerfile"),
+        "FROM alpine:3.19\nRUN true\n",
+    )
+    .unwrap();
+    let action_dir = TrustedActionDirectory::resolve(action.path(), Path::new(".")).unwrap();
+    let masks = Arc::new(tokio::sync::RwLock::new(Vec::new()));
+    let (log_tx, _log_rx) = tokio::sync::mpsc::channel(64);
+    let log_sender = LogSender::new_for_test(log_tx, masks);
+    let builder = DockerActionBuilder::new();
+    let scope = DockerBuildScope::new(
+        "test-runner",
+        format!("test/post-publication-{}", uuid::Uuid::new_v4()),
+    );
+    let built = builder
+        .build(DockerBuildRequest {
+            docker: &docker,
+            action_dir: &action_dir,
+            dockerfile: "Dockerfile",
+            scope: &scope,
+            registry_auth: None,
+            log_sender: &log_sender,
+            cancel_token: &CancellationToken::new(),
+            deadline: Instant::now() + Duration::from_secs(120),
+            reuse: None,
+        })
+        .await
+        .unwrap();
+    let DockerBuildOutcome::Ready(image) = built else {
+        panic!("expected published Docker action image");
+    };
+    let container_name = format!(
+        "chimera-test-post-publication-{}",
+        uuid::Uuid::new_v4().simple()
+    );
+    let cancel = CancellationToken::new();
+    cancel.cancel();
+
+    let result = run_engine_test_container(
+        &docker,
+        &image.image_id,
+        &container_name,
+        &cancel,
+        EngineTestLaunchPath::FullLifecycle,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(result.conclusion, StepConclusion::Cancelled);
+    assert_engine_container_absent(&docker, &container_name).await;
+}
 
 // ── split_shell_args ────────────────────────────────────────────
 
@@ -67,42 +387,192 @@ fn make_docker_metadata(image: &str) -> ActionMetadata {
 }
 
 #[test]
-fn resolve_image_strips_docker_prefix() {
-    let m = make_docker_metadata("docker://node:18");
-    assert_eq!(resolve_image(&m).unwrap(), "node:18");
+fn metadata_image_classifies_dockerfile_and_prebuilt_references() {
+    assert!(matches!(
+        resolve_metadata_image(&make_docker_metadata("Dockerfile")).unwrap(),
+        MetadataImage::Dockerfile("Dockerfile")
+    ));
+    assert!(matches!(
+        resolve_metadata_image(&make_docker_metadata("docker/build/Dockerfile")).unwrap(),
+        MetadataImage::Dockerfile("docker/build/Dockerfile")
+    ));
+    assert!(matches!(
+        resolve_metadata_image(&make_docker_metadata("docker://alpine:3.19")).unwrap(),
+        MetadataImage::Prebuilt("alpine:3.19")
+    ));
+    assert!(matches!(
+        resolve_metadata_image(&make_docker_metadata("docker://example/Dockerfile")).unwrap(),
+        MetadataImage::Prebuilt("example/Dockerfile")
+    ));
+    assert!(matches!(
+        resolve_metadata_image(&make_docker_metadata("ghcr.io/owner/image:v1")).unwrap(),
+        MetadataImage::Prebuilt("ghcr.io/owner/image:v1")
+    ));
+}
 
-    let m = make_docker_metadata("docker://alpine:latest");
-    assert_eq!(resolve_image(&m).unwrap(), "alpine:latest");
+// ── trace_docker_metadata_action ────────────────────────────────
+
+const TRACE_ARG_VALUE_SENTINEL: &str = "sentinel-arg-value-never-trace";
+
+/// Resolve args the way the real caller does, so the sentinel value is
+/// genuinely part of the resolved arguments a caller holds at trace time.
+fn sentinel_resolved_args() -> Vec<String> {
+    let (_temp, workspace) = action_workspace();
+    let state = action_job_state();
+    let step = docker_action_step(Some(HashMap::from([(
+        "SENTINEL_ARG".to_string(),
+        TRACE_ARG_VALUE_SENTINEL.to_string(),
+    )])));
+    let raw_args = vec!["${{ env.SENTINEL_ARG }}".to_string()];
+    let base_env = HashMap::new();
+
+    let (_env, resolved_args) = build_metadata_action_env(
+        &make_docker_metadata("alpine:3.19"),
+        "main",
+        &raw_args,
+        &step,
+        &state,
+        &workspace,
+        &base_env,
+    )
+    .unwrap();
+
+    assert_eq!(
+        resolved_args,
+        vec![TRACE_ARG_VALUE_SENTINEL.to_string()],
+        "arrange must produce the sentinel in the resolved args"
+    );
+    resolved_args
+}
+
+fn capture_docker_metadata_trace(
+    selected_image: &SelectedDockerImage,
+    entry_point: &str,
+    entrypoint: &Option<String>,
+    resolved_arg_count: usize,
+) -> String {
+    let captured_output = Arc::new(Mutex::new(Vec::new()));
+    let writer_output = Arc::clone(&captured_output);
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .without_time()
+        .with_ansi(false)
+        .with_target(false)
+        .with_writer(move || TraceWriter(Arc::clone(&writer_output)))
+        .finish();
+    tracing::subscriber::with_default(subscriber, || {
+        trace_docker_metadata_action(selected_image, entry_point, entrypoint, resolved_arg_count);
+    });
+    String::from_utf8(captured_output.lock().unwrap().clone()).unwrap()
 }
 
 #[test]
-fn resolve_image_no_prefix() {
-    let m = make_docker_metadata("node:18");
-    assert_eq!(resolve_image(&m).unwrap(), "node:18");
+fn built_image_trace_omits_arg_values_and_local_id() {
+    const SENTINEL_IMAGE_ID: &str = "sha256:sentinel-built-image-id";
+    let resolved_args = sentinel_resolved_args();
+    let selected_image = SelectedDockerImage::Built(SENTINEL_IMAGE_ID.to_string());
+    let entrypoint: Option<String> = None;
 
-    let m = make_docker_metadata("alpine");
-    assert_eq!(resolve_image(&m).unwrap(), "alpine");
+    let captured =
+        capture_docker_metadata_trace(&selected_image, "main", &entrypoint, resolved_args.len());
+
+    assert!(!captured.contains(SENTINEL_IMAGE_ID), "{captured}");
+    assert!(!captured.contains(TRACE_ARG_VALUE_SENTINEL), "{captured}");
+    assert!(captured.contains("image_source=\"built\""), "{captured}");
+    assert!(
+        captured.contains("resolved_arg_count=1"),
+        "resolved argument count must be traced: {captured}"
+    );
 }
 
 #[test]
-fn resolve_image_dockerfile_error() {
-    let m = make_docker_metadata("Dockerfile");
-    let err = resolve_image(&m).unwrap_err();
-    assert!(err.to_string().contains("Dockerfile"));
-    assert!(err.to_string().contains("not supported"));
+fn prebuilt_image_trace_omits_arg_values_and_keeps_reference() {
+    const IMAGE_REFERENCE: &str = "ghcr.io/owner/safe-action:v1";
+    let resolved_args = sentinel_resolved_args();
+    let selected_image = SelectedDockerImage::Prebuilt(IMAGE_REFERENCE.to_string());
+    let entrypoint: Option<String> = None;
+
+    let captured =
+        capture_docker_metadata_trace(&selected_image, "main", &entrypoint, resolved_args.len());
+
+    assert!(!captured.contains(TRACE_ARG_VALUE_SENTINEL), "{captured}");
+    assert!(captured.contains(IMAGE_REFERENCE), "{captured}");
+    assert!(captured.contains("image_source=\"prebuilt\""), "{captured}");
+    assert!(
+        captured.contains("resolved_arg_count=1"),
+        "resolved argument count must be traced: {captured}"
+    );
 }
 
-#[test]
-fn resolve_image_path_dockerfile_error() {
-    let m = make_docker_metadata("path/to/Dockerfile");
-    let err = resolve_image(&m).unwrap_err();
-    assert!(err.to_string().contains("not supported"));
+// ── run_docker_metadata_action ──────────────────────────────────
+
+fn test_docker_config(tmp: &tempfile::TempDir) -> crate::job::docker_config::JobDockerConfig {
+    let root = JobResourceRoot::prepare(&tmp.path().join("job-resources")).unwrap();
+    root.create_docker_config().unwrap()
 }
 
-#[test]
-fn resolve_image_registry_with_prefix() {
-    let m = make_docker_metadata("docker://ghcr.io/owner/image:v1");
-    assert_eq!(resolve_image(&m).unwrap(), "ghcr.io/owner/image:v1");
+#[tokio::test]
+async fn build_timeout_log_send_never_blocks_on_a_full_log_channel() {
+    let action = tempfile::tempdir().unwrap();
+    std::fs::write(
+        action.path().join("action.yml"),
+        "name: dockerfile-action\nruns:\n  using: docker\n  image: Dockerfile\n",
+    )
+    .unwrap();
+    std::fs::write(action.path().join("Dockerfile"), "FROM alpine:3.19\n").unwrap();
+    let action_dir = TrustedActionDirectory::resolve(action.path(), Path::new(".")).unwrap();
+    let (_work_temp, workspace) = action_workspace();
+    let mut job_state = action_job_state();
+    let step = docker_action_step(None);
+    let metadata = make_docker_metadata("Dockerfile");
+
+    // A capacity-1 channel already holding one line has no room for the
+    // timeout notice, and nothing drains it for the lifetime of the test.
+    let masks = Arc::new(tokio::sync::RwLock::new(Vec::new()));
+    let (log_tx, _log_rx) = tokio::sync::mpsc::channel(1);
+    let log_sender = LogSender::new_for_test(log_tx, Arc::clone(&masks));
+    log_sender.send("filler line".into()).await;
+
+    let docker_action_builder = DockerActionBuilder::new();
+    let docker_build_scope = DockerBuildScope::new("test-runner", "test/timeout-notice");
+    let base_env = HashMap::new();
+    let resources = tempfile::tempdir().unwrap();
+    let docker_config = test_docker_config(&resources);
+    let node_runtimes = crate::node::NodeRuntimes::single("node".into());
+    // An HTTP-transport client never dials until a request is made, so the
+    // expired-deadline short-circuit is under test, not daemon reachability.
+    let docker = Docker::connect_with_http("127.0.0.1:9", 120, bollard::API_DEFAULT_VERSION)
+        .expect("lazy HTTP docker client must construct without a daemon");
+    let docker_resources = JobDockerResources::new(docker);
+    let execution =
+        JobExecutionContext::new(&docker_config, Some(&docker_resources), &node_runtimes);
+    let deadline = Instant::now() - Duration::from_secs(1);
+    let cancel_token = CancellationToken::new();
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(2),
+        run_docker_metadata_action(
+            &action_dir,
+            &metadata,
+            "main",
+            &step,
+            &mut job_state,
+            &workspace,
+            &base_env,
+            &log_sender,
+            &docker_action_builder,
+            &docker_build_scope,
+            None,
+            deadline,
+            &cancel_token,
+            &execution,
+        ),
+    )
+    .await
+    .expect("timeout notice must not wait for log channel capacity")
+    .unwrap();
+
+    assert_eq!(result.conclusion, StepConclusion::Failed);
 }
 
 #[test]
@@ -126,7 +596,7 @@ fn resolve_image_missing_field() {
             env: None,
         },
     };
-    assert!(resolve_image(&m).is_err());
+    assert!(resolve_metadata_image(&m).is_err());
 }
 
 // ── resolve_entry_point ─────────────────────────────────────────
@@ -388,4 +858,234 @@ fn docker_action_env_drops_github_env_docker_config() {
     let env = build_docker_action_env(&step, &state, &workspace, &base).unwrap();
 
     assert!(!env.contains_key(DOCKER_CONFIG_ENV));
+}
+
+#[test]
+fn docker_action_binds_never_mount_the_action_directory() {
+    let (_temp, workspace) = action_workspace();
+
+    let binds = build_bind_mounts(&workspace).unwrap();
+
+    // The action directory reaches the container only through the
+    // descriptor-pinned build context; no runtime bind may expose it (a
+    // pathname bind would reopen the root-swap TOCTOU window, and runc
+    // engines reject /proc/<pid>/fd bind sources cross-process).
+    assert_eq!(binds.len(), 3);
+    assert!(
+        binds
+            .iter()
+            .any(|bind| bind.ends_with(":/github/workspace"))
+    );
+    assert!(binds.iter().any(|bind| bind.ends_with(":/github/workflow")));
+    assert!(binds.iter().any(|bind| bind.ends_with(":/github/tmp")));
+    assert!(!binds.iter().any(|bind| bind.contains("/github/action")));
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[ignore]
+async fn engine_action_contents_come_from_pinned_context_after_root_replacement() {
+    use crate::job::action::{ActionCache, ActionSource};
+
+    let docker = crate::docker::client::connect(None).unwrap();
+    crate::docker::client::ping(&docker).await.unwrap();
+    crate::docker::client::ensure_image(&docker, "alpine:3.19", None)
+        .await
+        .unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let source_root = tmp.path().join("source");
+    let action_dir = source_root.join("actions/test");
+    std::fs::create_dir_all(&action_dir).unwrap();
+    std::fs::write(action_dir.join("sentinel"), "original").unwrap();
+    std::fs::write(
+        action_dir.join("Dockerfile"),
+        "FROM alpine:3.19\nCOPY sentinel /baked/sentinel\n",
+    )
+    .unwrap();
+    let cache = ActionCache::new(tmp.path().join("cache"), reqwest::Client::new());
+    let source = ActionSource::Local {
+        path: "actions/test".into(),
+    };
+    let trusted = cache
+        .get_action(&source, &source_root, "fake-token")
+        .await
+        .unwrap();
+    let workspace = Workspace::create(
+        &tmp.path().join("work"),
+        &tmp.path().join("runner-temp"),
+        &tmp.path().join("tool-cache"),
+        "runner",
+        "owner/repo",
+    )
+    .unwrap();
+
+    // Swap the pathname out from under the resolved capability before the
+    // build: the context must still be prepared from the pinned descriptors.
+    std::fs::rename(&source_root, tmp.path().join("original-source")).unwrap();
+    std::fs::create_dir_all(&action_dir).unwrap();
+    std::fs::write(action_dir.join("sentinel"), "replacement-canary").unwrap();
+    std::fs::write(
+        action_dir.join("Dockerfile"),
+        "FROM alpine:3.19\nCOPY sentinel /baked/sentinel\n",
+    )
+    .unwrap();
+
+    let masks = Arc::new(tokio::sync::RwLock::new(Vec::new()));
+    let (log_tx, _log_rx) = tokio::sync::mpsc::channel(32);
+    let log_sender = LogSender::new_for_test(log_tx, Arc::clone(&masks));
+    let mut job_state = JobState::new(masks, HashMap::new(), serde_json::json!({}));
+
+    let builder = DockerActionBuilder::new();
+    let scope = DockerBuildScope::new(
+        "test-runner",
+        format!("test/context-swap-{}", uuid::Uuid::new_v4()),
+    );
+    let outcome = builder
+        .build(DockerBuildRequest {
+            docker: &docker,
+            action_dir: &trusted,
+            dockerfile: "Dockerfile",
+            scope: &scope,
+            registry_auth: None,
+            log_sender: &log_sender,
+            cancel_token: &CancellationToken::new(),
+            deadline: Instant::now() + Duration::from_secs(120),
+            reuse: None,
+        })
+        .await
+        .unwrap();
+    let DockerBuildOutcome::Ready(built) = outcome else {
+        panic!("expected the pinned-context build to succeed");
+    };
+
+    // The run path mounts no action directory; the container must observe
+    // only what the pinned context baked into the image.
+    let env = HashMap::new();
+    let args = vec![
+        "-c".to_string(),
+        "test \"$(cat /baked/sentinel)\" = original".to_string(),
+    ];
+    let result = run_docker_container(RunDockerParams {
+        docker: &docker,
+        image: &built.image_id,
+        pull_if_missing: false,
+        deadline: Instant::now() + Duration::from_secs(30),
+        entrypoint: Some("/bin/sh"),
+        args: &args,
+        env: &env,
+        job_state: &mut job_state,
+        workspace: &workspace,
+        log_sender: &log_sender,
+        cancel_token: &CancellationToken::new(),
+        docker_resources: None,
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(result.conclusion, StepConclusion::Succeeded);
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[ignore]
+async fn engine_action_contents_come_from_pinned_context_after_symlink_root_replacement() {
+    use std::os::unix::fs::symlink;
+
+    use crate::job::action::{ActionCache, ActionSource};
+
+    let docker = crate::docker::client::connect(None).unwrap();
+    crate::docker::client::ping(&docker).await.unwrap();
+    crate::docker::client::ensure_image(&docker, "alpine:3.19", None)
+        .await
+        .unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let source_root = tmp.path().join("source");
+    let action_dir = source_root.join("actions/test");
+    std::fs::create_dir_all(&action_dir).unwrap();
+    std::fs::write(action_dir.join("sentinel"), "original").unwrap();
+    std::fs::write(
+        action_dir.join("Dockerfile"),
+        "FROM alpine:3.19\nCOPY sentinel /baked/sentinel\n",
+    )
+    .unwrap();
+    let cache = ActionCache::new(tmp.path().join("cache"), reqwest::Client::new());
+    let source = ActionSource::Local {
+        path: "actions/test".into(),
+    };
+    let trusted = cache
+        .get_action(&source, &source_root, "fake-token")
+        .await
+        .unwrap();
+    let workspace = Workspace::create(
+        &tmp.path().join("work"),
+        &tmp.path().join("runner-temp"),
+        &tmp.path().join("tool-cache"),
+        "runner",
+        "owner/repo",
+    )
+    .unwrap();
+
+    std::fs::rename(&source_root, tmp.path().join("original-source")).unwrap();
+    let replacement = tmp.path().join("replacement-source");
+    let replacement_action = replacement.join("actions/test");
+    std::fs::create_dir_all(&replacement_action).unwrap();
+    std::fs::write(replacement_action.join("sentinel"), "replacement-canary").unwrap();
+    std::fs::write(
+        replacement_action.join("Dockerfile"),
+        "FROM alpine:3.19\nCOPY sentinel /baked/sentinel\n",
+    )
+    .unwrap();
+    symlink(&replacement, &source_root).unwrap();
+
+    let masks = Arc::new(tokio::sync::RwLock::new(Vec::new()));
+    let (log_tx, _log_rx) = tokio::sync::mpsc::channel(32);
+    let log_sender = LogSender::new_for_test(log_tx, Arc::clone(&masks));
+    let mut job_state = JobState::new(masks, HashMap::new(), serde_json::json!({}));
+
+    let builder = DockerActionBuilder::new();
+    let scope = DockerBuildScope::new(
+        "test-runner",
+        format!("test/context-symlink-swap-{}", uuid::Uuid::new_v4()),
+    );
+    let outcome = builder
+        .build(DockerBuildRequest {
+            docker: &docker,
+            action_dir: &trusted,
+            dockerfile: "Dockerfile",
+            scope: &scope,
+            registry_auth: None,
+            log_sender: &log_sender,
+            cancel_token: &CancellationToken::new(),
+            deadline: Instant::now() + Duration::from_secs(120),
+            reuse: None,
+        })
+        .await
+        .unwrap();
+    let DockerBuildOutcome::Ready(built) = outcome else {
+        panic!("expected the pinned-context build to succeed");
+    };
+
+    let env = HashMap::new();
+    let args = vec![
+        "-c".to_string(),
+        "test \"$(cat /baked/sentinel)\" = original".to_string(),
+    ];
+    let result = run_docker_container(RunDockerParams {
+        docker: &docker,
+        image: &built.image_id,
+        pull_if_missing: false,
+        deadline: Instant::now() + Duration::from_secs(30),
+        entrypoint: Some("/bin/sh"),
+        args: &args,
+        env: &env,
+        job_state: &mut job_state,
+        workspace: &workspace,
+        log_sender: &log_sender,
+        cancel_token: &CancellationToken::new(),
+        docker_resources: None,
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(result.conclusion, StepConclusion::Succeeded);
 }

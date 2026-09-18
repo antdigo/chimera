@@ -1,7 +1,37 @@
 use super::*;
+use crate::job::action::{ActionCache, ActionSource, TrustedActionDirectory};
 
-#[test]
-fn parse_node_action() {
+async fn trust_action_root(root: &std::path::Path) -> TrustedActionDirectory {
+    let cache = ActionCache::new(root.join("cache"), reqwest::Client::new());
+    cache
+        .get_action(
+            &ActionSource::Local { path: ".".into() },
+            root,
+            "fake-token",
+        )
+        .await
+        .unwrap()
+}
+
+async fn resolve_test_action(
+    tmp: &tempfile::TempDir,
+) -> (std::path::PathBuf, TrustedActionDirectory) {
+    let workspace = tmp.path().join("workspace");
+    let action_dir = workspace.join("actions/test");
+    std::fs::create_dir_all(&action_dir).unwrap();
+    let cache = ActionCache::new(tmp.path().join("cache"), reqwest::Client::new());
+    let source = ActionSource::Local {
+        path: "actions/test".into(),
+    };
+    let resolved = cache
+        .get_action(&source, &workspace, "fake-token")
+        .await
+        .unwrap();
+    (workspace, resolved)
+}
+
+#[tokio::test]
+async fn parse_node_action() {
     let tmp = tempfile::tempdir().unwrap();
     std::fs::write(
         tmp.path().join("action.yml"),
@@ -27,7 +57,8 @@ runs:
     )
     .unwrap();
 
-    let metadata = load_action_metadata(tmp.path()).unwrap();
+    let trusted = trust_action_root(tmp.path()).await;
+    let metadata = load_action_metadata(&trusted).unwrap();
     assert_eq!(metadata.name.as_deref(), Some("Test Action"));
     assert!(metadata.runs.is_node());
     assert!(!metadata.runs.is_composite());
@@ -41,8 +72,8 @@ runs:
     assert_eq!(token_input.default.as_deref(), Some("${{ github.token }}"));
 }
 
-#[test]
-fn parse_composite_action() {
+#[tokio::test]
+async fn parse_composite_action() {
     let tmp = tempfile::tempdir().unwrap();
     std::fs::write(
         tmp.path().join("action.yml"),
@@ -59,15 +90,16 @@ runs:
     )
     .unwrap();
 
-    let metadata = load_action_metadata(tmp.path()).unwrap();
+    let trusted = trust_action_root(tmp.path()).await;
+    let metadata = load_action_metadata(&trusted).unwrap();
     assert!(metadata.runs.is_composite());
     assert!(!metadata.runs.is_node());
     assert!(metadata.runs.steps.is_some());
     assert_eq!(metadata.runs.steps.as_ref().unwrap().len(), 2);
 }
 
-#[test]
-fn parse_docker_action() {
+#[tokio::test]
+async fn parse_docker_action() {
     let tmp = tempfile::tempdir().unwrap();
     std::fs::write(
         tmp.path().join("action.yml"),
@@ -80,13 +112,14 @@ runs:
     )
     .unwrap();
 
-    let metadata = load_action_metadata(tmp.path()).unwrap();
+    let trusted = trust_action_root(tmp.path()).await;
+    let metadata = load_action_metadata(&trusted).unwrap();
     assert!(metadata.runs.is_docker());
     assert_eq!(metadata.runs.image.as_deref(), Some("Dockerfile"));
 }
 
-#[test]
-fn parse_docker_action_full_fields() {
+#[tokio::test]
+async fn parse_docker_action_full_fields() {
     let tmp = tempfile::tempdir().unwrap();
     std::fs::write(
         tmp.path().join("action.yml"),
@@ -112,7 +145,8 @@ runs:
     )
     .unwrap();
 
-    let metadata = load_action_metadata(tmp.path()).unwrap();
+    let trusted = trust_action_root(tmp.path()).await;
+    let metadata = load_action_metadata(&trusted).unwrap();
     assert!(metadata.runs.is_docker());
     assert_eq!(
         metadata.runs.image.as_deref(),
@@ -131,8 +165,8 @@ runs:
     assert_eq!(env.get("ANOTHER").unwrap(), "world");
 }
 
-#[test]
-fn parse_docker_action_minimal() {
+#[tokio::test]
+async fn parse_docker_action_minimal() {
     let tmp = tempfile::tempdir().unwrap();
     std::fs::write(
         tmp.path().join("action.yml"),
@@ -145,7 +179,8 @@ runs:
     )
     .unwrap();
 
-    let metadata = load_action_metadata(tmp.path()).unwrap();
+    let trusted = trust_action_root(tmp.path()).await;
+    let metadata = load_action_metadata(&trusted).unwrap();
     assert!(metadata.runs.is_docker());
     assert_eq!(metadata.runs.image.as_deref(), Some("alpine:latest"));
     assert!(metadata.runs.entrypoint.is_none());
@@ -155,8 +190,8 @@ runs:
     assert!(metadata.runs.env.is_none());
 }
 
-#[test]
-fn inputs_with_defaults() {
+#[tokio::test]
+async fn inputs_with_defaults() {
     let tmp = tempfile::tempdir().unwrap();
     std::fs::write(
         tmp.path().join("action.yml"),
@@ -174,7 +209,8 @@ runs:
     )
     .unwrap();
 
-    let metadata = load_action_metadata(tmp.path()).unwrap();
+    let trusted = trust_action_root(tmp.path()).await;
+    let metadata = load_action_metadata(&trusted).unwrap();
     assert_eq!(
         metadata.inputs["flavor"].default.as_deref(),
         Some("vanilla")
@@ -182,8 +218,8 @@ runs:
     assert!(metadata.inputs["size"].default.is_none());
 }
 
-#[test]
-fn pre_and_post_scripts() {
+#[tokio::test]
+async fn pre_and_post_scripts() {
     let tmp = tempfile::tempdir().unwrap();
     std::fs::write(
         tmp.path().join("action.yml"),
@@ -200,7 +236,8 @@ runs:
     )
     .unwrap();
 
-    let metadata = load_action_metadata(tmp.path()).unwrap();
+    let trusted = trust_action_root(tmp.path()).await;
+    let metadata = load_action_metadata(&trusted).unwrap();
     assert_eq!(metadata.runs.pre.as_deref(), Some("dist/pre.js"));
     assert_eq!(metadata.runs.pre_if.as_deref(), Some("always()"));
     assert_eq!(metadata.runs.main.as_deref(), Some("dist/main.js"));
@@ -208,16 +245,17 @@ runs:
     assert_eq!(metadata.runs.post_if.as_deref(), Some("success()"));
 }
 
-#[test]
-fn missing_file_returns_error() {
+#[tokio::test]
+async fn missing_file_returns_error() {
     let tmp = tempfile::tempdir().unwrap();
-    let result = load_action_metadata(tmp.path());
+    let trusted = trust_action_root(tmp.path()).await;
+    let result = load_action_metadata(&trusted);
     assert!(result.is_err());
     assert!(result.unwrap_err().to_string().contains("no action.yml"));
 }
 
-#[test]
-fn yaml_alternative_extension() {
+#[tokio::test]
+async fn yaml_alternative_extension() {
     let tmp = tempfile::tempdir().unwrap();
     std::fs::write(
         tmp.path().join("action.yaml"),
@@ -230,7 +268,191 @@ runs:
     )
     .unwrap();
 
-    let metadata = load_action_metadata(tmp.path()).unwrap();
+    let trusted = trust_action_root(tmp.path()).await;
+    let metadata = load_action_metadata(&trusted).unwrap();
     assert_eq!(metadata.name.as_deref(), Some("YAML Extension"));
     assert!(metadata.runs.is_node());
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn trusted_metadata_keeps_reading_original_action_after_source_root_replacement() {
+    let tmp = tempfile::tempdir().unwrap();
+    let workspace = tmp.path().join("workspace");
+    let action_dir = workspace.join("actions/test");
+    std::fs::create_dir_all(&action_dir).unwrap();
+    std::fs::write(
+        action_dir.join("action.yml"),
+        "name: original\nruns:\n  using: node20\n  main: index.js\n",
+    )
+    .unwrap();
+    let cache = ActionCache::new(tmp.path().join("cache"), reqwest::Client::new());
+    let source = ActionSource::Local {
+        path: "actions/test".into(),
+    };
+    let trusted = cache
+        .get_action(&source, &workspace, "fake-token")
+        .await
+        .unwrap();
+
+    std::fs::rename(&workspace, tmp.path().join("original-workspace")).unwrap();
+    std::fs::create_dir_all(&action_dir).unwrap();
+    std::fs::write(
+        action_dir.join("action.yml"),
+        "name: replacement-canary\nruns:\n  using: node20\n  main: canary.js\n",
+    )
+    .unwrap();
+
+    let metadata = load_action_metadata(&trusted).unwrap();
+
+    assert_eq!(metadata.name.as_deref(), Some("original"));
+    assert_eq!(metadata.runs.main.as_deref(), Some("index.js"));
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+#[tokio::test]
+async fn trusted_metadata_fails_closed_after_source_root_replacement() {
+    let tmp = tempfile::tempdir().unwrap();
+    let workspace = tmp.path().join("workspace");
+    let action_dir = workspace.join("actions/test");
+    std::fs::create_dir_all(&action_dir).unwrap();
+    std::fs::write(
+        action_dir.join("action.yml"),
+        "name: original\nruns:\n  using: node20\n  main: index.js\n",
+    )
+    .unwrap();
+    let cache = ActionCache::new(tmp.path().join("cache"), reqwest::Client::new());
+    let source = ActionSource::Local {
+        path: "actions/test".into(),
+    };
+    let trusted = cache
+        .get_action(&source, &workspace, "fake-token")
+        .await
+        .unwrap();
+
+    std::fs::rename(&workspace, tmp.path().join("original-workspace")).unwrap();
+    std::fs::create_dir_all(&action_dir).unwrap();
+    std::fs::write(
+        action_dir.join("action.yml"),
+        "name: replacement-canary\nruns:\n  using: node20\n  main: canary.js\n",
+    )
+    .unwrap();
+
+    let error = load_action_metadata(&trusted).unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("action directory changed after it was resolved"),
+        "{error:#}"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn trusted_metadata_keeps_reading_original_action_after_symlink_root_replacement() {
+    use std::os::unix::fs::symlink;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let workspace = tmp.path().join("workspace");
+    let action_dir = workspace.join("actions/test");
+    std::fs::create_dir_all(&action_dir).unwrap();
+    std::fs::write(
+        action_dir.join("action.yml"),
+        "name: original\nruns:\n  using: node20\n  main: index.js\n",
+    )
+    .unwrap();
+    let cache = ActionCache::new(tmp.path().join("cache"), reqwest::Client::new());
+    let source = ActionSource::Local {
+        path: "actions/test".into(),
+    };
+    let trusted = cache
+        .get_action(&source, &workspace, "fake-token")
+        .await
+        .unwrap();
+
+    std::fs::rename(&workspace, tmp.path().join("original-workspace")).unwrap();
+    let replacement = tmp.path().join("replacement-workspace");
+    let replacement_action = replacement.join("actions/test");
+    std::fs::create_dir_all(&replacement_action).unwrap();
+    std::fs::write(
+        replacement_action.join("action.yml"),
+        "name: replacement-canary\nruns:\n  using: node20\n  main: canary.js\n",
+    )
+    .unwrap();
+    symlink(&replacement, &workspace).unwrap();
+
+    let metadata = load_action_metadata(&trusted).unwrap();
+
+    assert_eq!(metadata.name.as_deref(), Some("original"));
+    assert_eq!(metadata.runs.main.as_deref(), Some("index.js"));
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+#[tokio::test]
+async fn trusted_metadata_fails_closed_after_symlink_root_replacement() {
+    use std::os::unix::fs::symlink;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let workspace = tmp.path().join("workspace");
+    let action_dir = workspace.join("actions/test");
+    std::fs::create_dir_all(&action_dir).unwrap();
+    std::fs::write(
+        action_dir.join("action.yml"),
+        "name: original\nruns:\n  using: node20\n  main: index.js\n",
+    )
+    .unwrap();
+    let cache = ActionCache::new(tmp.path().join("cache"), reqwest::Client::new());
+    let source = ActionSource::Local {
+        path: "actions/test".into(),
+    };
+    let trusted = cache
+        .get_action(&source, &workspace, "fake-token")
+        .await
+        .unwrap();
+
+    std::fs::rename(&workspace, tmp.path().join("original-workspace")).unwrap();
+    let replacement = tmp.path().join("replacement-workspace");
+    let replacement_action = replacement.join("actions/test");
+    std::fs::create_dir_all(&replacement_action).unwrap();
+    std::fs::write(
+        replacement_action.join("action.yml"),
+        "name: replacement-canary\nruns:\n  using: node20\n  main: canary.js\n",
+    )
+    .unwrap();
+    symlink(&replacement, &workspace).unwrap();
+
+    let error = load_action_metadata(&trusted).unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("action directory changed after it was resolved"),
+        "{error:#}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn action_metadata_symlink_is_rejected_without_following_it() {
+    use std::os::unix::fs::symlink;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let outside = tmp.path().join("outside.yml");
+    std::fs::write(
+        &outside,
+        "name: canary\nruns:\n  using: node20\n  main: canary.js\n",
+    )
+    .unwrap();
+    let (_workspace, trusted) = resolve_test_action(&tmp).await;
+    symlink(&outside, trusted.path().join("action.yml")).unwrap();
+
+    let error = load_action_metadata(&trusted).unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("action metadata must be a regular file"),
+        "{error:#}"
+    );
 }

@@ -1,14 +1,15 @@
 use std::collections::HashMap;
 use std::ffi::OsStr;
-use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
-use super::download::ActionCache;
+use super::download::{ActionCache, TrustedActionDirectory};
 use super::metadata::ActionMetadata;
+use crate::docker::build::{DockerActionBuilder, DockerBuildScope, RegistryAuth};
 use crate::job::docker_config::DOCKER_CONFIG_ENV;
 use crate::job::execute::{
     JobExecutionContext, JobState, StepConclusion, StepResult, build_step_env, run_process,
@@ -28,7 +29,7 @@ fn ykey(s: &str) -> serde_yaml::Value {
 
 #[allow(clippy::too_many_arguments)]
 pub fn run_composite_action<'a>(
-    action_dir: &'a Path,
+    action_dir: &'a TrustedActionDirectory,
     metadata: &'a ActionMetadata,
     step: &'a Step,
     job_state: &'a mut JobState,
@@ -36,8 +37,12 @@ pub fn run_composite_action<'a>(
     base_env: &'a HashMap<String, String>,
     log_sender: &'a LogSender,
     action_cache: &'a ActionCache,
+    docker_action_builder: &'a DockerActionBuilder,
+    docker_build_scope: &'a DockerBuildScope,
+    registry_auth: Option<&'a RegistryAuth>,
     access_token: &'a str,
     depth: u32,
+    deadline: Instant,
     cancel_token: &'a CancellationToken,
     execution: &'a JobExecutionContext<'_>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<StepResult>> + Send + 'a>> {
@@ -50,8 +55,12 @@ pub fn run_composite_action<'a>(
         base_env,
         log_sender,
         action_cache,
+        docker_action_builder,
+        docker_build_scope,
+        registry_auth,
         access_token,
         depth,
+        deadline,
         cancel_token,
         execution,
     ))
@@ -59,7 +68,7 @@ pub fn run_composite_action<'a>(
 
 #[allow(clippy::too_many_arguments)]
 async fn run_composite_action_inner(
-    action_dir: &Path,
+    action_dir: &TrustedActionDirectory,
     metadata: &ActionMetadata,
     step: &Step,
     job_state: &mut JobState,
@@ -67,8 +76,12 @@ async fn run_composite_action_inner(
     base_env: &HashMap<String, String>,
     log_sender: &LogSender,
     action_cache: &ActionCache,
+    docker_action_builder: &DockerActionBuilder,
+    docker_build_scope: &DockerBuildScope,
+    registry_auth: Option<&RegistryAuth>,
     access_token: &str,
     depth: u32,
+    deadline: Instant,
     cancel_token: &CancellationToken,
     execution: &JobExecutionContext<'_>,
 ) -> Result<StepResult> {
@@ -125,7 +138,7 @@ async fn run_composite_action_inner(
 
         debug!(
             composite_step = i,
-            action_dir = %action_dir.display(),
+            action_dir = %action_dir.path().display(),
             "running composite sub-step"
         );
 
@@ -137,9 +150,13 @@ async fn run_composite_action_inner(
                 &composite_env,
                 log_sender,
                 action_cache,
+                docker_action_builder,
+                docker_build_scope,
+                registry_auth,
                 access_token,
                 timeout,
                 depth,
+                deadline,
                 cancel_token,
                 execution,
             )
@@ -298,9 +315,13 @@ async fn run_nested_action(
     env: &HashMap<String, String>,
     log_sender: &LogSender,
     action_cache: &ActionCache,
+    docker_action_builder: &DockerActionBuilder,
+    docker_build_scope: &DockerBuildScope,
+    registry_auth: Option<&RegistryAuth>,
     access_token: &str,
     timeout: Duration,
     depth: u32,
+    deadline: Instant,
     cancel_token: &CancellationToken,
     execution: &JobExecutionContext<'_>,
 ) -> Result<StepResult> {
@@ -358,6 +379,7 @@ async fn run_nested_action(
             workspace,
             env,
             log_sender,
+            deadline,
             cancel_token,
             execution,
         )
@@ -370,8 +392,9 @@ async fn run_nested_action(
     let metadata = super::metadata::load_action_metadata(&action_dir)?;
 
     if metadata.runs.is_node() {
+        action_dir.validate_path_identity()?;
         super::node::run_node_action(
-            &action_dir,
+            action_dir.path(),
             &metadata,
             "main",
             &nested_step,
@@ -384,6 +407,7 @@ async fn run_nested_action(
         )
         .await
     } else if metadata.runs.is_composite() {
+        action_dir.validate_path_identity()?;
         run_composite_action(
             &action_dir,
             &metadata,
@@ -393,8 +417,12 @@ async fn run_nested_action(
             env,
             log_sender,
             action_cache,
+            docker_action_builder,
+            docker_build_scope,
+            registry_auth,
             access_token,
             depth + 1,
+            deadline,
             cancel_token,
             execution,
         )
@@ -409,6 +437,10 @@ async fn run_nested_action(
             workspace,
             env,
             log_sender,
+            docker_action_builder,
+            docker_build_scope,
+            registry_auth,
+            deadline,
             cancel_token,
             execution,
         )

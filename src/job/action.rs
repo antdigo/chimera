@@ -12,7 +12,7 @@ use metadata::ActionMetadata;
 use crate::job::expression::ExprContext;
 use crate::job::schema::Step;
 
-pub use download::ActionCache;
+pub use download::{ActionCache, TrustedActionDirectory};
 pub use metadata::load_action_metadata;
 pub use resolve::{ActionSource, resolve_action};
 

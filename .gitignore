@@ -20,3 +20,6 @@ Thumbs.db
 # Claude Code
 .claude/settings.local.json
 .claude/worktrees/
+
+# macOS Docker test scratch (docs/testing-macos-docker.md)
+/.tmp/

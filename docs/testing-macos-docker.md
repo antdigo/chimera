@@ -227,8 +227,15 @@ docker run -d \
   -e XDG_RUNTIME_DIR=/run/user/1000 \
   -v "$DIND_RUNTIME_VOLUME:/run/user/1000" \
   -v "$DIND_TMP_VOLUME:/chimera-tmp" \
-  "$DIND_IMAGE"
+  "$DIND_IMAGE" \
+  --feature containerd-snapshotter=false
 ```
+
+`--feature containerd-snapshotter=false` selects the classic image store:
+the Dockerfile-action build adapter uses the classic BuilderV1 `/build` path
+(for streamed progress through the masking pipeline), which the containerd
+image store cannot export — on it, builds fail with
+`NotFound: content digest ...`.
 
 `--privileged` applies only to the outer test container. The daemon inside it
 must still report the rootless security marker required by C-10. Wait up to one
@@ -309,7 +316,9 @@ run_in_chimera_test_container docker buildx version
 Pulling an image into Docker Desktop does not make it available to the nested
 rootless daemon. Save the pinned images on the host, load them through the Linux
 CLI connected to the rootless socket, and create the two tags used by the test
-harness:
+harness. The classic image store assigns fresh IDs on load — the digest-pinned
+references do not resolve after loading — so each image is resolved to its
+loaded ID, in save order (registry, httpd, buildkit):
 
 ```bash
 docker save --output "$IMAGE_ARCHIVE" \
@@ -317,14 +326,21 @@ docker save --output "$IMAGE_ARCHIVE" \
   "$HTTPD_IMAGE" \
   "$BUILDKIT_IMAGE"
 
-run_in_chimera_test_container \
-  docker load --input /test-assets/rootless-dind-images.tar
-run_in_chimera_test_container docker tag "$REGISTRY_DIGEST" registry:2
-run_in_chimera_test_container docker tag "$HTTPD_DIGEST" httpd:2.4-alpine
+loaded_ids="$(run_in_chimera_test_container \
+  docker load --input /test-assets/rootless-dind-images.tar)"
+REGISTRY_LOADED_ID="$(printf '%s\n' "$loaded_ids" | sed -n '1s/^Loaded image ID: //p')"
+HTTPD_LOADED_ID="$(printf '%s\n' "$loaded_ids" | sed -n '2s/^Loaded image ID: //p')"
+BUILDKIT_LOADED_ID="$(printf '%s\n' "$loaded_ids" | sed -n '3s/^Loaded image ID: //p')"
+test -n "$REGISTRY_LOADED_ID"
+test -n "$HTTPD_LOADED_ID"
+test -n "$BUILDKIT_LOADED_ID"
+run_in_chimera_test_container docker tag "$REGISTRY_LOADED_ID" registry:2
+run_in_chimera_test_container docker tag "$HTTPD_LOADED_ID" httpd:2.4-alpine
 
 test "$(run_in_chimera_test_container \
-  docker image inspect --format '{{.Id}}' "$BUILDKIT_IMAGE_ID")" \
-  = "$BUILDKIT_IMAGE_ID"
+  docker image inspect --format '{{.Id}}' "$BUILDKIT_LOADED_ID")" \
+  = "$BUILDKIT_LOADED_ID"
+BUILDKIT_IMAGE_ID="$BUILDKIT_LOADED_ID"
 ```
 
 Do not replace `CHIMERA_TEST_BUILDKIT_IMAGE_ID` with a tag. C-10 intentionally
@@ -369,12 +385,27 @@ done
 This is the command that satisfies the repository's Docker verification gate:
 
 ```bash
-run_in_chimera_test_container cargo test --offline -- --ignored
+run_in_chimera_test_container cargo test --offline -- --ignored --test-threads=2
 ```
 
 `--offline` applies to Cargo only. The first full run may still download the
 existing tag-based Docker test images listed in the security section. C-10 may
 also download its three action archives at the exact SHA pins.
+
+Known issue (pre-dates the Dockerfile-actions branch): the C-10 test
+`pinned_buildx_flow_uses_job_config_and_original_socket` fails with
+`HTTP 401 Unauthorized` — the harness requests the pinned public archives from
+api.github.com with the fake job token, which GitHub rejects even for public
+repositories. It was added after the fork's last CI run and had never executed
+before this runbook first reached its binary; fix belongs to the job Docker
+config lineage.
+
+`--test-threads=2` is a macOS-only accommodation: the nested rootless daemon
+builds `linux/amd64` images through QEMU emulation on the arm64 Docker Desktop
+VM, and running every Engine test concurrently makes the daemon fail otherwise
+passing builds with engine-side errors. CI's native amd64 runners need no such
+limit. Individual tests always pass in isolation; do not "fix" the suite by
+weakening assertions.
 
 ## 7. Verify test cleanup
 

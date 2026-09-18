@@ -5,6 +5,7 @@ use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use chimera::job::action::ActionCache;
 
 pub async fn install_pinned_action(
     actions_dir: &Path,
@@ -15,14 +16,6 @@ pub async fn install_pinned_action(
     validate_action_name("owner", owner)?;
     validate_action_name("repository", repo)?;
     validate_commit_sha(sha)?;
-
-    let destination = actions_dir.join(owner).join(repo).join(sha);
-    if path_exists(&destination) {
-        if action_cache_is_ready(&destination)? {
-            return Ok(());
-        }
-        bail!("pinned action cache destination exists without action metadata");
-    }
 
     let url = format!("https://codeload.github.com/{owner}/{repo}/tar.gz/{sha}");
     let response = reqwest::Client::builder()
@@ -40,17 +33,14 @@ pub async fn install_pinned_action(
         );
     }
     let bytes = response.bytes().await?;
-    let destination_for_task = destination.clone();
-    tokio::task::spawn_blocking(move || {
-        publish_action_archive(bytes.as_ref(), &destination_for_task)
-    })
-    .await
-    .context("pinned action extraction task panicked")??;
 
-    if !action_cache_is_ready(&destination)? {
-        bail!("pinned action {owner}/{repo}@{sha} has no action metadata");
-    }
-    Ok(())
+    // Publish through the production cache layout: get_action resolves
+    // remote actions by a content-hash path, so writing an owner/repo/sha
+    // directory here would always miss the cache and send the runner to the
+    // GitHub API with the harness's non-production token.
+    ActionCache::new(actions_dir.to_path_buf(), reqwest::Client::new())
+        .install_tarball(owner, repo, sha, &bytes)
+        .await
 }
 
 fn validate_action_name(label: &str, value: &str) -> Result<()> {

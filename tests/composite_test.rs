@@ -188,3 +188,31 @@ async fn composite_action_forwards_hyphenated_input() {
     let (conclusion, _) = env.run(&manifest).await.unwrap();
     assert_eq!(conclusion, JobConclusion::Succeeded);
 }
+
+/// A local action may only become resolvable once an earlier step (typically
+/// checkout) has materialized it: pre-step discovery must defer such actions
+/// to execution time instead of failing the job up front.
+#[tokio::test]
+async fn local_action_created_by_an_earlier_step_runs() {
+    let env = TestEnv::setup().await;
+
+    let action_yml = "name: 'Late local action'\nruns:\n  using: 'composite'\n  steps:\n    - shell: bash\n      run: echo late-local-action-ran >> \"$GITHUB_WORKSPACE/late-ran\"\n";
+    let setup = script_step(
+        "materialize",
+        &format!(
+            "mkdir -p .github/actions/late && printf '%b' {action_yml:?} > .github/actions/late/action.yml\n"
+        ),
+    );
+    let manifest = manifest_with_steps(
+        vec![
+            setup,
+            composite_step("late", ".github/actions/late", serde_json::json!({})),
+        ],
+        &env.mock_server.uri(),
+    );
+
+    let (conclusion, _) = env.run(&manifest).await.unwrap();
+
+    assert_eq!(conclusion, JobConclusion::Succeeded);
+    assert!(env.workspace.workspace_dir().join("late-ran").exists());
+}

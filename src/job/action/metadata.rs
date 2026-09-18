@@ -1,6 +1,6 @@
 use std::collections::HashMap;
-use std::path::Path;
 
+use super::download::TrustedActionDirectory;
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use serde::de::Deserializer;
@@ -165,24 +165,23 @@ impl ActionRuns {
     }
 }
 
-pub fn load_action_metadata(action_dir: &Path) -> Result<ActionMetadata> {
-    let yml_path = action_dir.join("action.yml");
-    let yaml_path = action_dir.join("action.yaml");
-
-    let content = if yml_path.exists() {
-        std::fs::read_to_string(&yml_path)
-            .with_context(|| format!("reading {}", yml_path.display()))?
-    } else if yaml_path.exists() {
-        std::fs::read_to_string(&yaml_path)
-            .with_context(|| format!("reading {}", yaml_path.display()))?
+pub fn load_action_metadata(action_dir: &TrustedActionDirectory) -> Result<ActionMetadata> {
+    let bytes = if let Some(bytes) = action_dir.read_optional_regular_file("action.yml")? {
+        bytes
+    } else if let Some(bytes) = action_dir.read_optional_regular_file("action.yaml")? {
+        bytes
     } else {
         anyhow::bail!(
             "no action.yml or action.yaml found in {}",
-            action_dir.display()
+            action_dir.path().display()
         );
     };
+    let content = std::str::from_utf8(&bytes).context("action metadata is not valid UTF-8")?;
+    parse_action_metadata(content)
+}
 
-    serde_yaml::from_str(&content).context("parsing action metadata")
+fn parse_action_metadata(content: &str) -> Result<ActionMetadata> {
+    serde_yaml::from_str(content).context("parsing action metadata")
 }
 
 #[cfg(test)]
