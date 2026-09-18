@@ -164,7 +164,7 @@ async fn poll_202_returns_none() {
         .await;
 
     let client = make_client(&mock_server.uri(), tm);
-    let result = client.poll_message().await.unwrap();
+    let result = client.poll_message(AgentStatus::Online).await.unwrap();
     assert!(result.is_none());
 }
 
@@ -183,10 +183,31 @@ async fn poll_200_returns_message() {
         .await;
 
     let client = make_client(&mock_server.uri(), tm);
-    let msg = client.poll_message().await.unwrap().unwrap();
+    let msg = client
+        .poll_message(AgentStatus::Online)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(msg.message_id, 12345);
     assert_eq!(msg.message_type, MessageType::RunnerJobRequest);
     assert!(msg.body.is_some());
+}
+
+#[tokio::test]
+async fn poll_sends_requested_agent_status_on_the_wire() {
+    let (mock_server, tm) = setup().await;
+
+    Mock::given(method("GET"))
+        .and(path("/message"))
+        .and(query_param("status", "Busy"))
+        .respond_with(ResponseTemplate::new(202))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let client = make_client(&mock_server.uri(), tm);
+    let result = client.poll_message(AgentStatus::Busy).await.unwrap();
+    assert!(result.is_none());
 }
 
 #[tokio::test]
@@ -217,7 +238,7 @@ async fn poll_500_returns_error() {
         .await;
 
     let client = make_client(&mock_server.uri(), tm);
-    let result = client.poll_message().await;
+    let result = client.poll_message(AgentStatus::Online).await;
     assert!(result.is_err());
 }
 
@@ -233,7 +254,7 @@ async fn poll_401_returns_error() {
         .await;
 
     let client = make_client(&mock_server.uri(), tm);
-    let result = client.poll_message().await;
+    let result = client.poll_message(AgentStatus::Online).await;
     let err = result.unwrap_err();
     assert!(
         err.downcast_ref::<BrokerError>()
@@ -254,8 +275,8 @@ async fn poll_timeout_classified_as_broker_timeout() {
         .await;
 
     let client = make_client(&mock_server.uri(), tm).with_poll_timeout(Duration::from_millis(300));
-    let result = client.poll_message().await;
-    let err = result.err().expect("client timeout should be an error");
+    let result = client.poll_message(AgentStatus::Online).await;
+    let err = result.expect_err("client timeout should be an error");
     assert!(
         err.downcast_ref::<BrokerError>()
             .is_some_and(|be| matches!(be, BrokerError::Timeout)),
@@ -302,8 +323,8 @@ async fn poll_connect_timeout_classified_as_connection_error() {
     // Warm the token cache so the poll itself is the only HTTP request left.
     tm.get_token().await.unwrap();
 
-    let result = broker.poll_message().await;
-    let err = result.err().expect("stalled connect should be an error");
+    let result = broker.poll_message(AgentStatus::Online).await;
+    let err = result.expect_err("stalled connect should be an error");
     assert!(
         err.downcast_ref::<BrokerError>()
             .is_some_and(|be| matches!(be, BrokerError::Connection(_))),

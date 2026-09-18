@@ -14,7 +14,7 @@ use crate::docker::build::DockerActionBuilder;
 use crate::docker::resources::{JobDockerResources, SetupParams};
 use crate::github::RUNNER_VERSION;
 use crate::github::auth::TokenManager;
-use crate::github::broker::{BrokerClient, BrokerError, BrokerMessage, MessageType};
+use crate::github::broker::{AgentStatus, BrokerClient, BrokerError, BrokerMessage, MessageType};
 use crate::job::JobClient;
 use crate::job::action::ActionCache;
 use crate::job::client::JobConclusion;
@@ -712,7 +712,7 @@ impl Runner {
             }
 
             let poll_result = tokio::select! {
-                result = broker.poll_message() => result,
+                result = broker.poll_message(AgentStatus::Online) => result,
                 _ = shutdown_rx.changed() => {
                     info!("shutdown signal received, cancelling poll");
                     return Ok(None);

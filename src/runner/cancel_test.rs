@@ -1,9 +1,9 @@
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use crate::github::auth::TokenManager;
@@ -68,6 +68,94 @@ async fn cancel_poller_triggers_token_on_cancellation() {
 
     assert!(cancel_token.is_cancelled());
     let _ = handle.await;
+}
+
+#[tokio::test]
+async fn cancel_poller_polls_with_busy_status() {
+    let (mock_server, tm, _shutdown_tx) = setup().await;
+
+    // Only requests reporting the agent as Busy may be answered; anything the
+    // poller sends with another status falls through to wiremock's 404.
+    Mock::given(method("GET"))
+        .and(path("/message"))
+        .and(query_param("status", "Busy"))
+        .respond_with(ResponseTemplate::new(202))
+        .expect(3..)
+        .mount(&mock_server)
+        .await;
+
+    let broker = BrokerClient::new(
+        reqwest::Client::new(),
+        mock_server.uri(),
+        "session-123".into(),
+        tm,
+    );
+
+    let cancel_token = CancellationToken::new();
+    let handle = spawn_cancel_poller(&broker, cancel_token.clone());
+
+    // The broker only delivers JobCancellation to a session that reports
+    // Busy while its job executes, so every poll the cancel poller makes
+    // must carry status=Busy — from the first request on, not just once.
+    // Let several poll cycles run so a regression that mixes statuses gets
+    // caught by the every-poll assertion below.
+    let min_polls = 3;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let busy_polls = count_busy_message_polls(&mock_server).await;
+        if busy_polls >= min_polls {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "cancel poller issued only {busy_polls} polls with status=Busy"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    cancel_token.cancel();
+    tokio::time::timeout(Duration::from_secs(5), handle)
+        .await
+        .expect("poller should exit within 5s")
+        .expect("poller task should not panic");
+
+    let requests = mock_server
+        .received_requests()
+        .await
+        .expect("wiremock request journal disabled");
+    let all_polls_busy = requests
+        .iter()
+        .filter(|request| is_message_poll(request))
+        .all(|request| {
+            request
+                .url
+                .query_pairs()
+                .any(|(key, value)| key == "status" && value == "Busy")
+        });
+    assert!(
+        all_polls_busy,
+        "cancel poller issued a GET /message without status=Busy"
+    );
+}
+
+async fn count_busy_message_polls(mock_server: &MockServer) -> usize {
+    mock_server
+        .received_requests()
+        .await
+        .expect("wiremock request journal disabled")
+        .iter()
+        .filter(|request| is_message_poll(request))
+        .filter(|request| {
+            request
+                .url
+                .query_pairs()
+                .any(|(key, value)| key == "status" && value == "Busy")
+        })
+        .count()
+}
+
+fn is_message_poll(request: &wiremock::Request) -> bool {
+    request.method == "GET" && request.url.path() == "/message"
 }
 
 #[tokio::test]

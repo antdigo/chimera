@@ -4,13 +4,15 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
-use crate::github::broker::{BrokerClient, MessageType};
+use crate::github::broker::{AgentStatus, BrokerClient, MessageType};
 
 const CANCEL_POLL_DELAY: Duration = Duration::from_millis(2000);
 const CANCEL_POLL_ERROR_DELAY: Duration = Duration::from_millis(5000);
 
-/// Spawn a background task that polls the broker for cancellation messages.
-/// When a `JobCancellation` arrives, it triggers the token.
+/// Spawn a background task that polls the broker for cancellation messages
+/// while a job executes, reporting the session as Busy so the broker routes
+/// the running job's cancellation to it. When a `JobCancellation` arrives,
+/// it triggers the token.
 pub fn spawn_cancel_poller(
     broker: &BrokerClient,
     cancel_token: CancellationToken,
@@ -28,7 +30,7 @@ pub fn spawn_cancel_poller(
             }
 
             let poll_result = tokio::select! {
-                result = poller.poll_message() => result,
+                result = poller.poll_message(AgentStatus::Busy) => result,
                 _ = cancel_token.cancelled() => return,
             };
 
