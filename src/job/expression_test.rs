@@ -214,6 +214,32 @@ fn resolve_github_repository() {
 }
 
 #[test]
+fn github_context_walk_is_case_insensitive() {
+    // contextData dictionaries are case-insensitive in the official runner
+    let data = serde_json::json!({
+        "github": { "repository": "owner/repo" }
+    });
+    let ctx = ctx_with_json(&data);
+
+    assert_eq!(
+        resolve_expression("${{ github.REPOSITORY }}", &ctx),
+        "owner/repo"
+    );
+}
+
+#[test]
+fn env_lookup_stays_case_sensitive() {
+    // On Linux the official runner deliberately uses a case-sensitive env
+    // context (CaseSensitiveDictionaryContextData), mirroring the OS.
+    let mut env = HashMap::new();
+    env.insert("FOO".to_string(), "bar".to_string());
+    let ctx = ctx_with_env(&env);
+
+    assert_eq!(resolve_expression("${{ env.FOO }}", &ctx), "bar");
+    assert_eq!(resolve_expression("${{ env.foo }}", &ctx), "");
+}
+
+#[test]
 fn resolve_input_with_default() {
     let mut env = HashMap::new();
     env.insert("INPUT_TOOLCHAIN".into(), "stable".into());
@@ -454,6 +480,73 @@ fn secrets_missing_is_null() {
     assert_eq!(resolve_expression("${{ secrets.NOPE }}", &ctx), "");
 }
 
+#[test]
+fn secrets_lookup_is_case_insensitive() {
+    // The official runner stores contexts in OrdinalIgnoreCase dictionaries;
+    // the system job token arrives as the lowercase `github_token` variable.
+    let env = HashMap::new();
+    let secrets = HashMap::from([
+        ("github_token".to_string(), "ghs_test_token".to_string()),
+        ("Deploy_Token".to_string(), "deploy-value".to_string()),
+    ]);
+    let empty_steps = HashMap::new();
+    let empty_outcomes = HashMap::new();
+    let null_json = serde_json::json!({});
+
+    let ctx = ExprContext {
+        env: &env,
+        secrets: &secrets,
+        step_outputs: &empty_steps,
+        step_outcomes: &empty_outcomes,
+        context_data: &null_json,
+        job_failed: false,
+        job_cancelled: false,
+        workspace_path: None,
+    };
+
+    assert_eq!(
+        resolve_expression("${{ secrets.GITHUB_TOKEN }}", &ctx),
+        "ghs_test_token"
+    );
+    assert_eq!(
+        resolve_expression("${{ secrets.github_token }}", &ctx),
+        "ghs_test_token"
+    );
+    assert_eq!(
+        resolve_expression("${{ secrets['GITHUB_TOKEN'] }}", &ctx),
+        "ghs_test_token"
+    );
+    assert_eq!(
+        resolve_expression("${{ secrets.deploy_token }}", &ctx),
+        "deploy-value"
+    );
+}
+
+#[test]
+fn secrets_root_context_name_is_case_insensitive() {
+    let env = HashMap::new();
+    let secrets = HashMap::from([("MY_TOKEN".to_string(), "s3cret".to_string())]);
+    let empty_steps = HashMap::new();
+    let empty_outcomes = HashMap::new();
+    let null_json = serde_json::json!({});
+
+    let ctx = ExprContext {
+        env: &env,
+        secrets: &secrets,
+        step_outputs: &empty_steps,
+        step_outcomes: &empty_outcomes,
+        context_data: &null_json,
+        job_failed: false,
+        job_cancelled: false,
+        workspace_path: None,
+    };
+
+    assert_eq!(
+        resolve_expression("${{ SECRETS.MY_TOKEN }}", &ctx),
+        "s3cret"
+    );
+}
+
 // ── steps ───────────────────────────────────────────────────────────
 
 #[test]
@@ -578,6 +671,80 @@ fn steps_outcome_missing_is_null() {
     assert_eq!(resolve_expression("${{ steps.nope.outcome }}", &ctx), "");
 }
 
+#[test]
+fn steps_lookup_is_case_insensitive() {
+    let env = HashMap::new();
+    let secrets = HashMap::new();
+    let step_outputs = HashMap::from([(
+        "build".to_string(),
+        HashMap::from([("version".to_string(), "1.2.3".to_string())]),
+    )]);
+    let empty_outcomes = HashMap::new();
+    let null_json = serde_json::json!({});
+
+    let ctx = ExprContext {
+        env: &env,
+        secrets: &secrets,
+        step_outputs: &step_outputs,
+        step_outcomes: &empty_outcomes,
+        context_data: &null_json,
+        job_failed: false,
+        job_cancelled: false,
+        workspace_path: None,
+    };
+
+    assert_eq!(
+        resolve_expression("${{ steps.BUILD.outputs.version }}", &ctx),
+        "1.2.3"
+    );
+    assert_eq!(
+        resolve_expression("${{ steps.build.outputs.VERSION }}", &ctx),
+        "1.2.3"
+    );
+}
+
+#[test]
+fn steps_field_names_are_case_insensitive() {
+    let env = HashMap::new();
+    let secrets = HashMap::new();
+    let step_outputs = HashMap::from([(
+        "build".to_string(),
+        HashMap::from([("version".to_string(), "1.2.3".to_string())]),
+    )]);
+    let step_outcomes = HashMap::from([(
+        "build".to_string(),
+        StepOutcome {
+            outcome: "failure".to_string(),
+            conclusion: "success".to_string(),
+        },
+    )]);
+    let null_json = serde_json::json!({});
+
+    let ctx = ExprContext {
+        env: &env,
+        secrets: &secrets,
+        step_outputs: &step_outputs,
+        step_outcomes: &step_outcomes,
+        context_data: &null_json,
+        job_failed: false,
+        job_cancelled: false,
+        workspace_path: None,
+    };
+
+    assert_eq!(
+        resolve_expression("${{ steps.BUILD.OUTPUTS.version }}", &ctx),
+        "1.2.3"
+    );
+    assert_eq!(
+        resolve_expression("${{ steps.build.OUTCOME }}", &ctx),
+        "failure"
+    );
+    assert_eq!(
+        resolve_expression("${{ steps['build']['Conclusion'] }}", &ctx),
+        "success"
+    );
+}
+
 // ── needs ───────────────────────────────────────────────────────────
 
 #[test]
@@ -614,6 +781,44 @@ fn needs_output_lookup() {
         resolve_expression("${{ needs.setup.result }}", &ctx),
         "success"
     );
+}
+
+#[test]
+fn needs_lookup_is_case_insensitive() {
+    let data = serde_json::json!({
+        "needs": {
+            "Build": { "result": "success" }
+        }
+    });
+    let ctx = ctx_with_json(&data);
+
+    assert_eq!(
+        parse_and_eval("needs.BUILD.result", &ctx)
+            .unwrap()
+            .to_display(),
+        "success"
+    );
+}
+
+#[test]
+fn wildcard_traversal_resolves_case_insensitive_keys() {
+    let data = serde_json::json!({
+        "needs": {
+            "build": { "outputs": { "version": "1.0" } },
+            "test": { "outputs": { "version": "2.0" } }
+        }
+    });
+    let ctx = ctx_with_json(&data);
+
+    let result = parse_and_eval("needs.*.OUTPUTS.version", &ctx).unwrap();
+    match result {
+        Value::Array(mut items) => {
+            items.sort_by_key(|v| v.to_display());
+            let strs: Vec<String> = items.iter().map(|v| v.to_display()).collect();
+            assert_eq!(strs, vec!["1.0", "2.0"]);
+        }
+        other => panic!("expected Array, got {other:?}"),
+    }
 }
 
 #[test]
@@ -1432,6 +1637,23 @@ fn vars_bracket_notation() {
     assert_eq!(
         parse_and_eval("vars['my-var']", &ctx).unwrap().to_display(),
         "world"
+    );
+}
+
+#[test]
+fn vars_lookup_is_case_insensitive() {
+    let data = serde_json::json!({
+        "vars": {
+            "Build_Token": "hello"
+        }
+    });
+    let ctx = ctx_with_json(&data);
+
+    assert_eq!(
+        parse_and_eval("vars.BUILD_TOKEN", &ctx)
+            .unwrap()
+            .to_display(),
+        "hello"
     );
 }
 

@@ -239,8 +239,9 @@ impl JobManifest {
     }
 
     pub fn github_token(&self) -> Option<&str> {
-        self.variables
-            .get("system.github.token")
+        // The official Variables dictionary is OrdinalIgnoreCase; the token
+        // variable must resolve under any casing for the GITHUB_TOKEN alias.
+        crate::utils::find_case_insensitive(&self.variables, "system.github.token")
             .map(|v| v.value.as_str())
     }
 

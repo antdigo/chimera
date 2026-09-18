@@ -6,6 +6,7 @@ use super::ExprContext;
 use super::parser::{BinOp, Expr, PropertySegment};
 use super::runner::build_runner_context;
 use super::value::Value;
+use crate::utils::find_case_insensitive;
 
 pub(crate) fn eval(expr: &Expr, ctx: &ExprContext) -> Result<Value, String> {
     match expr {
@@ -94,7 +95,10 @@ fn resolve_property(segments: &[PropertySegment], ctx: &ExprContext) -> Result<V
     };
     let rest = &segments[1..];
 
-    match root {
+    // Context names resolve case-insensitively, like every context dictionary
+    // in the official runner.
+    let root_lower = root.to_ascii_lowercase();
+    match root_lower.as_str() {
         "github" => {
             // Try env lookup for the first key
             if let Some(seg) = rest.first()
@@ -112,6 +116,8 @@ fn resolve_property(segments: &[PropertySegment], ctx: &ExprContext) -> Result<V
         }
         "runner" => resolve_runner(rest, ctx),
         "env" => {
+            // Deliberately case-sensitive: on Linux the official runner uses a
+            // case-sensitive env context, mirroring the OS environment.
             let key = rest
                 .first()
                 .map(|s| segment_to_key(s, ctx))
@@ -149,9 +155,7 @@ fn resolve_property(segments: &[PropertySegment], ctx: &ExprContext) -> Result<V
                 .map(|s| segment_to_key(s, ctx))
                 .transpose()?
                 .unwrap_or_default();
-            Ok(ctx
-                .secrets
-                .get(&key)
+            Ok(find_case_insensitive(ctx.secrets, &key)
                 .map(|v| Value::String(v.clone()))
                 .unwrap_or(Value::Null))
         }
@@ -160,7 +164,7 @@ fn resolve_property(segments: &[PropertySegment], ctx: &ExprContext) -> Result<V
             if let Some(seg) = rest.first() {
                 let key = segment_to_key(seg, ctx)?;
                 if let Some(vars) = ctx.context_data.get("vars")
-                    && let Some(val) = vars.get(&key)
+                    && let Some(val) = json_get_case_insensitive(vars, &key)
                 {
                     return Ok(json_to_value(val));
                 }
@@ -173,6 +177,19 @@ fn resolve_property(segments: &[PropertySegment], ctx: &ExprContext) -> Result<V
             Ok(Value::Null)
         }
     }
+}
+
+/// Look up a key in a JSON object, falling back to a case-insensitive scan
+/// (ASCII-only, like the other context lookups). contextData is materialized
+/// into OrdinalIgnoreCase dictionaries by the official runner, so
+/// `github.REPOSITORY` and `github.repository` both resolve.
+fn json_get_case_insensitive<'a>(value: &'a JsonValue, key: &str) -> Option<&'a JsonValue> {
+    let map = value.as_object()?;
+    map.get(key).or_else(|| {
+        map.keys()
+            .find(|k| k.eq_ignore_ascii_case(key))
+            .and_then(|k| map.get(k))
+    })
 }
 
 fn resolve_runner(rest: &[PropertySegment], ctx: &ExprContext<'_>) -> Result<Value, String> {
@@ -200,26 +217,20 @@ fn resolve_steps(rest: &[PropertySegment], ctx: &ExprContext) -> Result<Value, S
         return Ok(Value::Null);
     }
     let step_id = segment_to_key(&rest[0], ctx)?;
-    let field = segment_to_key(&rest[1], ctx)?;
+    let field = segment_to_key(&rest[1], ctx)?.to_ascii_lowercase();
 
     match field.as_str() {
         "outputs" if rest.len() >= 3 => {
             let output_key = segment_to_key(&rest[2], ctx)?;
-            Ok(ctx
-                .step_outputs
-                .get(&step_id)
-                .and_then(|m| m.get(&output_key))
+            Ok(find_case_insensitive(ctx.step_outputs, &step_id)
+                .and_then(|m| find_case_insensitive(m, &output_key))
                 .map(|v| Value::String(v.clone()))
                 .unwrap_or(Value::Null))
         }
-        "outcome" => Ok(ctx
-            .step_outcomes
-            .get(&step_id)
+        "outcome" => Ok(find_case_insensitive(ctx.step_outcomes, &step_id)
             .map(|s| Value::String(s.outcome.clone()))
             .unwrap_or(Value::Null)),
-        "conclusion" => Ok(ctx
-            .step_outcomes
-            .get(&step_id)
+        "conclusion" => Ok(find_case_insensitive(ctx.step_outcomes, &step_id)
             .map(|s| Value::String(s.conclusion.clone()))
             .unwrap_or(Value::Null)),
         _ => Ok(Value::Null),
@@ -265,7 +276,7 @@ fn walk_json_inner(
         _ => {
             let key = segment_to_key(seg, ctx)?;
             match current {
-                JsonValue::Object(map) => match map.get(&key) {
+                JsonValue::Object(_) => match json_get_case_insensitive(current, &key) {
                     Some(v) => walk_json_inner(v, rest, ctx),
                     None => Ok(Value::Null),
                 },

@@ -45,6 +45,46 @@ pub fn arch_label() -> &'static str {
     }
 }
 
+/// Case-insensitive map lookup. Context dictionaries in the official runner
+/// use `StringComparer.OrdinalIgnoreCase` (`env` on Linux is the one
+/// case-sensitive exception), so context property lookups must ignore case.
+/// Comparison is ASCII-only: context and secret identifiers are ASCII.
+pub fn find_case_insensitive<'a, V>(
+    map: &'a std::collections::HashMap<String, V>,
+    key: &str,
+) -> Option<&'a V> {
+    map.iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case(key))
+        .map(|(_, v)| v)
+}
+
+/// Insert a value, replacing any existing key that differs only by ASCII case
+/// while preserving the stored key's casing. This mirrors the write semantics
+/// of the official runner's OrdinalIgnoreCase context dictionaries: the last
+/// write wins and no two keys differing only by case ever coexist.
+pub fn insert_case_insensitive(
+    map: &mut std::collections::HashMap<String, String>,
+    key: String,
+    value: String,
+) {
+    let stored_key = map
+        .keys()
+        .find(|k| k.eq_ignore_ascii_case(&key))
+        .cloned()
+        .unwrap_or(key);
+    map.insert(stored_key, value);
+}
+
+/// Merge `from` into `map` with `insert_case_insensitive` semantics.
+pub fn merge_case_insensitive(
+    map: &mut std::collections::HashMap<String, String>,
+    from: std::collections::HashMap<String, String>,
+) {
+    for (key, value) in from {
+        insert_case_insensitive(map, key, value);
+    }
+}
+
 #[cfg(test)]
 #[path = "utils_test.rs"]
 mod utils_test;

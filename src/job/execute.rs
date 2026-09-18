@@ -27,7 +27,10 @@ use crate::docker::output::OutputProcessor;
 use crate::docker::resources::JobDockerResources;
 use crate::job::docker_config::{DOCKER_CONFIG_ENV, JobDockerConfig, JobDockerConfigError};
 use crate::node::NodeRuntimes;
-use crate::utils::{format_results_timestamp, format_timeline_timestamp};
+use crate::utils::{
+    find_case_insensitive, format_results_timestamp, format_timeline_timestamp,
+    insert_case_insensitive, merge_case_insensitive,
+};
 
 pub struct JobExecutionContext<'a> {
     docker_config: &'a JobDockerConfig,
@@ -137,8 +140,7 @@ impl JobState {
         secrets: HashMap<String, String>,
         context_data: serde_json::Value,
     ) -> Self {
-        let debug_enabled = secrets
-            .get("ACTIONS_STEP_DEBUG")
+        let debug_enabled = find_case_insensitive(&secrets, "ACTIONS_STEP_DEBUG")
             .is_some_and(|v| v.eq_ignore_ascii_case("true"));
         Self {
             env: HashMap::new(),
@@ -762,30 +764,7 @@ pub async fn run_all_steps(
     let docker_build_scope = DockerBuildScope::new(runner_name, github_scope);
 
     let masks = collect_secret_masks(manifest);
-    let mut secrets: HashMap<String, String> = manifest
-        .variables
-        .iter()
-        .filter(|(_, v)| v.is_secret && !v.value.is_empty())
-        .map(|(k, v)| (k.clone(), v.value.clone()))
-        .collect();
-
-    // User-defined secrets (repo/org secrets) come via contextData["secrets"],
-    // not through the variables dict which only has system-level secrets.
-    if let Some(ctx_secrets) = manifest
-        .context_data
-        .get("secrets")
-        .and_then(|v| v.as_object())
-    {
-        for (k, v) in ctx_secrets {
-            if let Some(s) = v.as_str()
-                && !s.is_empty()
-            {
-                // Add to mask list so secret values are redacted in logs
-                masks.write().await.push(s.to_string());
-                secrets.insert(k.clone(), s.to_string());
-            }
-        }
-    }
+    let secrets = collect_secrets(manifest, &masks).await;
 
     let mut job_state = JobState::new(masks.clone(), secrets, manifest.context_data.clone());
 
@@ -982,7 +961,7 @@ pub async fn run_all_steps(
 
             // Read file-based outputs/env/path/state after pre steps
             if let Ok(file_outputs) = workspace.read_output_file() {
-                job_state.outputs.extend(file_outputs);
+                merge_case_insensitive(&mut job_state.outputs, file_outputs);
             }
             if let Ok(file_env) = workspace.read_env_file() {
                 job_state.env.extend(file_env);
@@ -1126,7 +1105,7 @@ pub async fn run_all_steps(
         // Read file-based outputs/env/path/state after each step.
         // Modern actions use these files instead of legacy :: workflow commands.
         if let Ok(file_outputs) = workspace.read_output_file() {
-            job_state.outputs.extend(file_outputs);
+            merge_case_insensitive(&mut job_state.outputs, file_outputs);
         }
         if let Ok(file_env) = workspace.read_env_file() {
             job_state.env.extend(file_env);
@@ -1137,11 +1116,8 @@ pub async fn run_all_steps(
         // Read GITHUB_STATE file (used by @actions/core saveState)
         if let Ok(file_state) = workspace.read_state_file() {
             let key = step.context_name.as_deref().unwrap_or(&step.id);
-            job_state
-                .action_states
-                .entry(key.to_string())
-                .or_default()
-                .extend(file_state);
+            let entry = job_state.action_states.entry(key.to_string()).or_default();
+            merge_case_insensitive(entry, file_state);
         }
         // Clear the files so the next step starts fresh
         workspace.clear_step_files();
@@ -1320,7 +1296,7 @@ pub async fn run_all_steps(
 
             // Read file-based outputs/env/path/state after post steps too
             if let Ok(file_outputs) = workspace.read_output_file() {
-                job_state.outputs.extend(file_outputs);
+                merge_case_insensitive(&mut job_state.outputs, file_outputs);
             }
             if let Ok(file_env) = workspace.read_env_file() {
                 job_state.env.extend(file_env);
@@ -1357,7 +1333,7 @@ pub async fn run_all_steps(
     for step in &manifest.steps {
         let key = step.context_name.as_deref().unwrap_or(&step.id);
         if let Some(outs) = job_state.step_outputs.get(key) {
-            job_state.outputs.extend(outs.clone());
+            merge_case_insensitive(&mut job_state.outputs, outs.clone());
         }
     }
 
@@ -1369,6 +1345,70 @@ pub async fn run_all_steps(
         JobConclusion::Succeeded
     };
     Ok((conclusion, job_state.outputs.clone()))
+}
+
+/// Build the secrets map for `secrets.<name>` expression resolution.
+///
+/// Effective precedence, highest first: contextData["secrets"] (merged last,
+/// replacing same-name entries regardless of casing), the `github_token`
+/// secret variable, and the `GITHUB_TOKEN` alias — the latter is only filled
+/// from the `system.github.token` variable when no earlier source provided a
+/// token. The map never holds two keys differing only by case.
+///
+/// Values inserted here (the alias fallback and contextData secrets) are also
+/// pushed to the mask list; variable values must already be masked by
+/// `collect_secret_masks` before this runs.
+async fn collect_secrets(
+    manifest: &JobManifest,
+    masks: &Arc<RwLock<Vec<String>>>,
+) -> HashMap<String, String> {
+    // The official ToSecretsContext excludes the dotted system token names:
+    // they reach workflows only through the canonical `github.token` /
+    // `GITHUB_TOKEN` aliases, never as literal `secrets['system.github.token']`.
+    const EXCLUDED_SECRET_VARIABLES: [&str; 2] = ["system.github.token", "system.accessToken"];
+
+    let mut secrets: HashMap<String, String> = HashMap::new();
+    for (k, v) in manifest.variables.iter() {
+        if v.is_secret
+            && !v.value.is_empty()
+            && !EXCLUDED_SECRET_VARIABLES
+                .iter()
+                .any(|name| k.eq_ignore_ascii_case(name))
+        {
+            insert_case_insensitive(&mut secrets, k.clone(), v.value.clone());
+        }
+    }
+
+    // `secrets.GITHUB_TOKEN` is documented to always exist. The job message
+    // delivers the system token as `github_token` and/or `system.github.token`;
+    // make sure it resolves no matter which path carried it (#15).
+    if find_case_insensitive(&secrets, "GITHUB_TOKEN").is_none()
+        && let Some(token) = manifest.github_token()
+        && !token.is_empty()
+    {
+        masks.write().await.push(token.to_string());
+        secrets.insert("GITHUB_TOKEN".to_string(), token.to_string());
+    }
+
+    // User-defined secrets (repo/org secrets) come via contextData["secrets"],
+    // not through the variables dict which only has system-level secrets.
+    if let Some(ctx_secrets) = manifest
+        .context_data
+        .get("secrets")
+        .and_then(|v| v.as_object())
+    {
+        for (k, v) in ctx_secrets {
+            if let Some(s) = v.as_str()
+                && !s.is_empty()
+            {
+                // Add to mask list so secret values are redacted in logs
+                masks.write().await.push(s.to_string());
+                insert_case_insensitive(&mut secrets, k.clone(), s.to_string());
+            }
+        }
+    }
+
+    secrets
 }
 
 fn collect_secret_masks(manifest: &JobManifest) -> Arc<RwLock<Vec<String>>> {

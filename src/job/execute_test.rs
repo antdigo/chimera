@@ -112,6 +112,42 @@ fn test_job_state() -> JobState {
     )
 }
 
+#[test]
+fn step_debug_secret_name_is_case_insensitive() {
+    let secrets = HashMap::from([("actions_step_debug".to_string(), "true".to_string())]);
+    let state = JobState::new(
+        Arc::new(RwLock::new(Vec::new())),
+        secrets,
+        serde_json::json!({}),
+    );
+    assert!(state.debug_enabled);
+}
+
+#[tokio::test]
+async fn context_data_secret_overrides_variable_regardless_of_case() {
+    // A variable secret and a contextData secret whose names differ only by
+    // case must collapse to a single entry; contextData wins and any spelling
+    // resolves to its value.
+    let manifest: JobManifest = serde_json::from_value(serde_json::json!({
+        "variables": { "Deploy_Token": { "value": "old", "isSecret": true } },
+        "contextData": { "secrets": { "DEPLOY_TOKEN": "new" } }
+    }))
+    .unwrap();
+    let masks = Arc::new(RwLock::new(Vec::new()));
+
+    let secrets = collect_secrets(&manifest, &masks).await;
+
+    assert_eq!(secrets.len(), 1);
+    assert_eq!(
+        find_case_insensitive(&secrets, "DEPLOY_TOKEN").unwrap(),
+        "new"
+    );
+    assert_eq!(
+        find_case_insensitive(&secrets, "deploy_token").unwrap(),
+        "new"
+    );
+}
+
 fn test_workspace() -> (tempfile::TempDir, Workspace) {
     let temp = tempfile::tempdir().unwrap();
     let workspace = Workspace::create(
