@@ -139,10 +139,51 @@ fn rejects_malformed_json_and_base64_without_echoing_values() {
 
     let invalid_base64 = copy_fixture();
     mutate_json(invalid_base64.path(), ".credentials_rsaparams", |rsa| {
-        rsa["D"] = json!("not-base64-SECRET_RSA");
+        rsa["d"] = json!("not-base64-SECRET_RSA");
     });
     let diagnostic = assert_category(invalid_base64.path(), "invalid-source");
     assert!(!diagnostic.contains("SECRET_RSA"));
+}
+
+#[test]
+fn rejects_csharp_pascal_case_rsa_field_names() {
+    let source = copy_fixture();
+    mutate_json(source.path(), ".credentials_rsaparams", |rsa| {
+        let object = rsa.as_object_mut().unwrap();
+        let pascal_case: serde_json::Map<String, serde_json::Value> = object
+            .iter()
+            .map(|(key, value)| {
+                let renamed = match key.as_str() {
+                    "d" => "D",
+                    "dp" => "DP",
+                    "dq" => "DQ",
+                    "exponent" => "Exponent",
+                    "inverseQ" => "InverseQ",
+                    "modulus" => "Modulus",
+                    "p" => "P",
+                    "q" => "Q",
+                    other => unreachable!("fixture uses only official RSA keys: {other}"),
+                };
+                (renamed.to_owned(), value.clone())
+            })
+            .collect();
+        *object = pascal_case;
+    });
+
+    assert_category(source.path(), "invalid-source");
+}
+
+#[test]
+fn rejects_unknown_rsa_fields_alongside_valid_ones() {
+    for extra_key in ["D", "e", "SECRET_EXTRA_RSA_FIELD"] {
+        let source = copy_fixture();
+        mutate_json(source.path(), ".credentials_rsaparams", |rsa| {
+            rsa[extra_key] = json!("c2VjcmV0");
+        });
+
+        let diagnostic = assert_category(source.path(), "invalid-source");
+        assert!(!diagnostic.contains("c2VjcmV0"), "extra key {extra_key}");
+    }
 }
 
 #[test]
@@ -175,15 +216,24 @@ fn rejects_non_oauth_and_unknown_auth_metadata_without_echoing_values() {
 }
 
 #[test]
-fn rejects_fips_required_and_auth_migration_without_echoing_values() {
-    let fips_required = copy_fixture();
-    set_auth_value(
-        fips_required.path(),
-        "requireFipsCryptography",
-        json!("True"),
-    );
-    assert_category(fips_required.path(), "unsupported-registration");
+fn accepts_fips_required_and_explicitly_non_fips_registrations() {
+    let expected = fixture_credentials();
 
+    for value in ["True", "true", "False", "false"] {
+        let source = copy_fixture();
+        set_auth_value(source.path(), "requireFipsCryptography", json!(value));
+
+        let registration = read_official_registration(source.path()).unwrap();
+
+        assert_eq!(
+            registration.credentials.oauth, expected.oauth,
+            "value {value}"
+        );
+    }
+}
+
+#[test]
+fn rejects_auth_migration_without_echoing_values() {
     let migration_enabled = copy_fixture();
     set_auth_value(
         migration_enabled.path(),
@@ -483,7 +533,7 @@ fn allows_same_numeric_agent_id_to_be_scoped_by_repo() {
 fn preserves_leading_zero_bytes_for_every_rsa_component() {
     let original_key = rsa_params_to_private_key(&fixture_credentials().rsa_params).unwrap();
 
-    for field in ["D", "DP", "DQ", "Exponent", "InverseQ", "Modulus", "P", "Q"] {
+    for field in ["d", "dp", "dq", "exponent", "inverseQ", "modulus", "p", "q"] {
         let source = copy_fixture();
         let path = source.path().join(".credentials_rsaparams");
         let mut document: serde_json::Value =
@@ -496,14 +546,14 @@ fn preserves_leading_zero_bytes_for_every_rsa_component() {
 
         let registration = read_official_registration(source.path()).unwrap();
         let imported = match field {
-            "D" => &registration.credentials.rsa_params.d,
-            "DP" => &registration.credentials.rsa_params.dp,
-            "DQ" => &registration.credentials.rsa_params.dq,
-            "Exponent" => &registration.credentials.rsa_params.exponent,
-            "InverseQ" => &registration.credentials.rsa_params.inverse_q,
-            "Modulus" => &registration.credentials.rsa_params.modulus,
-            "P" => &registration.credentials.rsa_params.p,
-            "Q" => &registration.credentials.rsa_params.q,
+            "d" => &registration.credentials.rsa_params.d,
+            "dp" => &registration.credentials.rsa_params.dp,
+            "dq" => &registration.credentials.rsa_params.dq,
+            "exponent" => &registration.credentials.rsa_params.exponent,
+            "inverseQ" => &registration.credentials.rsa_params.inverse_q,
+            "modulus" => &registration.credentials.rsa_params.modulus,
+            "p" => &registration.credentials.rsa_params.p,
+            "q" => &registration.credentials.rsa_params.q,
             _ => unreachable!("table contains only the eight RSA fields"),
         };
         let imported_bytes = BASE64.decode(imported).unwrap();

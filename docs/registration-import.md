@@ -39,14 +39,41 @@ It writes these corresponding files under the local Chimera runner storage:
 - `rsa_params.json`
 
 The supported OAuth metadata keys are `clientId` and `authorizationUrl`, both
-required, plus optional `requireFipsCryptography=false`.
-`enableAuthMigrationByDefault=false` is recognized as inactive. A value of
-`true`, any `authorizationUrlV2` entry, and migration sibling files are
-rejected. Any other OAuth metadata key is rejected.
+required, plus optional `requireFipsCryptography` with a boolean string value
+(`"true"`/`"false"`, case-insensitive; both meanings are accepted).
+`enableAuthMigrationByDefault=false`
+is recognized as inactive. A value of `true`, any `authorizationUrlV2`
+entry, and migration sibling files are rejected. Any other OAuth metadata
+key is rejected.
+
+Chimera signs the token-exchange client assertion with RSASSA-PSS (PS256)
+regardless of this flag — the same signature scheme the official runner
+switches to when `requireFipsCryptography` is set (`VssSigningCredentials`
+in runner 2.337.0). This is algorithm compatibility with the FIPS-required
+flow; Chimera makes no claim of CMVP-validated cryptography modules.
 
 The following non-auth `.runner` fields are known and accepted, but are not
 migrated: `poolName`, `skipSessionRecover`, `disableUpdate`,
 `monitorSocketAddress`, `useRunnerAdminFlow`, and `IsHostedServer=true`.
+
+### `.credentials_rsaparams` field names
+
+The official runner serializes this file as pretty-printed UTF-8 with a BOM,
+containing exactly these string (Base64) keys: `d`, `dp`, `dq`, `exponent`,
+`inverseQ`, `modulus`, `p`, `q`. The names come from the runner's JSON
+serializer (Newtonsoft camelCase through the VSS SDK settings behind
+`IOUtil.SaveObject`, verified in runner 2.337.0), not from the C#
+`RSAParameters` property names — do not "correct" the casing back to
+PascalCase. Any other key, including the PascalCase variants (`D`, `DP`, …),
+is rejected as `invalid-source`.
+
+### Fixture rule for formats we do not own
+
+The static fixture for these files must be transcribed from a real captured
+sample — file set, field names, casing, encoding — with the key material
+replaced by synthetic values. Authoring fixtures from source-language type
+definitions makes the implementation and the fixture share the same wrong
+assumption, which no test can then catch.
 
 An eligible source has all of the following:
 
@@ -55,7 +82,7 @@ An eligible source has all of the following:
 - Exactly the `https://github.com/{owner}/{repo}` repository scope.
 - Approved HTTPS endpoints at `actions.githubusercontent.com` or
   `*.actions.githubusercontent.com`.
-- The persistent, non-FIPS V2 flow.
+- The persistent V2 flow, including FIPS-required registrations.
 - A mathematically consistent RSA private key.
 
 ## Local storage and safety contract

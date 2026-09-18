@@ -108,6 +108,8 @@ Tests that require Docker are tagged `#[ignore]` so they don't run in environmen
 
 Keep tests readable. A test should be obvious about what it's checking. Arrange / Act / Assert with a blank line between sections is a good default structure.
 
+For file formats we do not own (e.g. the official runner's registration files), fixtures must be transcribed from a real captured sample — structure, field names, casing, encoding — with key material replaced by synthetic values. Never author them from source-language type definitions: the implementation and the fixture then share the same wrong assumption, and no test can catch it (this is how the `.credentials_rsaparams` PascalCase bug shipped, #11).
+
 ---
 
 ## Running Tests Locally

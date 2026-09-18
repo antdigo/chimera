@@ -93,24 +93,20 @@ where
     deserializer.deserialize_map(UniqueStringMapVisitor)
 }
 
+// Field names follow the official runner's serialized format (Newtonsoft
+// camelCase, verified against runner 2.337.0), not the C# `RSAParameters`
+// property names — hence `inverseQ` with its capital Q.
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct OfficialRsaParameters {
-    #[serde(rename = "D")]
     d: String,
-    #[serde(rename = "DP")]
     dp: String,
-    #[serde(rename = "DQ")]
     dq: String,
-    #[serde(rename = "Exponent")]
     exponent: String,
-    #[serde(rename = "InverseQ")]
+    #[serde(rename = "inverseQ")]
     inverse_q: String,
-    #[serde(rename = "Modulus")]
     modulus: String,
-    #[serde(rename = "P")]
     p: String,
-    #[serde(rename = "Q")]
     q: String,
 }
 
@@ -332,12 +328,12 @@ fn validate_oauth(
         ));
     }
 
-    if let Some(fips) = credentials.data.get("requireFipsCryptography")
-        && parse_bool(fips, "requireFipsCryptography")?
-    {
-        return Err(ImportError::UnsupportedRegistration(
-            "FIPS credential mode is not supported".into(),
-        ));
+    // FIPS-required registrations are supported: chimera signs the token
+    // exchange with RSASSA-PSS (PS256) unconditionally, which is exactly the
+    // signature scheme the official runner switches to when this flag is set
+    // (VssSigningCredentials.Create). Only the value's shape is validated.
+    if let Some(fips) = credentials.data.get("requireFipsCryptography") {
+        parse_bool(fips, "requireFipsCryptography")?;
     }
     if let Some(migration) = credentials.data.get("enableAuthMigrationByDefault")
         && parse_bool(migration, "enableAuthMigrationByDefault")?
