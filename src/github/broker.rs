@@ -12,8 +12,29 @@ use super::auth::TokenManager;
 // Types
 // ---------------------------------------------------------------------------
 
-const BROKER_PROTOCOL_VERSION: &str = "3.0.0";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+// Values the official runner sends on every broker poll and acknowledge
+// (VarUtil.OS / VarUtil.OSArchitecture). They ride along on the same requests
+// that drive message routing, so chimera must send them too.
+fn broker_os() -> &'static str {
+    match std::env::consts::OS {
+        "linux" => "Linux",
+        "macos" => "macOS",
+        "windows" => "Windows",
+        other => other,
+    }
+}
+
+fn broker_architecture() -> &'static str {
+    match std::env::consts::ARCH {
+        "x86_64" => "X64",
+        "x86" => "X86",
+        "aarch64" => "ARM64",
+        "arm" => "ARM",
+        other => other,
+    }
+}
 
 // The official runner's message-queue connection uses a 60s send timeout, and
 // the broker answers an idle long-poll with 202 shortly before that. A client
@@ -282,7 +303,8 @@ impl BrokerClient {
         self.token_manager.clone()
     }
 
-    /// Single poll request. Returns Some(message) on 200, None on 202.
+    /// Single poll request. Returns Some(message) when the broker delivers
+    /// one, None on an empty long-poll cycle.
     pub async fn poll_message(&self, status: AgentStatus) -> Result<Option<BrokerMessage>> {
         let token = self
             .token_manager
@@ -291,17 +313,20 @@ impl BrokerClient {
             .context("getting token for poll")?;
 
         let url = format!(
-            "{}/message?sessionId={}&status={}&runnerVersion={}&disableUpdate=true",
+            "{}/message?sessionId={}&status={}&runnerVersion={}&os={}&architecture={}&disableUpdate=true",
             self.server_url.trim_end_matches('/'),
             self.session_id,
             status.as_str(),
-            BROKER_PROTOCOL_VERSION,
+            RUNNER_VERSION,
+            broker_os(),
+            broker_architecture(),
         );
 
         let resp = self
             .client
             .get(&url)
             .bearer_auth(&token)
+            .header(reqwest::header::ACCEPT, "application/json")
             .timeout(self.poll_timeout)
             .send()
             .await
@@ -319,12 +344,20 @@ impl BrokerClient {
         let status = resp.status();
         debug!(status = %status, "poll response");
 
-        match status.as_u16() {
-            202 => Ok(None),
-            200 => {
-                let msg: BrokerMessage = resp.json().await.context("parsing broker message")?;
-                Ok(Some(msg))
+        // Any 2xx is a successful poll. The official client reads the body of
+        // every success status and treats an empty or JSON-null one as "no
+        // message", so a 202 or 204 empty long-poll cycle is not an error.
+        if status.is_success() {
+            let body = resp.text().await.context("reading poll response body")?;
+            if body.trim().is_empty() {
+                return Ok(None);
             }
+            let msg: Option<BrokerMessage> =
+                serde_json::from_str(&body).context("parsing broker message")?;
+            return Ok(msg);
+        }
+
+        match status.as_u16() {
             401 => Err(BrokerError::Unauthorized.into()),
             s if (500..600).contains(&s) => {
                 let body = resp.text().await.unwrap_or_default();
@@ -342,10 +375,13 @@ impl BrokerClient {
         let token = self.token_manager.get_token().await?;
 
         let url = format!(
-            "{}/acknowledge?sessionId={}&runnerVersion={}&status=Online&disableUpdate=true",
+            "{}/acknowledge?sessionId={}&status={}&runnerVersion={}&os={}&architecture={}",
             self.server_url.trim_end_matches('/'),
             self.session_id,
-            BROKER_PROTOCOL_VERSION,
+            AgentStatus::Online.as_str(),
+            RUNNER_VERSION,
+            broker_os(),
+            broker_architecture(),
         );
 
         let body = serde_json::json!({
@@ -356,6 +392,7 @@ impl BrokerClient {
             .client
             .post(&url)
             .bearer_auth(&token)
+            .header(reqwest::header::ACCEPT, "application/json")
             .json(&body)
             .timeout(REQUEST_TIMEOUT)
             .send()

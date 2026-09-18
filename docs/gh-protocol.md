@@ -54,8 +54,9 @@ manifest's variables. If present, use Twirp. If absent, fall back to VSS.
 
 **Runner version**: The runner reports itself as `2.329.0` (constant `RUNNER_VERSION`).
 The broker rejects runners with outdated versions — bumping this may be necessary
-when GitHub ships breaking changes. The broker protocol version is `3.0.0`
-(separate from the runner version).
+when GitHub ships breaking changes. The same version string is used everywhere
+the wire protocol carries a runner version (session body, poll and acknowledge
+query params); there is no separate "broker protocol version".
 
 ---
 
@@ -367,14 +368,19 @@ The runner uses **long polling** to wait for jobs from the broker.
 GET {broker_url}/message
     ?sessionId={session_id}
     &status={Online|Busy}
-    &runnerVersion=3.0.0
+    &runnerVersion=2.329.0
+    &os=Linux
+    &architecture=X64
     &disableUpdate=true
 Authorization: Bearer {oauth_token}
-Timeout: 55s (client-side)
+Accept: application/json
+Timeout: 60s (client-side)
 ```
 
-**Note**: The `runnerVersion` query parameter is `3.0.0` (the broker protocol
-version), NOT the runner version `2.329.0` used elsewhere.
+**Note**: The `runnerVersion` query parameter is the runner package version
+(`2.329.0`), the same string sent in the session-creation body. The `os` and
+`architecture` parameters use the official runner's `VarUtil` spellings
+(`Linux`/`macOS`/`Windows`, `X86`/`X64`/`ARM`/`ARM64`).
 
 **The `status` parameter is the agent status reported to the broker**
 (`TaskAgentStatus`: Offline=1, Online=2, Busy=3) and must track the runner's
@@ -387,23 +393,32 @@ The official runner polls with one status at a time and switches to `Busy` for
 the whole duration of a job (switching back to `Online` when it finishes),
 aborting any in-flight long-poll so the next poll carries the new status
 immediately; its job dispatcher is designed around the server not sending
-another job while one is still running.
+another job while one is still running. Verified against the official runner
+source (`BrokerMessageListener.GetNextMessageAsync` + `Runner.RunAsync`): the
+cancellation message arrives on this same `GET /message` endpoint while the
+runner polls as `Busy`.
 
-The broker's routing internals are not public, but its behavior is consistent
-with status-driven delivery: polling as `Online` while a job executes is how
+The broker's routing internals are not public, so exact routing keys beyond the
+poll's status are inferred: polling as `Online` while a job executes is how
 issue #18 lost its cancellation — the `JobCancellation` never reached the
 runner, the job ran to completion reporting `succeeded`, and GitHub reconciled
-the run to `cancelled` server-side. Match the official runner's status
-transitions.
+the run to `cancelled` server-side. Match the official runner's requests
+byte-for-byte (all query parameters, same version string) so no unverified
+inference remains in what we send.
 
-The server holds the connection for up to ~50 seconds before responding with 202.
+The server holds the connection for up to ~50 seconds before answering an
+empty cycle.
 
 | Status | Meaning | Action |
 |--------|---------|--------|
-| **200** | Job or message available | Parse and handle `BrokerMessage` |
-| **202** | No job available | Immediately re-poll |
+| **2xx with body** | Job or message available | Parse and handle `BrokerMessage` |
+| **2xx empty** (200/202/204) | No message | Immediately re-poll |
 | **401** | Token expired | Invalidate token, refresh, retry |
 | **5xx** | Transient error | Exponential backoff, then retry |
+
+The official client (`RawHttpClientBase.SendAsync<T>`) treats *any* 2xx as
+success and an empty/null body as "no message" — it does not require 202
+specifically.
 
 ### 5.2 Message Format
 
@@ -428,9 +443,12 @@ The server holds the connection for up to ~50 seconds before responding with 202
 **JobCancellation** — cancel a running job:
 ```json
 {
-  "jobId": "{job_uuid}"
+  "jobId": "{job_uuid}",
+  "timeout": "00:00:00"
 }
 ```
+(`timeout` is a `TimeSpan` string; the runner ignores it and cancels
+immediately.)
 
 **Unknown / BrokerMigration** — should be acknowledged and ignored.
 
@@ -441,9 +459,10 @@ After receiving a `RunnerJobRequest`, acknowledge it to prevent redelivery:
 ```
 POST {broker_url}/acknowledge
     ?sessionId={session_id}
-    &runnerVersion=3.0.0
     &status=Online
-    &disableUpdate=true
+    &runnerVersion=2.329.0
+    &os=Linux
+    &architecture=X64
 Authorization: Bearer {oauth_token}
 Content-Type: application/json
 Timeout: 30s
@@ -452,6 +471,17 @@ Timeout: 30s
   "runnerRequestId": "{runner_request_id}"
 }
 ```
+
+**Note**: The acknowledge carries no `disableUpdate` parameter — the official
+runner's `BrokerHttpClient.AcknowledgeRunnerRequestAsync` never sends one. The
+`status` is the runner's *current* status: the official runner acknowledges
+after receiving the job message but before dispatching, so it is `Online` at
+this point (the same value chimera sends).
+
+The official runner gates the acknowledge on a `should_acknowledge` boolean in
+the `RunnerJobRequest` body (a server-side feature flag) and treats ack
+failures as best-effort. chimera always acknowledges, which matches the
+flag-enabled behavior observed in practice.
 
 ---
 
@@ -1442,8 +1472,8 @@ host and Docker bridge networks.
 | V1 register | POST | `{tenant}/_apis/distributedtask/pools/1/agents?api-version=6.0-preview` | Bearer (temp OAuth) |
 | Create session | POST | `{broker}/session` | Bearer (OAuth) |
 | Delete session | DELETE | `{broker}/session` | Bearer (OAuth) |
-| Poll message | GET | `{broker}/message?sessionId=...&status={Online\|Busy}&runnerVersion=3.0.0&disableUpdate=true` | Bearer (OAuth) |
-| Acknowledge | POST | `{broker}/acknowledge?sessionId=...&runnerVersion=3.0.0&status=Online&disableUpdate=true` | Bearer (OAuth) |
+| Poll message | GET | `{broker}/message?sessionId=...&status={Online\|Busy}&runnerVersion={runner_version}&os={os}&architecture={arch}&disableUpdate=true` | Bearer (OAuth) |
+| Acknowledge | POST | `{broker}/acknowledge?sessionId=...&status=Online&runnerVersion={runner_version}&os={os}&architecture={arch}` | Bearer (OAuth) |
 | Acquire job | POST | `{run_service}/acquirejob` | Bearer (OAuth) |
 | Renew job | POST | `{run_service}/renewjob` | Bearer (job token) |
 | Complete job | POST | `{server}/completejob` | Bearer (job token) |
@@ -1516,9 +1546,12 @@ based on its own cancellation tracking.
 
 ### Version numbers matter
 
-- `RUNNER_VERSION` (`2.329.0`) in session/registration bodies
-- `BROKER_PROTOCOL_VERSION` (`3.0.0`) in poll/ack query strings
-- These are separate values. Confusing them causes 400 errors.
+- `RUNNER_VERSION` (`2.329.0`) is the single version string used in
+  session/registration bodies **and** the `runnerVersion` query parameter on
+  poll/acknowledge requests.
+- There is no separate broker protocol version. Sending an invented version
+  (chimera once sent `3.0.0`) claims to be a future runner and may trip
+  unknown version-keyed server behavior.
 
 ### Legacy VSS log upload is `Content-Type: application/octet-stream`
 
@@ -1564,9 +1597,11 @@ create-session request. Always use the response value.
 
 ### Poll timeout layering
 
-The client sets a 55-second timeout. The server holds for up to 50 seconds.
-The 5-second gap ensures the client timeout fires after the server response,
-not before.
+The client sets a 60-second timeout (matching the official runner's 60s
+message-queue send timeout). The server normally answers an idle long-poll
+with 202 shortly before that, but occasionally holds past the client deadline
+(see #19/#22) — a client timeout on an established request is therefore a
+normal empty poll cycle, not a failure.
 
 ### Log metadata is posted after every flush
 

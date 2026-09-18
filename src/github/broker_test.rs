@@ -211,6 +211,150 @@ async fn poll_sends_requested_agent_status_on_the_wire() {
 }
 
 #[tokio::test]
+async fn poll_204_returns_none() {
+    let (mock_server, tm) = setup().await;
+
+    Mock::given(method("GET"))
+        .and(path("/message"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let client = make_client(&mock_server.uri(), tm);
+    let result = client.poll_message(AgentStatus::Busy).await.unwrap();
+    assert!(result.is_none());
+}
+
+#[tokio::test]
+async fn poll_200_with_empty_body_returns_none() {
+    let (mock_server, tm) = setup().await;
+
+    Mock::given(method("GET"))
+        .and(path("/message"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(""))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let client = make_client(&mock_server.uri(), tm);
+    let result = client.poll_message(AgentStatus::Busy).await.unwrap();
+    assert!(result.is_none());
+}
+
+// The official client deserializes the body into a nullable message: a JSON
+// `null` body is a "no message" answer, not a parse failure.
+#[tokio::test]
+async fn poll_with_null_body_returns_none() {
+    let (mock_server, tm) = setup().await;
+
+    Mock::given(method("GET"))
+        .and(path("/message"))
+        .respond_with(ResponseTemplate::new(202).set_body_string("null"))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let client = make_client(&mock_server.uri(), tm);
+    let result = client.poll_message(AgentStatus::Busy).await.unwrap();
+    assert!(result.is_none());
+}
+
+// Guards against a blanket "202 means empty" regression: a success status
+// carrying a message body must be delivered regardless of the exact code.
+#[tokio::test]
+async fn poll_202_with_message_body_returns_some() {
+    let (mock_server, tm) = setup().await;
+
+    Mock::given(method("GET"))
+        .and(path("/message"))
+        .respond_with(ResponseTemplate::new(202).set_body_json(serde_json::json!({
+            "messageId": 7,
+            "messageType": "JobCancellation",
+            "body": "{\"jobId\": \"job-7\"}"
+        })))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let client = make_client(&mock_server.uri(), tm);
+    let msg = client
+        .poll_message(AgentStatus::Busy)
+        .await
+        .unwrap()
+        .expect("202 with a message body must be delivered");
+    assert_eq!(msg.message_id, 7);
+    assert_eq!(msg.message_type, MessageType::JobCancellation);
+}
+
+#[tokio::test]
+async fn poll_200_with_null_body_returns_none() {
+    let (mock_server, tm) = setup().await;
+
+    Mock::given(method("GET"))
+        .and(path("/message"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("null"))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let client = make_client(&mock_server.uri(), tm);
+    let result = client.poll_message(AgentStatus::Busy).await.unwrap();
+    assert!(result.is_none());
+}
+
+// The official runner's broker client (BrokerHttpClient.GetRunnerMessageAsync)
+// sends os and architecture alongside the package runnerVersion on every poll.
+// chimera must match: any of these can key the broker's message routing.
+// Values must use the official VarUtil spellings, not raw platform strings.
+#[tokio::test]
+async fn poll_matches_official_runner_wire_format() {
+    let (mock_server, tm) = setup().await;
+
+    Mock::given(method("GET"))
+        .and(path("/message"))
+        .respond_with(ResponseTemplate::new(202))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let client = make_client(&mock_server.uri(), tm);
+    client.poll_message(AgentStatus::Online).await.unwrap();
+
+    let params = single_request_query(&mock_server, "GET", "/message").await;
+    assert_param(&params, "runnerVersion", RUNNER_VERSION);
+    assert_param(&params, "disableUpdate", "true");
+    assert_enum_param(
+        &params,
+        "os",
+        &["Linux", "macOS", "Windows"],
+        "official VarUtil.OS spellings",
+    );
+    assert_enum_param(
+        &params,
+        "architecture",
+        &["X86", "X64", "ARM", "ARM64"],
+        "official VarUtil.OSArchitecture spellings",
+    );
+
+    let requests = mock_server
+        .received_requests()
+        .await
+        .expect("wiremock request journal disabled");
+    let poll = requests
+        .iter()
+        .find(|request| request.method == "GET" && request.url.path() == "/message")
+        .expect("poll request recorded");
+    assert_eq!(
+        poll.headers
+            .get("accept")
+            .map(|value| value.to_str().unwrap_or_default()),
+        Some("application/json"),
+        "poll must send Accept: application/json like the official client"
+    );
+}
+
+#[tokio::test]
 async fn ack_job_posts_acknowledge() {
     let (mock_server, tm) = setup().await;
 
@@ -224,6 +368,112 @@ async fn ack_job_posts_acknowledge() {
 
     let client = make_client(&mock_server.uri(), tm);
     client.ack_job("request-abc").await.unwrap();
+}
+
+// The official runner's acknowledge (BrokerHttpClient.AcknowledgeRunnerRequestAsync)
+// sends sessionId, status, runnerVersion, os, architecture — and no disableUpdate.
+#[tokio::test]
+async fn ack_matches_official_runner_wire_format() {
+    let (mock_server, tm) = setup().await;
+
+    Mock::given(method("POST"))
+        .and(path("/acknowledge"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let client = make_client(&mock_server.uri(), tm);
+    client.ack_job("request-abc").await.unwrap();
+
+    let params = single_request_query(&mock_server, "POST", "/acknowledge").await;
+    assert_param(&params, "status", "Online");
+    assert_param(&params, "runnerVersion", RUNNER_VERSION);
+    assert_enum_param(
+        &params,
+        "os",
+        &["Linux", "macOS", "Windows"],
+        "official VarUtil.OS spellings",
+    );
+    assert_enum_param(
+        &params,
+        "architecture",
+        &["X86", "X64", "ARM", "ARM64"],
+        "official VarUtil.OSArchitecture spellings",
+    );
+    assert!(
+        !params.iter().any(|(key, _)| key == "disableUpdate"),
+        "acknowledge must not carry disableUpdate (official runner never sends it): {params:?}"
+    );
+
+    let requests = mock_server
+        .received_requests()
+        .await
+        .expect("wiremock request journal disabled");
+    let ack = requests
+        .iter()
+        .find(|request| request.method == "POST" && request.url.path() == "/acknowledge")
+        .expect("acknowledge request recorded");
+    assert_eq!(
+        ack.headers
+            .get("accept")
+            .map(|value| value.to_str().unwrap_or_default()),
+        Some("application/json"),
+        "acknowledge must send Accept: application/json like the official client"
+    );
+}
+
+async fn single_request_query(
+    mock_server: &MockServer,
+    method: &str,
+    path: &str,
+) -> Vec<(String, String)> {
+    let requests = mock_server
+        .received_requests()
+        .await
+        .expect("wiremock request journal disabled");
+    let request = requests
+        .iter()
+        .find(|request| request.method == method && request.url.path() == path)
+        .unwrap_or_else(|| panic!("no {method} {path} request recorded"));
+    request
+        .url
+        .query_pairs()
+        .map(|(key, value)| (key.to_string(), value.to_string()))
+        .collect()
+}
+
+fn assert_param(params: &[(String, String)], key: &str, expected: &str) {
+    let actual = params
+        .iter()
+        .filter(|(k, _)| k == key)
+        .map(|(_, v)| v.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        actual,
+        vec![expected],
+        "query param {key} must be {expected:?} exactly once, got {params:?}"
+    );
+}
+
+// Presence-only assertions would accept raw platform strings (os=linux,
+// architecture=x86_64); the official client sends the VarUtil spellings.
+fn assert_enum_param(params: &[(String, String)], key: &str, allowed: &[&str], what: &str) {
+    let actual = params
+        .iter()
+        .filter(|(k, _)| k == key)
+        .map(|(_, v)| v.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        actual.len(),
+        1,
+        "query param {key} must appear exactly once, got {params:?}"
+    );
+    assert!(
+        allowed.contains(&actual[0]),
+        "query param {key} must use {what} {allowed:?}, got {:?}",
+        actual[0]
+    );
 }
 
 #[tokio::test]
