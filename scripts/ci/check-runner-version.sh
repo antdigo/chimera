@@ -29,57 +29,16 @@ echo "chimera claims runner version v$version"
 releases_file="$(mktemp)"
 trap 'rm -f "$releases_file"' EXIT
 
-# Releases newest-first. A failure here (API outage, rate limit) must fail the
-# check, not pass it silently.
+# Straight from the API, newest published first. Order decisions do NOT live
+# here: release-list position is not semver order (backports publish late),
+# so the python checker compares versions numerically. A failure here (API
+# outage, rate limit) must fail the check, not pass it silently.
 gh api "repos/$OFFICIAL_REPO/releases?per_page=100" --paginate \
-  --jq '.[] | select(.draft == false and .prerelease == false) | [.tag_name, .published_at] | @tsv' \
+  --jq '.[] | select(.draft == false and .prerelease == false and .published_at != null) | [.tag_name, .published_at] | @tsv' \
   > "$releases_file"
 
-# The release that started our deprecation clock is the newest entry ABOVE
-# ours in the newest-first list.
-found=false
-newer_tag=""
-newer_published=""
-while IFS=$'\t' read -r tag published; do
-  if [[ "$tag" == "v$version" ]]; then
-    found=true
-    break
-  fi
-  newer_tag="$tag"
-  newer_published="$published"
-done < "$releases_file"
-
-if [[ "$found" != true ]]; then
-  echo "check-runner-version: v$version is not an official $OFFICIAL_REPO release" >&2
-  exit 1
-fi
-
-if [[ -z "$newer_tag" ]]; then
-  echo "ok: v$version is the newest $OFFICIAL_REPO release"
-  exit 0
-fi
-
-lag_days="$(python3 - "$newer_published" <<'PY'
-import datetime
-import sys
-
-published = datetime.datetime.fromisoformat(sys.argv[1].replace("Z", "+00:00"))
-lag = datetime.datetime.now(datetime.timezone.utc) - published
-print(int(lag.total_seconds() // 86400))
-PY
-)"
-
-echo "newer release $newer_tag was published ${lag_days}d ago (policy wall: ${POLICY_DAYS}d)"
-
-if (( lag_days > MAX_LAG_DAYS )); then
-  cat >&2 <<EOF
-check-runner-version: RUNNER_VERSION v$version has fallen behind.
-GitHub stops delivering jobs to runners more than $POLICY_DAYS days older
-than the newest release ($newer_tag is already ${lag_days} days old).
-Bump RUNNER_VERSION in src/github.rs (and the example literals in
-docs/gh-protocol.md) to the newest release and merge before the wall.
-EOF
-  exit 1
-fi
-
-echo "ok: v$version is within the deprecation window"
+python3 "$REPO_ROOT/scripts/ci/runner_version_check.py" \
+  --releases "$releases_file" \
+  --version "$version" \
+  --policy-days "$POLICY_DAYS" \
+  --max-lag-days "$MAX_LAG_DAYS"

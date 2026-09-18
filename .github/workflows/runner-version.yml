@@ -14,6 +14,10 @@ concurrency:
   group: runner-version-${{ github.ref }}
   cancel-in-progress: true
 
+# The gate only reads the checkout and the public releases API.
+permissions:
+  contents: read
+
 jobs:
   check:
     name: RUNNER_VERSION freshness
@@ -21,6 +25,9 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
+
+      - name: Gate decision unit tests
+        run: python3 scripts/ci/runner_version_check_test.py
 
       - name: Check RUNNER_VERSION against the official deprecation window
         env:
