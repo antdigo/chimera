@@ -106,6 +106,27 @@ fn wait_for_signal(control: &Path, name: &str) {
     wait_for_path(&control.join(name));
 }
 
+fn wait_for_result(control: &Path, name: &str) -> String {
+    // Result files carry their signal in the content, and `fs::write` makes the
+    // path visible before the content lands (a scheduled-out child can leave it
+    // empty for milliseconds under load), so wait for non-empty content.
+    let path = control.join(name);
+    let deadline = Instant::now() + LOCK_TEST_TIMEOUT;
+    loop {
+        if let Ok(content) = std::fs::read_to_string(&path) {
+            if !content.is_empty() {
+                return content;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for {}",
+            path.display()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 // --- PID lock tests ---
 
 #[test]
@@ -223,11 +244,8 @@ fn fresh_pid_file_race_has_single_owner_and_valid_pid() {
         "contender",
     );
     wait_for_signal(&control, "contender.locked");
-    wait_for_signal(&control, "creator.result");
-    wait_for_signal(&control, "contender.result");
-
-    let creator_result = std::fs::read_to_string(control.join("creator.result")).unwrap();
-    let contender_result = std::fs::read_to_string(control.join("contender.result")).unwrap();
+    let creator_result = wait_for_result(&control, "creator.result");
+    let contender_result = wait_for_result(&control, "contender.result");
     let results = [&creator_result, &contender_result];
     assert_eq!(
         results
@@ -324,11 +342,8 @@ fn concurrent_stale_lock_reclamation_has_single_owner() {
     wait_for_signal(&control, "first.ready");
     wait_for_signal(&control, "second.ready");
     std::fs::write(control.join("start"), []).unwrap();
-    wait_for_signal(&control, "first.result");
-    wait_for_signal(&control, "second.result");
-
-    let first_result = std::fs::read_to_string(control.join("first.result")).unwrap();
-    let second_result = std::fs::read_to_string(control.join("second.result")).unwrap();
+    let first_result = wait_for_result(&control, "first.result");
+    let second_result = wait_for_result(&control, "second.result");
     let results = [&first_result, &second_result];
     assert_eq!(
         results
