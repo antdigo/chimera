@@ -42,7 +42,20 @@ fn daemon_holds_root_lock_for_its_lifetime() {
         RootLockError::Busy
     ));
     drop(daemon);
-    RootLock::acquire(root.path()).unwrap();
+    // A concurrently spawned child process (other tests spawn the test binary)
+    // transiently duplicates the lock-holding fd until its exec completes, so
+    // Busy can outlive drop(daemon) by milliseconds even though the daemon
+    // released its lock. Poll until the lock is genuinely free.
+    let deadline = Instant::now() + LOCK_TEST_TIMEOUT;
+    loop {
+        match RootLock::acquire(root.path()) {
+            Ok(_released) => break,
+            Err(RootLockError::Busy) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => panic!("root lock not acquirable after daemon drop: {error:?}"),
+        }
+    }
 }
 
 const LOCK_TEST_TIMEOUT: Duration = Duration::from_secs(5);
