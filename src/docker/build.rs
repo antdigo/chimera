@@ -326,9 +326,13 @@ async fn build_archive(
         {
             observer(info);
         }
-        let info = item.map_err(|_| anyhow!("Docker action image build failed"))?;
-        if info.error.is_some() {
-            return Err(anyhow!("Docker action image build failed"));
+        let info = item
+            .map_err(|error| DockerActionBuildFailure(Box::new(error)))
+            .map_err(anyhow::Error::new)?;
+        if let Some(engine_error) = info.error {
+            return Err(
+                DockerActionBuildFailure(Box::new(std::io::Error::other(engine_error))).into(),
+            );
         }
         send_build_progress(log_sender, info, internal_tag).await;
     }
@@ -368,6 +372,13 @@ async fn send_build_progress(log_sender: &LogSender, info: BuildInfo, internal_t
         log_sender.send(message).await;
     }
 }
+
+/// Keeps the stable public message the job log asserts on while preserving
+/// the Engine's own error text in the cause chain: without it, failures like
+/// a base-image platform mismatch are undiagnosable from the outside.
+#[derive(Debug, thiserror::Error)]
+#[error("Docker action image build failed")]
+struct DockerActionBuildFailure(#[source] Box<dyn std::error::Error + Send + Sync>);
 
 fn format_build_progress(info: BuildInfo, internal_tag: &str) -> Vec<String> {
     if let Some(stream) = info.stream {

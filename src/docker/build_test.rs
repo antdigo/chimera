@@ -528,6 +528,28 @@ fn preparation_interruption_recognizes_sentinels_behind_context_messages() {
     assert!(preparation_interruption(&unrelated).is_none());
 }
 
+/// The job log asserts on the stable outer message, but the Engine's own
+/// error text (platform mismatches, registry failures) must stay reachable
+/// in the cause chain for diagnosis.
+#[test]
+fn build_failure_keeps_the_engine_error_in_the_cause_chain() {
+    let error = anyhow::Error::new(DockerActionBuildFailure(Box::new(std::io::Error::other(
+        "image with reference sha256:deadbeef was found but its platform does not match",
+    ))));
+
+    assert_eq!(error.to_string(), "Docker action image build failed");
+    let causes = error
+        .chain()
+        .map(|cause| cause.to_string())
+        .collect::<Vec<_>>();
+    assert!(
+        causes
+            .iter()
+            .any(|cause| cause.contains("platform does not match")),
+        "engine text lost from the cause chain: {causes:?}"
+    );
+}
+
 async fn test_build(
     builder: &DockerActionBuilder,
     docker: &Docker,
