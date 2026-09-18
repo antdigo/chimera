@@ -41,6 +41,21 @@ pub enum DockerBuildOutcome {
     TimedOut,
 }
 
+/// Maps a preparation worker error carrying a sentinel to the matching
+/// lifecycle outcome. The sentinels start as plain strings deep inside the
+/// traversal but reach the caller wrapped in context messages ("adding file
+/// to Docker build context"), so every link of the cause chain is inspected.
+fn preparation_interruption(error: &anyhow::Error) -> Option<DockerBuildOutcome> {
+    let causes = || error.chain().map(|cause| cause.to_string());
+    if causes().any(|cause| cause == PREPARATION_CANCELLED) {
+        return Some(DockerBuildOutcome::Cancelled);
+    }
+    if causes().any(|cause| cause == PREPARATION_DEADLINE_EXCEEDED) {
+        return Some(DockerBuildOutcome::TimedOut);
+    }
+    None
+}
+
 pub struct DockerBuildRequest<'a> {
     pub docker: &'a Docker,
     pub action_dir: &'a TrustedActionDirectory,
@@ -160,12 +175,8 @@ impl DockerActionBuilder {
                     Ok(Err(error)) => {
                         // The worker noticed the budget before the async select
                         // did; report the interrupted lifecycle, not a failure.
-                        let message = error.to_string();
-                        if message == PREPARATION_CANCELLED {
-                            return Ok(DockerBuildOutcome::Cancelled);
-                        }
-                        if message == PREPARATION_DEADLINE_EXCEEDED {
-                            return Ok(DockerBuildOutcome::TimedOut);
+                        if let Some(interrupted) = preparation_interruption(&error) {
+                            return Ok(interrupted);
                         }
                         return Err(error);
                     }

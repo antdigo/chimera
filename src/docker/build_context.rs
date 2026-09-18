@@ -201,12 +201,13 @@ impl IgnoreRules {
         let specific = paths
             .dockerfile_relative
             .with_file_name(format!("{dockerfile_name}.dockerignore"));
-        let selected = if let Some(file) = read_optional_regular_file_inside(paths, &specific)? {
-            Some((specific, file))
-        } else {
-            let root = PathBuf::from(".dockerignore");
-            read_optional_regular_file_inside(paths, &root)?.map(|file| (root, file))
-        };
+        let selected =
+            if let Some(file) = read_optional_regular_file_inside(paths, &specific, budget)? {
+                Some((specific, file))
+            } else {
+                let root = PathBuf::from(".dockerignore");
+                read_optional_regular_file_inside(paths, &root, budget)?.map(|file| (root, file))
+            };
 
         let Some((relative, (bytes, canonical))) = selected else {
             return Ok((Self::default(), None));
@@ -216,6 +217,7 @@ impl IgnoreRules {
         let text = text.strip_prefix('\u{feff}').unwrap_or(text);
         let mut rules = Vec::new();
         for (line_number, raw) in text.lines().enumerate() {
+            budget.check()?;
             let trimmed = raw.trim();
             // Docker escapes a literal leading `#` as `\#`; the escape has to
             // be removed before comment detection so the compiled pattern
@@ -301,6 +303,7 @@ fn rule_matches(rule: &IgnoreRule, slash_path: &str) -> bool {
 fn read_optional_regular_file_inside(
     paths: &ResolvedBuildPaths,
     relative: &Path,
+    budget: &PreparationBudget,
 ) -> Result<Option<(Vec<u8>, PathBuf)>> {
     #[cfg(target_os = "linux")]
     {
@@ -321,7 +324,7 @@ fn read_optional_regular_file_inside(
         let parent = open_relative_directory(&paths.root, parent)?;
         let expected = FileIdentity::from_metadata(&resolved.canonical_metadata);
         let file = open_regular_file_at(&parent, name, expected)?;
-        let (bytes, _) = read_open_file(file)?;
+        let (bytes, _) = read_open_file(file, budget)?;
         return Ok(Some((bytes, resolved.canonical_relative)));
     }
 
@@ -349,7 +352,7 @@ fn read_optional_regular_file_inside(
             .strip_prefix(&paths.action_root)
             .context("build context file is outside the action directory")?
             .to_path_buf();
-        let (bytes, _) = read_context_file(&paths.action_root, &canonical, None)?;
+        let (bytes, _) = read_context_file(&paths.action_root, &canonical, None, budget)?;
         paths.validate_path_identity()?;
         Ok(Some((bytes, canonical_relative)))
     }
@@ -682,6 +685,7 @@ fn collect_context_entries_linux(
     ignore_file: Option<&IgnoreFile>,
     chain: &DockerfileChain,
     state: &mut TraversalState,
+    budget: &PreparationBudget,
 ) -> Result<fs::File> {
     let root = paths
         .root
@@ -695,6 +699,7 @@ fn collect_context_entries_linux(
         &root,
         Path::new(""),
         state,
+        budget,
     )?;
     Ok(root)
 }
@@ -710,7 +715,7 @@ fn collect_directory_entries_linux(
     state: &mut TraversalState,
     budget: &PreparationBudget,
 ) -> Result<()> {
-    for name in read_directory_names(directory)? {
+    for name in read_directory_names(directory, budget)? {
         budget.check()?;
         let relative = prefix.join(&name);
         let archive_path = path_to_slash_string(&relative)?;
@@ -792,15 +797,23 @@ fn read_context_file(
     action_root: &Path,
     source: &Path,
     expected: Option<FileIdentity>,
+    budget: &PreparationBudget,
 ) -> Result<(Vec<u8>, u32)> {
     let file = open_regular_file(action_root, source, expected)?;
-    read_open_file(file)
+    read_open_file(file, budget)
 }
 
-fn read_open_file(mut file: fs::File) -> Result<(Vec<u8>, u32)> {
+fn read_open_file(mut file: fs::File, budget: &PreparationBudget) -> Result<(Vec<u8>, u32)> {
     let metadata = file.metadata().context("reading build context metadata")?;
+    // The ignore file is action-authored input, so an oversized file must
+    // stop filling the buffer once the budget fires mid-read.
+    let mut reader = BudgetedReader {
+        file: &mut file,
+        budget,
+    };
     let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)
+    reader
+        .read_to_end(&mut bytes)
         .context("reading Docker build context file")?;
     Ok((bytes, metadata.mode()))
 }
@@ -1077,7 +1090,7 @@ fn open_at_raw(parent: &fs::File, name: &OsStr, flags: libc::c_int) -> std::io::
 }
 
 #[cfg(target_os = "linux")]
-fn read_directory_names(directory: &fs::File) -> Result<Vec<OsString>> {
+fn read_directory_names(directory: &fs::File, budget: &PreparationBudget) -> Result<Vec<OsString>> {
     let duplicate = unsafe { libc::dup(directory.as_raw_fd()) };
     if duplicate < 0 {
         return Err(std::io::Error::last_os_error())
@@ -1102,6 +1115,9 @@ fn read_directory_names(directory: &fs::File) -> Result<Vec<OsString>> {
 
     let mut names = Vec::new();
     loop {
+        // A directory with a huge number of entries must not buffer its full
+        // name list after the budget has already fired.
+        budget.check()?;
         unsafe { *libc::__errno_location() = 0 };
         let entry = unsafe { libc::readdir(stream) };
         if entry.is_null() {

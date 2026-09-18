@@ -125,9 +125,13 @@ async fn cancelling_build_stops_engine_work_and_never_publishes_image() {
         .unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let unique = uuid::Uuid::new_v4();
+    // The nonce lives inside the RUN instruction itself: a Dockerfile comment
+    // does not invalidate the layer, so a daemon that already cached the
+    // plain `RUN sleep 30` layer would finish instantly and never expose the
+    // running intermediate container this test needs to observe.
     std::fs::write(
         tmp.path().join("Dockerfile"),
-        format!("# {unique}\nFROM alpine:3.19\nRUN sleep 30\n"),
+        format!("FROM alpine:3.19\nRUN sleep 30 # {unique}\n"),
     )
     .unwrap();
     let (logger, _receiver) = test_log_sender();
@@ -165,15 +169,13 @@ async fn cancelling_build_stops_engine_work_and_never_publishes_image() {
         .expect("build must reach its RUN step")
         .unwrap();
 
-    let running = docker
-        .inspect_container(&container_id, None)
-        .await
-        .unwrap()
-        .state
-        .as_ref()
-        .and_then(|state| state.running)
-        .unwrap_or(false);
-    assert!(running, "intermediate container must be running");
+    // BuilderV1 emits the "Running in" record while it is still creating the
+    // container, before Start, so liveness needs a bounded poll rather than
+    // one inspection at a timing-dependent moment.
+    assert!(
+        wait_until_container_running(&docker, &container_id, Duration::from_secs(10)).await,
+        "intermediate container must reach the running state"
+    );
 
     cancel.cancel();
 
@@ -221,9 +223,10 @@ async fn timed_out_build_returns_bounded_and_never_publishes_image() {
         .unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let unique = uuid::Uuid::new_v4();
+    // Same cache-defeating nonce as the cancellation fixture.
     std::fs::write(
         tmp.path().join("Dockerfile"),
-        format!("# {unique}\nFROM alpine:3.19\nRUN sleep 30\n"),
+        format!("FROM alpine:3.19\nRUN sleep 30 # {unique}\n"),
     )
     .unwrap();
     let (logger, _receiver) = test_log_sender();
@@ -262,15 +265,11 @@ async fn timed_out_build_returns_bounded_and_never_publishes_image() {
     .await
     .expect("build must reach its RUN step before the deadline")
     .unwrap();
-    let running = docker
-        .inspect_container(&container_id, None)
-        .await
-        .unwrap()
-        .state
-        .as_ref()
-        .and_then(|state| state.running)
-        .unwrap_or(false);
-    assert!(running, "intermediate container must be running");
+    let running_budget = deadline.saturating_duration_since(Instant::now());
+    assert!(
+        wait_until_container_running(&docker, &container_id, running_budget).await,
+        "intermediate container must reach the running state before the deadline"
+    );
     assert!(
         Instant::now() < deadline,
         "deadline must fire only after the running state is proven"
@@ -387,6 +386,44 @@ fn builder_signalling_intermediate_container() -> (
     )
 }
 
+/// Bounded poll for the container's start; each Engine request is capped by
+/// the remaining budget so a stalled daemon cannot extend the wait.
+async fn wait_until_container_running(
+    docker: &Docker,
+    container_id: &str,
+    budget: Duration,
+) -> bool {
+    let deadline = Instant::now() + budget;
+    let mut ticker = tokio::time::interval(Duration::from_millis(100));
+    loop {
+        ticker.tick().await;
+        if Instant::now() >= deadline {
+            return false;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let observation =
+            tokio::time::timeout(remaining, docker.inspect_container(container_id, None)).await;
+        let Ok(observation) = observation else {
+            return false;
+        };
+        let Ok(inspect) = observation else {
+            continue;
+        };
+        if inspect
+            .state
+            .as_ref()
+            .and_then(|state| state.running)
+            .unwrap_or(false)
+        {
+            return true;
+        }
+    }
+}
+
+/// Observes the container leaving the running state inside the budget. Every
+/// observation is bounded by the same deadline: a "not running" answer that
+/// only arrives after the window has closed would also match the sleep
+/// finishing naturally, so it must not count as an Engine-side stop.
 async fn wait_until_container_not_running(
     docker: &Docker,
     container_id: &str,
@@ -396,7 +433,17 @@ async fn wait_until_container_not_running(
     let mut ticker = tokio::time::interval(Duration::from_millis(250));
     loop {
         ticker.tick().await;
-        match docker.inspect_container(container_id, None).await {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let observation =
+            tokio::time::timeout(remaining, docker.inspect_container(container_id, None)).await;
+        let observation = match observation {
+            Ok(observation) => observation,
+            Err(_stalled_past_the_window) => return false,
+        };
+        match observation {
             Err(DockerError::DockerResponseServerError {
                 status_code: 404, ..
             }) => return true,
@@ -411,9 +458,6 @@ async fn wait_until_container_not_running(
                     return true;
                 }
             }
-        }
-        if Instant::now() >= deadline {
-            return false;
         }
     }
 }
@@ -447,6 +491,29 @@ fn intermediate_container_id_extraction_rejects_instruction_echoes() {
         None
     );
     assert_eq!(intermediate_container_id_from_builder_stream("short"), None);
+}
+
+#[test]
+fn preparation_interruption_recognizes_sentinels_behind_context_messages() {
+    let error = Err::<(), std::io::Error>(std::io::Error::other(PREPARATION_CANCELLED))
+        .context("adding file to Docker build context")
+        .context("preparing Docker build context")
+        .unwrap_err();
+    assert!(matches!(
+        preparation_interruption(&error),
+        Some(DockerBuildOutcome::Cancelled)
+    ));
+
+    let error = Err::<(), std::io::Error>(std::io::Error::other(PREPARATION_DEADLINE_EXCEEDED))
+        .context("reading Docker build context file")
+        .unwrap_err();
+    assert!(matches!(
+        preparation_interruption(&error),
+        Some(DockerBuildOutcome::TimedOut)
+    ));
+
+    let unrelated = anyhow!("no such file or directory");
+    assert!(preparation_interruption(&unrelated).is_none());
 }
 
 async fn test_build(

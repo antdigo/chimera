@@ -231,6 +231,45 @@ fn cancelled_preparation_stops_before_packing_a_large_context() {
     );
 }
 
+/// The copy loop inside `append_regular_file` wraps every error with
+/// "adding file to Docker build context"; an interruption raised mid-copy
+/// must stay recognizable behind that wrapper so the build classifies it as
+/// a cancelled lifecycle instead of an ordinary failure.
+#[test]
+fn cancelled_during_file_copy_keeps_the_sentinel_through_context_wrapping() {
+    let tmp = tempfile::tempdir().unwrap();
+    let payload = tmp.path().join("payload.bin");
+    std::fs::write(&payload, vec![7u8; 64 * 1024]).unwrap();
+    let file = std::fs::File::open(&payload).unwrap();
+    let metadata = file.metadata().unwrap();
+    let identity = FileIdentity::from_metadata(&metadata);
+    let entry = ContextEntry {
+        relative: PathBuf::from("payload.bin"),
+        mode: metadata.mode(),
+        kind: ContextEntryKind::File(identity),
+        archive_path: "payload.bin".to_string(),
+    };
+
+    let cancel_token = tokio_util::sync::CancellationToken::new();
+    cancel_token.cancel();
+    let budget = PreparationBudget::new(
+        std::time::Instant::now() + std::time::Duration::from_secs(600),
+        cancel_token,
+    );
+
+    let mut builder = tar::Builder::new(Vec::new());
+    let error = append_regular_file(&mut builder, &entry, identity, file, &budget).unwrap_err();
+
+    let causes = error
+        .chain()
+        .map(|cause| cause.to_string())
+        .collect::<Vec<_>>();
+    assert!(
+        causes.iter().any(|cause| cause == PREPARATION_CANCELLED),
+        "sentinel lost behind context wrapping, chain: {causes:?}"
+    );
+}
+
 #[test]
 fn root_dockerignore_with_bom_and_escaped_hash_excludes_literal_hash_file() {
     let tmp = tempfile::tempdir().unwrap();
