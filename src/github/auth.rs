@@ -13,9 +13,32 @@ use tracing::{debug, warn};
 
 #[derive(Debug, thiserror::Error)]
 pub enum AuthError {
+    /// The token request could not be built — the endpoint URL is malformed.
+    #[error("invalid token endpoint URL: {0}")]
+    InvalidEndpoint(String),
+
+    /// The token request never completed (network error, timeout — including
+    /// a timeout while reading the response body).
     #[error("token exchange failed: {0}")]
-    TokenExchange(String),
+    Send(String),
+
+    /// The token endpoint answered with a non-success HTTP status.
+    #[error("token exchange failed: {status}: {body}")]
+    Status {
+        status: reqwest::StatusCode,
+        body: String,
+    },
+
+    /// A success-status response could not be parsed as a token grant.
+    #[error("token exchange failed: parsing response: {0}")]
+    BadResponse(String),
 }
+
+/// Overall deadline for one token exchange request. The client's
+/// connect_timeout only bounds connection establishment; without this a
+/// stalled response body would hang the exchange (and runner startup)
+/// indefinitely.
+const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct JwtClaims {
@@ -159,21 +182,37 @@ impl TokenManager {
                 ])
                 .context("encoding form body")?,
             )
+            .timeout(REQUEST_TIMEOUT)
             .send()
             .await
-            .map_err(|e| AuthError::TokenExchange(e.to_string()))
+            .map_err(|e| {
+                // A request-builder failure means the endpoint URL itself is
+                // unusable (bad registration data) — not something to retry.
+                if e.is_builder() {
+                    AuthError::InvalidEndpoint(self.authorization_url.clone())
+                } else {
+                    AuthError::Send(e.to_string())
+                }
+            })
             .context("sending token exchange request")?;
 
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            return Err(AuthError::TokenExchange(format!("{status}: {body}")).into());
+            return Err(AuthError::Status { status, body }.into());
         }
 
-        let token_resp: TokenResponse = resp
-            .json()
+        // Read the body before parsing so transport failures while reading
+        // (stalled body, connection reset) stay distinguishable from a
+        // well-received but malformed payload.
+        let body = resp
+            .bytes()
             .await
-            .map_err(|e| AuthError::TokenExchange(e.to_string()))
+            .map_err(|e| AuthError::Send(e.to_string()))
+            .context("reading token exchange response")?;
+
+        let token_resp: TokenResponse = serde_json::from_slice(&body)
+            .map_err(|e| AuthError::BadResponse(e.to_string()))
             .context("parsing token exchange response")?;
 
         let expires_in = token_resp.expires_in.unwrap_or(3600);

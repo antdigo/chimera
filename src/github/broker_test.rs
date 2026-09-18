@@ -121,6 +121,64 @@ async fn connect_marks_persistent_runner_as_non_ephemeral() {
 }
 
 #[tokio::test]
+async fn connect_maps_503_to_server_error() {
+    let (mock_server, tm) = setup().await;
+
+    Mock::given(method("POST"))
+        .and(path("/session"))
+        .respond_with(ResponseTemplate::new(503).set_body_string("blip"))
+        .mount(&mock_server)
+        .await;
+
+    let result = BrokerClient::connect(
+        reqwest::Client::new(),
+        &mock_server.uri(),
+        tm,
+        42,
+        "chimera-0",
+    )
+    .await;
+
+    let err = result
+        .err()
+        .expect("503 on session creation should be an error");
+    assert!(
+        err.downcast_ref::<BrokerError>()
+            .is_some_and(|be| matches!(be, BrokerError::ServerError(_))),
+        "expected BrokerError::ServerError, got: {err}"
+    );
+}
+
+#[tokio::test]
+async fn connect_maps_401_to_unauthorized() {
+    let (mock_server, tm) = setup().await;
+
+    Mock::given(method("POST"))
+        .and(path("/session"))
+        .respond_with(ResponseTemplate::new(401))
+        .mount(&mock_server)
+        .await;
+
+    let result = BrokerClient::connect(
+        reqwest::Client::new(),
+        &mock_server.uri(),
+        tm,
+        42,
+        "chimera-0",
+    )
+    .await;
+
+    let err = result
+        .err()
+        .expect("401 on session creation should be an error");
+    assert!(
+        err.downcast_ref::<BrokerError>()
+            .is_some_and(|be| matches!(be, BrokerError::Unauthorized)),
+        "expected BrokerError::Unauthorized, got: {err}"
+    );
+}
+
+#[tokio::test]
 async fn disconnect_success() {
     let (mock_server, tm) = setup().await;
 

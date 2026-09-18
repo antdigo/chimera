@@ -146,6 +146,9 @@ pub enum BrokerError {
 
     #[error("connection error: {0}")]
     Connection(String),
+
+    #[error("malformed broker response: {0}")]
+    BadResponse(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -259,17 +262,40 @@ impl BrokerClient {
             .timeout(REQUEST_TIMEOUT)
             .send()
             .await
+            .map_err(|e| {
+                // A request-builder failure means the broker URL itself is
+                // unusable (bad registration data) — not something to retry.
+                if e.is_builder() {
+                    anyhow::anyhow!("invalid broker URL {server_url}: {e}")
+                } else {
+                    BrokerError::Connection(e.to_string()).into()
+                }
+            })
             .context("sending create session request")?;
 
         let status = resp.status();
         if !status.is_success() {
             let body_text = resp.text().await.unwrap_or_default();
-            bail!("create session failed ({status}): {body_text}");
+            return match status.as_u16() {
+                401 => Err(BrokerError::Unauthorized.into()),
+                s if (500..600).contains(&s) || s == 429 => {
+                    Err(BrokerError::ServerError(format!("{status}: {body_text}")).into())
+                }
+                _ => bail!("create session failed ({status}): {body_text}"),
+            };
         }
 
-        let session: CreateSessionResponse = resp
-            .json()
+        // Read the body before parsing so transport failures while reading
+        // (stalled body, connection reset) stay retryable instead of being
+        // misfiled as a permanent malformed-response error.
+        let body = resp
+            .bytes()
             .await
+            .map_err(|e| BrokerError::Connection(e.to_string()))
+            .context("reading create session response")?;
+
+        let session: CreateSessionResponse = serde_json::from_slice(&body)
+            .map_err(|e| BrokerError::BadResponse(e.to_string()))
             .context("parsing create session response")?;
 
         debug!(session_id = %session.session_id, "broker session created");

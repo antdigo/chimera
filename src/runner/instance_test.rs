@@ -487,6 +487,481 @@ async fn poll_loop_persistent_401_returns_error() {
     );
 }
 
+/// A runner whose credentials point at a live mock server: a real RSA key
+/// (so `start` can reconstruct it) plus controllable token and broker URLs.
+fn make_startup_runner(
+    state: Option<Arc<DaemonState>>,
+    authorization_url: String,
+    server_url_v2: String,
+) -> (TempDir, Runner) {
+    let temp = TempDir::new().unwrap();
+    let paths = ChimeraPaths::new(temp.path().to_path_buf());
+    let job_resources =
+        crate::job::docker_config::JobResourceRoot::prepare(&paths.job_resources_dir()).unwrap();
+
+    let rsa_params =
+        crate::config::private_key_to_rsa_params(&crate::testing::test_private_key()).unwrap();
+
+    let runner = Runner {
+        name: "test-runner".into(),
+        credentials: crate::config::RunnerCredentials {
+            info: crate::config::RunnerInfo {
+                agent_id: 1,
+                agent_name: "test".into(),
+                pool_id: 1,
+                server_url: server_url_v2.clone(),
+                server_url_v2,
+                git_hub_url: "http://unused".into(),
+                work_folder: "_work".into(),
+                use_v2_flow: true,
+            },
+            oauth: crate::config::OAuthCredentials {
+                scheme: "OAuth".into(),
+                client_id: "test-client".into(),
+                authorization_url,
+            },
+            rsa_params,
+        },
+        paths,
+        state,
+        job_resources,
+        cache_port: 9999,
+        docker_action_builder: Arc::new(crate::docker::build::DockerActionBuilder::new()),
+    };
+
+    (temp, runner)
+}
+
+async fn wait_for_phase(
+    state: &Arc<DaemonState>,
+    runner_name: &str,
+    phase: RunnerPhase,
+) -> Result<(), tokio::time::error::Elapsed> {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let snapshot = state.snapshot().await;
+            if snapshot
+                .runners
+                .get(runner_name)
+                .is_some_and(|status| status.phase == phase)
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+}
+
+#[tokio::test]
+async fn start_retries_transient_token_exchange_failure() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/oauth2/token"))
+        .respond_with(
+            ResponseTemplate::new(503).set_body_string("GitHub Actions is temporarily unavailable"),
+        )
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/oauth2/token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "access_token": "test-token",
+            "expires_in": 7200
+        })))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/session"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "sessionId": "session-uuid-123"
+        })))
+        .mount(&mock_server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/message"))
+        .respond_with(ResponseTemplate::new(202).set_delay(Duration::from_millis(50)))
+        .mount(&mock_server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/session"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&mock_server)
+        .await;
+
+    let state = Arc::new(DaemonState::new(&["test-runner".to_string()]));
+    let (_temp, runner) = make_startup_runner(
+        Some(Arc::clone(&state)),
+        format!("{}/oauth2/token", mock_server.uri()),
+        mock_server.uri(),
+    );
+
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let start = tokio::spawn(runner.start(shutdown_rx));
+
+    wait_for_phase(&state, "test-runner", RunnerPhase::Idle)
+        .await
+        .expect("runner should reach Idle after a transient token exchange failure");
+
+    shutdown_tx.send(true).unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(10), start)
+        .await
+        .expect("runner should exit after shutdown")
+        .unwrap();
+    assert!(
+        result.is_ok(),
+        "runner should shut down cleanly after reaching Idle"
+    );
+}
+
+#[tokio::test]
+async fn start_retries_transient_broker_session_failure() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/oauth2/token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "access_token": "test-token",
+            "expires_in": 7200
+        })))
+        // The cached token must serve both the initial exchange and the
+        // session-creation retry: a second exchange would mean the retry
+        // rebuilt the token manager instead of reusing it.
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/session"))
+        .respond_with(ResponseTemplate::new(503).set_body_string("try later"))
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/session"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "sessionId": "session-uuid-123"
+        })))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/message"))
+        .respond_with(ResponseTemplate::new(202).set_delay(Duration::from_millis(50)))
+        .mount(&mock_server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/session"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&mock_server)
+        .await;
+
+    let state = Arc::new(DaemonState::new(&["test-runner".to_string()]));
+    let (_temp, runner) = make_startup_runner(
+        Some(Arc::clone(&state)),
+        format!("{}/oauth2/token", mock_server.uri()),
+        mock_server.uri(),
+    );
+
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let start = tokio::spawn(runner.start(shutdown_rx));
+
+    wait_for_phase(&state, "test-runner", RunnerPhase::Idle)
+        .await
+        .expect("runner should reach Idle after a transient broker session failure");
+
+    shutdown_tx.send(true).unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(10), start)
+        .await
+        .expect("runner should exit after shutdown")
+        .unwrap();
+    assert!(
+        result.is_ok(),
+        "runner should shut down cleanly after reaching Idle"
+    );
+}
+
+#[tokio::test]
+async fn start_permanent_token_failure_returns_error_without_retry() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/oauth2/token"))
+        .respond_with(ResponseTemplate::new(401).set_body_string("invalid_client"))
+        // Exactly one exchange: a permanent auth rejection must not be retried.
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let (_temp, runner) = make_startup_runner(
+        None,
+        format!("{}/oauth2/token", mock_server.uri()),
+        mock_server.uri(),
+    );
+
+    let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+    let result = tokio::time::timeout(Duration::from_secs(5), runner.start(shutdown_rx))
+        .await
+        .expect("start should fail fast on a permanent auth rejection");
+
+    let error = result.unwrap_err();
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("401"),
+        "error should mention the rejected status: {message}"
+    );
+}
+
+#[tokio::test]
+async fn start_shutdown_during_startup_retry_exits_cleanly() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/oauth2/token"))
+        .respond_with(ResponseTemplate::new(503).set_body_string("unavailable"))
+        .mount(&mock_server)
+        .await;
+
+    let (_temp, runner) = make_startup_runner(
+        None,
+        format!("{}/oauth2/token", mock_server.uri()),
+        mock_server.uri(),
+    );
+
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let start = tokio::spawn(runner.start(shutdown_rx));
+
+    // Land inside the post-failure backoff window, then shut down. Best-effort
+    // send: the assertion below is what flags a runner that already died.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let _ = shutdown_tx.send(true);
+
+    let result = tokio::time::timeout(Duration::from_secs(10), start)
+        .await
+        .expect("shutdown should interrupt the startup retry loop")
+        .unwrap();
+    assert!(
+        result.is_ok(),
+        "runner should exit cleanly when shutdown interrupts startup retries"
+    );
+}
+
+#[tokio::test]
+async fn start_fails_fast_on_malformed_authorization_url() {
+    let (_temp, runner) = make_startup_runner(None, "not a url".into(), "http://unused".into());
+
+    let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+    let result = tokio::time::timeout(Duration::from_secs(5), runner.start(shutdown_rx))
+        .await
+        .expect("a malformed endpoint URL must fail fast instead of retrying forever");
+
+    let error = result.unwrap_err();
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("invalid token endpoint URL"),
+        "error should name the bad URL: {message}"
+    );
+}
+
+#[tokio::test]
+async fn start_fails_fast_on_malformed_broker_url() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/oauth2/token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "access_token": "test-token",
+            "expires_in": 7200
+        })))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let (_temp, runner) = make_startup_runner(
+        None,
+        format!("{}/oauth2/token", mock_server.uri()),
+        "not a url".into(),
+    );
+
+    let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+    let result = tokio::time::timeout(Duration::from_secs(5), runner.start(shutdown_rx))
+        .await
+        .expect("a malformed broker URL must fail fast instead of retrying forever");
+
+    let error = result.unwrap_err();
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("invalid broker URL"),
+        "error should name the bad URL: {message}"
+    );
+}
+
+#[tokio::test]
+async fn start_shutdown_during_in_flight_startup_request_exits_cleanly() {
+    let mock_server = MockServer::start().await;
+
+    // The token exchange accepts the connection but never finishes, so the
+    // only way out of startup is the shutdown path, not a request timeout.
+    Mock::given(method("POST"))
+        .and(path("/oauth2/token"))
+        .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(30)))
+        .mount(&mock_server)
+        .await;
+
+    let (_temp, runner) = make_startup_runner(
+        None,
+        format!("{}/oauth2/token", mock_server.uri()),
+        mock_server.uri(),
+    );
+
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let start = tokio::spawn(runner.start(shutdown_rx));
+
+    // Wait until the request has actually reached the server, so the test
+    // exercises the in-flight cancellation branch even on slow schedulers.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let requests = mock_server.received_requests().await.unwrap();
+            if requests
+                .iter()
+                .any(|request| request.method == "POST" && request.url.path() == "/oauth2/token")
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("token exchange request should reach the server before shutdown");
+
+    let _ = shutdown_tx.send(true);
+
+    let result = tokio::time::timeout(Duration::from_secs(5), start)
+        .await
+        .expect("shutdown should interrupt an in-flight startup request")
+        .unwrap();
+    assert!(
+        result.is_ok(),
+        "runner should exit cleanly when shutdown interrupts an in-flight startup request"
+    );
+}
+
+#[tokio::test]
+async fn start_retries_transient_malformed_session_response() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/oauth2/token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "access_token": "test-token",
+            "expires_in": 7200
+        })))
+        .mount(&mock_server)
+        .await;
+    // A 200 whose body is not the expected session JSON — a truncated or
+    // proxy-mangled response, not a misconfigured registration.
+    Mock::given(method("POST"))
+        .and(path("/session"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("<html>gateway</html>"))
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/session"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "sessionId": "session-uuid-123"
+        })))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/message"))
+        .respond_with(ResponseTemplate::new(202).set_delay(Duration::from_millis(50)))
+        .mount(&mock_server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/session"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&mock_server)
+        .await;
+
+    let state = Arc::new(DaemonState::new(&["test-runner".to_string()]));
+    let (_temp, runner) = make_startup_runner(
+        Some(Arc::clone(&state)),
+        format!("{}/oauth2/token", mock_server.uri()),
+        mock_server.uri(),
+    );
+
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let start = tokio::spawn(runner.start(shutdown_rx));
+
+    wait_for_phase(&state, "test-runner", RunnerPhase::Idle)
+        .await
+        .expect("runner should reach Idle after a malformed session response");
+
+    shutdown_tx.send(true).unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(10), start)
+        .await
+        .expect("runner should exit after shutdown")
+        .unwrap();
+    assert!(
+        result.is_ok(),
+        "runner should shut down cleanly after reaching Idle"
+    );
+}
+
+#[test]
+fn startup_error_transient_classification() {
+    let auth_status = |code: u16| {
+        anyhow::Error::new(AuthError::Status {
+            status: reqwest::StatusCode::from_u16(code).unwrap(),
+            body: "synthetic body".into(),
+        })
+        .context("getting initial OAuth token")
+    };
+    assert!(startup_error_is_transient(&auth_status(503)));
+    assert!(startup_error_is_transient(&auth_status(500)));
+    assert!(startup_error_is_transient(&auth_status(429)));
+    assert!(!startup_error_is_transient(&auth_status(401)));
+    assert!(!startup_error_is_transient(&auth_status(400)));
+
+    let auth_invalid_endpoint = anyhow::Error::new(AuthError::InvalidEndpoint("not a url".into()))
+        .context("getting initial OAuth token");
+    assert!(!startup_error_is_transient(&auth_invalid_endpoint));
+
+    let auth_send =
+        anyhow::Error::new(AuthError::Send("dns failure".into())).context("getting token");
+    assert!(startup_error_is_transient(&auth_send));
+
+    let auth_bad_response = anyhow::Error::new(AuthError::BadResponse("bad json".into()))
+        .context("parsing token exchange response");
+    assert!(startup_error_is_transient(&auth_bad_response));
+
+    let broker_server = anyhow::Error::new(BrokerError::ServerError("503: blip".into()))
+        .context("creating broker session");
+    assert!(startup_error_is_transient(&broker_server));
+
+    let broker_connection = anyhow::Error::new(BrokerError::Connection("reset".into()))
+        .context("creating broker session");
+    assert!(startup_error_is_transient(&broker_connection));
+
+    let broker_bad_response = anyhow::Error::new(BrokerError::BadResponse("bad json".into()))
+        .context("creating broker session");
+    assert!(startup_error_is_transient(&broker_bad_response));
+
+    let broker_unauthorized =
+        anyhow::Error::new(BrokerError::Unauthorized).context("creating broker session");
+    assert!(!startup_error_is_transient(&broker_unauthorized));
+
+    let local = anyhow::anyhow!("reconstructing RSA private key");
+    assert!(
+        !startup_error_is_transient(&local),
+        "local setup failures must stay terminal"
+    );
+}
+
 #[tokio::test]
 async fn poll_loop_401_after_control_message_refreshes_again() {
     let (mock_server, tm, shutdown_tx) = setup().await;
