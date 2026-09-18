@@ -19,8 +19,68 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
+use tokio_util::sync::CancellationToken;
 
 use crate::job::action::TrustedActionDirectory;
+
+/// Cooperative budget for context preparation. `spawn_blocking` workers are
+/// not stopped by dropping their handle, so traversal and packing check this
+/// between entries and between file reads and abort as soon as the step's
+/// cancellation or deadline has fired.
+pub(crate) struct PreparationBudget {
+    deadline: Option<std::time::Instant>,
+    cancel_token: CancellationToken,
+}
+
+pub(crate) const PREPARATION_CANCELLED: &str = "build context preparation was cancelled";
+pub(crate) const PREPARATION_DEADLINE_EXCEEDED: &str =
+    "build context preparation exceeded its deadline";
+
+impl PreparationBudget {
+    #[cfg(test)]
+    pub(crate) fn unbounded() -> Self {
+        Self {
+            deadline: None,
+            cancel_token: CancellationToken::new(),
+        }
+    }
+
+    pub(crate) fn new(deadline: std::time::Instant, cancel_token: CancellationToken) -> Self {
+        Self {
+            deadline: Some(deadline),
+            cancel_token,
+        }
+    }
+
+    fn check(&self) -> Result<()> {
+        if self.cancel_token.is_cancelled() {
+            bail!(PREPARATION_CANCELLED);
+        }
+        if self
+            .deadline
+            .is_some_and(|deadline| std::time::Instant::now() > deadline)
+        {
+            bail!(PREPARATION_DEADLINE_EXCEEDED);
+        }
+        Ok(())
+    }
+}
+
+/// Wraps a context file so every read the tar builder performs is preceded
+/// by a budget check; large files therefore stop copying promptly.
+struct BudgetedReader<'a> {
+    file: &'a mut fs::File,
+    budget: &'a PreparationBudget,
+}
+
+impl std::io::Read for BudgetedReader<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.budget
+            .check()
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        self.file.read(buf)
+    }
+}
 
 #[derive(Debug)]
 pub(crate) struct ResolvedBuildPaths {
@@ -114,7 +174,6 @@ fn normalize_dockerfile_path(path: &Path) -> Result<PathBuf> {
 
 struct IgnoreRule {
     include: bool,
-    has_separator: bool,
     pattern: glob::Pattern,
 }
 
@@ -129,7 +188,11 @@ struct IgnoreFile {
 }
 
 impl IgnoreRules {
-    fn load(paths: &ResolvedBuildPaths) -> Result<(Self, Option<IgnoreFile>)> {
+    fn load(
+        paths: &ResolvedBuildPaths,
+        budget: &PreparationBudget,
+    ) -> Result<(Self, Option<IgnoreFile>)> {
+        budget.check()?;
         let dockerfile_name = paths
             .dockerfile_relative
             .file_name()
@@ -175,11 +238,7 @@ impl IgnoreRules {
             let pattern = glob::Pattern::new(&cleaned).with_context(|| {
                 format!("invalid Docker ignore rule at line {}", line_number + 1)
             })?;
-            rules.push(IgnoreRule {
-                include,
-                has_separator: cleaned.contains('/'),
-                pattern,
-            });
+            rules.push(IgnoreRule { include, pattern });
         }
         Ok((
             Self { rules },
@@ -227,12 +286,11 @@ fn rule_matches(rule: &IgnoreRule, slash_path: &str) -> bool {
         require_literal_separator: true,
         require_literal_leading_dot: false,
     };
-    if !rule.has_separator {
-        return slash_path
-            .split('/')
-            .any(|component| rule.pattern.matches_with(component, options));
-    }
-
+    // Docker matches complete context-relative paths, and a pattern applies
+    // to everything under a matching ancestor directory. Separator-free
+    // patterns stay root-level: `*.txt` does not match `docs/x.txt`, and
+    // `!public.pem` cannot rescue `private/public.pem` (verified against a
+    // real engine; `**` is the only cross-separator wildcard).
     slash_path
         .match_indices('/')
         .map(|(index, _)| &slash_path[..index])
@@ -507,12 +565,14 @@ fn collect_context_entries(
     paths: &ResolvedBuildPaths,
     ignore: &IgnoreRules,
     ignore_file: Option<&IgnoreFile>,
+    budget: &PreparationBudget,
 ) -> Result<CollectedContext> {
     let chain = DockerfileChain::resolve(paths)?;
     let mut state = TraversalState::default();
 
     #[cfg(target_os = "linux")]
-    let root = collect_context_entries_linux(paths, ignore, ignore_file, &chain, &mut state)?;
+    let root =
+        collect_context_entries_linux(paths, ignore, ignore_file, &chain, &mut state, budget)?;
 
     #[cfg(not(target_os = "linux"))]
     collect_context_entries_fallback(
@@ -522,6 +582,7 @@ fn collect_context_entries(
         &chain,
         &paths.action_root,
         &mut state,
+        budget,
     )?;
 
     chain.verify_complete(&state.seen_links, state.saw_canonical)?;
@@ -540,9 +601,11 @@ fn collect_context_entries_fallback(
     chain: &DockerfileChain,
     directory: &Path,
     state: &mut TraversalState,
+    budget: &PreparationBudget,
 ) -> Result<()> {
     paths.validate_path_identity()?;
     for entry in fs::read_dir(directory).context("reading Docker build context directory")? {
+        budget.check()?;
         let entry = entry.context("reading Docker build context entry")?;
         let source = entry.path();
         let relative = source
@@ -565,7 +628,15 @@ fn collect_context_entries_fallback(
                     archive_path,
                 });
             }
-            collect_context_entries_fallback(paths, ignore, ignore_file, chain, &source, state)?;
+            collect_context_entries_fallback(
+                paths,
+                ignore,
+                ignore_file,
+                chain,
+                &source,
+                state,
+                budget,
+            )?;
             continue;
         }
 
@@ -637,8 +708,10 @@ fn collect_directory_entries_linux(
     directory: &fs::File,
     prefix: &Path,
     state: &mut TraversalState,
+    budget: &PreparationBudget,
 ) -> Result<()> {
     for name in read_directory_names(directory)? {
+        budget.check()?;
         let relative = prefix.join(&name);
         let archive_path = path_to_slash_string(&relative)?;
         let inspected = open_at(
@@ -674,6 +747,7 @@ fn collect_directory_entries_linux(
                 &child,
                 &relative,
                 state,
+                budget,
             )?;
             continue;
         }
@@ -1082,6 +1156,7 @@ fn append_context_entry(
     builder: &mut tar::Builder<Vec<u8>>,
     root: &fs::File,
     entry: &ContextEntry,
+    budget: &PreparationBudget,
 ) -> Result<()> {
     match &entry.kind {
         ContextEntryKind::File(expected) => {
@@ -1092,7 +1167,7 @@ fn append_context_entry(
             let parent = entry.relative.parent().unwrap_or_else(|| Path::new(""));
             let parent = open_relative_directory(root, parent)?;
             let file = open_regular_file_at(&parent, name, *expected)?;
-            append_regular_file(builder, entry, *expected, file)
+            append_regular_file(builder, entry, *expected, file, budget)
         }
         ContextEntryKind::Directory | ContextEntryKind::Symlink(_) => {
             append_non_file_entry(builder, entry)
@@ -1105,6 +1180,7 @@ fn append_context_entry(
     builder: &mut tar::Builder<Vec<u8>>,
     paths: &ResolvedBuildPaths,
     entry: &ContextEntry,
+    budget: &PreparationBudget,
 ) -> Result<()> {
     match &entry.kind {
         ContextEntryKind::File(expected) => {
@@ -1112,7 +1188,7 @@ fn append_context_entry(
             let source = paths.action_root.join(&entry.relative);
             let file = open_regular_file(&paths.action_root, &source, Some(*expected))?;
             paths.validate_path_identity()?;
-            append_regular_file(builder, entry, *expected, file)
+            append_regular_file(builder, entry, *expected, file, budget)
         }
         ContextEntryKind::Directory | ContextEntryKind::Symlink(_) => {
             append_non_file_entry(builder, entry)
@@ -1125,6 +1201,7 @@ fn append_regular_file(
     entry: &ContextEntry,
     expected: FileIdentity,
     mut file: fs::File,
+    budget: &PreparationBudget,
 ) -> Result<()> {
     let metadata = file.metadata().context("reading build context metadata")?;
     reject_non_regular(&metadata)?;
@@ -1141,8 +1218,12 @@ fn append_regular_file(
     header.set_mode(entry.mode & 0o7777);
     header.set_size(metadata.len());
     header.set_cksum();
+    let mut reader = BudgetedReader {
+        file: &mut file,
+        budget,
+    };
     builder
-        .append_data(&mut header, &entry.relative, &mut file)
+        .append_data(&mut header, &entry.relative, &mut reader)
         .context("adding file to Docker build context")?;
     Ok(())
 }
@@ -1194,13 +1275,23 @@ pub(crate) struct PreparedBuildContext {
     pub digest: [u8; 32],
 }
 
+#[cfg(test)]
 pub(crate) fn prepare_build_context(
     action_dir: &TrustedActionDirectory,
     dockerfile: &str,
 ) -> Result<PreparedBuildContext> {
+    prepare_build_context_with_budget(action_dir, dockerfile, PreparationBudget::unbounded())
+}
+
+pub(crate) fn prepare_build_context_with_budget(
+    action_dir: &TrustedActionDirectory,
+    dockerfile: &str,
+    budget: PreparationBudget,
+) -> Result<PreparedBuildContext> {
+    budget.check()?;
     let paths = resolve_build_paths(action_dir, dockerfile)?;
-    let (ignore, ignore_file) = IgnoreRules::load(&paths)?;
-    let mut context = collect_context_entries(&paths, &ignore, ignore_file.as_ref())?;
+    let (ignore, ignore_file) = IgnoreRules::load(&paths, &budget)?;
+    let mut context = collect_context_entries(&paths, &ignore, ignore_file.as_ref(), &budget)?;
     context
         .entries
         .sort_by(|left, right| left.archive_path.cmp(&right.archive_path));
@@ -1208,11 +1299,13 @@ pub(crate) fn prepare_build_context(
     let mut builder = tar::Builder::new(Vec::new());
     builder.mode(tar::HeaderMode::Deterministic);
     for entry in &context.entries {
+        budget.check()?;
+
         #[cfg(target_os = "linux")]
-        append_context_entry(&mut builder, &context.root, entry)?;
+        append_context_entry(&mut builder, &context.root, entry, &budget)?;
 
         #[cfg(not(target_os = "linux"))]
-        append_context_entry(&mut builder, &paths, entry)?;
+        append_context_entry(&mut builder, &paths, entry, &budget)?;
     }
     builder.finish().context("finishing Docker build context")?;
     let archive = builder

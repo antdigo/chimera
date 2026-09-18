@@ -200,6 +200,37 @@ fn repeated_traversals_of_one_capability_see_the_full_directory() {
     }
 }
 
+/// Preparation runs on a blocking worker that outlives an abandoned
+/// `spawn_blocking` handle: it must stop itself once the step's budget has
+/// fired, instead of packing an arbitrarily large context forever.
+#[test]
+fn cancelled_preparation_stops_before_packing_a_large_context() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("Dockerfile"), "FROM scratch\n").unwrap();
+    let large = tmp.path().join("large.bin");
+    let mut buffer = vec![0u8; 32 * 1024 * 1024];
+    buffer.fill(7);
+    std::fs::write(&large, &buffer).unwrap();
+    let trusted = trusted_action(tmp.path());
+
+    let cancel_token = tokio_util::sync::CancellationToken::new();
+    cancel_token.cancel();
+    let budget = PreparationBudget::new(
+        std::time::Instant::now() + std::time::Duration::from_secs(600),
+        cancel_token,
+    );
+
+    let started = std::time::Instant::now();
+    let error = prepare_build_context_with_budget(&trusted, "Dockerfile", budget).unwrap_err();
+    let elapsed = started.elapsed();
+
+    assert_eq!(error.to_string(), PREPARATION_CANCELLED);
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "cancelled preparation must stop promptly, took {elapsed:?}"
+    );
+}
+
 #[test]
 fn root_dockerignore_with_bom_and_escaped_hash_excludes_literal_hash_file() {
     let tmp = tempfile::tempdir().unwrap();
@@ -300,8 +331,12 @@ fn negation_and_double_star_follow_last_matching_rule() {
     assert!(paths.contains(&"nested/keep/keep.log".to_string()));
 }
 
+/// Leading/trailing slashes in ignore rules are ignored, and separator-free
+/// patterns match complete context-relative paths: they stay root-level
+/// (`*.txt` does not reach `nested/drop.txt`; `**` is the only cross-level
+/// wildcard). Verified against a real engine alongside the exclusion probes.
 #[test]
-fn leading_slash_negation_is_not_root_only() {
+fn leading_slash_negation_matches_root_paths_only() {
     let tmp = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(tmp.path().join("nested")).unwrap();
     std::fs::write(tmp.path().join("Dockerfile"), "FROM scratch\n").unwrap();
@@ -313,9 +348,43 @@ fn leading_slash_negation_is_not_root_only() {
     let context = prepare_build_context(&trusted_action(tmp.path()), "Dockerfile").unwrap();
     let paths = archive_paths(&context.archive);
 
+    // Nothing under nested/ is matched by the root-level rules at all.
     assert!(paths.contains(&"nested/keep.txt".to_string()));
-    assert!(!paths.contains(&"nested/drop.txt".to_string()));
+    assert!(paths.contains(&"nested/drop.txt".to_string()));
     assert!(!paths.contains(&"drop.txt".to_string()));
+}
+
+/// Docker prunes excluded directories: an exception rule cannot re-include a
+/// file whose ancestor directory is excluded — the walk never offers the
+/// subtree for matching. A basename-shaped exception must not leak files out
+/// of an excluded directory.
+#[test]
+fn exception_rule_cannot_reinclude_files_inside_excluded_directory() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join("private")).unwrap();
+    std::fs::write(tmp.path().join("Dockerfile"), "FROM scratch\n").unwrap();
+    std::fs::write(
+        tmp.path().join("private/public.pem"),
+        "CHIMERA_PRIVATE_CANARY",
+    )
+    .unwrap();
+    std::fs::write(tmp.path().join("public.pem"), "shared").unwrap();
+    std::fs::write(tmp.path().join(".dockerignore"), "private/\n!public.pem\n").unwrap();
+
+    let context = prepare_build_context(&trusted_action(tmp.path()), "Dockerfile").unwrap();
+    let paths = archive_paths(&context.archive);
+
+    assert!(paths.contains(&"public.pem".to_string()));
+    assert!(!paths.contains(&"private/public.pem".to_string()));
+    assert!(!paths.contains(&"private".to_string()));
+    let canary = b"CHIMERA_PRIVATE_CANARY";
+    assert!(
+        context
+            .archive
+            .windows(canary.len())
+            .all(|window| window != canary),
+        "file from an excluded directory must not reach the daemon"
+    );
 }
 
 #[cfg(unix)]
@@ -646,8 +715,10 @@ fn collect_context_with_replaced_artifact()
     std::fs::write(&artifact, "original").unwrap();
 
     let paths = resolve_build_paths(&trusted_action(action_dir), "Dockerfile").unwrap();
-    let (ignore, ignore_file) = IgnoreRules::load(&paths).unwrap();
-    let mut context = collect_context_entries(&paths, &ignore, ignore_file.as_ref()).unwrap();
+    let budget = PreparationBudget::unbounded();
+    let (ignore, ignore_file) = IgnoreRules::load(&paths, &budget).unwrap();
+    let mut context =
+        collect_context_entries(&paths, &ignore, ignore_file.as_ref(), &budget).unwrap();
     context
         .entries
         .sort_by(|left, right| left.archive_path.cmp(&right.archive_path));
@@ -669,8 +740,9 @@ fn replacing_file_after_traversal_rejects_context_emission() {
         .find(|entry| entry.relative == Path::new("artifact.txt"))
         .unwrap();
     let mut builder = tar::Builder::new(Vec::new());
+    let budget = PreparationBudget::unbounded();
 
-    let error = append_context_entry(&mut builder, &context.root, artifact).unwrap_err();
+    let error = append_context_entry(&mut builder, &context.root, artifact, &budget).unwrap_err();
 
     assert_eq!(
         error.to_string(),
@@ -688,8 +760,9 @@ fn replacing_file_after_traversal_rejects_context_emission() {
         .find(|entry| entry.relative == Path::new("artifact.txt"))
         .unwrap();
     let mut builder = tar::Builder::new(Vec::new());
+    let budget = PreparationBudget::unbounded();
 
-    let error = append_context_entry(&mut builder, &paths, artifact).unwrap_err();
+    let error = append_context_entry(&mut builder, &paths, artifact, &budget).unwrap_err();
 
     assert_eq!(
         error.to_string(),

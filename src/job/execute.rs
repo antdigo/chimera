@@ -835,11 +835,26 @@ pub async fn run_all_steps(
     // before all main steps, in forward order (matching manifest order).
     let mut pre_steps = Vec::new();
     for (idx, step) in manifest.steps.iter().enumerate() {
-        let Some(collected) =
-            collect_pre_step(step, action_cache, workspace.workspace_dir(), access_token).await?
-        else {
-            continue;
-        };
+        let collected =
+            match collect_pre_step(step, action_cache, workspace.workspace_dir(), access_token)
+                .await
+            {
+                Ok(Some(collected)) => collected,
+                Ok(None) => continue,
+                Err(error) => {
+                    // A local action only becomes resolvable once an earlier
+                    // step (typically checkout) has materialized it, and a
+                    // step behind a false condition may reference an action
+                    // that never resolves at all: discovery failures must not
+                    // fail the job before those steps can decide.
+                    warn!(
+                        step_id = %step.id,
+                        error = %error,
+                        "deferring action resolution to step execution"
+                    );
+                    continue;
+                }
+            };
         job_state
             .trusted_action_directories
             .insert(step.id.clone(), collected.action_dir);

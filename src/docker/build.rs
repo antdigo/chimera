@@ -13,7 +13,12 @@ use tokio_util::sync::CancellationToken;
 
 pub use super::build_cache::DockerBuildScope;
 use super::build_cache::{BudgetOutcome, BuildCache, BuildCacheKey, CacheOutcome, within_budget};
-use super::build_context::{PreparedBuildContext, prepare_build_context};
+#[cfg(test)]
+use super::build_context::prepare_build_context;
+use super::build_context::{
+    PREPARATION_CANCELLED, PREPARATION_DEADLINE_EXCEEDED, PreparationBudget, PreparedBuildContext,
+    prepare_build_context_with_budget,
+};
 use crate::job::action::TrustedActionDirectory;
 use crate::job::logs::LogSender;
 
@@ -72,32 +77,6 @@ impl DockerActionBuilder {
     }
 
     pub async fn build(&self, request: DockerBuildRequest<'_>) -> Result<DockerBuildOutcome> {
-        match send_budgeted_log(
-            request.log_sender,
-            request.cancel_token,
-            request.deadline,
-            "Preparing Docker action build context".into(),
-        )
-        .await
-        {
-            BudgetOutcome::Ready(()) => {}
-            BudgetOutcome::Cancelled => return Ok(DockerBuildOutcome::Cancelled),
-            BudgetOutcome::TimedOut => return Ok(DockerBuildOutcome::TimedOut),
-        }
-        let action_dir = request.action_dir.clone();
-        let dockerfile = request.dockerfile.to_string();
-        let prepared = match within_budget(
-            request.deadline,
-            request.cancel_token,
-            tokio::task::spawn_blocking(move || prepare_build_context(&action_dir, &dockerfile)),
-        )
-        .await
-        {
-            BudgetOutcome::Ready(joined) => joined.context("preparing Docker build context")??,
-            BudgetOutcome::Cancelled => return Ok(DockerBuildOutcome::Cancelled),
-            BudgetOutcome::TimedOut => return Ok(DockerBuildOutcome::TimedOut),
-        };
-
         let daemon_id = match within_budget(
             request.deadline,
             request.cancel_token,
@@ -110,6 +89,11 @@ impl DockerActionBuilder {
             BudgetOutcome::TimedOut => return Ok(DockerBuildOutcome::TimedOut),
         };
 
+        // Reuse is validated before any context work: a job that already
+        // built the image keeps running its remaining phases even when the
+        // action directory has since become unbuildable (a main step may
+        // rewrite or delete its own Dockerfile), and repacking the context
+        // per phase would waste each phase's budget for no effect.
         if let Some(reuse) = request.reuse
             && reuse.daemon_id == daemon_id
         {
@@ -142,6 +126,55 @@ impl DockerActionBuilder {
                 BudgetOutcome::TimedOut => return Ok(DockerBuildOutcome::TimedOut),
             }
         }
+
+        match send_budgeted_log(
+            request.log_sender,
+            request.cancel_token,
+            request.deadline,
+            "Preparing Docker action build context".into(),
+        )
+        .await
+        {
+            BudgetOutcome::Ready(()) => {}
+            BudgetOutcome::Cancelled => return Ok(DockerBuildOutcome::Cancelled),
+            BudgetOutcome::TimedOut => return Ok(DockerBuildOutcome::TimedOut),
+        }
+        let action_dir = request.action_dir.clone();
+        let dockerfile = request.dockerfile.to_string();
+        let preparation_deadline =
+            std::time::Instant::now() + request.deadline.saturating_duration_since(Instant::now());
+        let preparation_budget =
+            PreparationBudget::new(preparation_deadline, request.cancel_token.clone());
+        let prepared = match within_budget(
+            request.deadline,
+            request.cancel_token,
+            tokio::task::spawn_blocking(move || {
+                prepare_build_context_with_budget(&action_dir, &dockerfile, preparation_budget)
+            }),
+        )
+        .await
+        {
+            BudgetOutcome::Ready(joined) => {
+                match joined.context("preparing Docker build context") {
+                    Ok(Ok(prepared)) => prepared,
+                    Ok(Err(error)) => {
+                        // The worker noticed the budget before the async select
+                        // did; report the interrupted lifecycle, not a failure.
+                        let message = error.to_string();
+                        if message == PREPARATION_CANCELLED {
+                            return Ok(DockerBuildOutcome::Cancelled);
+                        }
+                        if message == PREPARATION_DEADLINE_EXCEEDED {
+                            return Ok(DockerBuildOutcome::TimedOut);
+                        }
+                        return Err(error);
+                    }
+                    Err(join_error) => return Err(join_error),
+                }
+            }
+            BudgetOutcome::Cancelled => return Ok(DockerBuildOutcome::Cancelled),
+            BudgetOutcome::TimedOut => return Ok(DockerBuildOutcome::TimedOut),
+        };
 
         let key = BuildCacheKey::new(
             &daemon_id,
