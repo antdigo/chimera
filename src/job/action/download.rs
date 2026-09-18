@@ -130,7 +130,7 @@ impl TrustedActionDirectory {
             let mut bytes = Vec::new();
             file.read_to_end(&mut bytes)
                 .context("reading action metadata")?;
-            return Ok(Some(bytes));
+            Ok(Some(bytes))
         }
 
         #[cfg(not(target_os = "linux"))]
@@ -342,13 +342,13 @@ fn contained_action_dir(root: &Path, requested: &Path) -> Result<TrustedActionDi
             bail!("action directory changed while it was being resolved");
         }
 
-        return Ok(TrustedActionDirectory {
+        Ok(TrustedActionDirectory {
             action_path: canonical_action,
             source_identity,
             action_identity,
             _source_descriptor: Arc::new(source_descriptor),
             action_descriptor: Arc::new(action_descriptor),
-        });
+        })
     }
 
     #[cfg(not(target_os = "linux"))]

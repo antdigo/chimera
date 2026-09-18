@@ -790,9 +790,8 @@ fn collect_context_with_replaced_artifact()
 
     let paths = resolve_build_paths(&trusted_action(action_dir), "Dockerfile").unwrap();
     let budget = PreparationBudget::unbounded();
-    let (ignore, ignore_file) = IgnoreRules::load(&paths, &budget).unwrap();
-    let mut context =
-        collect_context_entries(&paths, &ignore, ignore_file.as_ref(), &budget).unwrap();
+    let ignore = IgnoreRules::load(&paths, &budget).unwrap();
+    let mut context = collect_context_entries(&paths, &ignore, &budget).unwrap();
     context
         .entries
         .sort_by(|left, right| left.archive_path.cmp(&right.archive_path));

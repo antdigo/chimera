@@ -117,10 +117,10 @@ pub(crate) fn resolve_build_paths(
             }
             Err(error) => return Err(error),
         }
-        return Ok(ResolvedBuildPaths {
+        Ok(ResolvedBuildPaths {
             dockerfile_relative,
             root,
-        });
+        })
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -180,6 +180,9 @@ struct IgnoreRule {
 #[derive(Default)]
 struct IgnoreRules {
     rules: Vec<IgnoreRule>,
+    // The selected ignore file is forced into the context alongside the
+    // Dockerfile chain; traversal reads it through this field.
+    file: Option<IgnoreFile>,
 }
 
 struct IgnoreFile {
@@ -188,10 +191,7 @@ struct IgnoreFile {
 }
 
 impl IgnoreRules {
-    fn load(
-        paths: &ResolvedBuildPaths,
-        budget: &PreparationBudget,
-    ) -> Result<(Self, Option<IgnoreFile>)> {
+    fn load(paths: &ResolvedBuildPaths, budget: &PreparationBudget) -> Result<Self> {
         budget.check()?;
         let dockerfile_name = paths
             .dockerfile_relative
@@ -210,7 +210,7 @@ impl IgnoreRules {
             };
 
         let Some((relative, (bytes, canonical))) = selected else {
-            return Ok((Self::default(), None));
+            return Ok(Self::default());
         };
         let text = std::str::from_utf8(&bytes).context("Docker ignore file is not valid UTF-8")?;
         // A single leading BOM must not corrupt the first rule.
@@ -242,13 +242,13 @@ impl IgnoreRules {
             })?;
             rules.push(IgnoreRule { include, pattern });
         }
-        Ok((
-            Self { rules },
-            Some(IgnoreFile {
+        Ok(Self {
+            rules,
+            file: Some(IgnoreFile {
                 selected: relative,
                 canonical,
             }),
-        ))
+        })
     }
 
     fn includes(&self, relative: &Path) -> Result<bool> {
@@ -325,7 +325,7 @@ fn read_optional_regular_file_inside(
         let expected = FileIdentity::from_metadata(&resolved.canonical_metadata);
         let file = open_regular_file_at(&parent, name, expected)?;
         let (bytes, _) = read_open_file(file, budget)?;
-        return Ok(Some((bytes, resolved.canonical_relative)));
+        Ok(Some((bytes, resolved.canonical_relative)))
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -390,12 +390,12 @@ impl DockerfileChain {
         {
             let resolved = resolve_file_chain_linux(&paths.root, &paths.dockerfile_relative)?
                 .context("resolving Dockerfile symlink chain")?;
-            return Ok(Self {
+            Ok(Self {
                 forced_paths: resolved.forced_paths,
                 expected_links: resolved.expected_links,
                 canonical_relative: resolved.canonical_relative,
                 canonical_identity: resolved.canonical_identity,
-            });
+            })
         }
 
         #[cfg(not(target_os = "linux"))]
@@ -567,21 +567,18 @@ struct CollectedContext {
 fn collect_context_entries(
     paths: &ResolvedBuildPaths,
     ignore: &IgnoreRules,
-    ignore_file: Option<&IgnoreFile>,
     budget: &PreparationBudget,
 ) -> Result<CollectedContext> {
     let chain = DockerfileChain::resolve(paths)?;
     let mut state = TraversalState::default();
 
     #[cfg(target_os = "linux")]
-    let root =
-        collect_context_entries_linux(paths, ignore, ignore_file, &chain, &mut state, budget)?;
+    let root = collect_context_entries_linux(paths, ignore, &chain, &mut state, budget)?;
 
     #[cfg(not(target_os = "linux"))]
     collect_context_entries_fallback(
         paths,
         ignore,
-        ignore_file,
         &chain,
         &paths.action_root,
         &mut state,
@@ -600,7 +597,6 @@ fn collect_context_entries(
 fn collect_context_entries_fallback(
     paths: &ResolvedBuildPaths,
     ignore: &IgnoreRules,
-    ignore_file: Option<&IgnoreFile>,
     chain: &DockerfileChain,
     directory: &Path,
     state: &mut TraversalState,
@@ -620,7 +616,7 @@ fn collect_context_entries_fallback(
         let metadata = fs::symlink_metadata(&source).context("reading build context metadata")?;
         paths.validate_path_identity()?;
         let file_type = metadata.file_type();
-        let forced = chain.includes(&relative, ignore_file);
+        let forced = chain.includes(&relative, ignore.file.as_ref());
 
         if file_type.is_dir() {
             if forced || ignore.includes(&relative)? {
@@ -631,15 +627,7 @@ fn collect_context_entries_fallback(
                     archive_path,
                 });
             }
-            collect_context_entries_fallback(
-                paths,
-                ignore,
-                ignore_file,
-                chain,
-                &source,
-                state,
-                budget,
-            )?;
+            collect_context_entries_fallback(paths, ignore, chain, &source, state, budget)?;
             continue;
         }
 
@@ -682,7 +670,6 @@ fn collect_context_entries_fallback(
 fn collect_context_entries_linux(
     paths: &ResolvedBuildPaths,
     ignore: &IgnoreRules,
-    ignore_file: Option<&IgnoreFile>,
     chain: &DockerfileChain,
     state: &mut TraversalState,
     budget: &PreparationBudget,
@@ -691,16 +678,7 @@ fn collect_context_entries_linux(
         .root
         .try_clone()
         .context("cloning trusted action directory descriptor")?;
-    collect_directory_entries_linux(
-        paths,
-        ignore,
-        ignore_file,
-        chain,
-        &root,
-        Path::new(""),
-        state,
-        budget,
-    )?;
+    collect_directory_entries_linux(paths, ignore, chain, &root, Path::new(""), state, budget)?;
     Ok(root)
 }
 
@@ -708,7 +686,6 @@ fn collect_context_entries_linux(
 fn collect_directory_entries_linux(
     paths: &ResolvedBuildPaths,
     ignore: &IgnoreRules,
-    ignore_file: Option<&IgnoreFile>,
     chain: &DockerfileChain,
     directory: &fs::File,
     prefix: &Path,
@@ -728,7 +705,7 @@ fn collect_directory_entries_linux(
             .metadata()
             .context("reading build context metadata")?;
         let file_type = metadata.file_type();
-        let forced = chain.includes(&relative, ignore_file);
+        let forced = chain.includes(&relative, ignore.file.as_ref());
 
         if file_type.is_dir() {
             let child = open_directory_at(directory, &name)?;
@@ -745,14 +722,7 @@ fn collect_directory_entries_linux(
                 });
             }
             collect_directory_entries_linux(
-                paths,
-                ignore,
-                ignore_file,
-                chain,
-                &child,
-                &relative,
-                state,
-                budget,
+                paths, ignore, chain, &child, &relative, state, budget,
             )?;
             continue;
         }
@@ -1338,8 +1308,8 @@ pub(crate) fn prepare_build_context_with_budget(
 ) -> Result<PreparedBuildContext> {
     budget.check()?;
     let paths = resolve_build_paths(action_dir, dockerfile)?;
-    let (ignore, ignore_file) = IgnoreRules::load(&paths, &budget)?;
-    let mut context = collect_context_entries(&paths, &ignore, ignore_file.as_ref(), &budget)?;
+    let ignore = IgnoreRules::load(&paths, &budget)?;
+    let mut context = collect_context_entries(&paths, &ignore, &budget)?;
     context
         .entries
         .sort_by(|left, right| left.archive_path.cmp(&right.archive_path));
