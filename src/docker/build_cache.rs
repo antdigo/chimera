@@ -99,7 +99,18 @@ pub(crate) async fn within_budget<T>(
         biased;
         _ = cancel_token.cancelled() => BudgetOutcome::Cancelled,
         _ = tokio::time::sleep_until(deadline) => BudgetOutcome::TimedOut,
-        value = &mut future => BudgetOutcome::Ready(value),
+        value = &mut future => {
+            // `biased` fixes the polling order, not the wakeup race: the timer
+            // wheel runs at millisecond granularity, so a deadline that has
+            // already passed can still be Pending while the wrapped future
+            // completes. The deadline is the contract — a completion observed
+            // at-or-after it is a timeout, never the future's own outcome.
+            if Instant::now() >= deadline {
+                BudgetOutcome::TimedOut
+            } else {
+                BudgetOutcome::Ready(value)
+            }
+        }
     }
 }
 
