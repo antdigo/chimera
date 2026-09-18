@@ -28,18 +28,28 @@ NOW = utc("2023-02-17T12:00:00Z")
 POLICY_DAYS = 30
 MAX_LAG_DAYS = 23
 
-# Captured shape of the real actions/runner release list around 2023-02-17,
-# when the backport v2.299.2 was the claimed version although far newer
-# releases had been out for months. Position in this list is not semver
-# order, so reading the row above ours (v2.302.0, two days old) as the
-# deprecation clock was a false pass — the clock is v2.300.0, the oldest
+# Captured from the real actions/runner release list (stable releases only,
+# publication-descending, exactly as the API returns them; v2.301.0 is
+# absent because the API marks it a prerelease and the wrapper filters it
+# out). The backport v2.299.2 was published 2023-01-30 — months AFTER the
+# whole v2.300.x line shipped — so the row immediately above ours is a
+# days-old v2.302.0. Reading that row as the deprecation clock (the round-1
+# positional algorithm) was a false pass; the clock is v2.300.0, the oldest
 # semver-newer release.
 BACKPORT_HISTORY = [
-    ("v2.302.0", "2023-02-15T00:00:00Z"),
-    ("v2.301.0", "2023-01-25T00:00:00Z"),
-    ("v2.300.0", "2022-12-14T00:00:00Z"),
-    ("v2.299.2", "2022-12-01T00:00:00Z"),
-    ("v2.299.1", "2022-11-20T00:00:00Z"),
+    ("v2.302.1", "2023-02-15T21:20:46Z"),
+    ("v2.302.0", "2023-02-14T15:10:58Z"),
+    ("v2.299.2", "2023-01-30T16:07:51Z"),
+    ("v2.296.3", "2023-01-30T16:08:41Z"),
+    ("v2.293.2", "2023-01-30T16:08:21Z"),
+    ("v2.289.5", "2023-01-30T16:06:46Z"),
+    ("v2.285.3", "2023-01-30T20:39:53Z"),
+    ("v2.301.1", "2023-01-19T01:13:29Z"),
+    ("v2.300.2", "2022-12-19T19:26:55Z"),
+    ("v2.300.1", "2022-12-19T16:35:54Z"),
+    ("v2.300.0", "2022-12-14T08:50:53Z"),
+    ("v2.299.1", "2022-11-03T00:04:55Z"),
+    ("v2.299.0", "2022-11-02T19:10:09Z"),
 ]
 
 
@@ -51,6 +61,31 @@ class EvaluateTest(unittest.TestCase):
     def test_backported_version_fails_on_the_oldest_newer_release(self):
         passed, report = gate.evaluate(
             "2.299.2", rows(*BACKPORT_HISTORY), NOW, POLICY_DAYS, MAX_LAG_DAYS
+        )
+        self.assertFalse(passed)
+        self.assertIn("v2.300.0", report_text(report))
+        self.assertIn("65d", report_text(report))
+        # The days-old v2.302.0 sits immediately above ours in the list; the
+        # clock must not be read from list position, so it stays unnamed.
+        self.assertNotIn("v2.302.0", report_text(report))
+
+    def test_duplicate_entries_do_not_postpone_the_clock(self):
+        duplicated = list(BACKPORT_HISTORY) + [("v2.300.0", "2023-01-05T00:00:00Z")]
+        passed, report = gate.evaluate(
+            "2.299.2", rows(*duplicated), NOW, POLICY_DAYS, MAX_LAG_DAYS
+        )
+        self.assertFalse(passed)
+        self.assertIn("65d", report_text(report))
+
+    def test_non_utc_timestamp_offsets_compare_correctly(self):
+        # +02:00 is the same instant as 08:50:53Z, so the clock is unchanged.
+        releases = (
+            rows(*BACKPORT_HISTORY[:-3])
+            + rows(("v2.300.0", "2022-12-14T10:50:53+02:00"))
+            + rows(*BACKPORT_HISTORY[-2:])
+        )
+        passed, report = gate.evaluate(
+            "2.299.2", releases, NOW, POLICY_DAYS, MAX_LAG_DAYS
         )
         self.assertFalse(passed)
         self.assertIn("v2.300.0", report_text(report))
