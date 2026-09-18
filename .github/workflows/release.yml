@@ -32,6 +32,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Release binaries must self-report exactly the tag version (issue #6):
+      # stamp it from the tag instead of trusting the checked-in Cargo.toml.
+      - name: Stamp version from tag
+        shell: bash
+        run: |
+          tag_version="${GITHUB_REF_NAME#v}"
+          sed -i.bak "s/^version = \".*\"/version = \"${tag_version}\"/" Cargo.toml
+          rm Cargo.toml.bak
+          stamped="$(cargo metadata --format-version 1 --no-deps | jq -r '.packages[] | select(.name == "chimera") | .version')"
+          if [ "$stamped" != "$tag_version" ]; then
+            echo "::error::Failed to stamp version from ${GITHUB_REF_NAME}: cargo reports ${stamped}"
+            exit 1
+          fi
+          echo "Building chimera ${stamped} from ${GITHUB_REF_NAME}"
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
