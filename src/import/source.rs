@@ -175,7 +175,10 @@ fn parse_source_file<T: DeserializeOwned>(source: &Path, name: &str) -> Result<T
     let bytes = read_regular_no_follow(&source.join(name)).map_err(|_| {
         ImportError::InvalidSource(format!("unable to read required credential file {name}"))
     })?;
-    serde_json::from_slice(&bytes).map_err(|error| {
+    // The official runner writes its registration files as UTF-8 with a BOM,
+    // which serde_json does not skip on its own.
+    let json = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(&bytes);
+    serde_json::from_slice(json).map_err(|error| {
         ImportError::InvalidSource(format!(
             "unable to parse {name} at line {} column {}",
             error.line(),

@@ -110,6 +110,20 @@ Keep tests readable. A test should be obvious about what it's checking. Arrange 
 
 ---
 
+## Running Tests Locally
+
+Always redirect test output to a file and filter the file, never grep the live stream — cargo interleaves output from parallel test binaries, and a failure's name gets lost:
+
+```bash
+cargo test > /tmp/chimera-test.log 2>&1; echo "EXIT=$?"
+grep "test result:" /tmp/chimera-test.log | grep -v " 0 failed"   # must print nothing
+grep -A 20 "^failures:" /tmp/chimera-test.log                     # names + panic locations
+```
+
+## Known Flaky Tests
+
+- `daemon::daemon_test::daemon_holds_root_lock_for_its_lifetime` (src/daemon_test.rs) — intermittently fails on `RootLock::acquire(...).unwrap()` right after `drop(daemon)`: the lock is not yet released. Observed ~2 failures per 5 `cargo test --lib` runs on main@9f62a41 (macOS). Pre-existing, unrelated to the import path; tracked in #8. If a single test fails in a full run, re-run it in isolation before investigating.
+
 ## Before Marking Any Task Done
 
 1. Run `cargo build` — must compile with zero errors.
