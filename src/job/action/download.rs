@@ -190,7 +190,7 @@ impl ActionCache {
                 let cache_path = remote_cache_path(&self.cache_dir, owner, repo, git_ref);
 
                 if !cache_path.exists() {
-                    self.download_tarball(owner, repo, git_ref, &cache_path, access_token)
+                    self.download_tarball(owner, repo, git_ref, access_token)
                         .await?;
                 } else {
                     debug!(owner, repo, git_ref, "action cache hit");
@@ -208,12 +208,27 @@ impl ActionCache {
         }
     }
 
+    /// Publishes an already-downloaded tarball into the cache layout
+    /// `get_action` looks up. Test harnesses use this to prefill pinned
+    /// actions: the cache is keyed by a content hash, so a plain
+    /// `owner/repo/ref` directory would always miss and push the runner into
+    /// a token-authenticated API download.
+    pub async fn install_tarball(
+        &self,
+        owner: &str,
+        repo: &str,
+        git_ref: &str,
+        bytes: &[u8],
+    ) -> Result<()> {
+        self.publish_tarball(owner, repo, git_ref, bytes.to_vec())
+            .await
+    }
+
     async fn download_tarball(
         &self,
         owner: &str,
         repo: &str,
         git_ref: &str,
-        dest: &Path,
         access_token: &str,
     ) -> Result<()> {
         let url = format!("https://api.github.com/repos/{owner}/{repo}/tarball/{git_ref}");
@@ -241,8 +256,26 @@ impl ActionCache {
             .await
             .context("reading tarball response body")?;
 
-        // Extract to a temp directory, then atomically rename to avoid TOCTOU races.
-        // All filesystem I/O runs on the blocking threadpool to avoid starving the runtime.
+        self.publish_tarball(owner, repo, git_ref, bytes.to_vec())
+            .await
+    }
+
+    /// Extracts the tarball into the cache at the layout `get_action`
+    /// expects, atomically: a temp directory first, then a rename, so a
+    /// concurrent reader never observes a half-written action.
+    async fn publish_tarball(
+        &self,
+        owner: &str,
+        repo: &str,
+        git_ref: &str,
+        bytes: Vec<u8>,
+    ) -> Result<()> {
+        let dest = remote_cache_path(&self.cache_dir, owner, repo, git_ref);
+        if dest.exists() {
+            debug!(owner, repo, git_ref, "action cache hit");
+            return Ok(());
+        }
+
         let tmp_name = format!(
             "{}.tmp-{}",
             dest.file_name()
@@ -250,12 +283,16 @@ impl ActionCache {
                 .unwrap_or("action"),
             uuid::Uuid::new_v4()
         );
-        let tmp_dir = dest.parent().context("dest has no parent")?.join(&tmp_name);
-        let dest = dest.to_path_buf();
+        let tmp_dir = dest
+            .parent()
+            .context("cache destination has no parent")?
+            .join(&tmp_name);
         let owner = owner.to_string();
         let repo = repo.to_string();
         let git_ref = git_ref.to_string();
 
+        // Filesystem I/O runs on the blocking threadpool to avoid starving
+        // the runtime.
         tokio::task::spawn_blocking(move || {
             std::fs::create_dir_all(&tmp_dir)
                 .with_context(|| format!("creating temp action dir {}", tmp_dir.display()))?;
