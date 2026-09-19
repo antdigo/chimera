@@ -359,6 +359,13 @@ async fn every_cache_api_handler_rejects_missing_bearer() {
 }
 
 #[tokio::test]
+async fn every_cache_api_handler_rejects_unknown_bearer() {
+    let tmp = TempDir::new().unwrap();
+    let (app, _, _) = make_test_app(&tmp).await;
+    assert_all_cache_handlers_reject(&app, "unknown-runtime-token", StatusCode::UNAUTHORIZED).await;
+}
+
+#[tokio::test]
 async fn unauthenticated_requests_reject_before_parsing_or_body_buffering() {
     let tmp = TempDir::new().unwrap();
     let (app, _, _) = make_test_app(&tmp).await;
@@ -687,6 +694,7 @@ async fn revoke_invalidates_previously_issued_download_grant() {
     let (capability_id, archive_location) =
         authorized_roundtrip(&app, &prefix, TOKEN_A, "k", b"secret").await;
     authority.revoke(&capability_id).await;
+    assert_all_cache_handlers_reject(&app, TOKEN_A, StatusCode::UNAUTHORIZED).await;
     let path = archive_location
         .strip_prefix("http://localhost:9999")
         .unwrap();
