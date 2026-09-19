@@ -516,7 +516,33 @@ async fn wait_for_healthy(docker: &Docker, container_id: &str, container_name: &
     }
 }
 
-/// Fetch and log the last 50 lines from a container's stdout/stderr.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ContainerTailSummary {
+    chunk_count: usize,
+    byte_count: usize,
+}
+
+impl ContainerTailSummary {
+    fn record(&mut self, chunk: &LogOutput) {
+        let message = match chunk {
+            LogOutput::StdOut { message } | LogOutput::StdErr { message } => message,
+            _ => return,
+        };
+        self.chunk_count += 1;
+        self.byte_count += message.len();
+    }
+}
+
+#[cfg(test)]
+fn summarize_container_tail(chunks: &[LogOutput]) -> ContainerTailSummary {
+    let mut summary = ContainerTailSummary::default();
+    for chunk in chunks {
+        summary.record(chunk);
+    }
+    summary
+}
+
+/// Fetch and summarize the last 50 lines from a container's stdout/stderr.
 async fn log_container_tail(docker: &Docker, container_id: &str, container_name: &str) {
     let opts = LogsOptions::<String> {
         stdout: true,
@@ -525,23 +551,18 @@ async fn log_container_tail(docker: &Docker, container_id: &str, container_name:
         ..Default::default()
     };
     let mut stream = docker.logs(container_id, Some(opts));
-    let mut lines = Vec::new();
+    let mut summary = ContainerTailSummary::default();
     while let Some(Ok(chunk)) = stream.next().await {
-        let text = match &chunk {
-            LogOutput::StdOut { message } | LogOutput::StdErr { message } => {
-                String::from_utf8_lossy(message).to_string()
-            }
-            _ => continue,
-        };
-        lines.push(text);
+        summary.record(&chunk);
     }
-    if lines.is_empty() {
+    if summary.chunk_count == 0 {
         error!(container = %container_name, "no container logs available");
     } else {
         error!(
             container = %container_name,
-            logs = %lines.join(""),
-            "container logs (last 50 lines)"
+            chunk_count = summary.chunk_count,
+            byte_count = summary.byte_count,
+            "container log summary (last 50 lines)"
         );
     }
 }
@@ -559,16 +580,17 @@ fn log_health_check_results(
     else {
         return;
     };
-    for entry in health_log.iter().rev().take(3).rev() {
-        let output = entry.output.as_deref().unwrap_or("");
-        let exit_code = entry.exit_code.unwrap_or(-1);
-        error!(
-            container = %container_name,
-            exit_code = exit_code,
-            output = %output.trim(),
-            "health check probe result"
-        );
-    }
+    let record_count = health_log.len().min(3);
+    let last_exit_code = health_log
+        .last()
+        .and_then(|entry| entry.exit_code)
+        .unwrap_or(-1);
+    error!(
+        container = %container_name,
+        record_count,
+        last_exit_code,
+        "health check probe summary"
+    );
 }
 
 /// Extract port mappings from an inspected container.

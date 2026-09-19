@@ -1,5 +1,98 @@
 use super::*;
 
+#[derive(Clone, Default)]
+struct CapturedWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for CapturedWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'writer> tracing_subscriber::fmt::MakeWriter<'writer> for CapturedWriter {
+    type Writer = Self;
+
+    fn make_writer(&'writer self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+impl CapturedWriter {
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+    }
+}
+
+#[test]
+fn health_diagnostic_omits_probe_output() {
+    let inspect = bollard::models::ContainerInspectResponse {
+        state: Some(bollard::models::ContainerState {
+            exit_code: Some(17),
+            health: Some(bollard::models::Health {
+                log: Some(vec![
+                    bollard::models::HealthcheckResult {
+                        exit_code: Some(1),
+                        output: Some("CANARY-HEALTH first".into()),
+                        ..Default::default()
+                    },
+                    bollard::models::HealthcheckResult {
+                        exit_code: Some(17),
+                        output: Some("CANARY-HEALTH last".into()),
+                        ..Default::default()
+                    },
+                ]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let captured = CapturedWriter::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::ERROR)
+        .with_ansi(false)
+        .without_time()
+        .with_writer(captured.clone())
+        .finish();
+    let dispatch = tracing::Dispatch::new(subscriber);
+    let _guard = tracing::dispatcher::set_default(&dispatch);
+
+    log_health_check_results(&inspect, "safe-container-id");
+    let trace = captured.text();
+
+    assert!(trace.contains("safe-container-id"));
+    assert!(trace.contains("17"));
+    assert!(trace.contains("record_count=2"));
+    assert!(
+        !trace.contains("CANARY-HEALTH"),
+        "health output leaked: {trace}"
+    );
+}
+
+#[test]
+fn container_tail_summary_discards_payload_bytes() {
+    let chunks = [
+        LogOutput::StdOut {
+            message: b"CANARY-TAIL stdout".to_vec().into(),
+        },
+        LogOutput::StdErr {
+            message: b"CANARY-TAIL stderr".to_vec().into(),
+        },
+    ];
+
+    let summary = summarize_container_tail(&chunks);
+    let rendered = format!("{summary:?}");
+
+    assert_eq!(summary.chunk_count, 2);
+    assert_eq!(summary.byte_count, 36);
+    assert!(!rendered.contains("CANARY-TAIL"));
+}
+
 #[test]
 fn parse_port_bindings_simple() {
     let ports = vec!["8080:8080".into()];

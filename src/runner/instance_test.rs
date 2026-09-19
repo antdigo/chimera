@@ -109,6 +109,43 @@ fn acquired_job_trace_contains_only_safe_structural_fields() {
     }
 }
 
+#[tokio::test]
+async fn masked_error_chain_hides_nested_source() {
+    let source = anyhow::anyhow!("source contains CANARY-NESTED");
+    let error = source.context("safe setup stage");
+    let masker = crate::job::secret_masker::shared_masker_for_test(&["CANARY-NESTED"]);
+
+    let rendered = mask_error_chain(&error, &masker).await;
+
+    assert!(rendered.contains("safe setup stage"));
+    assert!(rendered.contains("***"));
+    assert!(!rendered.contains("CANARY-NESTED"));
+}
+
+#[tokio::test]
+async fn concurrent_jobs_keep_secret_sets_isolated() {
+    let (tx_a, mut rx_a) = tokio::sync::mpsc::channel(1);
+    let (tx_b, mut rx_b) = tokio::sync::mpsc::channel(1);
+    let sender_a = crate::job::logs::LogSender::new_for_test(
+        tx_a,
+        crate::job::secret_masker::shared_masker_for_test(&["secret-a"]),
+    );
+    let sender_b = crate::job::logs::LogSender::new_for_test(
+        tx_b,
+        crate::job::secret_masker::shared_masker_for_test(&["secret-b"]),
+    );
+
+    tokio::join!(
+        sender_a.send("job-a=secret-a,other=secret-b".into()),
+        sender_b.send("job-b=secret-b,other=secret-a".into()),
+    );
+    let line_a = rx_a.recv().await.unwrap().content;
+    let line_b = rx_b.recv().await.unwrap().content;
+
+    assert_eq!(line_a, "job-a=***,other=secret-b");
+    assert_eq!(line_b, "job-b=***,other=secret-a");
+}
+
 async fn setup() -> (MockServer, Arc<TokenManager>, watch::Sender<bool>) {
     let mock_server = MockServer::start().await;
 
