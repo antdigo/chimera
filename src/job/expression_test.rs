@@ -547,6 +547,43 @@ fn secrets_root_context_name_is_case_insensitive() {
     );
 }
 
+#[test]
+fn secrets_root_serializes_the_allowed_secret_map() {
+    let env = HashMap::new();
+    let secrets = HashMap::from([
+        ("QUOTED".to_string(), "say \"hello\"".to_string()),
+        ("UNICODE".to_string(), "секрет 🔐".to_string()),
+        ("MULTILINE".to_string(), "first\nsecond".to_string()),
+        ("EMPTY".to_string(), String::new()),
+    ]);
+    let empty_steps = HashMap::new();
+    let empty_outcomes = HashMap::new();
+    let null_json = serde_json::json!({});
+    let ctx = ExprContext {
+        env: &env,
+        secrets: &secrets,
+        step_outputs: &empty_steps,
+        step_outcomes: &empty_outcomes,
+        context_data: &null_json,
+        job_failed: false,
+        job_cancelled: false,
+        workspace_path: None,
+    };
+
+    let serialized = resolve_expression("${{ toJSON(secrets) }}", &ctx);
+    let actual: serde_json::Value = serde_json::from_str(&serialized).unwrap();
+
+    assert_eq!(
+        actual,
+        serde_json::json!({
+            "QUOTED": "say \"hello\"",
+            "UNICODE": "секрет 🔐",
+            "MULTILINE": "first\nsecond",
+            "EMPTY": "",
+        })
+    );
+}
+
 // ── steps ───────────────────────────────────────────────────────────
 
 #[test]

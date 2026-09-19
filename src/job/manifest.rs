@@ -68,6 +68,10 @@ pub fn normalize_manifest(raw: &Value) -> Value {
         result.insert("resources".into(), resources.clone());
     }
 
+    if let Some(job_outputs) = obj.get("jobOutputs") {
+        result.insert("jobOutputs".into(), template_token_to_map(job_outputs));
+    }
+
     // ContextData: uses PipelineContextData format {t: 2, d: [{k: ..., v: ...}]}
     if let Some(ctx) = obj.get("contextData") {
         result.insert("contextData".into(), normalize_context_data(ctx));

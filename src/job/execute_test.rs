@@ -9,6 +9,7 @@ use crate::job::docker_config::{
     DOCKER_CONFIG_ENV, JobDockerConfig, JobDockerConfigError, JobResourceRoot,
 };
 use crate::job::schema::{StepReference, StepReferenceKind};
+use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 use wiremock::matchers::{method, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -146,6 +147,41 @@ async fn context_data_secret_overrides_variable_regardless_of_case() {
         find_case_insensitive(&secrets, "deploy_token").unwrap(),
         "new"
     );
+}
+
+#[tokio::test]
+async fn allowed_secrets_keep_empty_values_and_exclude_service_credentials() {
+    let manifest: JobManifest = serde_json::from_value(serde_json::json!({
+        "variables": {
+            "EMPTY_VARIABLE": { "value": "", "isSecret": true },
+            "system.github.token": { "value": "ghs_job_token", "isSecret": true },
+            "system.accessToken": { "value": "service-token", "isSecret": true }
+        },
+        "contextData": {
+            "secrets": {
+                "APP_KEY": "app-value",
+                "EMPTY_CONTEXT": "",
+                "system.accessToken": "context-service-token"
+            }
+        }
+    }))
+    .unwrap();
+    let masks = Arc::new(RwLock::new(Vec::new()));
+
+    let secrets = collect_secrets(&manifest, &masks).await;
+
+    assert_eq!(secrets.get("EMPTY_VARIABLE").map(String::as_str), Some(""));
+    assert_eq!(secrets.get("EMPTY_CONTEXT").map(String::as_str), Some(""));
+    assert_eq!(
+        secrets.get("APP_KEY").map(String::as_str),
+        Some("app-value")
+    );
+    assert_eq!(
+        secrets.get("GITHUB_TOKEN").map(String::as_str),
+        Some("ghs_job_token")
+    );
+    assert!(find_case_insensitive(&secrets, "system.github.token").is_none());
+    assert!(find_case_insensitive(&secrets, "system.accessToken").is_none());
 }
 
 fn test_workspace() -> (tempfile::TempDir, Workspace) {
@@ -1258,4 +1294,26 @@ fn update_job_status_transitions() {
     // Back to success
     update_job_status(&mut data, false, false);
     assert_eq!(data["job"]["status"], "success");
+}
+
+#[tokio::test]
+async fn server_mask_hint_registers_literal_encoded_forms_as_well_as_regex() {
+    let manifest: JobManifest = serde_json::from_value(serde_json::json!({
+        "mask": [{
+            "type": "regex",
+            "value": "credential-\"private\""
+        }]
+    }))
+    .unwrap();
+    let masks = collect_secret_masks(&manifest);
+    let masks = masks.read().await;
+
+    assert_eq!(
+        crate::job::masking::apply(&masks, r#"credential-\"private\""#),
+        "***"
+    );
+    assert!(crate::job::masking::contains_secret(
+        &masks,
+        r#"credential-\"private\""#
+    ));
 }

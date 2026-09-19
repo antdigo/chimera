@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use super::*;
 use crate::github::auth::TokenManager;
 use crate::utils::format_log_timestamp;
+use tokio::sync::RwLock;
 use wiremock::matchers::{header, method, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -151,7 +152,7 @@ async fn masking_replaces_secrets() {
         .mount(&mock_server)
         .await;
 
-    let masks = Arc::new(RwLock::new(vec!["supersecret".to_string()]));
+    let masks = crate::job::masking::masker_from_values(["supersecret".to_string()]);
     let logger = StepLogger::legacy(client, "plan-1", "step-1", masks, None).await;
 
     logger
@@ -183,7 +184,7 @@ async fn collector_collects_lines() {
 
 #[tokio::test]
 async fn collector_masks_secrets() {
-    let masks = Arc::new(RwLock::new(vec!["secret123".to_string()]));
+    let masks = crate::job::masking::masker_from_values(["secret123".to_string()]);
     let logger = StepLogger::results_for_test(masks);
 
     logger.sender().send("token is secret123 here".into()).await;
@@ -191,6 +192,44 @@ async fn collector_masks_secrets() {
     let collected = logger.finish().await.expect("should collect lines");
     assert!(!collected.text.contains("secret123"));
     assert!(collected.text.contains("***"));
+}
+
+#[tokio::test]
+async fn collector_applies_regex_mask_hints() {
+    let masks = crate::job::masking::empty_masker();
+    {
+        let mut patterns = masks.write().await;
+        crate::job::masking::append_regex(&mut patterns, r"credential-[0-9]+").unwrap();
+    }
+    let logger = StepLogger::results_for_test(masks);
+
+    logger
+        .sender()
+        .send("token is credential-12345 here".into())
+        .await;
+
+    let collected = logger.finish().await.expect("should collect lines");
+    assert!(!collected.text.contains("credential-12345"));
+    assert!(collected.text.contains("***"));
+}
+
+#[tokio::test]
+async fn collector_merges_overlapping_value_and_regex_masks() {
+    let masks = crate::job::masking::masker_from_values(["secret".to_string()]);
+    {
+        let mut patterns = masks.write().await;
+        crate::job::masking::append_regex(&mut patterns, r"secret-[0-9]+").unwrap();
+    }
+    let logger = StepLogger::results_for_test(masks);
+
+    logger
+        .sender()
+        .send("token is secret-12345 here".into())
+        .await;
+
+    let collected = logger.finish().await.expect("should collect lines");
+    assert!(collected.text.contains("token is *** here"));
+    assert!(!collected.text.contains("12345"));
 }
 
 /// Mount the Results endpoints a blob collector needs, recording every line that

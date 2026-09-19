@@ -1,10 +1,9 @@
 use std::sync::Arc;
 
-use tokio::sync::RwLock;
-
 use crate::job::commands::{WorkflowCommand, parse_command};
 use crate::job::execute::JobState;
 use crate::job::logs::LogSender;
+use crate::job::masking::SharedSecretMasker;
 
 /// Bundles the buffers and settings needed to process stdout/stderr output lines.
 ///
@@ -13,7 +12,7 @@ use crate::job::logs::LogSender;
 #[derive(Clone)]
 pub struct OutputProcessor {
     sender: LogSender,
-    masks: Arc<RwLock<Vec<String>>>,
+    masks: SharedSecretMasker,
     env_buf: Arc<tokio::sync::Mutex<Vec<(String, String)>>>,
     path_buf: Arc<tokio::sync::Mutex<Vec<String>>>,
     output_buf: Arc<tokio::sync::Mutex<Vec<(String, String)>>>,
@@ -22,7 +21,7 @@ pub struct OutputProcessor {
 }
 
 impl OutputProcessor {
-    pub fn new(sender: LogSender, masks: Arc<RwLock<Vec<String>>>, debug_enabled: bool) -> Self {
+    pub fn new(sender: LogSender, masks: SharedSecretMasker, debug_enabled: bool) -> Self {
         Self {
             sender,
             masks,
@@ -48,7 +47,7 @@ impl OutputProcessor {
                     self.output_buf.lock().await.push((name, value));
                 }
                 WorkflowCommand::AddMask(secret) => {
-                    self.masks.write().await.push(secret);
+                    crate::job::masking::add_value(&self.masks, &secret).await;
                 }
                 WorkflowCommand::Debug(msg) => {
                     if self.debug_enabled {

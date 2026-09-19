@@ -150,6 +150,14 @@ fn resolve_property(segments: &[PropertySegment], ctx: &ExprContext) -> Result<V
             Ok(from_context)
         }
         "secrets" => {
+            if rest.is_empty() {
+                return Ok(Value::Object(
+                    ctx.secrets
+                        .iter()
+                        .map(|(key, value)| (key.clone(), Value::String(value.clone())))
+                        .collect(),
+                ));
+            }
             let key = rest
                 .first()
                 .map(|s| segment_to_key(s, ctx))

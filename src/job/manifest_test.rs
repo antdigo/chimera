@@ -494,6 +494,31 @@ fn normalize_passes_through_mask_and_file_table() {
 }
 
 #[test]
+fn normalize_preserves_declared_job_output_expressions() {
+    let raw = json!({
+        "plan": { "planId": "p" },
+        "jobId": "j",
+        "timeline": { "id": "t" },
+        "jobOutputs": {
+            "type": 2,
+            "map": [{
+                "Key": { "type": 0, "lit": "artifact" },
+                "Value": { "type": 3, "expr": "steps.build.outputs.name" }
+            }]
+        }
+    });
+
+    let normalized = normalize_manifest(&raw);
+
+    assert_eq!(
+        normalized.get("jobOutputs"),
+        Some(&json!({
+            "artifact": "${{ steps.build.outputs.name }}"
+        }))
+    );
+}
+
+#[test]
 fn normalize_handles_missing_optional_fields() {
     let raw = json!({
         "plan": { "planId": "p" },
