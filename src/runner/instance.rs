@@ -1,9 +1,12 @@
 use std::collections::HashMap;
+use std::future::Future;
+use std::panic::{AssertUnwindSafe, resume_unwind};
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use chrono::Utc;
+use futures::FutureExt;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -156,6 +159,50 @@ async fn register_job_cache_capability(
         .context("registering cache capability")
 }
 
+struct JobCacheCapability {
+    authority: Arc<CacheAuthority>,
+    capability_id: CapabilityId,
+    active: bool,
+}
+
+impl JobCacheCapability {
+    fn new(authority: Arc<CacheAuthority>, capability_id: CapabilityId) -> Self {
+        Self {
+            authority,
+            capability_id,
+            active: true,
+        }
+    }
+
+    async fn revoke(&mut self) {
+        if self.active {
+            self.authority.revoke(&self.capability_id).await;
+            self.active = false;
+        }
+    }
+}
+
+impl Drop for JobCacheCapability {
+    fn drop(&mut self) {
+        if self.active {
+            self.authority.revoke_immediately(&self.capability_id);
+        }
+    }
+}
+
+async fn run_with_cache_capability<F, T>(capability: &mut JobCacheCapability, execution: F) -> T
+where
+    F: Future<Output = T>,
+{
+    match AssertUnwindSafe(execution).catch_unwind().await {
+        Ok(output) => output,
+        Err(panic) => {
+            capability.revoke().await;
+            resume_unwind(panic)
+        }
+    }
+}
+
 async fn finish_job(
     job_client: &Arc<JobClient>,
     manifest: &JobManifest,
@@ -197,14 +244,13 @@ async fn finish_job(
 }
 
 async fn finish_job_after_cache_revoke(
-    authority: &CacheAuthority,
-    capability_id: &CapabilityId,
+    capability: &mut JobCacheCapability,
     job_client: &Arc<JobClient>,
     manifest: &JobManifest,
     execution_result: Result<JobExecutionOutcome>,
     cleanup_result: std::result::Result<(), JobDockerConfigError>,
 ) -> Result<()> {
-    authority.revoke(capability_id).await;
+    capability.revoke().await;
     finish_job(job_client, manifest, execution_result, cleanup_result).await
 }
 
@@ -603,33 +649,39 @@ impl Runner {
                 };
             }
         };
+        let mut cache_capability =
+            JobCacheCapability::new(Arc::clone(&self.cache_authority), capability_id);
 
-        let execution_result = self
-            .run_job_body(
-                manifest,
-                job_client,
-                client,
-                cancel_token,
-                repo,
-                &cache_scope,
-                &docker_config,
-            )
+        let (execution_result, cleanup_result) =
+            run_with_cache_capability(&mut cache_capability, async {
+                let execution_result = self
+                    .run_job_body(
+                        manifest,
+                        job_client,
+                        client,
+                        cancel_token,
+                        repo,
+                        &cache_scope,
+                        &docker_config,
+                    )
+                    .await;
+
+                let cleanup_result = docker_config.cleanup();
+                match &cleanup_result {
+                    Ok(()) => info!(%attempt_id, "cleaned job Docker config"),
+                    Err(cleanup_error) => error!(
+                        category = "job-resource-cleanup",
+                        %attempt_id,
+                        error = %cleanup_error,
+                        "job Docker config cleanup failed"
+                    ),
+                }
+                (execution_result, cleanup_result)
+            })
             .await;
 
-        let cleanup_result = docker_config.cleanup();
-        match &cleanup_result {
-            Ok(()) => info!(%attempt_id, "cleaned job Docker config"),
-            Err(cleanup_error) => error!(
-                category = "job-resource-cleanup",
-                %attempt_id,
-                error = %cleanup_error,
-                "job Docker config cleanup failed"
-            ),
-        }
-
         finish_job_after_cache_revoke(
-            &self.cache_authority,
-            &capability_id,
+            &mut cache_capability,
             job_client,
             manifest,
             execution_result,

@@ -162,6 +162,83 @@ async fn registration_failure_cleans_docker_config_without_revoking_existing_cap
 }
 
 #[tokio::test]
+async fn panicking_job_execution_revokes_capability_and_download_grant_before_unwind() {
+    use futures::FutureExt;
+    use std::panic::AssertUnwindSafe;
+
+    let authority = Arc::new(CacheAuthority::new());
+    let manifest: JobManifest =
+        serde_json::from_str(include_str!("../../tests/fixtures/job_manifest.json")).unwrap();
+    let scope = cache_scope_for_job(&manifest, "owner/test-repo");
+    let id = register_job_cache_capability(&authority, &manifest, scope.clone(), Utc::now())
+        .await
+        .unwrap();
+    let authorized = authority.authorize("job-token-xyz", &scope).await.unwrap();
+    let grant = authority
+        .issue_download(&authorized, "a".repeat(64))
+        .await
+        .unwrap();
+    let mut capability = JobCacheCapability::new(Arc::clone(&authority), id);
+
+    let unwind = AssertUnwindSafe(run_with_cache_capability(&mut capability, async {
+        panic!("synthetic job execution panic");
+    }))
+    .catch_unwind()
+    .await;
+
+    assert!(unwind.is_err(), "execution panic must still propagate");
+    assert_eq!(
+        authority
+            .authorize("job-token-xyz", &scope)
+            .await
+            .unwrap_err(),
+        CacheAuthError::Unauthorized,
+    );
+    assert_eq!(
+        authority.resolve_download(grant).await.unwrap_err(),
+        CacheAuthError::DownloadNotFound,
+    );
+}
+
+#[tokio::test]
+async fn aborting_job_execution_revokes_capability_and_download_grant_on_drop() {
+    let authority = Arc::new(CacheAuthority::new());
+    let manifest: JobManifest =
+        serde_json::from_str(include_str!("../../tests/fixtures/job_manifest.json")).unwrap();
+    let scope = cache_scope_for_job(&manifest, "owner/test-repo");
+    let id = register_job_cache_capability(&authority, &manifest, scope.clone(), Utc::now())
+        .await
+        .unwrap();
+    let authorized = authority.authorize("job-token-xyz", &scope).await.unwrap();
+    let grant = authority
+        .issue_download(&authorized, "a".repeat(64))
+        .await
+        .unwrap();
+    let task_authority = Arc::clone(&authority);
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(async move {
+        let mut capability = JobCacheCapability::new(task_authority, id);
+        started_tx.send(()).unwrap();
+        run_with_cache_capability(&mut capability, std::future::pending::<()>()).await;
+    });
+    started_rx.await.unwrap();
+
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    assert_eq!(
+        authority
+            .authorize("job-token-xyz", &scope)
+            .await
+            .unwrap_err(),
+        CacheAuthError::Unauthorized,
+    );
+    assert_eq!(
+        authority.resolve_download(grant).await.unwrap_err(),
+        CacheAuthError::DownloadNotFound,
+    );
+}
+
+#[tokio::test]
 async fn poll_loop_returns_job_request() {
     let (mock_server, tm, shutdown_tx) = setup().await;
 
@@ -1178,7 +1255,7 @@ fn job_execution_error_is_terminal_covers_both_fatal_markers() {
 
 #[tokio::test]
 async fn cache_capability_is_revoked_before_failure_is_reported() {
-    let authority = CacheAuthority::new();
+    let authority = Arc::new(CacheAuthority::new());
     let server = MockServer::start().await;
     let manifest = finish_manifest(&server.uri());
     let scope = cache_scope_for_job(&manifest, "owner/test-repo");
@@ -1188,9 +1265,10 @@ async fn cache_capability_is_revoked_before_failure_is_reported() {
     let execution = Err(anyhow::anyhow!("setup failed"));
     let cleanup = Ok(());
     let client = finish_client(&server).await;
+    let mut capability = JobCacheCapability::new(Arc::clone(&authority), id);
 
     let result =
-        finish_job_after_cache_revoke(&authority, &id, &client, &manifest, execution, cleanup)
+        finish_job_after_cache_revoke(&mut capability, &client, &manifest, execution, cleanup)
             .await;
 
     assert!(result.is_err());
@@ -1218,7 +1296,7 @@ async fn successful_job_reports_failed_when_docker_config_cleanup_fails() {
         .expect(1)
         .mount(&server)
         .await;
-    let authority = CacheAuthority::new();
+    let authority = Arc::new(CacheAuthority::new());
     let client = finish_client(&server).await;
     let manifest = finish_manifest(&server.uri());
     let scope = cache_scope_for_job(&manifest, "owner/test-repo");
@@ -1232,9 +1310,10 @@ async fn successful_job_reports_failed_when_docker_config_cleanup_fails() {
     let cleanup = Err(JobDockerConfigError::UnsafeEntry {
         path: "/synthetic/job-resource/entry".into(),
     });
+    let mut capability = JobCacheCapability::new(Arc::clone(&authority), id);
 
     let error =
-        finish_job_after_cache_revoke(&authority, &id, &client, &manifest, execution, cleanup)
+        finish_job_after_cache_revoke(&mut capability, &client, &manifest, execution, cleanup)
             .await
             .unwrap_err();
 
@@ -1248,7 +1327,7 @@ async fn successful_job_reports_failed_when_docker_config_cleanup_fails() {
 #[tokio::test]
 async fn execution_and_cleanup_errors_are_both_returned_without_early_completion() {
     let server = MockServer::start().await;
-    let authority = CacheAuthority::new();
+    let authority = Arc::new(CacheAuthority::new());
     let client = finish_client(&server).await;
     let manifest = finish_manifest(&server.uri());
     let scope = cache_scope_for_job(&manifest, "owner/test-repo");
@@ -1259,9 +1338,10 @@ async fn execution_and_cleanup_errors_are_both_returned_without_early_completion
     let cleanup = Err(JobDockerConfigError::UnsafeEntry {
         path: "/synthetic/job-resource/entry".into(),
     });
+    let mut capability = JobCacheCapability::new(Arc::clone(&authority), id);
 
     let error =
-        finish_job_after_cache_revoke(&authority, &id, &client, &manifest, execution, cleanup)
+        finish_job_after_cache_revoke(&mut capability, &client, &manifest, execution, cleanup)
             .await
             .unwrap_err();
 
@@ -1298,7 +1378,7 @@ async fn cancelled_job_revokes_cache_capability_before_completion() {
         .expect(1)
         .mount(&server)
         .await;
-    let authority = CacheAuthority::new();
+    let authority = Arc::new(CacheAuthority::new());
     let client = finish_client(&server).await;
     let manifest = finish_manifest(&server.uri());
     let scope = cache_scope_for_job(&manifest, "owner/test-repo");
@@ -1309,8 +1389,9 @@ async fn cancelled_job_revokes_cache_capability_before_completion() {
         conclusion: JobConclusion::Cancelled,
         outputs: HashMap::new(),
     });
+    let mut capability = JobCacheCapability::new(Arc::clone(&authority), id);
 
-    finish_job_after_cache_revoke(&authority, &id, &client, &manifest, execution, Ok(()))
+    finish_job_after_cache_revoke(&mut capability, &client, &manifest, execution, Ok(()))
         .await
         .unwrap();
 

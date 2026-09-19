@@ -1,5 +1,5 @@
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use chrono::{DateTime, Duration, Utc};
 use thiserror::Error;
@@ -89,6 +89,7 @@ struct AuthorityState {
 
 pub struct CacheAuthority {
     state: RwLock<AuthorityState>,
+    revoked: Mutex<HashSet<CapabilityId>>,
     now: Arc<dyn Fn() -> DateTime<Utc> + Send + Sync>,
 }
 
@@ -96,6 +97,7 @@ impl CacheAuthority {
     pub fn new() -> Self {
         Self {
             state: RwLock::new(AuthorityState::default()),
+            revoked: Mutex::new(HashSet::new()),
             now: Arc::new(Utc::now),
         }
     }
@@ -104,12 +106,30 @@ impl CacheAuthority {
     pub(crate) fn with_clock(now: Arc<dyn Fn() -> DateTime<Utc> + Send + Sync>) -> Self {
         Self {
             state: RwLock::new(AuthorityState::default()),
+            revoked: Mutex::new(HashSet::new()),
             now,
         }
     }
 
     fn now(&self) -> DateTime<Utc> {
         (self.now)()
+    }
+
+    fn revoked(&self) -> MutexGuard<'_, HashSet<CapabilityId>> {
+        self.revoked
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn is_revoked(&self, id: &CapabilityId) -> bool {
+        self.revoked().contains(id)
+    }
+
+    /// Invalidate a capability synchronously so a lifecycle guard can revoke
+    /// access while an async task is being unwound or dropped. The async
+    /// `revoke` path additionally removes the capability's download grants.
+    pub(crate) fn revoke_immediately(&self, id: &CapabilityId) {
+        self.revoked().insert(id.clone());
     }
 
     pub async fn register_job(
@@ -125,10 +145,12 @@ impl CacheAuthority {
         let id = CapabilityId::from_token(token);
         let mut state = self.state.write().await;
         let now = self.now();
-        state
-            .jobs
-            .retain(|_, capability| !capability.revoked && capability.expires_at > now);
-        let active_parents: std::collections::HashSet<_> = state.jobs.keys().cloned().collect();
+        let mut revoked = self.revoked();
+        state.jobs.retain(|capability_id, capability| {
+            !capability.revoked && !revoked.contains(capability_id) && capability.expires_at > now
+        });
+        revoked.retain(|capability_id| state.jobs.contains_key(capability_id));
+        let active_parents: HashSet<_> = state.jobs.keys().cloned().collect();
         state
             .downloads
             .retain(|_, grant| grant.expires_at > now && active_parents.contains(&grant.parent));
@@ -137,6 +159,7 @@ impl CacheAuthority {
             return Err(CacheAuthError::DuplicateToken);
         }
 
+        revoked.remove(&id);
         state.jobs.insert(
             id.clone(),
             JobCapability {
@@ -161,7 +184,7 @@ impl CacheAuthority {
         let state = self.state.read().await;
         let now = self.now();
         let capability = state.jobs.get(&id).ok_or(CacheAuthError::Unauthorized)?;
-        if capability.revoked || capability.expires_at <= now {
+        if capability.revoked || self.is_revoked(&id) || capability.expires_at <= now {
             return Err(CacheAuthError::Unauthorized);
         }
         if &capability.claims.scope != requested_scope {
@@ -177,6 +200,7 @@ impl CacheAuthority {
 
     pub async fn revoke(&self, id: &CapabilityId) {
         let mut state = self.state.write().await;
+        self.revoke_immediately(id);
         if let Some(capability) = state.jobs.get_mut(id) {
             capability.revoked = true;
         }
@@ -194,7 +218,7 @@ impl CacheAuthority {
             .jobs
             .get(job.capability_id())
             .ok_or(CacheAuthError::Unauthorized)?;
-        if parent.revoked || parent.expires_at <= now {
+        if parent.revoked || self.is_revoked(job.capability_id()) || parent.expires_at <= now {
             return Err(CacheAuthError::Unauthorized);
         }
 
@@ -220,10 +244,9 @@ impl CacheAuthority {
         let parent = download.parent.clone();
         let blob_hash = download.blob_hash.clone();
         let grant_expired = download.expires_at <= now;
-        let parent_active = state
-            .jobs
-            .get(&parent)
-            .is_some_and(|capability| !capability.revoked && capability.expires_at > now);
+        let parent_active = state.jobs.get(&parent).is_some_and(|capability| {
+            !capability.revoked && !self.is_revoked(&parent) && capability.expires_at > now
+        });
         if grant_expired || !parent_active {
             state.downloads.remove(&grant);
             return Err(CacheAuthError::DownloadNotFound);
