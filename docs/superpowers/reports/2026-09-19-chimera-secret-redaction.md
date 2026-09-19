@@ -1,16 +1,23 @@
 # DPL-07 — отчёт о проверке сквозной защиты секретов
 
-Дата проверки: 2026-09-19. Целевой issue: [#41](https://github.com/antdigo/chimera/issues/41).
+Дата проверки: 2026-09-19, финальная перепроверка: 2026-09-20. Целевой
+issue: [#41](https://github.com/antdigo/chimera/issues/41).
 
 ## Проверенный диапазон
 
-- baseline: `be6adc97e5429689365d79c91cc9953b085892ef`;
-- проверенный implementation commit: `dacbf07`;
-- baseline `cargo test`: PASS — 788 unit tests, 15 ignored; integration и doc tests также завершились без ошибок;
-- итоговый `cargo test`: exit 0 — 825 unit tests passed, 15 ignored; по всем cargo test binaries суммарно 992 passed, 44 ignored, 0 failed;
+- baseline: `7c86b22b96dcf635a1aa36d576806f237a7a3204` (`main` и
+  `origin/main` на момент проверки);
+- проверенный implementation commit: `c06f4dc`;
+- итоговый macOS `cargo test`: exit 0 — 855 unit tests passed, 15 ignored;
+  по всем cargo test binaries суммарно 1032 passed, 44 ignored, 0 failed;
+- обязательный Linux/rootless Docker suite: 46 passed, 0 failed;
+- Linux-only `concurrent_webhook_flows_get_private_absolute_tmp`: PASS;
 - `cargo fmt --check`: PASS;
 - `cargo clippy --all-targets --all-features -- -D warnings`: PASS;
 - `cargo build --all-features`: PASS.
+
+Два независимых GPT-6-Astra review полного security diff завершились без
+Critical/Important замечаний с вердиктом «Готово к слиянию».
 
 Проверка использовала только synthetic canaries. Production secrets и действующие
 credentials не использовались.
@@ -32,8 +39,8 @@ credentials не использовались.
 | R-11 | независимые stdout/stderr partial lines — `docker_log_framer_keeps_stdout_and_stderr_partial_lines_separate` | `cargo test docker::output::output_test -- --nocapture` | PASS |
 | R-12 | фактические Results step/job blobs, legacy VSS и WebSocket live feed — `results_step_and_job_blobs_receive_identical_masked_content`, `legacy_vss_masks_multiline_and_json_encoded_canaries`, `log_sender_masks_before_websocket_feed_fan_out` | `cargo test job::logs::logs_test -- --nocapture`; `cargo test job::live_feed::live_feed_test -- --nocapture` | PASS |
 | R-13 | setup/action failure сохраняют safe message — `setup_failure_blob_masks_nested_error_chain`, `masked_error_chain_hides_nested_source`, `failing_node_action_masks_secret_in_collected_log` | `cargo test` | PASS |
-| R-14 | debug + malformed/semantic/HTTP manifest failures без body canary — `acquire_job_semantic_error_omits_raw_and_normalized_canary`, `acquire_job_syntax_error_reports_category_and_position_without_body`, `acquire_job_http_error_reports_status_and_length_without_response_body`, `acquired_job_trace_contains_only_safe_structural_fields` | `cargo test` | PASS |
-| R-15 | Docker health/tail/error/options daemon diagnostics — `health_diagnostic_omits_probe_output`, `container_tail_summary_discards_payload_bytes`, `docker_error_diagnostic_discards_daemon_payload`, `unknown_options_warning_omits_manifest_tokens`, Docker trace canary tests | `cargo test` | PASS |
+| R-14 | debug + malformed/semantic/HTTP manifest и broker failures без body canary — `acquire_job_semantic_error_omits_raw_and_normalized_canary`, `acquire_job_syntax_error_reports_category_and_position_without_body`, `acquire_job_http_error_reports_status_and_length_without_response_body`, `acquired_job_trace_contains_only_safe_structural_fields`, broker/cancel response-body tests | `cargo test` | PASS |
+| R-15 | Docker/action lifecycle diagnostics — health/tail/error/options payload, action ref/path, output keys, service aliases и unknown broker message types не попадают в trace; соответствующие captured-trace canary tests | `cargo test`; Linux/rootless ignored suite | PASS |
 | R-16 | два concurrent jobs с независимыми secret sets — `concurrent_jobs_keep_secret_sets_isolated` | `cargo test runner::instance::instance_test -- --nocapture` | PASS |
 
 ## Проверка sink boundaries
@@ -53,7 +60,12 @@ credentials не использовались.
 - Docker action traces сохраняют только image source, наличие entrypoint и число
   аргументов; image reference, entrypoint/args и daemon error payload отсутствуют;
 - предупреждения о неизвестных Docker options сохраняют только индекс token и не
-  выводят manifest option/value.
+  выводят manifest option/value;
+- ActionCache diagnostics не выводят URL, owner/repo/ref и tar-entry path;
+- broker errors/ack сохраняют только status и размер body, cancel poller — только
+  безопасную категорию ошибки;
+- unknown broker `messageType`, job output keys и service aliases заменены в
+  lifecycle traces фиксированными типами/индексами.
 
 ## Отдельные failure/framing сценарии
 
@@ -69,17 +81,24 @@ credentials не использовались.
 
 ## Docker E2E environment
 
-`docker info` выполнен успешно для Docker Desktop 29.7.2 (`linux/arm64`). В
-`Security Options` присутствуют `seccomp` и `cgroupns`, но отсутствует `rootless`.
-По условию плана следующие ignored tests не запускались и не заменялись
-privileged-прогоном:
+Проверка выполнена по `docs/testing-macos-docker.md` на Docker Desktop 29.7.2
+(`linux/arm64`) через отдельный pinned rootless DinD. Внутренний daemon сообщил
+`name=rootless`; registry/httpd/BuildKit были загружены из pinned images, а
+BuildKit identity проверена по immutable image ID.
 
-- `cargo test docker::exec::exec_test -- --ignored --nocapture` — **NOT RUN**:
-  доступный daemon не rootless;
-- `cargo test job::action::docker::docker_test -- --ignored --nocapture` —
-  **NOT RUN**: доступный daemon не rootless.
+Финальная команда
+`cargo test --offline -- --ignored --test-threads=2` завершилась успешно:
+46 passed, 0 failed. Прошли Engine build/exec/resources, container/service,
+Dockerfile-action и все четыре job Docker-config runtime tests, включая C-10
+`pinned_buildx_flow_uses_job_config_and_original_socket`. После suite во
+внутреннем daemon отсутствовали containers и volumes; внешние test-owned
+container/volumes и scratch-каталог удалены с проверкой ownership label.
 
-Детерминированные framing/redaction tests не требуют Docker daemon и прошли.
+Linux-only тест 20 параллельных synthetic webhook flows отдельно выполнен в том
+же Linux runner и прошёл. Для host-step namespace isolation test runner
+использовал `apparmor=unconfined` и `seccomp=unconfined`, как актуальный CI
+harness; эти опции относятся только к одноразовому внешнему runner container,
+а проверяемый daemon оставался rootless.
 
 ## Граница гарантии
 
@@ -88,5 +107,6 @@ Masker покрывает известные значения, manifest regex hi
 HMAC, hash, ciphertext и пользовательские необратимые преобразования не могут
 быть автоматически выведены из исходного secret и этой гарантией не покрываются.
 
-Production rollout, online GitHub/rootless Docker/registry/Deploy API E2E и серия
-из 20 параллельных production-like runs в рамках этой проверки не выполнялись.
+Production rollout и E2E с production GitHub/registry/Deploy API не выполнялись.
+Все сетевые и credential scenarios использовали public pinned action archives,
+локальный synthetic registry и synthetic canaries.
