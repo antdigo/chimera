@@ -1212,9 +1212,12 @@ chimera never activates. Both v3 and v4 of `actions/cache` support the REST API
 when `ACTIONS_CACHE_URL` is set.
 
 Every cache REST request sends `Authorization: Bearer $ACTIONS_RUNTIME_TOKEN`.
-Chimera registers that token as an in-memory job capability before steps start,
-binds it server-side to repository, current ref, default ref and job ID, expires it
-after 6 hours 10 minutes, and revokes it when the job finishes.
+The token comes from the existing
+`SystemVssConnection.Authorization.AccessToken` in the job manifest. Chimera
+registers it as an in-memory job capability before steps start, binds it
+server-side to repository, current ref, default ref and job ID, and expires it
+6 hours 10 minutes after registration. Job success, failure and cancellation all
+revoke the capability immediately rather than waiting for expiry.
 
 The base64url path segments remain part of `ACTIONS_CACHE_URL` for legacy-client
 compatibility. They are checked against the registered capability and are not an

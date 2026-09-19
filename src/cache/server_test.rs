@@ -288,12 +288,32 @@ async fn authority_restart_rejects_old_token_but_preserves_scoped_entries() {
         .await
         .unwrap();
     let prefix = scope_prefix(SCOPE_REPO, SCOPE_REF, DEFAULT_REF);
-    authorized_roundtrip(&first_app, &prefix, TOKEN_A, "persisted", b"bytes").await;
+    let (_, old_archive_location) =
+        authorized_roundtrip(&first_app, &prefix, TOKEN_A, "persisted", b"bytes").await;
     drop(first_app);
+    drop(manager);
     drop(first_authority);
 
+    let reopened_manager = make_test_manager(&tmp).await;
     let second_authority = Arc::new(CacheAuthority::new());
-    let second_app = router(manager, second_authority.clone());
+    let second_app = router(reopened_manager, second_authority.clone());
+    let old_download_path = old_archive_location
+        .strip_prefix("http://localhost:9999")
+        .unwrap();
+    assert_eq!(
+        second_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(old_download_path)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::NOT_FOUND,
+    );
     assert_eq!(
         lookup_status(&second_app, &prefix, TOKEN_A, "persisted", "v1").await,
         StatusCode::UNAUTHORIZED,
@@ -313,9 +333,26 @@ async fn authority_restart_rejects_old_token_but_preserves_scoped_entries() {
         )
         .await
         .unwrap();
+    let new_archive_location =
+        lookup(&second_app, &prefix, "new-runtime-token", "persisted", "v1").await;
+    let new_download_path = new_archive_location
+        .strip_prefix("http://localhost:9999")
+        .unwrap();
+    let response = second_app
+        .oneshot(
+            Request::builder()
+                .uri(new_download_path)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
-        lookup_status(&second_app, &prefix, "new-runtime-token", "persisted", "v1",).await,
-        StatusCode::OK,
+        axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap(),
+        b"bytes"[..],
     );
 }
 
@@ -899,19 +936,45 @@ async fn concurrent_http_clients() {
     let tmp = TempDir::new().unwrap();
     let manager = make_test_manager(&tmp).await;
     let authority = Arc::new(CacheAuthority::new());
-    for (repo, token, bytes) in [
-        ("org/repo-a", "seed-a", b"fallback-a".as_slice()),
-        ("org/repo-b", "seed-b", b"fallback-b".as_slice()),
+    for (repo, git_ref, key, token, bytes) in [
+        (
+            "org/repo-a",
+            "refs/heads/main",
+            "default-fallback",
+            "seed-main-a",
+            b"fallback-a".as_slice(),
+        ),
+        (
+            "org/repo-b",
+            "refs/heads/main",
+            "default-fallback",
+            "seed-main-b",
+            b"fallback-b".as_slice(),
+        ),
+        (
+            "org/repo-a",
+            "refs/heads/feature",
+            "feature-only",
+            "seed-feature-a",
+            b"feature-a".as_slice(),
+        ),
+        (
+            "org/repo-b",
+            "refs/heads/feature",
+            "feature-only",
+            "seed-feature-b",
+            b"feature-b".as_slice(),
+        ),
     ] {
         let owner = CapabilityId::from_token(token);
         let id = manager
             .reserve_upload(
                 owner.clone(),
                 format!("{token}-job"),
-                "default-fallback".into(),
+                key.into(),
                 "v1".into(),
                 repo.into(),
-                "refs/heads/main".into(),
+                git_ref.into(),
             )
             .await
             .unwrap();
@@ -935,7 +998,7 @@ async fn concurrent_http_clients() {
         } else {
             "org/repo-b"
         };
-        let git_ref = if i % 4 == 0 {
+        let git_ref = if i % 4 < 2 {
             "refs/heads/feature"
         } else {
             "refs/heads/main"
@@ -1041,9 +1104,42 @@ async fn concurrent_http_clients() {
                     b"fallback-b".as_slice()
                 };
                 assert_eq!(restored.bytes().await.unwrap(), expected);
+
+                let response = client
+                    .get(format!(
+                        "{base_url}{prefix}/_apis/artifactcache/cache?keys=feature-only&version=v1"
+                    ))
+                    .bearer_auth(&token)
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                let archive_location = response.json::<serde_json::Value>().await.unwrap()
+                    ["archiveLocation"]
+                    .as_str()
+                    .unwrap()
+                    .to_string();
+                let restored = client.get(archive_location).send().await.unwrap();
+                assert_eq!(restored.status(), StatusCode::OK);
+                let expected = if repo == "org/repo-a" {
+                    b"feature-a".as_slice()
+                } else {
+                    b"feature-b".as_slice()
+                };
+                assert_eq!(restored.bytes().await.unwrap(), expected);
+            } else {
+                let response = client
+                    .get(format!(
+                        "{base_url}{prefix}/_apis/artifactcache/cache?keys=feature-only&version=v1"
+                    ))
+                    .bearer_auth(&token)
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::NO_CONTENT);
             }
 
-            (i, downloaded)
+            (i, downloaded, repo, git_ref)
         }));
     }
 
@@ -1051,9 +1147,45 @@ async fn concurrent_http_clients() {
     for handle in handles {
         completed.push(handle.await.unwrap());
     }
-    completed.sort_by_key(|(i, _)| *i);
+    completed.sort_by_key(|(i, _, _, _)| *i);
     assert_eq!(completed.len(), 20);
-    for (i, body) in completed {
+    assert_eq!(
+        completed
+            .iter()
+            .filter(|(_, _, repo, git_ref)| {
+                *repo == "org/repo-a" && *git_ref == "refs/heads/feature"
+            })
+            .count(),
+        5,
+    );
+    assert_eq!(
+        completed
+            .iter()
+            .filter(|(_, _, repo, git_ref)| {
+                *repo == "org/repo-a" && *git_ref == "refs/heads/main"
+            })
+            .count(),
+        5,
+    );
+    assert_eq!(
+        completed
+            .iter()
+            .filter(|(_, _, repo, git_ref)| {
+                *repo == "org/repo-b" && *git_ref == "refs/heads/main"
+            })
+            .count(),
+        5,
+    );
+    assert_eq!(
+        completed
+            .iter()
+            .filter(|(_, _, repo, git_ref)| {
+                *repo == "org/repo-b" && *git_ref == "refs/heads/feature"
+            })
+            .count(),
+        5,
+    );
+    for (i, body, _, _) in completed {
         assert_eq!(body, format!("concurrent-data-{i}").as_bytes());
     }
 }
