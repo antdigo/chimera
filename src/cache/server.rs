@@ -13,6 +13,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 use tracing::{debug, info, warn};
+use uuid::Uuid;
 
 use super::auth::{AuthorizedJob, CacheAuthError, CacheAuthority, CacheScope};
 use super::error::CacheError;
@@ -62,7 +63,7 @@ pub fn router(manager: SharedManager, authority: Arc<CacheAuthority>) -> Router 
             "/cache/{scope_repo}/{scope_ref}/{default_ref}/_apis/artifactcache/caches/{id}",
             post(handle_commit),
         )
-        .route("/download/{hash}", get(handle_download))
+        .route("/download/{grant}", get(handle_download))
         .fallback(handle_unknown)
         .with_state(CacheServerState { manager, authority })
 }
@@ -239,14 +240,27 @@ async fn handle_lookup(
         .await;
     match entry {
         Some(entry) => {
+            let grant = match state
+                .authority
+                .issue_download(&authorized, entry.blob_hash.clone())
+                .await
+            {
+                Ok(grant) => grant,
+                Err(_) => return StatusCode::UNAUTHORIZED.into_response(),
+            };
             let host = headers
                 .get("host")
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("localhost:9999");
 
-            let location = format!("http://{host}/download/{}", entry.blob_hash);
+            let location = format!("http://{host}/download/{grant}");
 
-            debug!(cache_key = %entry.key, location = %location, "cache hit");
+            debug!(
+                cache_key = %entry.key,
+                scope_repo = %scope.repo,
+                scope_ref = %scope.git_ref,
+                "cache hit"
+            );
 
             let body = LookupResponse {
                 cache_key: entry.key,
@@ -380,12 +394,17 @@ async fn handle_commit(
 
 async fn handle_download(
     State(state): State<CacheServerState>,
-    Path(hash): Path<String>,
+    Path(grant): Path<String>,
 ) -> Response {
-    // Validate hash to prevent path traversal attacks (e.g. "../../etc/passwd")
-    if !super::store::is_valid_blob_hash(&hash) {
-        return StatusCode::BAD_REQUEST.into_response();
-    }
+    let grant = match Uuid::parse_str(&grant) {
+        Ok(grant) => grant,
+        Err(_) => return StatusCode::NOT_FOUND.into_response(),
+    };
+
+    let hash = match state.authority.resolve_download(grant).await {
+        Ok(hash) => hash,
+        Err(_) => return StatusCode::NOT_FOUND.into_response(),
+    };
 
     let blob_path = match state.manager.blob_path(&hash) {
         Ok(p) => p,

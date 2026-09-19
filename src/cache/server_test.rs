@@ -7,7 +7,9 @@ use tempfile::TempDir;
 use tower::ServiceExt;
 
 use super::*;
-use crate::cache::auth::{CacheAuthority, CacheScope, JobCapabilityClaims};
+use crate::cache::auth::{
+    CacheAuthority, CacheScope, CapabilityId, JOB_CAPABILITY_LIFETIME, JobCapabilityClaims,
+};
 use crate::cache::manager::CacheManager;
 
 const SCOPE_REPO: &str = "owner/repo";
@@ -75,6 +77,66 @@ async fn commit(app: &Router, prefix: &str, token: &str, cache_id: u64, size: us
     .body(Body::from(serde_json::json!({ "size": size }).to_string()))
     .unwrap();
     app.clone().oneshot(request).await.unwrap().status()
+}
+
+async fn lookup_status(
+    app: &Router,
+    prefix: &str,
+    token: &str,
+    key: &str,
+    version: &str,
+) -> StatusCode {
+    let request = bearer(
+        Request::builder().uri(format!(
+            "{prefix}/_apis/artifactcache/cache?keys={key}&version={version}"
+        )),
+        token,
+    )
+    .header("host", "localhost:9999")
+    .body(Body::empty())
+    .unwrap();
+    app.clone().oneshot(request).await.unwrap().status()
+}
+
+async fn lookup(app: &Router, prefix: &str, token: &str, key: &str, version: &str) -> String {
+    let request = bearer(
+        Request::builder().uri(format!(
+            "{prefix}/_apis/artifactcache/cache?keys={key}&version={version}"
+        )),
+        token,
+    )
+    .header("host", "localhost:9999")
+    .body(Body::empty())
+    .unwrap();
+    let response = app.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), 4096)
+        .await
+        .unwrap();
+    serde_json::from_slice::<serde_json::Value>(&body).unwrap()["archiveLocation"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+async fn authorized_roundtrip(
+    app: &Router,
+    prefix: &str,
+    token: &str,
+    key: &str,
+    data: &[u8],
+) -> (CapabilityId, String) {
+    let cache_id = reserve(app, prefix, token, key, "v1").await;
+    assert_eq!(
+        upload(app, prefix, token, cache_id, data).await,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        commit(app, prefix, token, cache_id, data.len()).await,
+        StatusCode::NO_CONTENT
+    );
+    let archive_location = lookup(app, prefix, token, key, "v1").await;
+    (CapabilityId::from_token(token), archive_location)
 }
 
 async fn make_test_manager(tmp: &TempDir) -> SharedManager {
@@ -407,20 +469,18 @@ async fn full_http_roundtrip() {
 }
 
 #[tokio::test]
-async fn download_invalid_hash_rejected() {
+async fn invalid_download_grants_return_not_found() {
     let tmp = TempDir::new().unwrap();
     let (app, _mgr, _) = make_test_app(&tmp).await;
 
-    // Non-hex characters -- rejected as bad request (prevents path traversal)
     let req = Request::builder()
         .uri("/download/nonexistent")
         .body(Body::empty())
         .unwrap();
 
     let resp = app.clone().oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 
-    // Valid hex but doesn't exist -- 404
     let fake_hash = "a".repeat(64);
     let req = Request::builder()
         .uri(format!("/download/{fake_hash}"))
@@ -429,6 +489,205 @@ async fn download_invalid_hash_rejected() {
 
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn blob_hash_is_not_a_download_authority() {
+    let tmp = TempDir::new().unwrap();
+    let (app, manager, _) = make_test_app(&tmp).await;
+    let prefix = scope_prefix(SCOPE_REPO, SCOPE_REF, DEFAULT_REF);
+    let (_, archive_location) = authorized_roundtrip(&app, &prefix, TOKEN_A, "k", b"secret").await;
+    let grant_path = archive_location
+        .strip_prefix("http://localhost:9999")
+        .unwrap();
+    let granted = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(grant_path)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(granted.status(), StatusCode::OK);
+
+    let entry = manager
+        .lookup(&["k".into()], "v1", SCOPE_REPO, SCOPE_REF, DEFAULT_REF)
+        .await
+        .unwrap();
+    let direct_hash_path = format!("/download/{}", entry.blob_hash);
+    let direct = app
+        .oneshot(
+            Request::builder()
+                .uri(direct_hash_path)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(direct.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn revoke_invalidates_previously_issued_download_grant() {
+    let tmp = TempDir::new().unwrap();
+    let (app, _, authority) = make_test_app(&tmp).await;
+    let prefix = scope_prefix(SCOPE_REPO, SCOPE_REF, DEFAULT_REF);
+    let (capability_id, archive_location) =
+        authorized_roundtrip(&app, &prefix, TOKEN_A, "k", b"secret").await;
+    authority.revoke(&capability_id).await;
+    let path = archive_location
+        .strip_prefix("http://localhost:9999")
+        .unwrap();
+    assert_eq!(
+        app.oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::NOT_FOUND,
+    );
+}
+
+#[tokio::test]
+async fn expired_parent_invalidates_previously_issued_download_grant() {
+    let tmp = TempDir::new().unwrap();
+    let manager = make_test_manager(&tmp).await;
+    let started_at = Utc::now();
+    let clock_value = Arc::new(std::sync::Mutex::new(started_at.to_owned()));
+    let clock_reader = clock_value.clone();
+    let authority = Arc::new(CacheAuthority::with_clock(Arc::new(move || {
+        clock_reader.lock().unwrap().to_owned()
+    })));
+    authority
+        .register_job(
+            TOKEN_A,
+            JobCapabilityClaims {
+                scope: CacheScope {
+                    repo: SCOPE_REPO.into(),
+                    git_ref: SCOPE_REF.into(),
+                    default_ref: DEFAULT_REF.into(),
+                },
+                job_id: "job-a".into(),
+            },
+            started_at.to_owned(),
+        )
+        .await
+        .unwrap();
+    let app = router(manager, authority);
+    let prefix = scope_prefix(SCOPE_REPO, SCOPE_REF, DEFAULT_REF);
+    let (_, archive_location) = authorized_roundtrip(&app, &prefix, TOKEN_A, "k", b"secret").await;
+
+    *clock_value.lock().unwrap() =
+        started_at + JOB_CAPABILITY_LIFETIME + chrono::Duration::seconds(1);
+    let path = archive_location
+        .strip_prefix("http://localhost:9999")
+        .unwrap();
+    assert_eq!(
+        app.oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::NOT_FOUND,
+    );
+}
+
+#[tokio::test]
+async fn feature_job_can_download_authorized_default_branch_fallback() {
+    let tmp = TempDir::new().unwrap();
+    let (app, _, authority) = make_test_app(&tmp).await;
+    let main_prefix = scope_prefix(SCOPE_REPO, DEFAULT_REF, DEFAULT_REF);
+    authorized_roundtrip(&app, &main_prefix, TOKEN_A, "shared", b"main-cache").await;
+
+    authority
+        .register_job(
+            "runtime-feature",
+            JobCapabilityClaims {
+                scope: CacheScope {
+                    repo: SCOPE_REPO.into(),
+                    git_ref: "refs/heads/feature".into(),
+                    default_ref: DEFAULT_REF.into(),
+                },
+                job_id: "job-feature".into(),
+            },
+            Utc::now(),
+        )
+        .await
+        .unwrap();
+    let feature_prefix = scope_prefix(SCOPE_REPO, "refs/heads/feature", DEFAULT_REF);
+    let archive_location = lookup(&app, &feature_prefix, "runtime-feature", "shared", "v1").await;
+    let path = archive_location
+        .strip_prefix("http://localhost:9999")
+        .unwrap();
+    let response = app
+        .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap(),
+        b"main-cache"[..]
+    );
+}
+
+#[tokio::test]
+async fn valid_grant_returns_not_found_when_bound_blob_disappears() {
+    let tmp = TempDir::new().unwrap();
+    let (app, manager, _) = make_test_app(&tmp).await;
+    let prefix = scope_prefix(SCOPE_REPO, SCOPE_REF, DEFAULT_REF);
+    let (_, archive_location) =
+        authorized_roundtrip(&app, &prefix, TOKEN_A, "missing", b"bytes").await;
+    let entry = manager
+        .lookup(
+            &["missing".into()],
+            "v1",
+            SCOPE_REPO,
+            SCOPE_REF,
+            DEFAULT_REF,
+        )
+        .await
+        .unwrap();
+    std::fs::remove_file(manager.blob_path(&entry.blob_hash).unwrap()).unwrap();
+
+    let path = archive_location
+        .strip_prefix("http://localhost:9999")
+        .unwrap();
+    let response = app
+        .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn repository_cannot_lookup_another_repository_entry_even_when_blob_exists() {
+    let tmp = TempDir::new().unwrap();
+    let (app, _, authority) = make_test_app(&tmp).await;
+    let repo_a_prefix = scope_prefix(SCOPE_REPO, SCOPE_REF, DEFAULT_REF);
+    authorized_roundtrip(&app, &repo_a_prefix, TOKEN_A, "shared", b"same-bytes").await;
+
+    authority
+        .register_job(
+            "runtime-repo-b",
+            JobCapabilityClaims {
+                scope: CacheScope {
+                    repo: "org/repo-b".into(),
+                    git_ref: SCOPE_REF.into(),
+                    default_ref: DEFAULT_REF.into(),
+                },
+                job_id: "job-repo-b".into(),
+            },
+            Utc::now(),
+        )
+        .await
+        .unwrap();
+    let repo_b_prefix = scope_prefix("org/repo-b", SCOPE_REF, DEFAULT_REF);
+    assert_eq!(
+        lookup_status(&app, &repo_b_prefix, "runtime-repo-b", "shared", "v1").await,
+        StatusCode::NO_CONTENT,
+    );
 }
 
 #[tokio::test]
