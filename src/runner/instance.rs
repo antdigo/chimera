@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::io;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -502,10 +503,12 @@ impl Runner {
         cancel_token: CancellationToken,
         repo: &str,
     ) -> Result<()> {
-        let mut docker_config = self
-            .job_resources
-            .create_docker_config()
-            .context("creating per-job Docker config")?;
+        let job_resources = self.job_resources.clone();
+        let mut docker_config =
+            tokio::task::spawn_blocking(move || job_resources.create_docker_config())
+                .await
+                .context("joining per-job resource creation task")?
+                .context("creating per-job Docker config")?;
         let attempt_id = docker_config.attempt_id();
         info!(%attempt_id, "created job Docker config");
 
@@ -520,7 +523,17 @@ impl Runner {
             )
             .await;
 
-        let cleanup_result = docker_config.cleanup();
+        let cleanup_path = docker_config.attempt_dir().to_path_buf();
+        let cleanup_result = tokio::task::spawn_blocking(move || docker_config.cleanup())
+            .await
+            .unwrap_or_else(|source| {
+                Err(JobDockerConfigError::Cleanup {
+                    path: cleanup_path,
+                    source: io::Error::other(format!(
+                        "per-job resource cleanup task failed: {source}"
+                    )),
+                })
+            });
         match &cleanup_result {
             Ok(()) => info!(%attempt_id, "cleaned job Docker config"),
             Err(cleanup_error) => error!(

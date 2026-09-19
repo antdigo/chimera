@@ -49,10 +49,13 @@ fn creates_private_empty_config() {
     let (_temp, root) = prepared_root();
 
     let config = root.create_docker_config().unwrap();
+    let private_tmp = config.attempt_dir().join("tmp");
 
     assert_eq!(mode(root.path()), 0o700);
     assert_eq!(mode(config.attempt_dir()), 0o700);
     assert_eq!(mode(config.directory()), 0o700);
+    assert_eq!(mode(&private_tmp), 0o700);
+    assert_eq!(std::fs::read_dir(&private_tmp).unwrap().count(), 0);
     assert_eq!(mode(config.config_file()), 0o600);
     assert_eq!(std::fs::read(config.config_file()).unwrap(), b"{}");
     assert_eq!(config.attempt_dir().parent(), Some(root.path()));
@@ -130,6 +133,60 @@ fn cleanup_is_idempotent_and_keeps_neighbor() {
 
     assert!(!owned_dir.exists());
     assert!(neighbor_dir.exists());
+}
+
+#[test]
+fn cleanup_allows_symlinks_and_sockets_inside_private_tmp() {
+    let temp = TempDir::new_in("/tmp").unwrap();
+    let root = JobResourceRoot::prepare(&temp.path().join("job-resources")).unwrap();
+    let mut config = root.create_docker_config().unwrap();
+    let target = temp.path().join("outside-target");
+    std::fs::write(&target, "preserve me").unwrap();
+    std::os::unix::fs::symlink(&target, config.private_tmp().join("link")).unwrap();
+    let socket =
+        std::os::unix::net::UnixListener::bind(config.private_tmp().join("service.sock")).unwrap();
+    let attempt = config.attempt_dir().to_path_buf();
+
+    config.cleanup().unwrap();
+
+    assert!(!attempt.exists());
+    assert_eq!(std::fs::read_to_string(target).unwrap(), "preserve me");
+    drop(socket);
+}
+
+#[test]
+fn cleanup_handles_non_writable_directories_inside_private_tmp() {
+    let temp = TempDir::new_in("/tmp").unwrap();
+    let root = JobResourceRoot::prepare(&temp.path().join("job-resources")).unwrap();
+    let mut config = root.create_docker_config().unwrap();
+    let attempt = config.attempt_dir().to_path_buf();
+    let private_tmp = config.private_tmp().to_path_buf();
+    let locked = private_tmp.join("locked");
+    let nested = locked.join("nested");
+    std::fs::create_dir_all(&nested).unwrap();
+    std::fs::write(nested.join("secret"), "synthetic").unwrap();
+    std::fs::set_permissions(&nested, std::fs::Permissions::from_mode(0o000)).unwrap();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o500)).unwrap();
+    std::fs::set_permissions(&private_tmp, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+    let result = config.cleanup();
+    if result.is_err() {
+        if nested.exists() {
+            std::fs::set_permissions(&nested, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        if locked.exists() {
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        if private_tmp.exists() {
+            std::fs::set_permissions(&private_tmp, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        if attempt.exists() {
+            std::fs::remove_dir_all(&attempt).unwrap();
+        }
+    }
+
+    result.unwrap();
+    assert!(!attempt.exists());
 }
 
 #[test]

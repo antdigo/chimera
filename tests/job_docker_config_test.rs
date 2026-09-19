@@ -406,11 +406,17 @@ async fn cleanup_runs_for_all_job_outcomes() {
         let workspace_dir = env.workspace.workspace_dir().to_path_buf();
         let cancel = CancellationToken::new();
         let steps = match case {
-            "success" => vec![script_step("success", "true")],
-            "failure" => vec![script_step("failure", "exit 1")],
+            "success" => vec![script_step(
+                "success",
+                "if [ \"$(uname -s)\" = Linux ]; then touch /tmp/chimera-dpl03-cleanup; fi",
+            )],
+            "failure" => vec![script_step(
+                "failure",
+                "if [ \"$(uname -s)\" = Linux ]; then touch /tmp/chimera-dpl03-cleanup; fi; exit 1",
+            )],
             "cancelled" => vec![script_step(
                 "cancelled",
-                "touch \"$GITHUB_WORKSPACE/cancel-ready\"; while :; do sleep 1; done",
+                "if [ \"$(uname -s)\" = Linux ]; then touch /tmp/chimera-dpl03-cleanup; fi; touch \"$GITHUB_WORKSPACE/cancel-ready\"; while :; do sleep 1; done",
             )],
             "pre-error" => {
                 let action_dir = workspace_dir.join(".github/actions/failing-pre");
@@ -422,7 +428,7 @@ async fn cleanup_runs_for_all_job_outcomes() {
                 .unwrap();
                 std::fs::write(
                     action_dir.join("pre.js"),
-                    "require('fs').writeFileSync(require('path').join(process.env.GITHUB_WORKSPACE, 'pre-ran'), 'yes'); process.exit(1);\n",
+                    "const fs = require('fs'); if (process.platform === 'linux') fs.writeFileSync('/tmp/chimera-dpl03-cleanup', 'yes'); fs.writeFileSync(require('path').join(process.env.GITHUB_WORKSPACE, 'pre-ran'), 'yes'); process.exit(1);\n",
                 )
                 .unwrap();
                 std::fs::write(

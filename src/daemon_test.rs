@@ -436,6 +436,72 @@ fn startup_preparation_rejects_stale_job_resources_without_deleting_them() {
     assert!(stale_dir.exists());
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn startup_rejects_chimera_root_under_host_tmp() {
+    let temp = TempDir::new_in("/tmp").unwrap();
+    let paths = ChimeraPaths::new(temp.path().to_path_buf());
+
+    let error = prepare_daemon_root(&paths).unwrap_err();
+
+    assert!(error.to_string().contains("chimera-root-under-host-tmp"));
+    assert!(!paths.job_resources_dir().exists());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn startup_rejects_tmp_symlink_to_root_outside_host_tmp() {
+    let test_root = std::env::var_os("CARGO_TARGET_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("target"));
+    std::fs::create_dir_all(&test_root).unwrap();
+    let target = TempDir::new_in(test_root).unwrap();
+    let link = std::path::PathBuf::from(format!(
+        "/tmp/chimera-root-link-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::os::unix::fs::symlink(target.path(), &link).unwrap();
+    let paths = ChimeraPaths::new(link.clone());
+
+    let result = prepare_daemon_root(&paths);
+    let error = result.as_ref().err().map(ToString::to_string);
+    drop(result);
+    std::fs::remove_file(&link).unwrap();
+
+    assert!(
+        error
+            .as_deref()
+            .is_some_and(|message| message.contains("chimera-root-under-host-tmp"))
+    );
+    assert!(!target.path().join("job-resources").exists());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn daemon_load_canonicalizes_root_with_intermediate_tmp_symlink() {
+    let test_root = std::env::var_os("CARGO_TARGET_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("target"));
+    std::fs::create_dir_all(&test_root).unwrap();
+    let outside = TempDir::new_in(test_root).unwrap();
+    let target_parent = outside.path().join("target-parent");
+    let target_root = target_parent.join("root");
+    std::fs::create_dir_all(&target_root).unwrap();
+    let tmp_link = std::path::PathBuf::from(format!(
+        "/tmp/chimera-intermediate-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::os::unix::fs::symlink(&target_parent, &tmp_link).unwrap();
+    let outside_link = outside.path().join("through-tmp");
+    std::os::unix::fs::symlink(&tmp_link, &outside_link).unwrap();
+    let paths = ChimeraPaths::new(outside_link.join("root"));
+
+    let daemon = Daemon::load(paths).unwrap();
+    std::fs::remove_file(&tmp_link).unwrap();
+
+    assert_eq!(daemon.paths.root, target_root.canonicalize().unwrap());
+}
+
 #[test]
 fn poisoned_job_resource_error_requires_daemon_shutdown() {
     let poisoned = anyhow::Error::new(JobDockerConfigError::PoisonedRoot {
