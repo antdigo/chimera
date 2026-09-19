@@ -93,6 +93,12 @@ pub struct CacheAuthority {
     now: Arc<dyn Fn() -> DateTime<Utc> + Send + Sync>,
 }
 
+impl Default for CacheAuthority {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl CacheAuthority {
     pub fn new() -> Self {
         Self {
