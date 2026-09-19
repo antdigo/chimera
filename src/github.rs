@@ -2,5 +2,10 @@ pub mod auth;
 pub mod broker;
 pub mod registration;
 
-pub const RUNNER_VERSION: &str = "2.329.0";
-// TODO: make this dynamic, e.g. by reading from a file or an environment variable OR getting from the GitHub API. This is the version of the GitHub Actions runner that Chimera will use to run jobs. We need to specify this version because the GitHub Actions runner is not backward compatible, and we want to ensure that Chimera uses a compatible version.
+// The runner package version chimera claims to be on every wire surface
+// (session body, poll/acknowledge query params, registration bodies,
+// User-Agent). GitHub stops delivering jobs to self-hosted runners once a
+// release newer than their version is more than 30 days old (#27), so this
+// must name a current actions/runner release; CI fails a week before that
+// wall (scripts/ci/check-runner-version.sh).
+pub const RUNNER_VERSION: &str = "2.337.0";
