@@ -154,6 +154,9 @@ fn build_common_env(
     if let Ok(token) = manifest.access_token() {
         env.insert("ACTIONS_RUNTIME_TOKEN".into(), token.into());
     }
+    if let Some(results_url) = manifest.results_service_url() {
+        env.insert("ACTIONS_RESULTS_URL".into(), results_url.into());
+    }
 
     env
 }

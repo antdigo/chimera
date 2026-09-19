@@ -161,6 +161,131 @@ fn sets_actions_runtime() {
 }
 
 #[test]
+fn sets_actions_results_url_from_endpoint_data() {
+    let mut manifest = minimal_manifest();
+    manifest.resources.endpoints[0].data.insert(
+        "ResultsServiceUrl".into(),
+        "https://results-receiver.actions.githubusercontent.com/x/".into(),
+    );
+    manifest.variables.insert(
+        "system.github.results_endpoint".into(),
+        JobVariable {
+            value: "https://from-variable/".into(),
+            is_secret: false,
+        },
+    );
+    let (_tmp, ws) = test_workspace();
+    let (_resources, config) = test_docker_config();
+
+    let env = build_base_env(&manifest, &ws, "test-runner", &config).unwrap();
+
+    assert_eq!(
+        env.get("ACTIONS_RESULTS_URL").unwrap(),
+        "https://results-receiver.actions.githubusercontent.com/x/"
+    );
+}
+
+#[test]
+fn falls_back_to_results_endpoint_variable() {
+    let mut manifest = minimal_manifest();
+    manifest.variables.insert(
+        "system.github.results_endpoint".into(),
+        JobVariable {
+            value: "https://results.actions.githubusercontent.com/y/".into(),
+            is_secret: false,
+        },
+    );
+    let (_tmp, ws) = test_workspace();
+    let (_resources, config) = test_docker_config();
+
+    let env = build_base_env(&manifest, &ws, "test-runner", &config).unwrap();
+
+    assert_eq!(
+        env.get("ACTIONS_RESULTS_URL").unwrap(),
+        "https://results.actions.githubusercontent.com/y/"
+    );
+}
+
+#[test]
+fn empty_results_service_url_in_endpoint_data_falls_back() {
+    let mut manifest = minimal_manifest();
+    manifest.resources.endpoints[0]
+        .data
+        .insert("ResultsServiceUrl".into(), String::new());
+    manifest.variables.insert(
+        "system.github.results_endpoint".into(),
+        JobVariable {
+            value: "https://results.actions.githubusercontent.com/y/".into(),
+            is_secret: false,
+        },
+    );
+    let (_tmp, ws) = test_workspace();
+    let (_resources, config) = test_docker_config();
+
+    let env = build_base_env(&manifest, &ws, "test-runner", &config).unwrap();
+
+    assert_eq!(
+        env.get("ACTIONS_RESULTS_URL").unwrap(),
+        "https://results.actions.githubusercontent.com/y/"
+    );
+}
+
+#[test]
+fn exports_results_url_even_when_variable_is_marked_secret() {
+    let mut manifest = minimal_manifest();
+    manifest.variables.insert(
+        "system.github.results_endpoint".into(),
+        JobVariable {
+            value: "https://results.actions.githubusercontent.com/y/".into(),
+            is_secret: true,
+        },
+    );
+    let (_tmp, ws) = test_workspace();
+    let (_resources, config) = test_docker_config();
+
+    let env = build_base_env(&manifest, &ws, "test-runner", &config).unwrap();
+
+    assert_eq!(
+        env.get("ACTIONS_RESULTS_URL").unwrap(),
+        "https://results.actions.githubusercontent.com/y/"
+    );
+    // The generic non-secret variable export must not shadow the alias with a
+    // SYSTEM_GITHUB_* name instead.
+    assert!(env.get("SYSTEM_GITHUB_RESULTS_ENDPOINT").is_none());
+}
+
+#[test]
+fn omits_actions_results_url_when_manifest_has_none() {
+    let manifest = minimal_manifest();
+    let (_tmp, ws) = test_workspace();
+    let (_resources, config) = test_docker_config();
+
+    let env = build_base_env(&manifest, &ws, "test-runner", &config).unwrap();
+
+    assert!(!env.contains_key("ACTIONS_RESULTS_URL"));
+}
+
+#[test]
+fn container_env_sets_actions_results_url() {
+    let mut manifest = minimal_manifest();
+    manifest.variables.insert(
+        "system.github.results_endpoint".into(),
+        JobVariable {
+            value: "https://results.actions.githubusercontent.com/y/".into(),
+            is_secret: false,
+        },
+    );
+    let (_tmp, ws) = test_workspace();
+
+    let env = build_container_env(&manifest, &ws, "test-runner");
+
+    assert_eq!(
+        env.get("ACTIONS_RESULTS_URL").unwrap(),
+        "https://results.actions.githubusercontent.com/y/"
+    );
+}
+
+#[test]
 fn host_env_sets_runner_owned_docker_config() {
     let manifest = minimal_manifest();
     let (_tmp, ws) = test_workspace();

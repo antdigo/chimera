@@ -238,6 +238,20 @@ impl JobManifest {
             .map(|v| v.value.as_str())
     }
 
+    /// URL of the GitHub Actions Results service, exported to steps as
+    /// `ACTIONS_RESULTS_URL`. The official runner reads it from the
+    /// `SystemVssConnection` endpoint data (`ResultsServiceUrl`); GitHub also
+    /// delivers it as the `system.github.results_endpoint` variable, so fall
+    /// back to that when the endpoint data carries no URL.
+    pub fn results_service_url(&self) -> Option<&str> {
+        let from_endpoint = self
+            .find_vss_endpoint()
+            .and_then(|e| e.data.get("ResultsServiceUrl"))
+            .map(|s| s.as_str())
+            .filter(|s| !s.is_empty());
+        from_endpoint.or_else(|| self.results_endpoint())
+    }
+
     pub fn github_token(&self) -> Option<&str> {
         // The official Variables dictionary is OrdinalIgnoreCase; the token
         // variable must resolve under any casing for the GITHUB_TOKEN alias.
