@@ -100,8 +100,9 @@ Callers знают только три операции: построить job 
 так и построчную обработку stdout/stderr. Дубликаты удаляются.
 
 Regex hint компилируется Rust `regex`, поэтому matching имеет линейную сложность.
-Неподдержанный hint type даёт safe warning только с индексом и типом. Невалидный
-regex завершает setup контролируемой ошибкой с индексом hint, не печатая pattern.
+Неподдержанный hint type даёт safe warning только с индексом hint: само значение
+type считается untrusted payload. Невалидный regex завершает setup контролируемой
+ошибкой с индексом hint, не печатая type или pattern.
 Сам pattern дополнительно регистрируется как literal value по поведению official
 runner.
 
