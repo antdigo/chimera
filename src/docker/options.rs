@@ -139,8 +139,8 @@ pub(crate) fn parse_options(options: Option<&str>) -> ContainerOptions {
                     opts.user = Some(val);
                 }
             }
-            other => {
-                warn!(option = other, "ignoring unrecognized container option");
+            _ => {
+                warn!(option_index = i, "ignoring unrecognized container option");
             }
         }
         i += 1;

@@ -126,11 +126,14 @@ impl SecretMasker {
             }));
         }
         for regex in &self.regexes {
-            ranges.extend(
-                regex
-                    .find_iter(input)
-                    .map(|found| (found.start(), found.end())),
-            );
+            let mut search_start = 0;
+            while let Some(found) = regex.find_at(input, search_start) {
+                ranges.push((found.start(), found.end()));
+                let Some(next_character) = input[found.start()..].chars().next() else {
+                    break;
+                };
+                search_start = found.start() + next_character.len_utf8();
+            }
         }
 
         if ranges.is_empty() {
@@ -211,7 +214,7 @@ fn base64_escape(value: &str, shift: usize) -> String {
 }
 
 fn trim_double_quotes(value: &str) -> String {
-    if value.len() > 8 && value.starts_with('"') && value.ends_with('"') {
+    if value.encode_utf16().count() > 8 && value.starts_with('"') && value.ends_with('"') {
         value[1..value.len() - 1].to_string()
     } else {
         value.to_string()

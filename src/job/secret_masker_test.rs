@@ -173,6 +173,16 @@ fn merges_self_overlapping_literal_matches() {
 }
 
 #[test]
+fn merges_self_overlapping_regex_matches() {
+    let manifest = manifest(serde_json::json!({
+        "mask": [{ "type": "regex", "value": "aba[b]" }]
+    }));
+    let masker = SecretMasker::from_manifest(&manifest).unwrap();
+
+    assert_eq!(masker.mask("value=ababab"), "value=***");
+}
+
+#[test]
 fn zero_width_regex_terminates_and_preserves_remaining_text() {
     let manifest = manifest(serde_json::json!({
         "mask": [{ "type": "regex", "value": "^" }]
@@ -205,6 +215,10 @@ fn trim_double_quotes_requires_more_than_eight_characters() {
     let mut short = SecretMasker::default();
     short.add_value("\"123456\"");
     assert_eq!(short.mask("value=123456"), "value=123456");
+
+    let mut unicode_short = SecretMasker::default();
+    unicode_short.add_value("\"éééé\"");
+    assert_eq!(unicode_short.mask("value=éééé"), "value=éééé");
 }
 
 #[test]
