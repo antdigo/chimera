@@ -1,7 +1,19 @@
 use std::collections::HashMap;
+#[cfg(target_os = "linux")]
+use std::collections::VecDeque;
 use std::ffi::OsStr;
+#[cfg(target_os = "linux")]
+use std::ffi::{CStr, CString, OsString};
+#[cfg(target_os = "linux")]
+use std::io;
+#[cfg(target_os = "linux")]
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
+#[cfg(target_os = "linux")]
+use std::os::unix::process::CommandExt;
+#[cfg(target_os = "linux")]
+use std::path::Component;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -498,6 +510,7 @@ const IMPLICIT_DOCKER_CREDENTIAL_HELPERS: [&str; 2] =
 fn validate_host_docker_capabilities(
     env: &HashMap<String, String>,
     working_dir: &Path,
+    private_tmp: &Path,
 ) -> Result<(), JobDockerConfigError> {
     let inherited_path = env
         .get("PATH")
@@ -514,14 +527,12 @@ fn validate_host_docker_capabilities(
 
     for helper in IMPLICIT_DOCKER_CREDENTIAL_HELPERS {
         for entry in std::env::split_paths(effective_path) {
-            let directory = if entry.as_os_str().is_empty() {
-                working_dir.to_path_buf()
-            } else if entry.is_absolute() {
-                entry
-            } else {
-                working_dir.join(entry)
-            };
-            let candidate = directory.join(helper);
+            let candidate =
+                match host_credential_helper_path(&entry, helper, working_dir, private_tmp) {
+                    Ok(candidate) => candidate,
+                    Err(error) if host_capability_path_is_unavailable(&error) => continue,
+                    Err(error) => return Err(error),
+                };
             let Ok(metadata) = std::fs::metadata(candidate) else {
                 continue;
             };
@@ -533,7 +544,161 @@ fn validate_host_docker_capabilities(
     Ok(())
 }
 
-fn host_command(
+#[cfg(target_os = "linux")]
+fn host_credential_helper_path(
+    path_entry: &Path,
+    helper: &str,
+    working_dir: &Path,
+    private_tmp: &Path,
+) -> Result<PathBuf, JobDockerConfigError> {
+    let child_candidate = if path_entry.is_absolute() {
+        path_entry.join(helper)
+    } else {
+        let resolved_working_dir = resolve_child_path(working_dir, private_tmp)?;
+        resolved_working_dir.join(path_entry).join(helper)
+    };
+    host_path_for_private_tmp(&child_candidate, private_tmp)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn host_credential_helper_path(
+    path_entry: &Path,
+    helper: &str,
+    working_dir: &Path,
+    _private_tmp: &Path,
+) -> Result<PathBuf, JobDockerConfigError> {
+    let directory = if path_entry.as_os_str().is_empty() {
+        working_dir.to_path_buf()
+    } else if path_entry.is_absolute() {
+        path_entry.to_path_buf()
+    } else {
+        working_dir.join(path_entry)
+    };
+    Ok(directory.join(helper))
+}
+
+#[cfg(target_os = "linux")]
+fn host_capability_path_is_unavailable(error: &JobDockerConfigError) -> bool {
+    matches!(
+        error,
+        JobDockerConfigError::Io { source, .. }
+            if source.kind() == io::ErrorKind::PermissionDenied
+                || source.raw_os_error() == Some(libc::ELOOP)
+    )
+}
+
+#[cfg(not(target_os = "linux"))]
+fn host_capability_path_is_unavailable(_error: &JobDockerConfigError) -> bool {
+    false
+}
+
+#[cfg(target_os = "linux")]
+fn host_path_for_private_tmp(
+    child_path: &Path,
+    private_tmp: &Path,
+) -> Result<PathBuf, JobDockerConfigError> {
+    let resolved = resolve_child_path(child_path, private_tmp)?;
+    Ok(project_private_tmp_path(&resolved, private_tmp))
+}
+
+#[cfg(target_os = "linux")]
+fn resolve_child_path(
+    child_path: &Path,
+    private_tmp: &Path,
+) -> Result<PathBuf, JobDockerConfigError> {
+    let absolute = if child_path.is_absolute() {
+        child_path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|source| JobDockerConfigError::Io {
+                operation: "resolving host capability path",
+                path: child_path.to_path_buf(),
+                source,
+            })?
+            .join(child_path)
+    };
+    let mut pending = child_path_components(&absolute);
+    let mut resolved = PathBuf::from("/");
+    let mut symlink_hops = 0;
+
+    while let Some(component) = pending.pop_front() {
+        if component == OsStr::new("..") {
+            resolved.pop();
+            continue;
+        }
+
+        let child_candidate = resolved.join(&component);
+        let host_candidate = project_private_tmp_path(&child_candidate, private_tmp);
+        match std::fs::symlink_metadata(&host_candidate) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                symlink_hops += 1;
+                if symlink_hops > 40 {
+                    return Err(JobDockerConfigError::Io {
+                        operation: "resolving host capability symlink",
+                        path: child_path.to_path_buf(),
+                        source: io::Error::from_raw_os_error(libc::ELOOP),
+                    });
+                }
+                let target = std::fs::read_link(&host_candidate).map_err(|source| {
+                    JobDockerConfigError::Io {
+                        operation: "reading host capability symlink",
+                        path: host_candidate,
+                        source,
+                    }
+                })?;
+                let target = if target.is_absolute() {
+                    target
+                } else {
+                    resolved.join(target)
+                };
+                let mut target_components = child_path_components(&target);
+                target_components.append(&mut pending);
+                pending = target_components;
+                resolved = PathBuf::from("/");
+            }
+            Ok(_) => resolved.push(component),
+            Err(source)
+                if matches!(
+                    source.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                ) =>
+            {
+                resolved.push(component);
+            }
+            Err(source) => {
+                return Err(JobDockerConfigError::Io {
+                    operation: "resolving host capability path",
+                    path: host_candidate,
+                    source,
+                });
+            }
+        }
+    }
+
+    Ok(resolved)
+}
+
+#[cfg(target_os = "linux")]
+fn child_path_components(path: &Path) -> VecDeque<OsString> {
+    path.components()
+        .filter_map(|component| match component {
+            Component::RootDir | Component::CurDir => None,
+            Component::ParentDir => Some(OsString::from("..")),
+            Component::Normal(part) => Some(part.to_os_string()),
+            Component::Prefix(_) => unreachable!("Unix paths do not have prefixes"),
+        })
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+fn project_private_tmp_path(child_path: &Path, private_tmp: &Path) -> PathBuf {
+    match child_path.strip_prefix("/tmp") {
+        Ok(relative) => private_tmp.join(relative),
+        Err(_) => child_path.to_path_buf(),
+    }
+}
+
+fn build_host_command(
     program: &str,
     args: &[&OsStr],
     env: &HashMap<String, String>,
@@ -544,17 +709,150 @@ fn host_command(
         .get(DOCKER_CONFIG_ENV)
         .context("host step is missing runner-owned DOCKER_CONFIG")?;
     docker_config.validate_override(configured, "host spawn")?;
-    validate_host_docker_capabilities(env, working_dir)?;
 
     let mut command = Command::new(program);
+    command.args(args);
+
+    #[cfg(target_os = "linux")]
+    configure_private_tmp(&mut command, docker_config.private_tmp(), working_dir)?;
+
+    #[cfg(not(target_os = "linux"))]
+    command.current_dir(working_dir);
+
     command
-        .args(args)
-        .current_dir(working_dir)
         .env_remove(DOCKER_CONFIG_ENV)
         .envs(env)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
     Ok(command)
+}
+
+#[cfg(test)]
+fn host_command(
+    program: &str,
+    args: &[&OsStr],
+    env: &HashMap<String, String>,
+    working_dir: &Path,
+    docker_config: &JobDockerConfig,
+) -> Result<Command> {
+    validate_host_docker_capabilities(env, working_dir, docker_config.private_tmp())?;
+    build_host_command(program, args, env, working_dir, docker_config)
+}
+
+async fn host_command_for_process(
+    program: &str,
+    args: &[&OsStr],
+    env: &HashMap<String, String>,
+    working_dir: &Path,
+    docker_config: &JobDockerConfig,
+) -> Result<Command> {
+    let validation_env = env.clone();
+    let validation_working_dir = working_dir.to_path_buf();
+    let validation_private_tmp = docker_config.private_tmp().to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        validate_host_docker_capabilities(
+            &validation_env,
+            &validation_working_dir,
+            &validation_private_tmp,
+        )
+    })
+    .await
+    .context("joining host capability validation task")??;
+
+    build_host_command(program, args, env, working_dir, docker_config)
+}
+
+#[cfg(target_os = "linux")]
+fn configure_private_tmp(
+    command: &mut Command,
+    private_tmp: &Path,
+    working_dir: &Path,
+) -> Result<()> {
+    let source = CString::new(private_tmp.as_os_str().as_bytes())
+        .context("private job temp path contains a NUL byte")?;
+    let working_dir = CString::new(working_dir.as_os_str().as_bytes())
+        .context("host working directory contains a NUL byte")?;
+    let uid = unsafe { libc::geteuid() };
+    let gid = unsafe { libc::getegid() };
+    let uid_map = format!("{uid} {uid} 1\n").into_bytes();
+    let gid_map = format!("{gid} {gid} 1\n").into_bytes();
+
+    // SAFETY: after fork, the closure performs only raw async-signal-safe syscalls and
+    // reads buffers/C strings fully allocated before `pre_exec`; it does not allocate,
+    // log, or acquire process-global locks.
+    unsafe {
+        command.as_std_mut().pre_exec(move || {
+            if libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNS) == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            write_proc_file(c"/proc/self/setgroups", b"deny\n")?;
+            write_proc_file(c"/proc/self/uid_map", &uid_map)?;
+            write_proc_file(c"/proc/self/gid_map", &gid_map)?;
+
+            if libc::mount(
+                std::ptr::null(),
+                c"/".as_ptr(),
+                std::ptr::null(),
+                (libc::MS_PRIVATE | libc::MS_REC) as libc::c_ulong,
+                std::ptr::null(),
+            ) == -1
+            {
+                return Err(io::Error::last_os_error());
+            }
+            if libc::mount(
+                source.as_ptr(),
+                c"/tmp".as_ptr(),
+                std::ptr::null(),
+                libc::MS_BIND as libc::c_ulong,
+                std::ptr::null(),
+            ) == -1
+            {
+                return Err(io::Error::last_os_error());
+            }
+            if libc::chdir(working_dir.as_ptr()) == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+unsafe fn write_proc_file(path: &CStr, value: &[u8]) -> io::Result<()> {
+    let file = unsafe { libc::open(path.as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC) };
+    if file == -1 {
+        return Err(io::Error::last_os_error());
+    }
+
+    let mut written = 0;
+    while written < value.len() {
+        let result = unsafe {
+            libc::write(
+                file,
+                value[written..].as_ptr().cast(),
+                value.len() - written,
+            )
+        };
+        if result == -1 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            unsafe { libc::close(file) };
+            return Err(error);
+        }
+        if result == 0 {
+            unsafe { libc::close(file) };
+            return Err(io::Error::from_raw_os_error(libc::EIO));
+        }
+        written += result as usize;
+    }
+
+    if unsafe { libc::close(file) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 /// Shared process runner used by host steps, node actions, and composite steps.
@@ -570,7 +868,8 @@ pub async fn run_process(
     timeout: Duration,
     cancel_token: &CancellationToken,
 ) -> Result<StepResult> {
-    let mut child = host_command(program, args, env, working_dir, docker_config)?
+    let mut child = host_command_for_process(program, args, env, working_dir, docker_config)
+        .await?
         .spawn()
         .with_context(|| format!("spawning {program}"))?;
 

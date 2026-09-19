@@ -52,8 +52,16 @@ jobs:
         with:
           shared-key: host-build
 
+      - name: Allow host-step private mount namespaces
+        run: |
+          if sysctl -N kernel.apparmor_restrict_unprivileged_userns >/dev/null 2>&1; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+
       - name: Run unit tests
-        run: cargo test --lib
+        run: |
+          mkdir -p "$RUNNER_TEMP/chimera-tests"
+          TMPDIR="$RUNNER_TEMP/chimera-tests" cargo test --lib
 
   host-integ:
     name: Host integration (${{ matrix.name }})
@@ -86,8 +94,16 @@ jobs:
         with:
           shared-key: host-build
 
+      - name: Allow host-step private mount namespaces
+        run: |
+          if sysctl -N kernel.apparmor_restrict_unprivileged_userns >/dev/null 2>&1; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+
       - name: Run host integration suites
-        run: cargo test ${{ matrix.suite-args }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/chimera-tests"
+          TMPDIR="$RUNNER_TEMP/chimera-tests" cargo test ${{ matrix.suite-args }}
 
   docker:
     name: Docker suite (${{ matrix.name }})
