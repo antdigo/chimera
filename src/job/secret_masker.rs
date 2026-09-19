@@ -17,6 +17,15 @@ pub(crate) struct SecretMasker {
 
 pub(crate) type SharedSecretMasker = Arc<RwLock<SecretMasker>>;
 
+#[cfg(test)]
+pub(crate) fn shared_masker_for_test(values: &[&str]) -> SharedSecretMasker {
+    let mut masker = SecretMasker::default();
+    for value in values {
+        masker.add_value(value);
+    }
+    Arc::new(RwLock::new(masker))
+}
+
 impl SecretMasker {
     pub(crate) fn from_manifest(manifest: &JobManifest) -> Result<Self> {
         let mut masker = Self::default();

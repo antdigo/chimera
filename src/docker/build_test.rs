@@ -22,7 +22,7 @@ fn test_log_sender_with_capacity(
     capacity: usize,
 ) -> (LogSender, tokio::sync::mpsc::Receiver<LogLine>) {
     let (tx, rx) = tokio::sync::mpsc::channel(capacity);
-    let masks = Arc::new(tokio::sync::RwLock::new(Vec::new()));
+    let masks = crate::job::secret_masker::shared_masker_for_test(&[]);
     (LogSender::new_for_test(tx, masks), rx)
 }
 

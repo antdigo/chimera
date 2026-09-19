@@ -1,7 +1,4 @@
 use std::collections::HashMap;
-use std::sync::Arc;
-
-use tokio::sync::RwLock;
 
 use super::*;
 use crate::job::docker_config::{DOCKER_CONFIG_ENV, JobResourceRoot};
@@ -86,11 +83,11 @@ async fn node_action_executes_script() {
     let metadata = make_node_metadata("index.js");
     let step = make_action_step("Test");
     let mut state = JobState::new(
-        Arc::new(RwLock::new(Vec::new())),
+        crate::job::secret_masker::shared_masker_for_test(&[]),
         HashMap::new(),
         serde_json::json!({}),
     );
-    let masks = Arc::new(RwLock::new(Vec::new()));
+    let masks = crate::job::secret_masker::shared_masker_for_test(&[]);
     let logger = StepLogger::results_for_test(masks);
     let docker_config = test_docker_config(&tmp);
     let base_env = HashMap::from([(
@@ -152,11 +149,11 @@ if (process.env.INPUT_TOKEN !== 'my-secret') {
     step.inputs.insert("token".into(), "my-secret".into());
 
     let mut state = JobState::new(
-        Arc::new(RwLock::new(Vec::new())),
+        crate::job::secret_masker::shared_masker_for_test(&[]),
         HashMap::new(),
         serde_json::json!({}),
     );
-    let masks = Arc::new(RwLock::new(Vec::new()));
+    let masks = crate::job::secret_masker::shared_masker_for_test(&[]);
     let logger = StepLogger::results_for_test(masks);
     let docker_config = test_docker_config(&tmp);
     let base_env = HashMap::from([(
@@ -216,11 +213,11 @@ if (process.env.INPUT_FLAVOR !== 'vanilla') {
 
     let step = make_action_step("Test");
     let mut state = JobState::new(
-        Arc::new(RwLock::new(Vec::new())),
+        crate::job::secret_masker::shared_masker_for_test(&[]),
         HashMap::new(),
         serde_json::json!({}),
     );
-    let masks = Arc::new(RwLock::new(Vec::new()));
+    let masks = crate::job::secret_masker::shared_masker_for_test(&[]);
     let logger = StepLogger::results_for_test(masks);
     let docker_config = test_docker_config(&tmp);
     let base_env = HashMap::from([(
@@ -265,11 +262,11 @@ async fn nonzero_exit_fails() {
     let metadata = make_node_metadata("index.js");
     let step = make_action_step("Test");
     let mut state = JobState::new(
-        Arc::new(RwLock::new(Vec::new())),
+        crate::job::secret_masker::shared_masker_for_test(&[]),
         HashMap::new(),
         serde_json::json!({}),
     );
-    let masks = Arc::new(RwLock::new(Vec::new()));
+    let masks = crate::job::secret_masker::shared_masker_for_test(&[]);
     let logger = StepLogger::results_for_test(masks);
     let docker_config = test_docker_config(&tmp);
     let base_env = HashMap::from([(
@@ -300,4 +297,64 @@ async fn nonzero_exit_fails() {
         }
         Err(e) => panic!("unexpected error: {e}"),
     }
+}
+
+#[tokio::test]
+async fn failing_node_action_masks_secret_in_collected_log() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ws = make_test_workspace(&tmp);
+    let action_dir = tmp.path().join("action");
+    std::fs::create_dir_all(&action_dir).unwrap();
+    std::fs::write(
+        action_dir.join("index.js"),
+        r#"
+console.log('safe-node-line');
+console.log('json=quote-\\\"slash\\\\-node-41');
+console.error('stderr=quote-\\\"slash\\\\-node-41');
+process.exit(1);
+"#,
+    )
+    .unwrap();
+
+    let secret = "quote-\"slash\\-node-41";
+    let masks = crate::job::secret_masker::shared_masker_for_test(&[secret]);
+    let mut state = JobState::new(masks.clone(), HashMap::new(), serde_json::json!({}));
+    let logger = StepLogger::results_for_test(masks);
+    let docker_config = test_docker_config(&tmp);
+    let base_env = HashMap::from([(
+        DOCKER_CONFIG_ENV.to_string(),
+        docker_config.directory().to_string_lossy().into_owned(),
+    )]);
+    let node_runtimes = crate::node::NodeRuntimes::single("node".into());
+    let execution = JobExecutionContext::new(&docker_config, None, &node_runtimes);
+
+    let result = run_node_action(
+        &action_dir,
+        &make_node_metadata("index.js"),
+        "main",
+        &make_action_step("Test"),
+        &mut state,
+        &ws,
+        &base_env,
+        logger.sender(),
+        &CancellationToken::new(),
+        &execution,
+    )
+    .await;
+
+    let result = match result {
+        Ok(result) => result,
+        Err(error) if error.to_string().contains("spawning node") => {
+            eprintln!("skipping test: node not found on PATH");
+            return;
+        }
+        Err(error) => panic!("unexpected error: {error}"),
+    };
+    let collected = logger.finish().await.expect("collected node action log");
+
+    assert_eq!(result.conclusion, StepConclusion::Failed);
+    assert!(collected.text.contains("safe-node-line"));
+    assert!(collected.text.contains("***"));
+    assert!(!collected.text.contains(secret));
+    assert!(!collected.text.contains(r#"quote-\"slash\\-node-41"#));
 }

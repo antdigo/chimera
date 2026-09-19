@@ -839,8 +839,11 @@ async fn start_and_stream_logs(
         return Ok(interrupted);
     }
 
-    let processor =
-        OutputProcessor::new(log_sender.clone(), job_state.masks.clone(), debug_enabled);
+    let processor = OutputProcessor::new(
+        log_sender.clone(),
+        job_state.secret_masker.clone(),
+        debug_enabled,
+    );
     let docker_for_logs = docker.clone();
     let container_id_for_logs = container_id.to_string();
     let processor_for_logs = processor.clone();

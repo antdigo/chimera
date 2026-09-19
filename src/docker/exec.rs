@@ -55,8 +55,11 @@ pub async fn docker_exec(
         anyhow::bail!("docker exec did not return attached output");
     };
 
-    let processor =
-        OutputProcessor::new(log_sender.clone(), job_state.masks.clone(), debug_enabled);
+    let processor = OutputProcessor::new(
+        log_sender.clone(),
+        job_state.secret_masker.clone(),
+        debug_enabled,
+    );
 
     let stream_processor = processor.clone();
     let stream_task = tokio::spawn(async move {

@@ -106,7 +106,7 @@ fn test_step() -> Step {
 
 fn test_job_state() -> JobState {
     JobState::new(
-        Arc::new(RwLock::new(Vec::new())),
+        crate::job::secret_masker::shared_masker_for_test(&[]),
         HashMap::new(),
         serde_json::json!({}),
     )
@@ -116,7 +116,7 @@ fn test_job_state() -> JobState {
 fn step_debug_secret_name_is_case_insensitive() {
     let secrets = HashMap::from([("actions_step_debug".to_string(), "true".to_string())]);
     let state = JobState::new(
-        Arc::new(RwLock::new(Vec::new())),
+        crate::job::secret_masker::shared_masker_for_test(&[]),
         secrets,
         serde_json::json!({}),
     );
@@ -133,9 +133,7 @@ async fn context_data_secret_overrides_variable_regardless_of_case() {
         "contextData": { "secrets": { "DEPLOY_TOKEN": "new" } }
     }))
     .unwrap();
-    let masks = Arc::new(RwLock::new(Vec::new()));
-
-    let secrets = collect_secrets(&manifest, &masks).await;
+    let secrets = collect_secrets(&manifest);
 
     assert_eq!(secrets.len(), 1);
     assert_eq!(
@@ -285,12 +283,12 @@ fn make_action_step(id: &str, context_name: &str) -> Step {
 #[tokio::test]
 async fn echo_step_stdout_captured() {
     let (_tmp, ws, client, _mock) = setup_execute().await;
-    let masks = Arc::new(RwLock::new(Vec::new()));
+    let masks = crate::job::secret_masker::shared_masker_for_test(&[]);
     let logger = StepLogger::legacy(client, "plan", "step", masks, None).await;
 
     let step = make_step("1", "echo hello world");
     let mut state = JobState::new(
-        Arc::new(RwLock::new(Vec::new())),
+        crate::job::secret_masker::shared_masker_for_test(&[]),
         HashMap::new(),
         serde_json::json!({}),
     );
@@ -316,12 +314,12 @@ async fn echo_step_stdout_captured() {
 #[tokio::test]
 async fn nonzero_exit_returns_failed() {
     let (_tmp, ws, client, _mock) = setup_execute().await;
-    let masks = Arc::new(RwLock::new(Vec::new()));
+    let masks = crate::job::secret_masker::shared_masker_for_test(&[]);
     let logger = StepLogger::legacy(client, "plan", "step", masks, None).await;
 
     let step = make_step("1", "exit 1");
     let mut state = JobState::new(
-        Arc::new(RwLock::new(Vec::new())),
+        crate::job::secret_masker::shared_masker_for_test(&[]),
         HashMap::new(),
         serde_json::json!({}),
     );
@@ -347,12 +345,12 @@ async fn nonzero_exit_returns_failed() {
 #[tokio::test]
 async fn set_env_updates_job_state() {
     let (_tmp, ws, client, _mock) = setup_execute().await;
-    let masks = Arc::new(RwLock::new(Vec::new()));
+    let masks = crate::job::secret_masker::shared_masker_for_test(&[]);
     let logger = StepLogger::legacy(client, "plan", "step", masks, None).await;
 
     let step = make_step("1", "echo '::set-env name=MY_KEY::my_val'");
     let mut state = JobState::new(
-        Arc::new(RwLock::new(Vec::new())),
+        crate::job::secret_masker::shared_masker_for_test(&[]),
         HashMap::new(),
         serde_json::json!({}),
     );
@@ -378,12 +376,12 @@ async fn set_env_updates_job_state() {
 #[tokio::test]
 async fn add_path_updates_path() {
     let (_tmp, ws, client, _mock) = setup_execute().await;
-    let masks = Arc::new(RwLock::new(Vec::new()));
+    let masks = crate::job::secret_masker::shared_masker_for_test(&[]);
     let logger = StepLogger::legacy(client, "plan", "step", masks, None).await;
 
     let step = make_step("1", "echo '::add-path::/opt/custom/bin'");
     let mut state = JobState::new(
-        Arc::new(RwLock::new(Vec::new())),
+        crate::job::secret_masker::shared_masker_for_test(&[]),
         HashMap::new(),
         serde_json::json!({}),
     );
@@ -409,12 +407,12 @@ async fn add_path_updates_path() {
 #[tokio::test]
 async fn set_output_populates_outputs() {
     let (_tmp, ws, client, _mock) = setup_execute().await;
-    let masks = Arc::new(RwLock::new(Vec::new()));
+    let masks = crate::job::secret_masker::shared_masker_for_test(&[]);
     let logger = StepLogger::legacy(client, "plan", "step", masks, None).await;
 
     let step = make_step("1", "echo '::set-output name=result::42'");
     let mut state = JobState::new(
-        Arc::new(RwLock::new(Vec::new())),
+        crate::job::secret_masker::shared_masker_for_test(&[]),
         HashMap::new(),
         serde_json::json!({}),
     );
@@ -440,12 +438,12 @@ async fn set_output_populates_outputs() {
 #[tokio::test]
 async fn env_propagation_across_steps() {
     let (_tmp, ws, client, _mock) = setup_execute().await;
-    let masks = Arc::new(RwLock::new(Vec::new()));
+    let masks = crate::job::secret_masker::shared_masker_for_test(&[]);
     let logger = StepLogger::legacy(client, "plan", "step", masks, None).await;
 
     let step1 = make_step("1", "echo '::set-env name=STEP1_VAR::hello'");
     let mut state = JobState::new(
-        Arc::new(RwLock::new(Vec::new())),
+        crate::job::secret_masker::shared_masker_for_test(&[]),
         HashMap::new(),
         serde_json::json!({}),
     );
@@ -737,12 +735,12 @@ async fn cancel_token_returns_cancelled_between_steps() {
 #[tokio::test]
 async fn cancel_token_kills_running_process() {
     let (_tmp, ws, client, _mock) = setup_execute().await;
-    let masks = Arc::new(RwLock::new(Vec::new()));
+    let masks = crate::job::secret_masker::shared_masker_for_test(&[]);
     let logger = StepLogger::legacy(client, "plan", "step", masks, None).await;
 
     let step = make_step("1", "sleep 60");
     let mut state = JobState::new(
-        Arc::new(RwLock::new(Vec::new())),
+        crate::job::secret_masker::shared_masker_for_test(&[]),
         HashMap::new(),
         serde_json::json!({}),
     );
@@ -1149,7 +1147,7 @@ async fn collection_error_post_propagates_directory_identity_failure() {
 #[test]
 fn action_lifecycle_suffix_bearing_identifiers_stay_main() {
     let state = JobState::new(
-        Arc::new(RwLock::new(Vec::new())),
+        crate::job::secret_masker::shared_masker_for_test(&[]),
         HashMap::new(),
         serde_json::json!({}),
     );
@@ -1174,7 +1172,7 @@ fn action_lifecycle_colliding_identifiers_keep_distinct_capabilities() {
     let plain = make_action_step("opaque-plain", "foo");
     let suffix = make_action_step("opaque-suffix", "foo_pre");
     let mut state = JobState::new(
-        Arc::new(RwLock::new(Vec::new())),
+        crate::job::secret_masker::shared_masker_for_test(&[]),
         HashMap::new(),
         serde_json::json!({}),
     );
@@ -1202,7 +1200,7 @@ fn action_lifecycle_colliding_identifiers_keep_distinct_capabilities() {
 #[test]
 fn action_lifecycle_synthetic_steps_share_explicit_instance() {
     let mut state = JobState::new(
-        Arc::new(RwLock::new(Vec::new())),
+        crate::job::secret_masker::shared_masker_for_test(&[]),
         HashMap::new(),
         serde_json::json!({}),
     );

@@ -135,7 +135,7 @@ async fn run_engine_test_container(
         "owner/repo",
     )
     .unwrap();
-    let masks = Arc::new(tokio::sync::RwLock::new(Vec::new()));
+    let masks = crate::job::secret_masker::shared_masker_for_test(&[]);
     let (log_tx, _log_rx) = tokio::sync::mpsc::channel(32);
     let log_sender = LogSender::new_for_test(log_tx, Arc::clone(&masks));
     let mut job_state = JobState::new(masks, HashMap::new(), serde_json::json!({}));
@@ -279,7 +279,7 @@ async fn cancellation_after_build_publication_does_not_launch_container() {
     )
     .unwrap();
     let action_dir = TrustedActionDirectory::resolve(action.path(), Path::new(".")).unwrap();
-    let masks = Arc::new(tokio::sync::RwLock::new(Vec::new()));
+    let masks = crate::job::secret_masker::shared_masker_for_test(&[]);
     let (log_tx, _log_rx) = tokio::sync::mpsc::channel(64);
     let log_sender = LogSender::new_for_test(log_tx, masks);
     let builder = DockerActionBuilder::new();
@@ -528,7 +528,7 @@ async fn build_timeout_log_send_never_blocks_on_a_full_log_channel() {
 
     // A capacity-1 channel already holding one line has no room for the
     // timeout notice, and nothing drains it for the lifetime of the test.
-    let masks = Arc::new(tokio::sync::RwLock::new(Vec::new()));
+    let masks = crate::job::secret_masker::shared_masker_for_test(&[]);
     let (log_tx, _log_rx) = tokio::sync::mpsc::channel(1);
     let log_sender = LogSender::new_for_test(log_tx, Arc::clone(&masks));
     log_sender.send("filler line".into()).await;
@@ -717,7 +717,7 @@ fn action_workspace() -> (tempfile::TempDir, Workspace) {
 
 fn action_job_state() -> JobState {
     JobState::new(
-        std::sync::Arc::new(tokio::sync::RwLock::new(Vec::new())),
+        crate::job::secret_masker::shared_masker_for_test(&[]),
         HashMap::new(),
         serde_json::json!({}),
     )
@@ -930,7 +930,7 @@ async fn engine_action_contents_come_from_pinned_context_after_root_replacement(
     )
     .unwrap();
 
-    let masks = Arc::new(tokio::sync::RwLock::new(Vec::new()));
+    let masks = crate::job::secret_masker::shared_masker_for_test(&[]);
     let (log_tx, _log_rx) = tokio::sync::mpsc::channel(32);
     let log_sender = LogSender::new_for_test(log_tx, Arc::clone(&masks));
     let mut job_state = JobState::new(masks, HashMap::new(), serde_json::json!({}));
@@ -1037,7 +1037,7 @@ async fn engine_action_contents_come_from_pinned_context_after_symlink_root_repl
     .unwrap();
     symlink(&replacement, &source_root).unwrap();
 
-    let masks = Arc::new(tokio::sync::RwLock::new(Vec::new()));
+    let masks = crate::job::secret_masker::shared_masker_for_test(&[]);
     let (log_tx, _log_rx) = tokio::sync::mpsc::channel(32);
     let log_sender = LogSender::new_for_test(log_tx, Arc::clone(&masks));
     let mut job_state = JobState::new(masks, HashMap::new(), serde_json::json!({}));

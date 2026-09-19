@@ -1,14 +1,11 @@
 use std::collections::HashMap;
-use std::sync::Arc;
-
-use tokio::sync::RwLock;
 
 use super::OutputProcessor;
 use crate::job::execute::JobState;
 use crate::job::logs::{LogLine, LogSender};
 
 fn make_processor(debug_enabled: bool) -> (OutputProcessor, tokio::sync::mpsc::Receiver<LogLine>) {
-    let masks = Arc::new(RwLock::new(Vec::new()));
+    let masks = crate::job::secret_masker::shared_masker_for_test(&[]);
     let (tx, rx) = tokio::sync::mpsc::channel(256);
     let sender = LogSender::new_for_test(tx, masks.clone());
     let processor = OutputProcessor::new(sender, masks, debug_enabled);
@@ -16,7 +13,7 @@ fn make_processor(debug_enabled: bool) -> (OutputProcessor, tokio::sync::mpsc::R
 }
 
 fn make_job_state() -> JobState {
-    let masks = Arc::new(RwLock::new(Vec::new()));
+    let masks = crate::job::secret_masker::shared_masker_for_test(&[]);
     JobState::new(masks, HashMap::new(), serde_json::json!({}))
 }
 
@@ -65,6 +62,16 @@ async fn add_mask_causes_masking() {
 
     // The LogSender masks content before sending, so the secret should be replaced
     assert_eq!(rx.recv().await.unwrap().content, "the *** value is here");
+}
+
+#[tokio::test]
+async fn add_mask_registers_encoded_variants_for_all_sender_clones() {
+    let (processor, mut rx) = make_processor(false);
+    let clone = processor.clone();
+    processor.process_line("::add-mask::quote-\"slash\\").await;
+    clone.process_line(r#"json=quote-\"slash\\"#).await;
+
+    assert_eq!(rx.recv().await.unwrap().content, "json=***");
 }
 
 #[tokio::test]
