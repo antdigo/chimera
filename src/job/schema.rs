@@ -18,6 +18,8 @@ pub struct JobManifest {
     #[serde(default)]
     pub resources: JobResources,
     #[serde(default)]
+    pub job_outputs: HashMap<String, String>,
+    #[serde(default)]
     pub context_data: serde_json::Value,
     pub job_container: Option<JobContainerSpec>,
     pub service_containers: Option<Vec<ServiceContainerSpec>>,

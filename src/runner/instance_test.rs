@@ -1135,6 +1135,38 @@ async fn successful_job_reports_failed_when_docker_config_cleanup_fails() {
 }
 
 #[tokio::test]
+async fn finish_job_serializes_only_the_execution_outcome_outputs() {
+    use wiremock::matchers::body_json;
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/completejob"))
+        .and(body_json(serde_json::json!({
+            "planId": "plan",
+            "jobId": "job",
+            "conclusion": "succeeded",
+            "outputs": {
+                "published": { "value": "release-42" }
+            },
+            "stepResults": []
+        })))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let client = finish_client(&server).await;
+    let manifest = finish_manifest(&server.uri());
+    let execution = Ok(JobExecutionOutcome {
+        conclusion: JobConclusion::Succeeded,
+        outputs: HashMap::from([("published".to_string(), "release-42".to_string())]),
+    });
+
+    finish_job(&client, &manifest, execution, Ok(()))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
 async fn execution_and_cleanup_errors_are_both_returned_without_early_completion() {
     let server = MockServer::start().await;
     let client = finish_client(&server).await;

@@ -1,11 +1,12 @@
 use std::sync::Arc;
 
 use chrono::Utc;
-use tokio::sync::{RwLock, mpsc};
+use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::warn;
 
 use super::JobClient;
+use super::masking::{SharedSecretMasker, apply};
 use crate::utils::format_log_timestamp;
 
 #[derive(Clone)]
@@ -18,13 +19,13 @@ pub struct LogLine {
 pub struct LogSender {
     tx: mpsc::Sender<LogLine>,
     job_tx: Option<mpsc::Sender<LogLine>>,
-    masks: Arc<RwLock<Vec<String>>>,
+    masks: SharedSecretMasker,
     feed: Option<(super::live_feed::FeedSender, String)>,
 }
 
 impl LogSender {
     #[cfg(test)]
-    pub fn new_for_test(tx: mpsc::Sender<LogLine>, masks: Arc<RwLock<Vec<String>>>) -> Self {
+    pub fn new_for_test(tx: mpsc::Sender<LogLine>, masks: SharedSecretMasker) -> Self {
         Self {
             tx,
             job_tx: None,
@@ -76,13 +77,7 @@ impl LogSender {
 
     async fn apply_masks(&self, content: &str) -> String {
         let masks = self.masks.read().await;
-        let mut result = content.to_string();
-        for mask in masks.iter() {
-            if !mask.is_empty() {
-                result = result.replace(mask, "***");
-            }
-        }
-        result
+        apply(&masks, content)
     }
 }
 
@@ -128,7 +123,7 @@ impl StepLogger {
         plan_id: String,
         job_id: String,
         step_id: String,
-        masks: Arc<RwLock<Vec<String>>>,
+        masks: SharedSecretMasker,
         feed: Option<(super::live_feed::FeedSender, String)>,
         job_tx: Option<mpsc::Sender<LogLine>>,
     ) -> Self {
@@ -156,7 +151,7 @@ impl StepLogger {
         client: Arc<JobClient>,
         plan_id: &str,
         step_name: &str,
-        masks: Arc<RwLock<Vec<String>>>,
+        masks: SharedSecretMasker,
         feed: Option<(super::live_feed::FeedSender, String)>,
     ) -> Self {
         let log_id = client
@@ -215,7 +210,7 @@ impl StepLogger {
 
     /// Test-only: creates a Results logger that collects lines without uploading.
     #[cfg(test)]
-    pub fn results_for_test(masks: Arc<RwLock<Vec<String>>>) -> Self {
+    pub fn results_for_test(masks: SharedSecretMasker) -> Self {
         let (tx, rx) = mpsc::channel::<LogLine>(256);
         let sender = LogSender {
             tx,

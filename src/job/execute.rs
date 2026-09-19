@@ -9,7 +9,7 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
-use tokio::sync::{RwLock, mpsc};
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
@@ -19,6 +19,7 @@ use super::client::{JobConclusion, ResultsConclusion, ResultsStatus, ResultsStep
 use super::expression::ExprContext;
 use super::live_feed::FeedSender;
 use super::logs::{JobLogger, LogLine, LogSender, StepLogger};
+use super::masking::{SharedSecretMasker, append_regex, append_value, contains_secret};
 use super::schema::{JobManifest, Step};
 use super::timeline::{TimelineLogRef, TimelineRecord, TimelineResult, TimelineState};
 use super::workspace::Workspace;
@@ -108,7 +109,7 @@ pub struct JobState {
     pub env: HashMap<String, String>,
     pub path_prepends: Vec<String>,
     pub outputs: HashMap<String, String>,
-    pub masks: Arc<RwLock<Vec<String>>>,
+    pub masks: SharedSecretMasker,
     /// Per-action state for pre→post transfer via SaveState workflow command.
     /// Key: action context_name, Value: map of state name→value.
     pub action_states: HashMap<String, HashMap<String, String>>,
@@ -136,7 +137,7 @@ pub struct JobState {
 
 impl JobState {
     pub fn new(
-        masks: Arc<RwLock<Vec<String>>>,
+        masks: SharedSecretMasker,
         secrets: HashMap<String, String>,
         context_data: serde_json::Value,
     ) -> Self {
@@ -1328,13 +1329,25 @@ pub async fn run_all_steps(
         logger.finish().await;
     }
 
-    // Reconstruct job-level outputs from all step outputs.
-    // The server uses these for `needs.X.outputs.Y` resolution in dependent jobs.
-    for step in &manifest.steps {
-        let key = step.context_name.as_deref().unwrap_or(&step.id);
-        if let Some(outs) = job_state.step_outputs.get(key) {
-            merge_case_insensitive(&mut job_state.outputs, outs.clone());
+    let mut output_env = base_env.clone();
+    output_env.extend(job_state.env.clone());
+    let output_ctx = ExprContext::new(&output_env, &job_state, job_failed, job_cancelled);
+    let secret_masks = masks.read().await;
+    let mut job_outputs = HashMap::new();
+    for (key, expression) in &manifest.job_outputs {
+        let value = super::expression::resolve_template(expression, &output_ctx);
+        if value.is_empty() {
+            debug!(output = key, "skipping empty job output");
+            continue;
         }
+        if contains_secret(&secret_masks, &value) {
+            warn!(
+                output = key,
+                "skipping job output because it may contain a secret"
+            );
+            continue;
+        }
+        insert_case_insensitive(&mut job_outputs, key.clone(), value);
     }
 
     let conclusion = if job_cancelled {
@@ -1344,7 +1357,7 @@ pub async fn run_all_steps(
     } else {
         JobConclusion::Succeeded
     };
-    Ok((conclusion, job_state.outputs.clone()))
+    Ok((conclusion, job_outputs))
 }
 
 /// Build the secrets map for `secrets.<name>` expression resolution.
@@ -1360,7 +1373,7 @@ pub async fn run_all_steps(
 /// `collect_secret_masks` before this runs.
 async fn collect_secrets(
     manifest: &JobManifest,
-    masks: &Arc<RwLock<Vec<String>>>,
+    masks: &SharedSecretMasker,
 ) -> HashMap<String, String> {
     // The official ToSecretsContext excludes the dotted system token names:
     // they reach workflows only through the canonical `github.token` /
@@ -1370,7 +1383,6 @@ async fn collect_secrets(
     let mut secrets: HashMap<String, String> = HashMap::new();
     for (k, v) in manifest.variables.iter() {
         if v.is_secret
-            && !v.value.is_empty()
             && !EXCLUDED_SECRET_VARIABLES
                 .iter()
                 .any(|name| k.eq_ignore_ascii_case(name))
@@ -1386,7 +1398,7 @@ async fn collect_secrets(
         && let Some(token) = manifest.github_token()
         && !token.is_empty()
     {
-        masks.write().await.push(token.to_string());
+        super::masking::add_value(masks, token).await;
         secrets.insert("GITHUB_TOKEN".to_string(), token.to_string());
     }
 
@@ -1398,11 +1410,17 @@ async fn collect_secrets(
         .and_then(|v| v.as_object())
     {
         for (k, v) in ctx_secrets {
-            if let Some(s) = v.as_str()
-                && !s.is_empty()
+            if EXCLUDED_SECRET_VARIABLES
+                .iter()
+                .any(|name| k.eq_ignore_ascii_case(name))
             {
-                // Add to mask list so secret values are redacted in logs
-                masks.write().await.push(s.to_string());
+                continue;
+            }
+            if let Some(s) = v.as_str() {
+                if !s.is_empty() {
+                    // Add to mask list so secret values are redacted in logs
+                    super::masking::add_value(masks, s).await;
+                }
                 insert_case_insensitive(&mut secrets, k.clone(), s.to_string());
             }
         }
@@ -1411,14 +1429,34 @@ async fn collect_secrets(
     secrets
 }
 
-fn collect_secret_masks(manifest: &JobManifest) -> Arc<RwLock<Vec<String>>> {
-    let masks: Vec<String> = manifest
+fn collect_secret_masks(manifest: &JobManifest) -> SharedSecretMasker {
+    let mut masks = Vec::new();
+    for value in manifest
         .variables
         .values()
-        .filter(|v| v.is_secret && !v.value.is_empty())
-        .map(|v| v.value.clone())
-        .collect();
-    Arc::new(RwLock::new(masks))
+        .filter(|variable| variable.is_secret)
+        .map(|variable| variable.value.as_str())
+        .chain(
+            manifest
+                .resources
+                .endpoints
+                .iter()
+                .filter_map(|endpoint| endpoint.authorization.as_ref())
+                .flat_map(|authorization| authorization.parameters.values().map(String::as_str)),
+        )
+    {
+        append_value(&mut masks, value);
+    }
+    for hint in &manifest.mask {
+        let Some(pattern) = hint.get("value").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        if let Err(error) = append_regex(&mut masks, pattern) {
+            warn!(%error, "ignoring invalid secret mask regex");
+        }
+        append_value(&mut masks, pattern);
+    }
+    Arc::new(tokio::sync::RwLock::new(masks))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1429,7 +1467,7 @@ async fn create_step_logger(
     job_id: &str,
     step_id: &str,
     step_name: &str,
-    masks: Arc<RwLock<Vec<String>>>,
+    masks: SharedSecretMasker,
     feed_sender: Option<&FeedSender>,
     job_log_tx: Option<&mpsc::Sender<LogLine>>,
 ) -> StepLogger {

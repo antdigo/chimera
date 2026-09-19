@@ -4,6 +4,8 @@ use std::collections::HashMap;
 
 use chimera::job::client::JobConclusion;
 use common::*;
+use wiremock::matchers::{body_json, method, path};
+use wiremock::{Mock, ResponseTemplate};
 
 #[tokio::test]
 async fn env_vars_are_set() {
@@ -249,18 +251,265 @@ async fn step_env_vars_resolved() {
 }
 
 #[tokio::test]
-async fn job_outputs_returned() {
+async fn only_declared_job_outputs_are_returned_and_step_outputs_stay_in_job() {
     let env = TestEnv::setup().await;
-    let manifest = manifest_with_steps(
-        vec![script_step(
-            "s1",
-            r#"echo "greeting=hello from job" >> "$GITHUB_OUTPUT""#,
-        )],
-        &env.mock_server.uri(),
+    let produce = script_step_env(
+        "collect-secrets",
+        r#"
+        printf '%s' "$ALL_SECRETS" | jq -e '
+          type == "object" and
+          .DEPLOY_TOKEN == "synthetic-secret" and
+          .EMPTY_SECRET == ""
+        ' >/dev/null
+        echo "published=release-42" >> "$GITHUB_OUTPUT"
+        echo 'app_env<<CHIMERA_OUTPUT' >> "$GITHUB_OUTPUT"
+        printf '%s\n' "$ALL_SECRETS" >> "$GITHUB_OUTPUT"
+        echo 'CHIMERA_OUTPUT' >> "$GITHUB_OUTPUT"
+        "#,
+        HashMap::from([("ALL_SECRETS".into(), "${{ toJSON(secrets) }}".into())]),
     );
+    let consume = script_step_env(
+        "consume",
+        r#"
+        printf '%s' "$APP_ENV" | jq -e '
+          .DEPLOY_TOKEN == "synthetic-secret" and
+          .EMPTY_SECRET == ""
+        ' >/dev/null
+        "#,
+        HashMap::from([(
+            "APP_ENV".into(),
+            "${{ steps.collect-secrets.outputs.app_env }}".into(),
+        )]),
+    );
+    let mut manifest = manifest_with_steps_and_context(
+        vec![produce, consume],
+        &env.mock_server.uri(),
+        serde_json::json!({
+            "secrets": {
+                "DEPLOY_TOKEN": "synthetic-secret",
+                "EMPTY_SECRET": ""
+            }
+        }),
+    );
+    manifest.job_outputs = HashMap::from([(
+        "published".to_string(),
+        "${{ steps.collect-secrets.outputs.published }}".to_string(),
+    )]);
+
     let (conclusion, outputs) = env.run(&manifest).await.unwrap();
+
     assert_eq!(conclusion, JobConclusion::Succeeded);
-    assert_eq!(outputs.get("greeting").unwrap(), "hello from job");
+    assert_eq!(
+        outputs,
+        HashMap::from([("published".to_string(), "release-42".to_string())])
+    );
+}
+
+#[tokio::test]
+async fn undeclared_secret_output_reaches_webhook_but_completejob_gets_no_outputs() {
+    let mut env = TestEnv::setup().await;
+    Mock::given(method("POST"))
+        .and(path("/deploy-hook"))
+        .and(body_json(serde_json::json!({
+            "DEPLOY_TOKEN": "synthetic-secret",
+            "EMPTY_SECRET": ""
+        })))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&env.mock_server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/completejob"))
+        .and(body_json(serde_json::json!({
+            "planId": "p",
+            "jobId": "j",
+            "conclusion": "succeeded",
+            "outputs": {},
+            "stepResults": []
+        })))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&env.mock_server)
+        .await;
+
+    let produce = script_step_env(
+        "collect-secrets",
+        r#"
+        echo 'app_env<<CHIMERA_OUTPUT' >> "$GITHUB_OUTPUT"
+        printf '%s\n' "$ALL_SECRETS" >> "$GITHUB_OUTPUT"
+        echo 'CHIMERA_OUTPUT' >> "$GITHUB_OUTPUT"
+        "#,
+        HashMap::from([("ALL_SECRETS".into(), "${{ toJSON(secrets) }}".into())]),
+    );
+    let consume = script_step_env(
+        "notify",
+        r#"curl --fail --silent --show-error -H 'Content-Type: application/json' --data "$APP_ENV" "$WEBHOOK_URL""#,
+        HashMap::from([
+            (
+                "APP_ENV".into(),
+                "${{ steps.collect-secrets.outputs.app_env }}".into(),
+            ),
+            (
+                "WEBHOOK_URL".into(),
+                format!("{}/deploy-hook", env.mock_server.uri()),
+            ),
+        ]),
+    );
+    let manifest = manifest_with_steps_and_context(
+        vec![produce, consume],
+        &env.mock_server.uri(),
+        serde_json::json!({
+            "secrets": {
+                "DEPLOY_TOKEN": "synthetic-secret",
+                "EMPTY_SECRET": ""
+            }
+        }),
+    );
+    env.configure_from_manifest(&manifest);
+
+    let (conclusion, outputs) = env.run(&manifest).await.unwrap();
+    let completejob_outputs = serde_json::Value::Object(
+        outputs
+            .iter()
+            .map(|(name, value)| (name.clone(), serde_json::json!({ "value": value })))
+            .collect(),
+    );
+    env.job_client
+        .complete_job(
+            &manifest.plan.plan_id,
+            &manifest.plan.job_id,
+            conclusion,
+            &completejob_outputs,
+            &[],
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(conclusion, JobConclusion::Succeeded);
+    assert!(outputs.is_empty());
+}
+
+#[tokio::test]
+async fn declared_job_output_containing_a_secret_is_suppressed() {
+    let env = TestEnv::setup().await;
+    let step = script_step_env(
+        "produce",
+        r#"
+        echo "safe=release-42" >> "$GITHUB_OUTPUT"
+        echo "exposed=prefix-$DEPLOY_TOKEN-suffix" >> "$GITHUB_OUTPUT"
+        "#,
+        HashMap::from([("DEPLOY_TOKEN".into(), "${{ secrets.DEPLOY_TOKEN }}".into())]),
+    );
+    let mut manifest = manifest_with_variables(
+        vec![step],
+        &env.mock_server.uri(),
+        serde_json::json!({}),
+        serde_json::json!({
+            "DEPLOY_TOKEN": { "value": "synthetic-secret", "isSecret": true }
+        }),
+    );
+    manifest.job_outputs = HashMap::from([
+        (
+            "safe".to_string(),
+            "${{ steps.produce.outputs.safe }}".to_string(),
+        ),
+        (
+            "exposed".to_string(),
+            "${{ steps.produce.outputs.exposed }}".to_string(),
+        ),
+    ]);
+
+    let (conclusion, outputs) = env.run(&manifest).await.unwrap();
+
+    assert_eq!(conclusion, JobConclusion::Succeeded);
+    assert_eq!(
+        outputs,
+        HashMap::from([("safe".to_string(), "release-42".to_string())])
+    );
+}
+
+#[tokio::test]
+async fn declared_job_output_with_json_escaped_secret_is_suppressed() {
+    let env = TestEnv::setup().await;
+    let mut manifest = manifest_with_variables(
+        vec![script_step("noop", "true")],
+        &env.mock_server.uri(),
+        serde_json::json!({}),
+        serde_json::json!({
+            "COMPLEX_SECRET": {
+                "value": "first \"quoted\" line\nsecond line",
+                "isSecret": true
+            }
+        }),
+    );
+    manifest.job_outputs = HashMap::from([(
+        "serialized_secrets".to_string(),
+        "${{ toJSON(secrets) }}".to_string(),
+    )]);
+
+    let (conclusion, outputs) = env.run(&manifest).await.unwrap();
+
+    assert_eq!(conclusion, JobConclusion::Succeeded);
+    assert!(outputs.is_empty());
+}
+
+#[tokio::test]
+async fn declared_job_output_with_base64_secret_is_suppressed() {
+    let env = TestEnv::setup().await;
+    let mut manifest = manifest_with_variables(
+        vec![script_step("noop", "true")],
+        &env.mock_server.uri(),
+        serde_json::json!({}),
+        serde_json::json!({
+            "DEPLOY_TOKEN": {
+                "value": "synthetic-secret",
+                "isSecret": true
+            }
+        }),
+    );
+    manifest.job_outputs = HashMap::from([(
+        "encoded".to_string(),
+        "c3ludGhldGljLXNlY3JldA==".to_string(),
+    )]);
+
+    let (conclusion, outputs) = env.run(&manifest).await.unwrap();
+
+    assert_eq!(conclusion, JobConclusion::Succeeded);
+    assert!(outputs.is_empty());
+}
+
+#[tokio::test]
+async fn declared_job_output_matching_a_regex_mask_is_suppressed() {
+    let env = TestEnv::setup().await;
+    let mut manifest =
+        manifest_with_steps(vec![script_step("noop", "true")], &env.mock_server.uri());
+    manifest.mask = vec![serde_json::json!({
+        "type": "regex",
+        "value": "credential-[0-9]+"
+    })];
+    manifest.job_outputs =
+        HashMap::from([("credential".to_string(), "credential-12345".to_string())]);
+
+    let (conclusion, outputs) = env.run(&manifest).await.unwrap();
+
+    assert_eq!(conclusion, JobConclusion::Succeeded);
+    assert!(outputs.is_empty());
+}
+
+#[tokio::test]
+async fn empty_declared_job_output_is_not_returned() {
+    let env = TestEnv::setup().await;
+    let step = script_step("produce", r#"echo "empty=" >> "$GITHUB_OUTPUT""#);
+    let mut manifest = manifest_with_steps(vec![step], &env.mock_server.uri());
+    manifest.job_outputs = HashMap::from([(
+        "empty".to_string(),
+        "${{ steps.produce.outputs.empty }}".to_string(),
+    )]);
+
+    let (conclusion, outputs) = env.run(&manifest).await.unwrap();
+
+    assert_eq!(conclusion, JobConclusion::Succeeded);
+    assert!(outputs.is_empty());
 }
 
 #[tokio::test]
@@ -282,6 +531,51 @@ async fn env_accumulates_across_three_steps() {
     );
     let (conclusion, _) = env.run(&manifest).await.unwrap();
     assert_eq!(conclusion, JobConclusion::Succeeded);
+}
+
+#[tokio::test]
+async fn declared_job_output_can_use_env_written_by_a_step() {
+    let env = TestEnv::setup().await;
+    let mut manifest = manifest_with_steps(
+        vec![script_step(
+            "set-version",
+            r#"echo "VERSION=1.2.3" >> "$GITHUB_ENV""#,
+        )],
+        &env.mock_server.uri(),
+    );
+    manifest.job_outputs =
+        HashMap::from([("version".to_string(), "${{ env.VERSION }}".to_string())]);
+
+    let (conclusion, outputs) = env.run(&manifest).await.unwrap();
+
+    assert_eq!(conclusion, JobConclusion::Succeeded);
+    assert_eq!(outputs.get("version").map(String::as_str), Some("1.2.3"));
+}
+
+#[tokio::test]
+async fn declared_job_output_env_keeps_linux_case_distinctions() {
+    let env = TestEnv::setup().await;
+    let mut manifest = manifest_with_variables(
+        vec![script_step(
+            "set-lowercase",
+            r#"echo "foo=from-step" >> "$GITHUB_ENV""#,
+        )],
+        &env.mock_server.uri(),
+        serde_json::json!({}),
+        serde_json::json!({
+            "FOO": { "value": "from-base", "isSecret": false }
+        }),
+    );
+    manifest.job_outputs = HashMap::from([
+        ("upper".to_string(), "${{ env.FOO }}".to_string()),
+        ("lower".to_string(), "${{ env.foo }}".to_string()),
+    ]);
+
+    let (conclusion, outputs) = env.run(&manifest).await.unwrap();
+
+    assert_eq!(conclusion, JobConclusion::Succeeded);
+    assert_eq!(outputs.get("upper").map(String::as_str), Some("from-base"));
+    assert_eq!(outputs.get("lower").map(String::as_str), Some("from-step"));
 }
 
 #[tokio::test]
