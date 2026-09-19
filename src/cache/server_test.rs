@@ -177,6 +177,148 @@ async fn make_test_app(tmp: &TempDir) -> (Router, SharedManager, Arc<CacheAuthor
     )
 }
 
+async fn make_test_app_without_registration(
+    tmp: &TempDir,
+) -> (Router, SharedManager, Arc<CacheAuthority>) {
+    let manager = make_test_manager(tmp).await;
+    let authority = Arc::new(CacheAuthority::new());
+    (
+        router(manager.clone(), authority.clone()),
+        manager,
+        authority,
+    )
+}
+
+async fn assert_all_cache_handlers_reject(app: &Router, token: &str, expected: StatusCode) {
+    let prefix = scope_prefix(SCOPE_REPO, SCOPE_REF, DEFAULT_REF);
+    let requests = [
+        bearer(
+            Request::builder().uri(format!(
+                "{prefix}/_apis/artifactcache/cache?keys=k&version=v1"
+            )),
+            token,
+        )
+        .body(Body::empty())
+        .unwrap(),
+        bearer(
+            Request::builder()
+                .method("POST")
+                .uri(format!("{prefix}/_apis/artifactcache/caches"))
+                .header("content-type", "application/json"),
+            token,
+        )
+        .body(Body::from(r#"{"key":"k","version":"v1"}"#))
+        .unwrap(),
+        bearer(
+            Request::builder()
+                .method("PATCH")
+                .uri(format!("{prefix}/_apis/artifactcache/caches/1"))
+                .header("content-range", "bytes 0-0/*"),
+            token,
+        )
+        .body(Body::from("x"))
+        .unwrap(),
+        bearer(
+            Request::builder()
+                .method("POST")
+                .uri(format!("{prefix}/_apis/artifactcache/caches/1"))
+                .header("content-type", "application/json"),
+            token,
+        )
+        .body(Body::from(r#"{"size":1}"#))
+        .unwrap(),
+    ];
+
+    for request in requests {
+        assert_eq!(
+            app.clone().oneshot(request).await.unwrap().status(),
+            expected,
+        );
+    }
+}
+
+#[tokio::test]
+async fn expired_capability_is_unauthorized_on_all_cache_api_handlers() {
+    let tmp = TempDir::new().unwrap();
+    let manager = make_test_manager(&tmp).await;
+    let issued_at = Utc::now();
+    let clock_value = Arc::new(std::sync::Mutex::new(issued_at));
+    let clock_reader = clock_value.clone();
+    let authority = Arc::new(CacheAuthority::with_clock(Arc::new(move || {
+        *clock_reader.lock().unwrap()
+    })));
+    let app = router(manager, authority.clone());
+    authority
+        .register_job(
+            "expired-token",
+            JobCapabilityClaims {
+                scope: CacheScope {
+                    repo: SCOPE_REPO.into(),
+                    git_ref: SCOPE_REF.into(),
+                    default_ref: DEFAULT_REF.into(),
+                },
+                job_id: "expired-job".into(),
+            },
+            issued_at,
+        )
+        .await
+        .unwrap();
+
+    *clock_value.lock().unwrap() = issued_at + JOB_CAPABILITY_LIFETIME;
+    assert_all_cache_handlers_reject(&app, "expired-token", StatusCode::UNAUTHORIZED).await;
+}
+
+#[tokio::test]
+async fn authority_restart_rejects_old_token_but_preserves_scoped_entries() {
+    let tmp = TempDir::new().unwrap();
+    let (first_app, manager, first_authority) = make_test_app_without_registration(&tmp).await;
+    first_authority
+        .register_job(
+            TOKEN_A,
+            JobCapabilityClaims {
+                scope: CacheScope {
+                    repo: SCOPE_REPO.into(),
+                    git_ref: SCOPE_REF.into(),
+                    default_ref: DEFAULT_REF.into(),
+                },
+                job_id: "job-a".into(),
+            },
+            Utc::now(),
+        )
+        .await
+        .unwrap();
+    let prefix = scope_prefix(SCOPE_REPO, SCOPE_REF, DEFAULT_REF);
+    authorized_roundtrip(&first_app, &prefix, TOKEN_A, "persisted", b"bytes").await;
+    drop(first_app);
+    drop(first_authority);
+
+    let second_authority = Arc::new(CacheAuthority::new());
+    let second_app = router(manager, second_authority.clone());
+    assert_eq!(
+        lookup_status(&second_app, &prefix, TOKEN_A, "persisted", "v1").await,
+        StatusCode::UNAUTHORIZED,
+    );
+    second_authority
+        .register_job(
+            "new-runtime-token",
+            JobCapabilityClaims {
+                scope: CacheScope {
+                    repo: SCOPE_REPO.into(),
+                    git_ref: SCOPE_REF.into(),
+                    default_ref: DEFAULT_REF.into(),
+                },
+                job_id: "new-job".into(),
+            },
+            Utc::now(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        lookup_status(&second_app, &prefix, "new-runtime-token", "persisted", "v1",).await,
+        StatusCode::OK,
+    );
+}
+
 #[tokio::test]
 async fn every_cache_api_handler_rejects_missing_bearer() {
     let tmp = TempDir::new().unwrap();
@@ -747,71 +889,164 @@ async fn unknown_path_returns_404() {
 #[tokio::test]
 async fn concurrent_http_clients() {
     let tmp = TempDir::new().unwrap();
-    let (_app, mgr, authority) = make_test_app(&tmp).await;
+    let manager = make_test_manager(&tmp).await;
+    let authority = Arc::new(CacheAuthority::new());
+    for (repo, token, bytes) in [
+        ("org/repo-a", "seed-a", b"fallback-a".as_slice()),
+        ("org/repo-b", "seed-b", b"fallback-b".as_slice()),
+    ] {
+        let owner = CapabilityId::from_token(token);
+        let id = manager
+            .reserve_upload(
+                owner.clone(),
+                format!("{token}-job"),
+                "default-fallback".into(),
+                "v1".into(),
+                repo.into(),
+                "refs/heads/main".into(),
+            )
+            .await
+            .unwrap();
+        manager.write_chunk(&owner, id, 0, bytes).await.unwrap();
+        manager
+            .commit_upload(&owner, id, bytes.len() as u64)
+            .await
+            .unwrap();
+    }
 
-    // Start a real TCP server on port 0
-    let addr = start(mgr, authority, 0).await.unwrap();
+    let addr = start(manager, authority.clone(), 0).await.unwrap();
     let base_url = format!("http://{addr}");
-    let prefix = scope_prefix(SCOPE_REPO, SCOPE_REF, DEFAULT_REF);
     let client = reqwest::Client::new();
-
     let mut handles = Vec::new();
-    for i in 0..5 {
-        let c = client.clone();
-        let url = base_url.clone();
-        let pfx = prefix.clone();
-        handles.push(tokio::spawn(async move {
-            let key = format!("concurrent-http-{i}");
-            let data = format!("concurrent data {i}");
 
-            // Reserve
-            let resp = c
-                .post(format!("{url}{pfx}/_apis/artifactcache/caches"))
-                .bearer_auth(TOKEN_A)
+    for i in 0..20 {
+        let token = format!("runtime-{i}");
+        let job_id = format!("job-{i}");
+        let repo = if i % 2 == 0 {
+            "org/repo-a"
+        } else {
+            "org/repo-b"
+        };
+        let git_ref = if i % 4 == 0 {
+            "refs/heads/feature"
+        } else {
+            "refs/heads/main"
+        };
+        let prefix = scope_prefix(repo, git_ref, "refs/heads/main");
+        authority
+            .register_job(
+                &token,
+                JobCapabilityClaims {
+                    scope: CacheScope {
+                        repo: repo.into(),
+                        git_ref: git_ref.into(),
+                        default_ref: "refs/heads/main".into(),
+                    },
+                    job_id,
+                },
+                Utc::now(),
+            )
+            .await
+            .unwrap();
+
+        let client = client.clone();
+        let base_url = base_url.clone();
+        handles.push(tokio::spawn(async move {
+            let key = format!("concurrent-{i}");
+            let data = format!("concurrent-data-{i}");
+            let response = client
+                .post(format!(
+                    "{base_url}{prefix}/_apis/artifactcache/caches"
+                ))
+                .bearer_auth(&token)
                 .json(&serde_json::json!({ "key": key, "version": "v1" }))
                 .send()
                 .await
                 .unwrap();
-            assert_eq!(resp.status(), 200);
-            let reserve_resp: serde_json::Value = resp.json().await.unwrap();
-            let cache_id = reserve_resp["cacheId"].as_u64().unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let cache_id = response.json::<serde_json::Value>().await.unwrap()["cacheId"]
+                .as_u64()
+                .unwrap();
 
-            // Upload
-            let resp = c
-                .patch(format!("{url}{pfx}/_apis/artifactcache/caches/{cache_id}"))
-                .bearer_auth(TOKEN_A)
+            let response = client
+                .patch(format!(
+                    "{base_url}{prefix}/_apis/artifactcache/caches/{cache_id}"
+                ))
+                .bearer_auth(&token)
                 .header("content-range", format!("bytes 0-{}/*", data.len() - 1))
                 .body(data.clone())
                 .send()
                 .await
                 .unwrap();
-            assert_eq!(resp.status(), 204);
+            assert_eq!(response.status(), StatusCode::NO_CONTENT);
 
-            // Commit
-            let resp = c
-                .post(format!("{url}{pfx}/_apis/artifactcache/caches/{cache_id}"))
-                .bearer_auth(TOKEN_A)
+            let response = client
+                .post(format!(
+                    "{base_url}{prefix}/_apis/artifactcache/caches/{cache_id}"
+                ))
+                .bearer_auth(&token)
                 .json(&serde_json::json!({ "size": data.len() }))
                 .send()
                 .await
                 .unwrap();
-            assert_eq!(resp.status(), 204);
+            assert_eq!(response.status(), StatusCode::NO_CONTENT);
 
-            // Lookup
-            let resp = c
+            let response = client
                 .get(format!(
-                    "{url}{pfx}/_apis/artifactcache/cache?keys={key}&version=v1"
+                    "{base_url}{prefix}/_apis/artifactcache/cache?keys={key}&version=v1"
                 ))
-                .bearer_auth(TOKEN_A)
+                .bearer_auth(&token)
                 .send()
                 .await
                 .unwrap();
-            assert_eq!(resp.status(), 200);
+            assert_eq!(response.status(), StatusCode::OK);
+            let archive_location = response.json::<serde_json::Value>().await.unwrap()
+                ["archiveLocation"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            let downloaded = client.get(archive_location).send().await.unwrap();
+            assert_eq!(downloaded.status(), StatusCode::OK);
+            let downloaded = downloaded.bytes().await.unwrap();
+            assert_eq!(downloaded, data.as_bytes());
+
+            if git_ref == "refs/heads/feature" {
+                let response = client
+                    .get(format!(
+                        "{base_url}{prefix}/_apis/artifactcache/cache?keys=default-fallback&version=v1"
+                    ))
+                    .bearer_auth(&token)
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                let archive_location = response.json::<serde_json::Value>().await.unwrap()
+                    ["archiveLocation"]
+                    .as_str()
+                    .unwrap()
+                    .to_string();
+                let restored = client.get(archive_location).send().await.unwrap();
+                assert_eq!(restored.status(), StatusCode::OK);
+                let expected = if repo == "org/repo-a" {
+                    b"fallback-a".as_slice()
+                } else {
+                    b"fallback-b".as_slice()
+                };
+                assert_eq!(restored.bytes().await.unwrap(), expected);
+            }
+
+            (i, downloaded)
         }));
     }
 
-    for h in handles {
-        h.await.unwrap();
+    let mut completed = Vec::with_capacity(20);
+    for handle in handles {
+        completed.push(handle.await.unwrap());
+    }
+    completed.sort_by_key(|(i, _)| *i);
+    assert_eq!(completed.len(), 20);
+    for (i, body) in completed {
+        assert_eq!(body, format!("concurrent-data-{i}").as_bytes());
     }
 }
 

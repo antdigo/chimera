@@ -1211,14 +1211,29 @@ The Twirp protocol (`ACTIONS_CACHE_SERVICE_V2`) is a separate code path that
 chimera never activates. Both v3 and v4 of `actions/cache` support the REST API
 when `ACTIONS_CACHE_URL` is set.
 
-**No authentication** is enforced on the local server. The official runner sends
-a bearer token, but chimera's server ignores it — only local/bridge network
-traffic can reach it.
+Every cache REST request sends `Authorization: Bearer $ACTIONS_RUNTIME_TOKEN`.
+Chimera registers that token as an in-memory job capability before steps start,
+binds it server-side to repository, current ref, default ref and job ID, expires it
+after 6 hours 10 minutes, and revokes it when the job finishes.
+
+The base64url path segments remain part of `ACTIONS_CACHE_URL` for legacy-client
+compatibility. They are checked against the registered capability and are not an
+authorization mechanism.
+
+On a cache hit, `archiveLocation` is `/download/{grant_id}`. The opaque UUID v4
+grant is bound server-side to the authorized job and one blob; it contains neither
+the runtime token nor the blob hash and stops working when its parent job capability
+is revoked or expires.
+
+Capability and download-grant state exists only in memory. After Chimera restarts,
+old runtime tokens and download URLs are invalid, while persisted cache entries and
+blobs remain available to a newly registered job whose capability has the matching
+scope.
 
 ### 14.2 ACTIONS_CACHE_URL Format
 
-The URL includes scope information encoded in the path so the server can enforce
-repository and ref isolation:
+The URL includes scope information encoded in the path for compatibility and
+server-side validation against the registered capability:
 
 ```
 ACTIONS_CACHE_URL=http://{host}:{port}/cache/{scope_repo}/{scope_ref}/{default_ref}/
@@ -1247,6 +1262,12 @@ All cache API paths are relative to `ACTIONS_CACHE_URL`. Since that URL already
 includes the `/cache/{scope_repo}/{scope_ref}/{default_ref}/` prefix, the
 `actions/cache` client appends its standard paths after the trailing slash.
 
+For lookup, reserve, upload and commit, a missing, malformed, unknown, expired or
+revoked bearer capability returns **401**. A valid capability paired with different
+repository, current-ref or default-ref path metadata returns **403**. These checks
+run before cache or upload state is inspected. Unknown or foreign upload IDs return
+**404** only after the request capability and scope have been authorized.
+
 #### Lookup (cache hit check)
 
 ```
@@ -1274,7 +1295,7 @@ literal `%2C`. The server decodes this remaining layer before splitting on comma
 ```json
 {
   "cacheKey": "cargo-Linux-abc123",
-  "archiveLocation": "http://{host}:{port}/download/{blake3_hash}",
+  "archiveLocation": "http://{host}:{port}/download/{grant_id}",
   "scope": "refs/heads/main"
 }
 ```
@@ -1298,8 +1319,8 @@ Content-Type: application/json
 }
 ```
 
-Creates an upload session. The server associates it with the scope from the URL
-path.
+Creates an upload session. The server associates it with the capability's job ID
+and server-side repository/ref scope after verifying the URL metadata.
 
 **Response (200)**:
 ```json
@@ -1332,7 +1353,8 @@ upload time.
 
 **Response (400)**: Missing or malformed `Content-Range` header.
 
-**Response (404)**: Unknown `cacheId` (session expired or never existed).
+**Response (404)**: Unknown or foreign `cacheId` (session expired, never existed,
+or belongs to another job capability).
 
 #### Commit (finalize upload)
 
@@ -1356,27 +1378,32 @@ across all chunks. On commit:
 
 **Response (204)**: Success.
 
+**Response (404)**: Unknown or foreign `cacheId`.
+
 **Response (500)**: Size mismatch or internal error.
 
 #### Download
 
 ```
-GET /download/{blake3_hash}
+GET /download/{grant_id}
 ```
 
 This endpoint is **global** (not scoped) — it lives outside the
 `/cache/{scope}/...` prefix. The `archiveLocation` URL from a lookup response
-points here directly.
+points here directly and is already authorized, so the download does not send a
+bearer header.
 
-The hash is validated to be exactly 64 lowercase hex characters before any
-filesystem access (prevents path traversal). The response streams the blob file
-with `Content-Type: application/octet-stream`.
+The grant ID is an opaque UUID v4 created after an authorized lookup. Server-side
+state binds it to exactly one parent job capability and one blob. It contains no
+runtime token or blob hash, supports retries while active, and cannot be used for
+a different blob. Knowing a valid content hash does not authorize a download.
+The response streams the bound blob with `Content-Type: application/octet-stream`.
 
 **Response (200)**: Streaming blob bytes.
 
-**Response (400)**: Invalid hash format (not 64 hex chars).
-
-**Response (404)**: Blob not found on disk.
+**Response (404)**: Malformed or unknown grant, expired or revoked parent
+capability, or bound blob missing from disk. These cases intentionally share one
+status so the endpoint cannot reveal whether a blob or capability exists.
 
 ### 14.4 Storage Layout
 
@@ -1492,11 +1519,11 @@ host and Docker bridge networks.
 | Append block | PUT | `{signed_url}&comp=appendblock` | URL-signed (no header) |
 | Seal blob | PUT | `{signed_url}&comp=seal` | URL-signed (no header) |
 | Live feed | WSS | `wss://feed.actions.githubusercontent.com/{id}` | Bearer (job token, in header) |
-| Cache lookup | GET | `{cache_url}/_apis/artifactcache/cache?keys=...&version=...` | None (local) |
-| Cache reserve | POST | `{cache_url}/_apis/artifactcache/caches` | None (local) |
-| Cache upload chunk | PATCH | `{cache_url}/_apis/artifactcache/caches/{id}` | None (local) |
-| Cache commit | POST | `{cache_url}/_apis/artifactcache/caches/{id}` | None (local) |
-| Cache download | GET | `http://{host}:{port}/download/{hash}` | None (local) |
+| Cache lookup | GET | `{cache_url}/_apis/artifactcache/cache?keys=...&version=...` | Bearer (`ACTIONS_RUNTIME_TOKEN`) |
+| Cache reserve | POST | `{cache_url}/_apis/artifactcache/caches` | Bearer (`ACTIONS_RUNTIME_TOKEN`) |
+| Cache upload chunk | PATCH | `{cache_url}/_apis/artifactcache/caches/{id}` | Bearer (`ACTIONS_RUNTIME_TOKEN`) |
+| Cache commit | POST | `{cache_url}/_apis/artifactcache/caches/{id}` | Bearer (`ACTIONS_RUNTIME_TOKEN`) |
+| Cache download | GET | `http://{host}:{port}/download/{grant_id}` | Pre-authorized opaque grant |
 
 ---
 
@@ -1642,10 +1669,10 @@ literal `,` as key separators.
 ### Cache: `archiveLocation` depends on `Host` header
 
 The lookup response's `archiveLocation` URL is constructed from the request's
-`Host` header (e.g. `http://localhost:9999/download/{hash}` or
-`http://172.18.0.1:9999/download/{hash}`). This makes it work transparently for
-both host-mode and container-mode runners without configuration. If the `Host`
-header is missing, it falls back to `localhost:9999`.
+`Host` header (e.g. `http://localhost:9999/download/{grant_id}` or
+`http://172.18.0.1:9999/download/{grant_id}`). This makes it work transparently
+for both host-mode and container-mode runners without configuration. If the
+`Host` header is missing, it falls back to `localhost:9999`.
 
 ### Cache: scope encoding uses base64url without padding
 
