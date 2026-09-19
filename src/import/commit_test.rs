@@ -1,11 +1,12 @@
 use std::cell::{Cell, RefCell};
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
 
 use crate::config::{load_config_if_exists, load_runner_credentials};
 use crate::import::target::{PreparedImport, prepare_import, prepare_import_locked};
-use crate::import::test_support::{copy_fixture, fixture_path, write_chimera_credentials};
+use crate::import::test_support::{
+    copy_fixture, fixture_path, import_official_after_lock_release, write_chimera_credentials,
+};
 use crate::storage::RootLock;
 
 use super::*;
@@ -22,30 +23,6 @@ fn prepare_locked_import(source: &Path, name: &str, root: &Path) -> (RootLock, P
     )
     .unwrap();
     (lock, prepared)
-}
-
-const LOCK_RELEASE_TIMEOUT: Duration = Duration::from_secs(5);
-
-// Other tests in this binary spawn child processes, and between fork and exec
-// such a child transiently duplicates this test's lock-holding open file
-// description, so TargetBusy can outlive drop(lock) by milliseconds.
-// import_official writes nothing before the root lock is acquired, so retrying
-// the whole call is safe; once the deadline passes the error is returned
-// unchanged and a genuinely held lock still fails the test.
-fn import_official_after_lock_release(
-    source: &Path,
-    name: &str,
-    root: &Path,
-) -> Result<ImportOutcome, ImportError> {
-    let deadline = Instant::now() + LOCK_RELEASE_TIMEOUT;
-    loop {
-        match crate::import::import_official(source, name, root, false) {
-            Err(ImportError::TargetBusy(_)) if Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            outcome => return outcome,
-        }
-    }
 }
 
 #[cfg(unix)]

@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use crate::config::{load_config, load_config_if_exists};
-use crate::import::test_support::{copy_fixture, fixture_path};
+use crate::import::test_support::{copy_fixture, fixture_path, import_official_after_lock_release};
 use crate::storage::{RootLock, RootLockError};
 
 use super::*;
@@ -77,7 +77,8 @@ fn import_then_repeat_is_noop_without_rewriting_credentials_or_config() {
     ];
     let before: Vec<_> = paths.iter().map(|path| snapshot(path)).collect();
 
-    let second = import_official(&fixture_path(), "local-runner", &root, false).unwrap();
+    let second =
+        import_official_after_lock_release(&fixture_path(), "local-runner", &root).unwrap();
     let after: Vec<_> = paths.iter().map(|path| snapshot(path)).collect();
 
     assert_eq!(second.status, ImportStatus::AlreadyImported);
