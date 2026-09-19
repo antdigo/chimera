@@ -179,7 +179,7 @@ async fn authorize_request(
 
 fn encoded_scope_from_path(path: &str) -> Option<(&str, &str, &str)> {
     let mut segments = path.split('/');
-    (segments.next()? == "").then_some(())?;
+    segments.next()?.is_empty().then_some(())?;
     (segments.next()? == "cache").then_some(())?;
     Some((segments.next()?, segments.next()?, segments.next()?))
 }
