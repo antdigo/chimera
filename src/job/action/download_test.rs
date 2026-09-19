@@ -29,7 +29,8 @@ fn make_test_tarball(files: &[(&str, &str, u32)]) -> Vec<u8> {
 async fn cache_hit_skips_download() {
     let tmp = tempfile::tempdir().unwrap();
     let cache_dir = tmp.path().join("actions");
-    let action_dir = remote_cache_path(&cache_dir, "actions", "checkout", "v4");
+    let canary = "CANARY-ACTION-REF";
+    let action_dir = remote_cache_path(&cache_dir, "actions", "checkout", canary);
     std::fs::create_dir_all(&action_dir).unwrap();
     std::fs::write(action_dir.join("action.yml"), "name: checkout").unwrap();
 
@@ -37,16 +38,29 @@ async fn cache_hit_skips_download() {
     let source = ActionSource::Remote {
         owner: "actions".into(),
         repo: "checkout".into(),
-        git_ref: "v4".into(),
+        git_ref: canary.into(),
         path: None,
     };
+    let captured = crate::testing::TracingWriter::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .with_ansi(false)
+        .without_time()
+        .with_writer(captured.clone())
+        .finish();
+    let dispatch = tracing::Dispatch::new(subscriber);
+    let _guard = tracing::dispatcher::set_default(&dispatch);
 
     let result = cache
         .get_action(&source, tmp.path(), "fake-token")
         .await
         .unwrap();
+    let trace = captured.text();
+
     assert_eq!(result.path(), action_dir.canonicalize().unwrap());
     assert!(result.path().join("action.yml").exists());
+    assert!(trace.contains("action cache hit"), "{trace}");
+    assert!(!trace.contains(canary), "{trace}");
 }
 
 #[tokio::test]
@@ -338,9 +352,13 @@ fn make_unsafe_tarball(files: &[(&str, &[u8])]) -> Vec<u8> {
 
 #[test]
 fn path_traversal_entries_are_skipped() {
+    let canary = "CANARY-ARCHIVE-PATH";
     let tarball = make_unsafe_tarball(&[
         ("owner-repo-abc123/action.yml", b"name: legit\n"),
-        ("owner-repo-abc123/../escape.txt", b"malicious\n"),
+        (
+            "owner-repo-abc123/../CANARY-ARCHIVE-PATH.txt",
+            b"malicious\n",
+        ),
         (
             "owner-repo-abc123/sub/../../etc/passwd",
             b"also malicious\n",
@@ -350,14 +368,27 @@ fn path_traversal_entries_are_skipped() {
     let tmp = tempfile::tempdir().unwrap();
     let dest = tmp.path().join("extracted");
     std::fs::create_dir_all(&dest).unwrap();
+    let captured = crate::testing::TracingWriter::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::WARN)
+        .with_ansi(false)
+        .without_time()
+        .with_writer(captured.clone())
+        .finish();
+    let dispatch = tracing::Dispatch::new(subscriber);
+    let _guard = tracing::dispatcher::set_default(&dispatch);
+
     extract_tarball(&tarball, &dest).unwrap();
+    let trace = captured.text();
 
     // Legit file should be extracted
     assert!(dest.join("action.yml").exists());
 
     // Malicious entries should not escape or be created
-    assert!(!tmp.path().join("escape.txt").exists());
+    assert!(!tmp.path().join(format!("{canary}.txt")).exists());
     assert!(!tmp.path().join("etc").exists());
+    assert!(trace.contains("skipping tarball entry"), "{trace}");
+    assert!(!trace.contains(canary), "{trace}");
 }
 
 #[test]

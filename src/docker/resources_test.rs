@@ -125,6 +125,14 @@ fn parse_port_bindings_empty() {
 }
 
 #[test]
+fn service_container_name_uses_safe_index() {
+    assert_eq!(
+        service_container_name("runner", "job", 7),
+        "chimera-runner-job-svc-7"
+    );
+}
+
+#[test]
 fn remap_to_container_path_works() {
     use std::path::PathBuf;
     let docker = bollard::Docker::connect_with_http_defaults().expect("create bollard HTTP client");

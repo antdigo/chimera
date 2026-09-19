@@ -193,7 +193,7 @@ impl ActionCache {
                     self.download_tarball(owner, repo, git_ref, access_token)
                         .await?;
                 } else {
-                    debug!(owner, repo, git_ref, "action cache hit");
+                    debug!("action cache hit");
                 }
 
                 TrustedActionDirectory::resolve(
@@ -232,7 +232,7 @@ impl ActionCache {
         access_token: &str,
     ) -> Result<()> {
         let url = format!("https://api.github.com/repos/{owner}/{repo}/tarball/{git_ref}");
-        debug!(%url, "downloading action tarball");
+        debug!("downloading action tarball");
 
         let response = self
             .client
@@ -242,11 +242,11 @@ impl ActionCache {
             .header("User-Agent", "chimera")
             .send()
             .await
-            .with_context(|| format!("requesting tarball for {owner}/{repo}@{git_ref}"))?;
+            .context("requesting action tarball")?;
 
         if !response.status().is_success() {
             bail!(
-                "failed to download {owner}/{repo}@{git_ref}: HTTP {}",
+                "failed to download action tarball: HTTP {}",
                 response.status()
             );
         }
@@ -272,7 +272,7 @@ impl ActionCache {
     ) -> Result<()> {
         let dest = remote_cache_path(&self.cache_dir, owner, repo, git_ref);
         if dest.exists() {
-            debug!(owner, repo, git_ref, "action cache hit");
+            debug!("action cache hit");
             return Ok(());
         }
 
@@ -287,23 +287,18 @@ impl ActionCache {
             .parent()
             .context("cache destination has no parent")?
             .join(&tmp_name);
-        let owner = owner.to_string();
-        let repo = repo.to_string();
-        let git_ref = git_ref.to_string();
-
         // Filesystem I/O runs on the blocking threadpool to avoid starving
         // the runtime.
         tokio::task::spawn_blocking(move || {
             std::fs::create_dir_all(&tmp_dir)
                 .with_context(|| format!("creating temp action dir {}", tmp_dir.display()))?;
 
-            extract_tarball(&bytes, &tmp_dir)
-                .with_context(|| format!("extracting tarball for {owner}/{repo}@{git_ref}"))?;
+            extract_tarball(&bytes, &tmp_dir).context("extracting action tarball")?;
 
             match std::fs::rename(&tmp_dir, &dest) {
                 Ok(()) => {}
-                Err(e) if dest.exists() => {
-                    debug!(error = %e, "action cache dir already exists (concurrent download), using existing");
+                Err(_) if dest.exists() => {
+                    debug!("action cache dir already exists (concurrent download), using existing");
                     let _ = std::fs::remove_dir_all(&tmp_dir);
                 }
                 Err(e) => {
@@ -479,7 +474,11 @@ pub(crate) fn extract_tarball(data: &[u8], dest: &Path) -> Result<()> {
     let decoder = flate2::read::GzDecoder::new(data);
     let mut archive = tar::Archive::new(decoder);
 
-    for entry in archive.entries().context("reading tarball entries")? {
+    for (entry_index, entry) in archive
+        .entries()
+        .context("reading tarball entries")?
+        .enumerate()
+    {
         let mut entry = entry.context("reading tarball entry")?;
         let entry_path = entry.path().context("reading entry path")?.into_owned();
 
@@ -490,7 +489,7 @@ pub(crate) fn extract_tarball(data: &[u8], dest: &Path) -> Result<()> {
         }
 
         if has_path_traversal(&stripped) {
-            warn!(path = %entry_path.display(), "skipping tarball entry with path traversal");
+            warn!(entry_index, "skipping tarball entry with path traversal");
             continue;
         }
 

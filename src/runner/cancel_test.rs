@@ -185,3 +185,47 @@ async fn cancel_poller_stops_when_token_cancelled_externally() {
         .expect("poller should exit within 5s")
         .expect("poller task should not panic");
 }
+
+#[tokio::test]
+async fn cancel_poller_error_trace_omits_broker_response_body() {
+    let (mock_server, tm, _shutdown_tx) = setup().await;
+    let canary = "CANARY-CANCEL-POLL-BODY";
+
+    Mock::given(method("GET"))
+        .and(path("/message"))
+        .respond_with(ResponseTemplate::new(500).set_body_string(canary))
+        .mount(&mock_server)
+        .await;
+    let broker = BrokerClient::new(
+        reqwest::Client::new(),
+        mock_server.uri(),
+        "session-123".into(),
+        tm,
+    );
+    let captured = crate::testing::TracingWriter::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::WARN)
+        .with_ansi(false)
+        .without_time()
+        .with_writer(captured.clone())
+        .finish();
+    let dispatch = tracing::Dispatch::new(subscriber);
+    let _guard = tracing::dispatcher::set_default(&dispatch);
+    let cancel_token = CancellationToken::new();
+    let handle = spawn_cancel_poller(&broker, cancel_token.clone());
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !captured.text().contains("cancellation poll failed") {
+        assert!(
+            Instant::now() < deadline,
+            "poller did not emit an error trace"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    cancel_token.cancel();
+    handle.await.unwrap();
+    let trace = captured.text();
+
+    assert!(trace.contains("error_kind"), "{trace}");
+    assert!(!trace.contains(canary), "{trace}");
+}

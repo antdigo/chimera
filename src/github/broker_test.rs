@@ -144,7 +144,7 @@ async fn connect_maps_503_to_server_error() {
         .expect("503 on session creation should be an error");
     assert!(
         err.downcast_ref::<BrokerError>()
-            .is_some_and(|be| matches!(be, BrokerError::ServerError(_))),
+            .is_some_and(|be| matches!(be, BrokerError::ServerError { .. })),
         "expected BrokerError::ServerError, got: {err}"
     );
 }
@@ -428,6 +428,38 @@ async fn ack_job_posts_acknowledge() {
     client.ack_job("request-abc").await.unwrap();
 }
 
+#[tokio::test]
+async fn ack_failure_trace_omits_response_body() {
+    let (mock_server, tm) = setup().await;
+    let canary = "CANARY-ACK-RESPONSE-BODY";
+
+    Mock::given(method("POST"))
+        .and(path("/acknowledge"))
+        .respond_with(ResponseTemplate::new(500).set_body_string(canary))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+    let captured = crate::testing::TracingWriter::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::WARN)
+        .with_ansi(false)
+        .without_time()
+        .with_writer(captured.clone())
+        .finish();
+    let dispatch = tracing::Dispatch::new(subscriber);
+    let _guard = tracing::dispatcher::set_default(&dispatch);
+
+    make_client(&mock_server.uri(), tm)
+        .ack_job("request-abc")
+        .await
+        .unwrap();
+    let trace = captured.text();
+
+    assert!(trace.contains("500"), "{trace}");
+    assert!(trace.contains("response_body_bytes"), "{trace}");
+    assert!(!trace.contains(canary), "{trace}");
+}
+
 // The official runner's acknowledge (BrokerHttpClient.AcknowledgeRunnerRequestAsync)
 // sends sessionId, status, runnerVersion, os, architecture — and no disableUpdate.
 #[tokio::test]
@@ -548,6 +580,29 @@ async fn poll_500_returns_error() {
     let client = make_client(&mock_server.uri(), tm);
     let result = client.poll_message(AgentStatus::Online).await;
     assert!(result.is_err());
+}
+
+#[tokio::test]
+async fn poll_server_error_omits_response_body() {
+    let (mock_server, tm) = setup().await;
+    let canary = "CANARY-POLL-RESPONSE-BODY";
+
+    Mock::given(method("GET"))
+        .and(path("/message"))
+        .respond_with(ResponseTemplate::new(500).set_body_string(canary))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let error = make_client(&mock_server.uri(), tm)
+        .poll_message(AgentStatus::Online)
+        .await
+        .unwrap_err();
+    let rendered = format!("{error:#}");
+
+    assert!(rendered.contains("500"), "{rendered}");
+    assert!(rendered.contains("response_body_bytes"), "{rendered}");
+    assert!(!rendered.contains(canary), "{rendered}");
 }
 
 #[tokio::test]

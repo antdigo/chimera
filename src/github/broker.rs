@@ -135,8 +135,11 @@ impl BrokerMessage {
 
 #[derive(Debug, thiserror::Error)]
 pub enum BrokerError {
-    #[error("broker error: {0}")]
-    ServerError(String),
+    #[error("broker server error (status={status}, response_body_bytes={response_body_bytes})")]
+    ServerError {
+        status: u16,
+        response_body_bytes: usize,
+    },
 
     #[error("unauthorized (401)")]
     Unauthorized,
@@ -275,13 +278,21 @@ impl BrokerClient {
 
         let status = resp.status();
         if !status.is_success() {
-            let body_text = resp.text().await.unwrap_or_default();
+            let response_body_bytes = resp
+                .bytes()
+                .await
+                .map(|body| body.len())
+                .unwrap_or_default();
             return match status.as_u16() {
                 401 => Err(BrokerError::Unauthorized.into()),
-                s if (500..600).contains(&s) || s == 429 => {
-                    Err(BrokerError::ServerError(format!("{status}: {body_text}")).into())
+                s if (500..600).contains(&s) || s == 429 => Err(BrokerError::ServerError {
+                    status: s,
+                    response_body_bytes,
                 }
-                _ => bail!("create session failed ({status}): {body_text}"),
+                .into()),
+                _ => bail!(
+                    "create session failed ({status}), response_body_bytes={response_body_bytes}"
+                ),
             };
         }
 
@@ -386,12 +397,24 @@ impl BrokerClient {
         match status.as_u16() {
             401 => Err(BrokerError::Unauthorized.into()),
             s if (500..600).contains(&s) => {
-                let body = resp.text().await.unwrap_or_default();
-                Err(BrokerError::ServerError(format!("{s}: {body}")).into())
+                let response_body_bytes = resp
+                    .bytes()
+                    .await
+                    .map(|body| body.len())
+                    .unwrap_or_default();
+                Err(BrokerError::ServerError {
+                    status: s,
+                    response_body_bytes,
+                }
+                .into())
             }
             other => {
-                let body = resp.text().await.unwrap_or_default();
-                bail!("unexpected poll status {other}: {body}");
+                let response_body_bytes = resp
+                    .bytes()
+                    .await
+                    .map(|body| body.len())
+                    .unwrap_or_default();
+                bail!("unexpected poll status {other}, response_body_bytes={response_body_bytes}");
             }
         }
     }
@@ -427,8 +450,17 @@ impl BrokerClient {
 
         let status = resp.status();
         if !status.is_success() {
-            let resp_body = resp.text().await.unwrap_or_default();
-            tracing::warn!(runner_request_id, status = %status, "ack failed: {resp_body}");
+            let response_body_bytes = resp
+                .bytes()
+                .await
+                .map(|body| body.len())
+                .unwrap_or_default();
+            tracing::warn!(
+                runner_request_id,
+                status = %status,
+                response_body_bytes,
+                "ack failed"
+            );
         } else {
             debug!(runner_request_id, "job acknowledged");
         }
@@ -455,8 +487,12 @@ impl BrokerClient {
 
         let status = resp.status();
         if !status.is_success() && status.as_u16() != 404 {
-            let body_text = resp.text().await.unwrap_or_default();
-            bail!("delete session failed ({status}): {body_text}");
+            let response_body_bytes = resp
+                .bytes()
+                .await
+                .map(|body| body.len())
+                .unwrap_or_default();
+            bail!("delete session failed ({status}), response_body_bytes={response_body_bytes}");
         }
 
         debug!("broker session deleted");

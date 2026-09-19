@@ -77,7 +77,15 @@ pub fn spawn_cancel_poller(
                         if timed_out {
                             debug!("busy long-poll window expired without a message");
                         } else {
-                            warn!(error = %error, cause = ?error, "cancellation poll failed");
+                            let error_kind = match error.downcast_ref::<BrokerError>() {
+                                Some(BrokerError::Unauthorized) => "unauthorized",
+                                Some(BrokerError::Timeout) => "timeout",
+                                Some(BrokerError::Connection(_)) => "connection",
+                                Some(BrokerError::ServerError { .. }) => "server",
+                                Some(BrokerError::BadResponse(_)) => "bad_response",
+                                None => "unknown",
+                            };
+                            warn!(error_kind, "cancellation poll failed");
                         }
                         pause(CANCEL_POLL_ERROR_DELAY, &cancel_token).await;
                     }

@@ -102,7 +102,7 @@ fn startup_error_is_transient(error: &anyhow::Error) -> bool {
     }
     matches!(
         error.downcast_ref::<BrokerError>(),
-        Some(BrokerError::ServerError(_))
+        Some(BrokerError::ServerError { .. })
             | Some(BrokerError::Connection(_))
             | Some(BrokerError::BadResponse(_))
     )

@@ -1071,8 +1071,11 @@ fn startup_error_transient_classification() {
         .context("parsing token exchange response");
     assert!(startup_error_is_transient(&auth_bad_response));
 
-    let broker_server = anyhow::Error::new(BrokerError::ServerError("503: blip".into()))
-        .context("creating broker session");
+    let broker_server = anyhow::Error::new(BrokerError::ServerError {
+        status: 503,
+        response_body_bytes: 4,
+    })
+    .context("creating broker session");
     assert!(startup_error_is_transient(&broker_server));
 
     let broker_connection = anyhow::Error::new(BrokerError::Connection("reset".into()))

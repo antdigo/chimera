@@ -116,10 +116,7 @@ impl JobDockerResources {
             ensure_image(&self.docker, &svc.image, svc.credentials.as_ref()).await?;
 
             let alias = svc.alias.clone().unwrap_or_else(|| format!("svc-{i}"));
-            let container_name = format!(
-                "chimera-{}-{}-svc-{alias}",
-                params.runner_name, params.job_id
-            );
+            let container_name = service_container_name(params.runner_name, params.job_id, i);
 
             let port_bindings = parse_port_bindings(&svc.ports);
             let env_list: Vec<String> = svc
@@ -215,8 +212,8 @@ impl JobDockerResources {
             }
 
             info!(
-                container = %container_name,
-                alias = %alias,
+                container = %container.id,
+                service_index = i,
                 "service container started"
             );
         }
@@ -606,6 +603,10 @@ fn log_health_check_results(
         last_exit_code,
         "health check probe summary"
     );
+}
+
+fn service_container_name(runner_name: &str, job_id: &str, service_index: usize) -> String {
+    format!("chimera-{runner_name}-{job_id}-svc-{service_index}")
 }
 
 /// Extract port mappings from an inspected container.

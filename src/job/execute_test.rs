@@ -711,10 +711,16 @@ async fn step_diagnostics_omit_secret_bearing_manifest_fields() {
             "order": 1
         }],
         "variables": {
-            "TRACE_SECRET": { "value": "CANARY-STEP-DIAGNOSTIC", "isSecret": true }
+            "TRACE_SECRET": { "value": "CANARY-STEP-DIAGNOSTIC", "isSecret": true },
+            "EMPTY_KEY_SECRET": { "value": "CANARY-EMPTY-OUTPUT-KEY", "isSecret": true },
+            "VALUE_KEY_SECRET": { "value": "CANARY-VALUE-OUTPUT-KEY", "isSecret": true }
+        },
+        "jobOutputs": {
+            "CANARY-EMPTY-OUTPUT-KEY": "${{ '' }}",
+            "CANARY-VALUE-OUTPUT-KEY": "${{ secrets.OUTPUT_VALUE }}"
         },
         "resources": { "endpoints": [] },
-        "contextData": {},
+        "contextData": { "secrets": { "OUTPUT_VALUE": "CANARY-OUTPUT-VALUE" } },
         "jobContainer": null,
         "serviceContainers": null
     }))
@@ -755,7 +761,14 @@ async fn step_diagnostics_omit_secret_bearing_manifest_fields() {
 
     assert_eq!(result.0, JobConclusion::Succeeded);
     assert!(trace.contains("safe-step-id"), "{trace}");
-    assert!(!trace.contains("CANARY-STEP-DIAGNOSTIC"), "{trace}");
+    for canary in [
+        "CANARY-STEP-DIAGNOSTIC",
+        "CANARY-EMPTY-OUTPUT-KEY",
+        "CANARY-VALUE-OUTPUT-KEY",
+        "CANARY-OUTPUT-VALUE",
+    ] {
+        assert!(!trace.contains(canary), "trace leaked {canary}: {trace}");
+    }
 }
 
 #[tokio::test]

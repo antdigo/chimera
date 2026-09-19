@@ -1670,14 +1670,11 @@ pub(crate) async fn run_all_steps_with_masker(
     for (key, expression) in &manifest.job_outputs {
         let value = super::expression::resolve_template(expression, &output_ctx);
         if value.is_empty() {
-            debug!(output = key, "skipping empty job output");
+            debug!("skipping empty job output");
             continue;
         }
         if secret_masker.read().await.contains_secret(&value) {
-            warn!(
-                output = key,
-                "skipping job output because it may contain a secret"
-            );
+            warn!("skipping job output because it may contain a secret");
             continue;
         }
         insert_case_insensitive(&mut job_outputs, key.clone(), value);
