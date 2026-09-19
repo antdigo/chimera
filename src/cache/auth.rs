@@ -87,6 +87,17 @@ struct AuthorityState {
     downloads: HashMap<Uuid, DownloadGrant>,
 }
 
+impl AuthorityState {
+    fn prune(&mut self, revoked: &mut HashSet<CapabilityId>, now: DateTime<Utc>) {
+        self.jobs.retain(|id, capability| {
+            !capability.revoked && !revoked.contains(id) && capability.expires_at > now
+        });
+        revoked.retain(|id| self.jobs.contains_key(id));
+        self.downloads
+            .retain(|_, grant| grant.expires_at > now && self.jobs.contains_key(&grant.parent));
+    }
+}
+
 pub struct CacheAuthority {
     state: RwLock<AuthorityState>,
     revoked: Mutex<HashSet<CapabilityId>>,
@@ -152,14 +163,7 @@ impl CacheAuthority {
         let mut state = self.state.write().await;
         let now = self.now();
         let mut revoked = self.revoked();
-        state.jobs.retain(|capability_id, capability| {
-            !capability.revoked && !revoked.contains(capability_id) && capability.expires_at > now
-        });
-        revoked.retain(|capability_id| state.jobs.contains_key(capability_id));
-        let active_parents: HashSet<_> = state.jobs.keys().cloned().collect();
-        state
-            .downloads
-            .retain(|_, grant| grant.expires_at > now && active_parents.contains(&grant.parent));
+        state.prune(&mut revoked, now);
 
         if state.jobs.contains_key(&id) {
             return Err(CacheAuthError::DuplicateToken);
@@ -182,6 +186,14 @@ impl CacheAuthority {
         token: &str,
         requested_scope: &CacheScope,
     ) -> Result<AuthorizedJob, CacheAuthError> {
+        let job = self.authenticate(token).await?;
+        if job.scope() != requested_scope {
+            return Err(CacheAuthError::ScopeMismatch);
+        }
+        Ok(job)
+    }
+
+    pub async fn authenticate(&self, token: &str) -> Result<AuthorizedJob, CacheAuthError> {
         if token.is_empty() {
             return Err(CacheAuthError::Unauthorized);
         }
@@ -193,10 +205,6 @@ impl CacheAuthority {
         if capability.revoked || self.is_revoked(&id) || capability.expires_at <= now {
             return Err(CacheAuthError::Unauthorized);
         }
-        if &capability.claims.scope != requested_scope {
-            return Err(CacheAuthError::ScopeMismatch);
-        }
-
         Ok(AuthorizedJob {
             capability_id: id,
             claims: capability.claims.clone(),
@@ -220,14 +228,12 @@ impl CacheAuthority {
     ) -> Result<Uuid, CacheAuthError> {
         let mut state = self.state.write().await;
         let now = self.now();
+        let mut revoked = self.revoked();
+        state.prune(&mut revoked, now);
         let parent = state
             .jobs
             .get(job.capability_id())
             .ok_or(CacheAuthError::Unauthorized)?;
-        if parent.revoked || self.is_revoked(job.capability_id()) || parent.expires_at <= now {
-            return Err(CacheAuthError::Unauthorized);
-        }
-
         let expires_at = parent.expires_at.to_owned();
         let grant = Uuid::new_v4();
         state.downloads.insert(

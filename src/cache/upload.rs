@@ -11,8 +11,6 @@ use super::error::CacheError;
 
 struct UploadSession {
     owner_capability_id: CapabilityId,
-    // Retained as job-scoped session metadata; capability ID is the authorization key.
-    #[allow(dead_code)]
     owner_job_id: String,
     key: String,
     version: String,
@@ -137,6 +135,13 @@ impl UploadTracker {
             }
             .into());
         }
+
+        tracing::debug!(
+            upload_id = id,
+            owner_job_id = %session.owner_job_id,
+            bytes = session.bytes_written,
+            "cache upload session committed"
+        );
 
         Ok((
             session.key,

@@ -47,6 +47,46 @@ async fn reserve_and_commit() {
 }
 
 #[tokio::test]
+async fn committed_upload_diagnostics_identify_job_without_capability() {
+    use tracing::instrument::WithSubscriber;
+
+    let tmp = TempDir::new().unwrap();
+    let tracker = make_tracker(&tmp);
+    let token = "SENTINEL_UPLOAD_RUNTIME_TOKEN";
+    let owner = owner(token);
+    let id = tracker
+        .reserve(
+            owner.clone(),
+            "safe-job-id".into(),
+            "key".into(),
+            "v1".into(),
+            "owner/repo".into(),
+            "refs/heads/main".into(),
+        )
+        .await
+        .unwrap();
+    tracker.write_chunk(&owner, id, 0, b"data").await.unwrap();
+    let logs = crate::testing::CapturedLogs::default();
+
+    let (_, _, _, _, path, size) = tracker
+        .commit(&owner, id, 4)
+        .with_subscriber(logs.subscriber())
+        .await
+        .unwrap();
+
+    assert_eq!(std::fs::read(path).unwrap(), b"data");
+    assert_eq!(size, 4);
+    let output = logs.text();
+    assert!(
+        output.contains("safe-job-id"),
+        "committed session should identify its owner job"
+    );
+    assert!(!output.contains(token));
+    assert!(!output.contains(&format!("{owner:?}")));
+    assert!(!output.contains(&blake3::hash(token.as_bytes()).to_hex().to_string()));
+}
+
+#[tokio::test]
 async fn chunked_upload() {
     let tmp = TempDir::new().unwrap();
     let tracker = make_tracker(&tmp);

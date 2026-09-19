@@ -18,6 +18,64 @@ const DEFAULT_REF: &str = "refs/heads/main";
 const TOKEN_A: &str = "runtime-token-a";
 const TOKEN_B: &str = "runtime-token-b";
 
+#[tokio::test]
+async fn unmatched_download_paths_do_not_log_live_grants() {
+    use tracing::instrument::WithSubscriber;
+
+    let tmp = TempDir::new().unwrap();
+    let (app, _, authority) = make_test_app(&tmp).await;
+    let job = authority
+        .authorize(
+            TOKEN_A,
+            &CacheScope {
+                repo: SCOPE_REPO.into(),
+                git_ref: SCOPE_REF.into(),
+                default_ref: DEFAULT_REF.into(),
+            },
+        )
+        .await
+        .unwrap();
+    let grant = authority
+        .issue_download(&job, "b".repeat(64))
+        .await
+        .unwrap();
+    for path in [
+        format!("/download/{grant}/"),
+        format!("/download/{grant}/twirp/CacheService"),
+    ] {
+        let logs = crate::testing::CapturedLogs::default();
+        let response = app
+            .clone()
+            .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+            .with_subscriber(logs.subscriber())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert!(!logs.text().is_empty());
+        assert!(
+            !logs.text().contains(&grant.to_string()),
+            "fallback logged a live download grant"
+        );
+        assert_eq!(
+            authority.resolve_download(grant).await.unwrap(),
+            "b".repeat(64)
+        );
+    }
+    let logs = crate::testing::CapturedLogs::default();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/twirp/github.actions.results.api.v1.CacheService/GetCacheEntryDownloadURL")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .with_subscriber(logs.subscriber())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert!(logs.text().contains("ACTIONS_CACHE_SERVICE_V2"));
+}
+
 fn scope_prefix(repo: &str, git_ref: &str, default_ref: &str) -> String {
     format!(
         "/cache/{}/{}/{}",
@@ -191,6 +249,15 @@ async fn make_test_app_without_registration(
 
 async fn assert_all_cache_handlers_reject(app: &Router, token: &str, expected: StatusCode) {
     let prefix = scope_prefix(SCOPE_REPO, SCOPE_REF, DEFAULT_REF);
+    assert_scoped_handlers_reject(app, token, &prefix, expected).await;
+}
+
+async fn assert_scoped_handlers_reject(
+    app: &Router,
+    token: &str,
+    prefix: &str,
+    expected: StatusCode,
+) {
     let requests = [
         bearer(
             Request::builder().uri(format!(
@@ -235,6 +302,53 @@ async fn assert_all_cache_handlers_reject(app: &Router, token: &str, expected: S
             expected,
         );
     }
+}
+
+#[tokio::test]
+async fn scoped_handlers_authenticate_before_decoding_scope() {
+    let tmp = TempDir::new().unwrap();
+    let manager = make_test_manager(&tmp).await;
+    let issued_at = Utc::now();
+    let clock_value = Arc::new(std::sync::Mutex::new(issued_at));
+    let now = clock_value.clone();
+    let authority = Arc::new(CacheAuthority::with_clock(Arc::new(move || {
+        *now.lock().unwrap()
+    })));
+    let claims = JobCapabilityClaims {
+        scope: CacheScope {
+            repo: SCOPE_REPO.into(),
+            git_ref: SCOPE_REF.into(),
+            default_ref: DEFAULT_REF.into(),
+        },
+        job_id: "scope-order-job".into(),
+    };
+    let revoked = authority
+        .register_job("revoked", claims.clone(), issued_at)
+        .await
+        .unwrap();
+    authority
+        .register_job("expired", claims.clone(), issued_at)
+        .await
+        .unwrap();
+    authority
+        .register_job("active", claims, issued_at + chrono::Duration::seconds(1))
+        .await
+        .unwrap();
+    authority.revoke(&revoked).await;
+    *clock_value.lock().unwrap() = issued_at + JOB_CAPABILITY_LIFETIME;
+    let app = router(manager, authority);
+    let malformed = format!(
+        "/cache/!/{}/{}",
+        encode_scope(SCOPE_REF),
+        encode_scope(DEFAULT_REF)
+    );
+
+    for token in ["unknown", "expired", "revoked"] {
+        assert_scoped_handlers_reject(&app, token, &malformed, StatusCode::UNAUTHORIZED).await;
+    }
+    assert_scoped_handlers_reject(&app, "active", &malformed, StatusCode::BAD_REQUEST).await;
+    let wrong_scope = scope_prefix("other/repo", SCOPE_REF, DEFAULT_REF);
+    assert_scoped_handlers_reject(&app, "active", &wrong_scope, StatusCode::FORBIDDEN).await;
 }
 
 #[tokio::test]

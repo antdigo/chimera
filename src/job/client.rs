@@ -121,7 +121,7 @@ impl JobClient {
         let status = resp.status();
         let body_text = resp.text().await.unwrap_or_default();
         if !status.is_success() {
-            bail!("acquire job failed ({status}): {body_text}");
+            bail!("acquire job failed ({status})");
         }
 
         debug!(manifest_length = body_text.len(), "received job manifest");
@@ -130,16 +130,9 @@ impl JobClient {
             serde_json::from_str(&body_text).context("parsing raw job manifest JSON")?;
         let normalized = manifest::normalize_manifest(&raw);
 
-        debug!(normalized = %normalized, "normalized manifest");
-
-        serde_json::from_value(normalized).with_context(|| {
-            let preview = if body_text.len() > 2000 {
-                format!("{}...(truncated)", &body_text[..2000])
-            } else {
-                body_text.clone()
-            };
-            format!("deserializing normalized manifest: {preview}")
-        })
+        // Serde data errors can quote the rejected value, including credentials.
+        serde_json::from_value(normalized)
+            .map_err(|_| anyhow::anyhow!("deserializing normalized manifest: invalid data"))
     }
 
     pub async fn renew_job(&self, plan_id: &str, job_id: &str) -> Result<()> {

@@ -198,3 +198,106 @@ async fn empty_token_is_never_registered() {
         CacheAuthError::EmptyToken,
     );
 }
+
+#[tokio::test]
+async fn grant_issuance_prunes_unrelated_inactive_authority_state() {
+    assert_opportunistic_pruning(true).await;
+}
+
+#[tokio::test]
+async fn registration_prunes_unrelated_inactive_authority_state() {
+    assert_opportunistic_pruning(false).await;
+}
+
+async fn assert_opportunistic_pruning(issue_grant: bool) {
+    let issued_at = Utc.timestamp_opt(0, 0).single().unwrap();
+    let (timestamp, now) = clock(issued_at);
+    let authority = CacheAuthority::with_clock(now);
+    let requested_scope = scope("org/repo", "refs/heads/feature", "refs/heads/main");
+    let mut ids = Vec::new();
+    let mut grants = Vec::new();
+    for token in ["expired", "revoked", "dropped", "orphaned"] {
+        let registration_time = issued_at + Duration::seconds(i64::from(token != "expired"));
+        timestamp.store(registration_time.timestamp(), Ordering::SeqCst);
+        let id = authority
+            .register_job(token, claims(token, "org/repo"), registration_time)
+            .await
+            .unwrap();
+        let job = authority.authorize(token, &requested_scope).await.unwrap();
+        grants.push(
+            authority
+                .issue_download(&job, "a".repeat(64))
+                .await
+                .unwrap(),
+        );
+        ids.push(id);
+    }
+    timestamp.store(issued_at.timestamp() + 1, Ordering::SeqCst);
+    authority
+        .register_job(
+            "active",
+            claims("active-job", "org/repo"),
+            issued_at + Duration::seconds(1),
+        )
+        .await
+        .unwrap();
+    let active = authority
+        .authorize("active", &requested_scope)
+        .await
+        .unwrap();
+    let active_grant = authority
+        .issue_download(&active, "b".repeat(64))
+        .await
+        .unwrap();
+
+    authority.revoke(&ids[1]).await;
+    authority.revoke_immediately(&ids[2]);
+    // An orphan must not survive even if its parent was already removed.
+    authority.state.write().await.jobs.remove(&ids[3]);
+    authority.revoke_immediately(&ids[3]);
+    timestamp.store(
+        (issued_at + JOB_CAPABILITY_LIFETIME).timestamp(),
+        Ordering::SeqCst,
+    );
+
+    if issue_grant {
+        authority
+            .issue_download(&active, "c".repeat(64))
+            .await
+            .unwrap();
+    } else {
+        authority
+            .register_job(
+                "new",
+                claims("new-job", "org/repo"),
+                issued_at + JOB_CAPABILITY_LIFETIME,
+            )
+            .await
+            .unwrap();
+    }
+
+    let state = authority.state.read().await;
+    assert_eq!(state.jobs.len(), if issue_grant { 1 } else { 2 });
+    assert!(
+        authority.revoked().is_empty(),
+        "pruning must reclaim tombstones"
+    );
+    assert_eq!(state.downloads.len(), if issue_grant { 2 } else { 1 });
+    drop(state);
+    for grant in grants {
+        assert_eq!(
+            authority.resolve_download(grant).await.unwrap_err(),
+            CacheAuthError::DownloadNotFound
+        );
+    }
+    assert_eq!(
+        authority.resolve_download(active_grant).await.unwrap(),
+        "b".repeat(64)
+    );
+    assert!(
+        authority
+            .authorize("active", &requested_scope)
+            .await
+            .is_ok()
+    );
+}

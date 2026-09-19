@@ -16,7 +16,7 @@ use tokio::net::TcpListener;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
-use super::auth::{AuthorizedJob, CacheAuthError, CacheAuthority, CacheScope};
+use super::auth::{AuthorizedJob, CacheAuthority, CacheScope};
 use super::error::CacheError;
 use super::manager::CacheManager;
 use super::upload::parse_content_range;
@@ -165,16 +165,17 @@ async fn authorize_request(
     path: &str,
 ) -> Result<AuthorizedJob, StatusCode> {
     let token = bearer_token(headers)?;
+    let authorized = state
+        .authority
+        .authenticate(token)
+        .await
+        .map_err(|_| StatusCode::UNAUTHORIZED)?;
     let encoded_scope = encoded_scope_from_path(path).ok_or(StatusCode::BAD_REQUEST)?;
     let scope = extract_scope(encoded_scope.0, encoded_scope.1, encoded_scope.2)?;
-    state
-        .authority
-        .authorize(token, &scope)
-        .await
-        .map_err(|error| match error {
-            CacheAuthError::ScopeMismatch => StatusCode::FORBIDDEN,
-            _ => StatusCode::UNAUTHORIZED,
-        })
+    if authorized.scope() != &scope {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    Ok(authorized)
 }
 
 fn encoded_scope_from_path(path: &str) -> Option<(&str, &str, &str)> {
@@ -447,13 +448,12 @@ async fn handle_unknown(uri: Uri) -> Response {
     // requests, something has gone wrong with environment variable injection.
     if uri.path().contains("twirp") || uri.path().contains("CacheService") {
         warn!(
-            path = %uri.path(),
             "received Twirp cache request — this means ACTIONS_CACHE_SERVICE_V2 is set \
              unexpectedly. Chimera's cache server uses the REST API which both actions/cache \
              v3 and v4 support when ACTIONS_CACHE_URL is set"
         );
     } else {
-        warn!(path = %uri.path(), "unknown cache API request");
+        warn!("unknown cache API request");
     }
     StatusCode::NOT_FOUND.into_response()
 }
