@@ -18,6 +18,15 @@ cargo test                         # run tests (skips Docker tests by default)
 cargo test -- --ignored            # run Docker tests (requires Docker)
 ```
 
+On Linux, create a test temp directory outside `/tmp` and export it before running the
+commands above, because host-step tests intentionally replace `/tmp` inside child mount
+namespaces:
+
+```bash
+mkdir -p "$PWD/target/chimera-tests"
+export TMPDIR="$PWD/target/chimera-tests"
+```
+
 All three checks must pass before submitting a PR.
 
 ## Submitting changes

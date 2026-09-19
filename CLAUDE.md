@@ -114,6 +114,14 @@ For file formats we do not own (e.g. the official runner's registration files), 
 
 ## Running Tests Locally
 
+On Linux, set `TMPDIR` to an absolute directory outside `/tmp` before running tests so
+test workspaces remain visible after host commands install their private `/tmp` mount:
+
+```bash
+mkdir -p "$PWD/target/chimera-tests"
+export TMPDIR="$PWD/target/chimera-tests"
+```
+
 Always redirect test output to a file and filter the file, never grep the live stream — cargo interleaves output from parallel test binaries, and a failure's name gets lost:
 
 ```bash

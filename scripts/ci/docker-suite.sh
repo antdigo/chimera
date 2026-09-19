@@ -162,6 +162,8 @@ docker exec \
 # shellcheck disable=SC2086  # SUITE_ARGS and TEST_FILTERS are fixed CI matrix strings
 docker run --rm \
   --user 1000:1000 \
+  --security-opt apparmor=unconfined \
+  --security-opt seccomp=unconfined \
   --network "container:$DIND_NAME" \
   -v "$RUNTIME_VOLUME":/run/user/1000 \
   -v "$TMP_VOLUME":/chimera-tmp \
