@@ -6,9 +6,14 @@ use anyhow::{Context, Result};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::RwLock;
 
+use super::auth::CapabilityId;
 use super::error::CacheError;
 
 struct UploadSession {
+    owner_capability_id: CapabilityId,
+    // Retained as job-scoped session metadata; capability ID is the authorization key.
+    #[allow(dead_code)]
+    owner_job_id: String,
     key: String,
     version: String,
     scope_repo: String,
@@ -38,6 +43,8 @@ impl UploadTracker {
     /// Reserve a new upload session. Returns the cache ID.
     pub async fn reserve(
         &self,
+        owner_capability_id: CapabilityId,
+        owner_job_id: String,
         key: String,
         version: String,
         scope_repo: String,
@@ -52,6 +59,8 @@ impl UploadTracker {
             .with_context(|| format!("creating upload file {}", tmp_path.display()))?;
 
         let session = UploadSession {
+            owner_capability_id,
+            owner_job_id,
             key,
             version,
             scope_repo,
@@ -65,7 +74,13 @@ impl UploadTracker {
     }
 
     /// Write a chunk to an upload session at the given offset.
-    pub async fn write_chunk(&self, id: u64, offset: u64, data: &[u8]) -> Result<()> {
+    pub async fn write_chunk(
+        &self,
+        owner: &CapabilityId,
+        id: u64,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<()> {
         // Hold write lock for the entire operation to prevent races with commit().
         // The lock scope covers both the file I/O and the bytes_written update,
         // ensuring the session can't be removed mid-write.
@@ -73,6 +88,9 @@ impl UploadTracker {
         let session = sessions
             .get_mut(&id)
             .ok_or(CacheError::UploadNotFound(id))?;
+        if &session.owner_capability_id != owner {
+            return Err(CacheError::UploadNotFound(id).into());
+        }
 
         let mut file = tokio::fs::OpenOptions::new()
             .write(true)
@@ -97,15 +115,18 @@ impl UploadTracker {
     /// The caller is responsible for storing the blob and cleaning up.
     pub async fn commit(
         &self,
+        owner: &CapabilityId,
         id: u64,
         expected_size: u64,
     ) -> Result<(String, String, String, String, PathBuf, u64)> {
-        let session = self
-            .sessions
-            .write()
-            .await
-            .remove(&id)
-            .ok_or(CacheError::UploadNotFound(id))?;
+        let session = {
+            let mut sessions = self.sessions.write().await;
+            let session = sessions.get(&id).ok_or(CacheError::UploadNotFound(id))?;
+            if &session.owner_capability_id != owner {
+                return Err(CacheError::UploadNotFound(id).into());
+            }
+            sessions.remove(&id).ok_or(CacheError::UploadNotFound(id))?
+        };
 
         if session.bytes_written != expected_size {
             // Clean up tmp file on mismatch

@@ -4,6 +4,7 @@ use std::sync::atomic::Ordering;
 use tempfile::TempDir;
 
 use super::*;
+use crate::cache::auth::CapabilityId;
 
 const REPO: &str = "owner/repo";
 const MAIN_REF: &str = "refs/heads/main";
@@ -31,8 +32,11 @@ async fn upload_scoped_blob(
     git_ref: &str,
     data: &[u8],
 ) {
+    let owner = CapabilityId::from_token("manager-test-owner");
     let id = manager
         .reserve_upload(
+            owner.clone(),
+            "manager-test-job".into(),
             key.to_string(),
             version.to_string(),
             repo.to_string(),
@@ -40,8 +44,11 @@ async fn upload_scoped_blob(
         )
         .await
         .unwrap();
-    manager.write_chunk(id, 0, data).await.unwrap();
-    manager.commit_upload(id, data.len() as u64).await.unwrap();
+    manager.write_chunk(&owner, id, 0, data).await.unwrap();
+    manager
+        .commit_upload(&owner, id, data.len() as u64)
+        .await
+        .unwrap();
 }
 
 #[tokio::test]

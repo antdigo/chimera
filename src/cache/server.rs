@@ -15,6 +15,7 @@ use tokio::net::TcpListener;
 use tracing::{debug, info, warn};
 
 use super::auth::{AuthorizedJob, CacheAuthError, CacheAuthority, CacheScope};
+use super::error::CacheError;
 use super::manager::CacheManager;
 use super::upload::parse_content_range;
 
@@ -277,6 +278,8 @@ async fn handle_reserve(
     match state
         .manager
         .reserve_upload(
+            authorized.capability_id().clone(),
+            authorized.job_id().to_owned(),
             body.key,
             body.version,
             scope.repo.clone(),
@@ -327,7 +330,11 @@ async fn handle_upload_chunk(
         "cache upload chunk"
     );
 
-    match state.manager.write_chunk(id, start, &body).await {
+    match state
+        .manager
+        .write_chunk(authorized.capability_id(), id, start, &body)
+        .await
+    {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => {
             debug!(error = %e, id, "upload chunk failed");
@@ -352,11 +359,21 @@ async fn handle_commit(
         "cache commit"
     );
 
-    match state.manager.commit_upload(id, body.size).await {
+    match state
+        .manager
+        .commit_upload(authorized.capability_id(), id, body.size)
+        .await
+    {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => {
             debug!(error = %e, id, "commit failed");
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            if e.downcast_ref::<CacheError>()
+                .is_some_and(|error| matches!(error, CacheError::UploadNotFound(_)))
+            {
+                StatusCode::NOT_FOUND.into_response()
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            }
         }
     }
 }

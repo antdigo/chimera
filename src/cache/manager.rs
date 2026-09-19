@@ -6,6 +6,7 @@ use chrono::Utc;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
+use super::auth::CapabilityId;
 use super::entry::{CacheEntry, EntryIndex, load_entries_from_disk};
 use super::error::CacheError;
 use super::store::BlobStore;
@@ -141,25 +142,38 @@ impl CacheManager {
     /// Reserve a new upload session with scope.
     pub async fn reserve_upload(
         &self,
+        owner: CapabilityId,
+        owner_job_id: String,
         key: String,
         version: String,
         scope_repo: String,
         scope_ref: String,
     ) -> Result<u64> {
         self.uploads
-            .reserve(key, version, scope_repo, scope_ref)
+            .reserve(owner, owner_job_id, key, version, scope_repo, scope_ref)
             .await
     }
 
     /// Write a chunk to an upload session.
-    pub async fn write_chunk(&self, id: u64, offset: u64, data: &[u8]) -> Result<()> {
-        self.uploads.write_chunk(id, offset, data).await
+    pub async fn write_chunk(
+        &self,
+        owner: &CapabilityId,
+        id: u64,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<()> {
+        self.uploads.write_chunk(owner, id, offset, data).await
     }
 
     /// Commit an upload: finalize the blob and create a cache entry.
-    pub async fn commit_upload(&self, id: u64, expected_size: u64) -> Result<()> {
+    pub async fn commit_upload(
+        &self,
+        owner: &CapabilityId,
+        id: u64,
+        expected_size: u64,
+    ) -> Result<()> {
         let (key, version, scope_repo, scope_ref, tmp_path, size) =
-            self.uploads.commit(id, expected_size).await?;
+            self.uploads.commit(owner, id, expected_size).await?;
 
         let hash = self
             .store

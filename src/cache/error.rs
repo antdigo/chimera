@@ -2,6 +2,7 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum CacheError {
+    /// Also returned for a session owned by another capability, so ownership is not disclosed.
     #[error("upload session {0} not found")]
     UploadNotFound(u64),
 

@@ -29,6 +29,54 @@ fn bearer(request: axum::http::request::Builder, token: &str) -> axum::http::req
     request.header("authorization", format!("Bearer {token}"))
 }
 
+async fn reserve(app: &Router, prefix: &str, token: &str, key: &str, version: &str) -> u64 {
+    let request = bearer(
+        Request::builder()
+            .method("POST")
+            .uri(format!("{prefix}/_apis/artifactcache/caches"))
+            .header("content-type", "application/json"),
+        token,
+    )
+    .body(Body::from(
+        serde_json::json!({ "key": key, "version": version }).to_string(),
+    ))
+    .unwrap();
+    let response = app.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), 1024)
+        .await
+        .unwrap();
+    serde_json::from_slice::<serde_json::Value>(&body).unwrap()["cacheId"]
+        .as_u64()
+        .unwrap()
+}
+
+async fn upload(app: &Router, prefix: &str, token: &str, cache_id: u64, data: &[u8]) -> StatusCode {
+    let request = bearer(
+        Request::builder()
+            .method("PATCH")
+            .uri(format!("{prefix}/_apis/artifactcache/caches/{cache_id}"))
+            .header("content-range", format!("bytes 0-{}/*", data.len() - 1)),
+        token,
+    )
+    .body(Body::from(Bytes::copy_from_slice(data)))
+    .unwrap();
+    app.clone().oneshot(request).await.unwrap().status()
+}
+
+async fn commit(app: &Router, prefix: &str, token: &str, cache_id: u64, size: usize) -> StatusCode {
+    let request = bearer(
+        Request::builder()
+            .method("POST")
+            .uri(format!("{prefix}/_apis/artifactcache/caches/{cache_id}"))
+            .header("content-type", "application/json"),
+        token,
+    )
+    .body(Body::from(serde_json::json!({ "size": size }).to_string()))
+    .unwrap();
+    app.clone().oneshot(request).await.unwrap().status()
+}
+
 async fn make_test_manager(tmp: &TempDir) -> SharedManager {
     Arc::new(
         CacheManager::new(
@@ -207,6 +255,46 @@ async fn valid_token_cannot_select_another_repo_ref_or_default_ref() {
             StatusCode::FORBIDDEN,
         );
     }
+}
+
+#[tokio::test]
+async fn another_job_in_same_scope_cannot_write_or_commit_upload() {
+    let tmp = TempDir::new().unwrap();
+    let (app, _, authority) = make_test_app(&tmp).await;
+    authority
+        .register_job(
+            "runtime-token-b",
+            JobCapabilityClaims {
+                scope: CacheScope {
+                    repo: SCOPE_REPO.into(),
+                    git_ref: SCOPE_REF.into(),
+                    default_ref: DEFAULT_REF.into(),
+                },
+                job_id: "job-b".into(),
+            },
+            Utc::now(),
+        )
+        .await
+        .unwrap();
+
+    let prefix = scope_prefix(SCOPE_REPO, SCOPE_REF, DEFAULT_REF);
+    let cache_id = reserve(&app, &prefix, TOKEN_A, "owned", "v1").await;
+    assert_eq!(
+        upload(&app, &prefix, "runtime-token-b", cache_id, b"evil").await,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        commit(&app, &prefix, "runtime-token-b", cache_id, 4).await,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        upload(&app, &prefix, TOKEN_A, cache_id, b"owner").await,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        commit(&app, &prefix, TOKEN_A, cache_id, 5).await,
+        StatusCode::NO_CONTENT
+    );
 }
 
 #[tokio::test]
