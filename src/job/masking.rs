@@ -34,6 +34,7 @@ pub async fn add_value(masks: &SharedSecretMasker, value: &str) {
 pub fn append_value(masks: &mut Vec<SecretMask>, value: &str) {
     let mut originals = vec![value];
     originals.extend(value.split(['\r', '\n']).map(str::trim));
+    originals.push(value.trim());
 
     let mut candidates = Vec::new();
     for original in &originals {

@@ -251,7 +251,7 @@ fn exports_results_url_even_when_variable_is_marked_secret() {
     );
     // The generic non-secret variable export must not shadow the alias with a
     // SYSTEM_GITHUB_* name instead.
-    assert!(env.get("SYSTEM_GITHUB_RESULTS_ENDPOINT").is_none());
+    assert!(!env.contains_key("SYSTEM_GITHUB_RESULTS_ENDPOINT"));
 }
 
 #[test]

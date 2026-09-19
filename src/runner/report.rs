@@ -4,6 +4,7 @@ use chrono::Utc;
 use crate::job::JobClient;
 use crate::job::client::{JobConclusion, ResultsConclusion, ResultsStatus, ResultsStep};
 use crate::job::schema::JobManifest;
+use crate::job::secret_masker::SharedSecretMasker;
 use crate::utils::format_results_timestamp;
 
 /// Report a setup failure to GitHub with a visible error log.
@@ -14,6 +15,7 @@ pub async fn report_setup_failure(
     job_client: &JobClient,
     manifest: &JobManifest,
     err: &anyhow::Error,
+    secret_masker: &SharedSecretMasker,
 ) -> Result<()> {
     let plan_id = &manifest.plan.plan_id;
     let job_id = &manifest.plan.job_id;
@@ -36,7 +38,10 @@ pub async fn report_setup_failure(
         .context("registering synthetic setup step")?;
 
     // 2. Upload the error log to the step's blob
-    let error_log = format_setup_error_log(err);
+    let error_log = secret_masker
+        .read()
+        .await
+        .mask(&format_setup_error_log(err));
     let line_count = error_log.lines().count() as i64;
 
     let signed = job_client
@@ -107,3 +112,7 @@ pub fn outputs_to_variable_values(
     }
     serde_json::Value::Object(map)
 }
+
+#[cfg(test)]
+#[path = "report_test.rs"]
+mod report_test;

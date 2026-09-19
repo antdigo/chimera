@@ -9,7 +9,7 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
-use tokio::sync::mpsc;
+use tokio::sync::{RwLock, mpsc};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
@@ -19,8 +19,8 @@ use super::client::{JobConclusion, ResultsConclusion, ResultsStatus, ResultsStep
 use super::expression::ExprContext;
 use super::live_feed::FeedSender;
 use super::logs::{JobLogger, LogLine, LogSender, StepLogger};
-use super::masking::{SharedSecretMasker, append_regex, append_value, contains_secret};
 use super::schema::{JobManifest, Step};
+use super::secret_masker::{SecretMasker, SharedSecretMasker};
 use super::timeline::{TimelineLogRef, TimelineRecord, TimelineResult, TimelineState};
 use super::workspace::Workspace;
 use crate::docker::build::{BuiltDockerImage, DockerActionBuilder, DockerBuildScope, RegistryAuth};
@@ -109,7 +109,7 @@ pub struct JobState {
     pub env: HashMap<String, String>,
     pub path_prepends: Vec<String>,
     pub outputs: HashMap<String, String>,
-    pub masks: SharedSecretMasker,
+    pub(crate) secret_masker: SharedSecretMasker,
     /// Per-action state for pre→post transfer via SaveState workflow command.
     /// Key: action context_name, Value: map of state name→value.
     pub action_states: HashMap<String, HashMap<String, String>>,
@@ -136,8 +136,8 @@ pub struct JobState {
 }
 
 impl JobState {
-    pub fn new(
-        masks: SharedSecretMasker,
+    pub(crate) fn new(
+        secret_masker: SharedSecretMasker,
         secrets: HashMap<String, String>,
         context_data: serde_json::Value,
     ) -> Self {
@@ -147,7 +147,7 @@ impl JobState {
             env: HashMap::new(),
             path_prepends: Vec::new(),
             outputs: HashMap::new(),
-            masks,
+            secret_masker,
             action_states: HashMap::new(),
             step_outputs: HashMap::new(),
             step_outcomes: HashMap::new(),
@@ -579,7 +579,7 @@ pub async fn run_process(
 
     let processor = OutputProcessor::new(
         log_sender.clone(),
-        job_state.masks.clone(),
+        job_state.secret_masker.clone(),
         job_state.debug_enabled,
     );
 
@@ -749,6 +749,41 @@ pub async fn run_all_steps(
     execution: &JobExecutionContext<'_>,
     feed_sender: Option<&FeedSender>,
 ) -> Result<(JobConclusion, HashMap<String, String>)> {
+    let secret_masker = Arc::new(RwLock::new(SecretMasker::from_manifest(manifest)?));
+    run_all_steps_with_masker(
+        manifest,
+        job_client,
+        workspace,
+        base_env,
+        runner_name,
+        action_cache,
+        docker_action_builder,
+        registry_auth,
+        access_token,
+        cancel_token,
+        execution,
+        feed_sender,
+        secret_masker,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_all_steps_with_masker(
+    manifest: &JobManifest,
+    job_client: &Arc<JobClient>,
+    workspace: &Workspace,
+    base_env: &HashMap<String, String>,
+    runner_name: &str,
+    action_cache: &ActionCache,
+    docker_action_builder: &DockerActionBuilder,
+    registry_auth: Option<&RegistryAuth>,
+    access_token: &str,
+    cancel_token: CancellationToken,
+    execution: &JobExecutionContext<'_>,
+    feed_sender: Option<&FeedSender>,
+    secret_masker: SharedSecretMasker,
+) -> Result<(JobConclusion, HashMap<String, String>)> {
     let server = manifest
         .context_data
         .get("github")
@@ -764,10 +799,13 @@ pub async fn run_all_steps(
     };
     let docker_build_scope = DockerBuildScope::new(runner_name, github_scope);
 
-    let masks = collect_secret_masks(manifest);
-    let secrets = collect_secrets(manifest, &masks).await;
+    let secrets = collect_secrets(manifest);
 
-    let mut job_state = JobState::new(masks.clone(), secrets, manifest.context_data.clone());
+    let mut job_state = JobState::new(
+        secret_masker.clone(),
+        secrets,
+        manifest.context_data.clone(),
+    );
 
     // Populate the `job` context for expression evaluation
     if let serde_json::Value::Object(ref mut map) = job_state.context_data {
@@ -919,7 +957,7 @@ pub async fn run_all_steps(
                 &manifest.plan.job_id,
                 &pre_step.id,
                 &pre_step.display_name,
-                masks.clone(),
+                secret_masker.clone(),
                 feed_sender,
                 job_log_tx.as_ref(),
             )
@@ -1060,7 +1098,7 @@ pub async fn run_all_steps(
             &manifest.plan.job_id,
             &step.id,
             &step.display_name,
-            masks.clone(),
+            secret_masker.clone(),
             feed_sender,
             job_log_tx.as_ref(),
         )
@@ -1254,7 +1292,7 @@ pub async fn run_all_steps(
                 &manifest.plan.job_id,
                 &post_step.id,
                 &post_step.display_name,
-                masks.clone(),
+                secret_masker.clone(),
                 feed_sender,
                 job_log_tx.as_ref(),
             )
@@ -1332,7 +1370,6 @@ pub async fn run_all_steps(
     let mut output_env = base_env.clone();
     output_env.extend(job_state.env.clone());
     let output_ctx = ExprContext::new(&output_env, &job_state, job_failed, job_cancelled);
-    let secret_masks = masks.read().await;
     let mut job_outputs = HashMap::new();
     for (key, expression) in &manifest.job_outputs {
         let value = super::expression::resolve_template(expression, &output_ctx);
@@ -1340,7 +1377,7 @@ pub async fn run_all_steps(
             debug!(output = key, "skipping empty job output");
             continue;
         }
-        if contains_secret(&secret_masks, &value) {
+        if secret_masker.read().await.contains_secret(&value) {
             warn!(
                 output = key,
                 "skipping job output because it may contain a secret"
@@ -1367,14 +1404,7 @@ pub async fn run_all_steps(
 /// secret variable, and the `GITHUB_TOKEN` alias — the latter is only filled
 /// from the `system.github.token` variable when no earlier source provided a
 /// token. The map never holds two keys differing only by case.
-///
-/// Values inserted here (the alias fallback and contextData secrets) are also
-/// pushed to the mask list; variable values must already be masked by
-/// `collect_secret_masks` before this runs.
-async fn collect_secrets(
-    manifest: &JobManifest,
-    masks: &SharedSecretMasker,
-) -> HashMap<String, String> {
+fn collect_secrets(manifest: &JobManifest) -> HashMap<String, String> {
     // The official ToSecretsContext excludes the dotted system token names:
     // they reach workflows only through the canonical `github.token` /
     // `GITHUB_TOKEN` aliases, never as literal `secrets['system.github.token']`.
@@ -1398,7 +1428,6 @@ async fn collect_secrets(
         && let Some(token) = manifest.github_token()
         && !token.is_empty()
     {
-        super::masking::add_value(masks, token).await;
         secrets.insert("GITHUB_TOKEN".to_string(), token.to_string());
     }
 
@@ -1417,46 +1446,12 @@ async fn collect_secrets(
                 continue;
             }
             if let Some(s) = v.as_str() {
-                if !s.is_empty() {
-                    // Add to mask list so secret values are redacted in logs
-                    super::masking::add_value(masks, s).await;
-                }
                 insert_case_insensitive(&mut secrets, k.clone(), s.to_string());
             }
         }
     }
 
     secrets
-}
-
-fn collect_secret_masks(manifest: &JobManifest) -> SharedSecretMasker {
-    let mut masks = Vec::new();
-    for value in manifest
-        .variables
-        .values()
-        .filter(|variable| variable.is_secret)
-        .map(|variable| variable.value.as_str())
-        .chain(
-            manifest
-                .resources
-                .endpoints
-                .iter()
-                .filter_map(|endpoint| endpoint.authorization.as_ref())
-                .flat_map(|authorization| authorization.parameters.values().map(String::as_str)),
-        )
-    {
-        append_value(&mut masks, value);
-    }
-    for hint in &manifest.mask {
-        let Some(pattern) = hint.get("value").and_then(serde_json::Value::as_str) else {
-            continue;
-        };
-        if let Err(error) = append_regex(&mut masks, pattern) {
-            warn!(%error, "ignoring invalid secret mask regex");
-        }
-        append_value(&mut masks, pattern);
-    }
-    Arc::new(tokio::sync::RwLock::new(masks))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1467,7 +1462,7 @@ async fn create_step_logger(
     job_id: &str,
     step_id: &str,
     step_name: &str,
-    masks: SharedSecretMasker,
+    secret_masker: SharedSecretMasker,
     feed_sender: Option<&FeedSender>,
     job_log_tx: Option<&mpsc::Sender<LogLine>>,
 ) -> StepLogger {
@@ -1478,12 +1473,12 @@ async fn create_step_logger(
             plan_id.to_string(),
             job_id.to_string(),
             step_id.to_string(),
-            masks,
+            secret_masker,
             feed,
             job_log_tx.cloned(),
         )
     } else {
-        StepLogger::legacy(client.clone(), plan_id, step_name, masks, feed).await
+        StepLogger::legacy(client.clone(), plan_id, step_name, secret_masker, feed).await
     }
 }
 

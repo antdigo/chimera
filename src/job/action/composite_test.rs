@@ -1,7 +1,4 @@
 use std::collections::HashMap;
-use std::sync::Arc;
-
-use tokio::sync::RwLock;
 
 use super::*;
 use crate::job::action::download::{ActionCache, TrustedActionDirectory};
@@ -105,11 +102,11 @@ async fn nested_script_steps_execute() {
 
     let step = make_step();
     let mut state = JobState::new(
-        Arc::new(RwLock::new(Vec::new())),
+        crate::job::secret_masker::shared_masker_for_test(&[]),
         HashMap::new(),
         serde_json::json!({}),
     );
-    let masks = Arc::new(RwLock::new(Vec::new()));
+    let masks = crate::job::secret_masker::shared_masker_for_test(&[]);
     let logger = StepLogger::results_for_test(masks);
     let cache = ActionCache::new(tmp.path().join("cache"), reqwest::Client::new());
     let docker_action_builder = crate::docker::build::DockerActionBuilder::new();
@@ -168,11 +165,11 @@ async fn failure_propagates() {
 
     let step = make_step();
     let mut state = JobState::new(
-        Arc::new(RwLock::new(Vec::new())),
+        crate::job::secret_masker::shared_masker_for_test(&[]),
         HashMap::new(),
         serde_json::json!({}),
     );
-    let masks = Arc::new(RwLock::new(Vec::new()));
+    let masks = crate::job::secret_masker::shared_masker_for_test(&[]);
     let logger = StepLogger::results_for_test(masks);
     let cache = ActionCache::new(tmp.path().join("cache"), reqwest::Client::new());
     let docker_action_builder = crate::docker::build::DockerActionBuilder::new();
@@ -234,11 +231,11 @@ async fn inputs_available_as_env() {
     step.inputs.insert("name".into(), "world".into());
 
     let mut state = JobState::new(
-        Arc::new(RwLock::new(Vec::new())),
+        crate::job::secret_masker::shared_masker_for_test(&[]),
         HashMap::new(),
         serde_json::json!({}),
     );
-    let masks = Arc::new(RwLock::new(Vec::new()));
+    let masks = crate::job::secret_masker::shared_masker_for_test(&[]);
     let logger = StepLogger::results_for_test(masks);
     let cache = ActionCache::new(tmp.path().join("cache"), reqwest::Client::new());
     let docker_action_builder = crate::docker::build::DockerActionBuilder::new();
@@ -295,11 +292,12 @@ async fn nested_host_script_rejects_mismatched_docker_config_before_spawn() {
     ));
     let step = make_step();
     let mut state = JobState::new(
-        Arc::new(RwLock::new(Vec::new())),
+        crate::job::secret_masker::shared_masker_for_test(&[]),
         HashMap::new(),
         serde_json::json!({}),
     );
-    let logger = StepLogger::results_for_test(Arc::new(RwLock::new(Vec::new())));
+    let logger =
+        StepLogger::results_for_test(crate::job::secret_masker::shared_masker_for_test(&[]));
     let cache = ActionCache::new(tmp.path().join("cache"), reqwest::Client::new());
     let action_dir =
         TrustedActionDirectory::resolve(&action_dir, std::path::Path::new(".")).unwrap();
@@ -356,11 +354,12 @@ async fn nested_host_script_allows_matching_docker_config() {
     );
     let step = make_step();
     let mut state = JobState::new(
-        Arc::new(RwLock::new(Vec::new())),
+        crate::job::secret_masker::shared_masker_for_test(&[]),
         HashMap::new(),
         serde_json::json!({}),
     );
-    let logger = StepLogger::results_for_test(Arc::new(RwLock::new(Vec::new())));
+    let logger =
+        StepLogger::results_for_test(crate::job::secret_masker::shared_masker_for_test(&[]));
     let cache = ActionCache::new(tmp.path().join("cache"), reqwest::Client::new());
     let action_dir =
         TrustedActionDirectory::resolve(&action_dir, std::path::Path::new(".")).unwrap();
@@ -417,11 +416,12 @@ async fn nested_local_node_rejects_mismatched_docker_config_before_spawn() {
     );
     let step = make_step();
     let mut state = JobState::new(
-        Arc::new(RwLock::new(Vec::new())),
+        crate::job::secret_masker::shared_masker_for_test(&[]),
         HashMap::new(),
         serde_json::json!({}),
     );
-    let logger = StepLogger::results_for_test(Arc::new(RwLock::new(Vec::new())));
+    let logger =
+        StepLogger::results_for_test(crate::job::secret_masker::shared_masker_for_test(&[]));
     let cache = ActionCache::new(tmp.path().join("cache"), reqwest::Client::new());
     let action_dir =
         TrustedActionDirectory::resolve(&action_dir, std::path::Path::new(".")).unwrap();
@@ -490,11 +490,12 @@ test "$DOCKER_CONFIG" = "$EXPECTED_CONFIG"
     );
     let step = make_step();
     let mut state = JobState::new(
-        Arc::new(RwLock::new(Vec::new())),
+        crate::job::secret_masker::shared_masker_for_test(&[]),
         HashMap::new(),
         serde_json::json!({}),
     );
-    let logger = StepLogger::results_for_test(Arc::new(RwLock::new(Vec::new())));
+    let logger =
+        StepLogger::results_for_test(crate::job::secret_masker::shared_masker_for_test(&[]));
     let cache = ActionCache::new(tmp.path().join("cache"), reqwest::Client::new());
     let action_dir =
         TrustedActionDirectory::resolve(&action_dir, std::path::Path::new(".")).unwrap();
@@ -558,11 +559,11 @@ async fn recursion_depth_limit() {
 
     let step = make_step();
     let mut state = JobState::new(
-        Arc::new(RwLock::new(Vec::new())),
+        crate::job::secret_masker::shared_masker_for_test(&[]),
         HashMap::new(),
         serde_json::json!({}),
     );
-    let masks = Arc::new(RwLock::new(Vec::new()));
+    let masks = crate::job::secret_masker::shared_masker_for_test(&[]);
     let logger = StepLogger::results_for_test(masks);
     let cache = ActionCache::new(tmp.path().join("cache"), reqwest::Client::new());
     let docker_action_builder = crate::docker::build::DockerActionBuilder::new();

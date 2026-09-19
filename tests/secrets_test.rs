@@ -315,3 +315,56 @@ async fn fallback_token_is_masked_when_variable_not_flagged_secret() {
         "unflagged system token leaked into uploaded logs"
     );
 }
+
+#[tokio::test]
+async fn synthetic_canaries_are_absent_from_uploaded_logs() {
+    let mut env = TestEnv::setup().await;
+    let step = script_step_env(
+        "s1",
+        r#"
+        printf 'stdout=%s\n' "$PLAIN"
+        printf 'stderr=%s\n' "$PLAIN" >&2
+        printf 'multiline=%s\n' "$MULTILINE"
+        printf 'json=LINE_ONE_41\\nLINE_TWO_41\n'
+        printf 'json=quote-\\"slash\\\\-41\n'
+        printf '::warning::%s\n' "$PLAIN"
+        printf '::error::%s\n' "$QUOTED"
+        echo safe-before-failure
+        exit 1
+        "#,
+        HashMap::from([
+            ("PLAIN".into(), "${{ secrets.PLAIN }}".into()),
+            ("MULTILINE".into(), "${{ secrets.MULTILINE }}".into()),
+            ("QUOTED".into(), "${{ secrets.QUOTED }}".into()),
+        ]),
+    );
+    let manifest = manifest_with_steps_and_context(
+        vec![step],
+        &env.mock_server.uri(),
+        serde_json::json!({
+            "secrets": {
+                "PLAIN": "PLAIN_CANARY_41",
+                "MULTILINE": "LINE_ONE_41\nLINE_TWO_41",
+                "QUOTED": "quote-\"slash\\-41"
+            }
+        }),
+    );
+    env.configure_from_manifest(&manifest);
+
+    let (conclusion, _) = env.run(&manifest).await.unwrap();
+    assert_eq!(conclusion, JobConclusion::Failed);
+
+    let legacy = env.uploaded_legacy_log_text().await;
+    assert!(legacy.contains("safe-before-failure"));
+    assert!(legacy.contains("***"));
+    for canary in [
+        "PLAIN_CANARY_41",
+        "LINE_ONE_41",
+        "LINE_TWO_41",
+        "quote-\"slash\\-41",
+        r#"LINE_ONE_41\nLINE_TWO_41"#,
+        r#"quote-\"slash\\-41"#,
+    ] {
+        assert!(!legacy.contains(canary), "canary leaked: {canary}");
+    }
+}

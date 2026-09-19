@@ -1,5 +1,4 @@
 use serde_json::{Map, Value, json};
-use tracing::debug;
 
 /// Convert a raw job manifest (template token format) into normalized plain JSON
 /// that our JobManifest struct can deserialize.
@@ -82,10 +81,7 @@ pub fn normalize_manifest(raw: &Value) -> Value {
     // Normalize container fields — environment maps inside may be template tokens
     if let Some(jc) = obj.get("jobContainer") {
         let normalized_jc = normalize_container_spec(jc);
-        debug!(raw = %jc, normalized = %normalized_jc, "normalizing jobContainer");
         result.insert("jobContainer".into(), normalized_jc);
-    } else {
-        debug!("no jobContainer field in raw manifest");
     }
     if let Some(sc) = obj
         .get("jobServiceContainers")

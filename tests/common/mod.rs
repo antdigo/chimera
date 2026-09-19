@@ -232,6 +232,10 @@ impl TestEnv {
     }
 
     pub async fn uploaded_log_text(&self) -> String {
+        self.uploaded_legacy_log_text().await
+    }
+
+    pub async fn uploaded_legacy_log_text(&self) -> String {
         self.mock_server
             .received_requests()
             .await
@@ -240,6 +244,18 @@ impl TestEnv {
             .filter(|request| {
                 request.method.as_str() == "POST" && request.url.path().contains("/logs/")
             })
+            .map(|request| String::from_utf8_lossy(&request.body).into_owned())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    pub async fn uploaded_results_log_text(&self) -> String {
+        self.mock_server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|request| request.method.as_str() == "PUT")
             .map(|request| String::from_utf8_lossy(&request.body).into_owned())
             .collect::<Vec<_>>()
             .join("\n")

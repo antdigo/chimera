@@ -8,7 +8,7 @@ use futures::StreamExt;
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
-use super::output::OutputProcessor;
+use super::output::{DockerErrorDiagnostic, DockerLogFramer, OutputProcessor};
 use crate::job::execute::{JobState, StepConclusion, StepResult};
 use crate::job::logs::LogSender;
 
@@ -55,16 +55,38 @@ pub async fn docker_exec(
         anyhow::bail!("docker exec did not return attached output");
     };
 
-    let processor =
-        OutputProcessor::new(log_sender.clone(), job_state.masks.clone(), debug_enabled);
+    let processor = OutputProcessor::new(
+        log_sender.clone(),
+        job_state.secret_masker.clone(),
+        debug_enabled,
+    );
 
     let stream_processor = processor.clone();
     let stream_task = tokio::spawn(async move {
-        while let Some(Ok(output)) = output.next().await {
-            let text = output.to_string();
-            for line in text.lines() {
-                stream_processor.process_line(line).await;
+        let mut framer = DockerLogFramer::default();
+        loop {
+            match output.next().await {
+                Some(Ok(output)) => {
+                    for line in framer.push(output) {
+                        stream_processor.process_line(&line).await;
+                    }
+                }
+                Some(Err(error)) => {
+                    let diagnostic = DockerErrorDiagnostic::from(&error);
+                    warn!(
+                        error_kind = diagnostic.kind,
+                        status_code = ?diagnostic.status_code,
+                        error_code = ?diagnostic.error_code,
+                        column = ?diagnostic.column,
+                        "Docker exec log stream failed"
+                    );
+                    return;
+                }
+                None => break,
             }
+        }
+        for line in framer.finish() {
+            stream_processor.process_line(&line).await;
         }
     });
     let stream_abort = stream_task.abort_handle();

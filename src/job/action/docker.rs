@@ -23,7 +23,7 @@ use crate::docker::build::{
     require_local_image,
 };
 use crate::docker::build_cache::{BudgetOutcome, within_budget};
-use crate::docker::output::OutputProcessor;
+use crate::docker::output::{DockerErrorDiagnostic, DockerLogFramer, OutputProcessor};
 use crate::docker::resources::JobDockerResources;
 use crate::job::docker_config::DOCKER_CONFIG_ENV;
 use crate::job::execute::{
@@ -49,7 +49,7 @@ pub async fn run_docker_image_action(
 ) -> Result<StepResult> {
     let plan = build_inline_action_env(step, job_state, workspace, base_env)?;
 
-    debug!(image, entrypoint = ?plan.entrypoint, args = ?plan.args, "running inline docker action");
+    trace_inline_docker_action(&plan);
 
     let owned_docker;
     let docker = match execution.docker_resources() {
@@ -172,12 +172,7 @@ pub(crate) async fn run_docker_metadata_action(
         base_env,
     )?;
 
-    trace_docker_metadata_action(
-        &selected_image,
-        entry_point,
-        &entrypoint,
-        resolved_args.len(),
-    );
+    trace_docker_metadata_action(&selected_image, entrypoint.is_some(), resolved_args.len());
 
     let result = run_docker_container(RunDockerParams {
         docker,
@@ -226,6 +221,15 @@ struct InlineActionPlan {
     env: HashMap<String, String>,
     entrypoint: Option<String>,
     args: Vec<String>,
+}
+
+fn trace_inline_docker_action(plan: &InlineActionPlan) {
+    debug!(
+        image_source = "prebuilt",
+        has_entrypoint = plan.entrypoint.is_some(),
+        resolved_arg_count = plan.args.len(),
+        "running inline docker action"
+    );
 }
 
 fn build_inline_action_env(
@@ -298,25 +302,17 @@ impl SelectedDockerImage {
 /// enter global tracing; only their count is recorded here.
 fn trace_docker_metadata_action(
     selected_image: &SelectedDockerImage,
-    entry_point: &str,
-    entrypoint: &Option<String>,
+    has_entrypoint: bool,
     resolved_arg_count: usize,
 ) {
     match selected_image {
-        SelectedDockerImage::Prebuilt(image) => debug!(
-            image,
+        SelectedDockerImage::Prebuilt(_) => debug!(
             image_source = "prebuilt",
-            entry_point,
-            ?entrypoint,
-            resolved_arg_count,
-            "running docker metadata action"
+            has_entrypoint, resolved_arg_count, "running docker metadata action"
         ),
         SelectedDockerImage::Built(_) => debug!(
             image_source = "built",
-            entry_point,
-            ?entrypoint,
-            resolved_arg_count,
-            "running docker metadata action"
+            has_entrypoint, resolved_arg_count, "running docker metadata action"
         ),
     }
 }
@@ -673,7 +669,7 @@ async fn pull_action_image(docker: &Docker, image: &str) -> Result<()> {
     };
     let mut stream = docker.create_image(options.into(), None, None);
     while let Some(result) = stream.next().await {
-        result.with_context(|| format!("pulling image {image}"))?;
+        result.context("pulling Docker action image")?;
     }
     Ok(())
 }
@@ -704,7 +700,15 @@ async fn cleanup_action_container(docker: &Docker, container_name: &str, ambiguo
             Ok(Ok(())) => {}
             Ok(Err(error)) if docker_error_is_not_found(&error) => {}
             Ok(Err(error)) => {
-                debug!(container = container_name, error = %error, "Docker action stop failed");
+                let diagnostic = DockerErrorDiagnostic::from(&error);
+                debug!(
+                    container = container_name,
+                    error_kind = diagnostic.kind,
+                    status_code = ?diagnostic.status_code,
+                    error_code = ?diagnostic.error_code,
+                    column = ?diagnostic.column,
+                    "Docker action stop failed"
+                );
             }
             Err(_) => {
                 warn!(
@@ -747,7 +751,15 @@ async fn cleanup_action_container(docker: &Docker, container_name: &str, ambiguo
             }
             Ok(Err(error)) if docker_error_is_not_found(&error) => return,
             Ok(Err(error)) => {
-                warn!(container = container_name, error = %error, "Docker action container removal failed");
+                let diagnostic = DockerErrorDiagnostic::from(&error);
+                warn!(
+                    container = container_name,
+                    error_kind = diagnostic.kind,
+                    status_code = ?diagnostic.status_code,
+                    error_code = ?diagnostic.error_code,
+                    column = ?diagnostic.column,
+                    "Docker action container removal failed"
+                );
                 return;
             }
             Err(_) => {
@@ -839,8 +851,11 @@ async fn start_and_stream_logs(
         return Ok(interrupted);
     }
 
-    let processor =
-        OutputProcessor::new(log_sender.clone(), job_state.masks.clone(), debug_enabled);
+    let processor = OutputProcessor::new(
+        log_sender.clone(),
+        job_state.secret_masker.clone(),
+        debug_enabled,
+    );
     let docker_for_logs = docker.clone();
     let container_id_for_logs = container_id.to_string();
     let processor_for_logs = processor.clone();
@@ -854,10 +869,30 @@ async fn start_and_stream_logs(
                 ..Default::default()
             }),
         );
-        while let Some(Ok(output)) = stream.next().await {
-            for line in output.to_string().lines() {
-                processor_for_logs.process_line(line).await;
+        let mut framer = DockerLogFramer::default();
+        loop {
+            match stream.next().await {
+                Some(Ok(output)) => {
+                    for line in framer.push(output) {
+                        processor_for_logs.process_line(&line).await;
+                    }
+                }
+                Some(Err(error)) => {
+                    let diagnostic = DockerErrorDiagnostic::from(&error);
+                    warn!(
+                        error_kind = diagnostic.kind,
+                        status_code = ?diagnostic.status_code,
+                        error_code = ?diagnostic.error_code,
+                        column = ?diagnostic.column,
+                        "Docker action log stream failed"
+                    );
+                    return;
+                }
+                None => break,
             }
+        }
+        for line in framer.finish() {
+            processor_for_logs.process_line(&line).await;
         }
     });
 

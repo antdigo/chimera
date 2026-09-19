@@ -1,8 +1,6 @@
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
 use super::*;
@@ -42,7 +40,7 @@ async fn exec_echo_in_container() {
         .await
         .unwrap();
 
-    let masks = Arc::new(RwLock::new(Vec::new()));
+    let masks = crate::job::secret_masker::shared_masker_for_test(&[]);
     let (tx, _rx) = tokio::sync::mpsc::channel(256);
     let sender = LogSender::new_for_test(tx, masks.clone());
     let mut job_state = JobState::new(masks, HashMap::new(), serde_json::json!({}));
@@ -110,7 +108,7 @@ async fn exec_failing_command() {
         .await
         .unwrap();
 
-    let masks = Arc::new(RwLock::new(Vec::new()));
+    let masks = crate::job::secret_masker::shared_masker_for_test(&[]);
     let (tx, _rx) = tokio::sync::mpsc::channel(256);
     let sender = LogSender::new_for_test(tx, masks.clone());
     let mut job_state = JobState::new(masks, HashMap::new(), serde_json::json!({}));
