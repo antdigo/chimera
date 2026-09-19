@@ -312,7 +312,7 @@ impl Runner {
                 Ok(Some(msg)) => {
                     info!(
                         message_id = msg.message_id,
-                        message_type = %msg.message_type,
+                        message_type = %msg.message_type.diagnostic_kind(),
                         "received job message"
                     );
 
@@ -841,7 +841,7 @@ impl Runner {
                     if msg.message_type != MessageType::RunnerJobRequest {
                         info!(
                             message_id = msg.message_id,
-                            message_type = %msg.message_type,
+                            message_type = %msg.message_type.diagnostic_kind(),
                             "received control message while idle, skipping"
                         );
                         // Control messages (JobCancellation, BrokerMigration, etc)
@@ -860,7 +860,7 @@ impl Runner {
                     // not deleted. No delete needed here.
                     info!(
                         message_id = msg.message_id,
-                        message_type = %msg.message_type,
+                        message_type = %msg.message_type.diagnostic_kind(),
                         "received job message"
                     );
                     return Ok(Some(msg));

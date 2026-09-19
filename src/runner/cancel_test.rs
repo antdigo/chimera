@@ -187,6 +187,58 @@ async fn cancel_poller_stops_when_token_cancelled_externally() {
 }
 
 #[tokio::test]
+async fn cancel_poller_unknown_message_trace_omits_external_type() {
+    let (mock_server, tm, _shutdown_tx) = setup().await;
+    let canary = "CANARY-UNKNOWN-MESSAGE-TYPE";
+
+    Mock::given(method("GET"))
+        .and(path("/message"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "messageId": 91,
+            "messageType": canary,
+            "body": null
+        })))
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+    let broker = BrokerClient::new(
+        reqwest::Client::new(),
+        mock_server.uri(),
+        "session-123".into(),
+        tm,
+    );
+    let captured = crate::testing::TracingWriter::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .with_ansi(false)
+        .without_time()
+        .with_writer(captured.clone())
+        .finish();
+    let dispatch = tracing::Dispatch::new(subscriber);
+    let _guard = tracing::dispatcher::set_default(&dispatch);
+    let cancel_token = CancellationToken::new();
+    let handle = spawn_cancel_poller(&broker, cancel_token.clone());
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !captured
+        .text()
+        .contains("received non-cancellation message while busy")
+    {
+        assert!(
+            Instant::now() < deadline,
+            "poller did not emit the control-message trace"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    cancel_token.cancel();
+    handle.await.unwrap();
+    let trace = captured.text();
+
+    assert!(trace.contains("message_type=Unknown"), "{trace}");
+    assert!(!trace.contains(canary), "{trace}");
+}
+
+#[tokio::test]
 async fn cancel_poller_error_trace_omits_broker_response_body() {
     let (mock_server, tm, _shutdown_tx) = setup().await;
     let canary = "CANARY-CANCEL-POLL-BODY";

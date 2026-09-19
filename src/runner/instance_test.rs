@@ -256,12 +256,13 @@ async fn poll_loop_returns_job_request() {
 #[tokio::test]
 async fn poll_loop_skips_control_then_returns_job() {
     let (mock_server, tm, shutdown_tx) = setup().await;
+    let canary = "CANARY-IDLE-UNKNOWN-MESSAGE-TYPE";
 
     Mock::given(method("GET"))
         .and(path("/message"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "messageId": 1,
-            "messageType": "AgentRefresh",
+            "messageType": canary,
             "body": null
         })))
         .up_to_n_times(1)
@@ -293,10 +294,22 @@ async fn poll_loop_skips_control_then_returns_job() {
 
     let (_temp, runner) = make_runner();
     let mut rx = shutdown_tx.subscribe();
+    let captured = crate::testing::TracingWriter::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .with_ansi(false)
+        .without_time()
+        .with_writer(captured.clone())
+        .finish();
+    let dispatch = tracing::Dispatch::new(subscriber);
+    let _guard = tracing::dispatcher::set_default(&dispatch);
     let result = runner.poll_loop(&broker, &mut rx).await.unwrap();
     let msg = result.expect("should return job after skipping control message");
     assert_eq!(msg.message_id, 2);
     assert_eq!(msg.message_type, MessageType::RunnerJobRequest);
+    let trace = captured.text();
+    assert!(trace.contains("message_type=Unknown"), "{trace}");
+    assert!(!trace.contains(canary), "{trace}");
 }
 
 #[tokio::test]

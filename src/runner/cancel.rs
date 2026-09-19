@@ -58,7 +58,7 @@ pub fn spawn_cancel_poller(
                         // visible.
                         info!(
                             message_id = msg.message_id,
-                            message_type = %msg.message_type,
+                            message_type = %msg.message_type.diagnostic_kind(),
                             "received non-cancellation message while busy, ignoring"
                         );
                         pause(CANCEL_POLL_DELAY, &cancel_token).await;

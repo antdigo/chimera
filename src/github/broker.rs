@@ -48,6 +48,16 @@ pub enum MessageType {
     Unknown(String),
 }
 
+impl MessageType {
+    pub(crate) fn diagnostic_kind(&self) -> &'static str {
+        match self {
+            Self::RunnerJobRequest => "RunnerJobRequest",
+            Self::JobCancellation => "JobCancellation",
+            Self::Unknown(_) => "Unknown",
+        }
+    }
+}
+
 impl std::fmt::Display for MessageType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
