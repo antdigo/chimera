@@ -1,9 +1,12 @@
 use std::collections::HashMap;
+use std::io::Write;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use tempfile::TempDir;
 use tokio::sync::watch;
+use tracing_subscriber::fmt::MakeWriter;
 use wiremock::matchers::{method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -13,6 +16,98 @@ use crate::github::broker::{BrokerClient, MessageType};
 use crate::job::docker_config::JobDockerConfigError;
 
 use super::*;
+
+#[derive(Clone, Default)]
+struct TracingWriter(Arc<Mutex<Vec<u8>>>);
+
+impl Write for TracingWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'writer> MakeWriter<'writer> for TracingWriter {
+    type Writer = Self;
+
+    fn make_writer(&'writer self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+impl TracingWriter {
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+    }
+}
+
+#[test]
+fn acquired_job_trace_contains_only_safe_structural_fields() {
+    let manifest: JobManifest = serde_json::from_value(serde_json::json!({
+        "plan": { "planId": "safe-plan", "jobId": "safe-job", "timelineId": "safe-timeline" },
+        "steps": [{
+            "id": "safe-step",
+            "reference": { "type": "script" },
+            "inputs": {},
+            "order": 1
+        }],
+        "variables": {
+            "CANARY_VARIABLE_NAME": { "value": "CANARY_VARIABLE_VALUE", "isSecret": true }
+        },
+        "resources": { "endpoints": [{
+            "name": "CANARY_ENDPOINT_NAME",
+            "url": "https://CANARY-ENDPOINT.invalid",
+            "authorization": null,
+            "data": { "CANARY_DATA_KEY": "CANARY_DATA_VALUE" }
+        }]},
+        "contextData": {},
+        "jobContainer": { "image": "CANARY-CONTAINER-IMAGE" },
+        "serviceContainers": null,
+        "mask": [{ "type": "regex", "value": "CANARY-MASK" }],
+        "fileTable": ["CANARY-FILENAME"]
+    }))
+    .unwrap();
+    let captured = TracingWriter::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .with_ansi(false)
+        .without_time()
+        .with_writer(captured.clone())
+        .finish();
+    let dispatch = tracing::Dispatch::new(subscriber);
+    let _guard = tracing::dispatcher::set_default(&dispatch);
+
+    log_job_acquired(&manifest);
+    let trace = captured.text();
+
+    for field in [
+        "steps",
+        "variable_count",
+        "endpoint_count",
+        "has_container",
+        "has_services",
+        "mask_hint_count",
+    ] {
+        assert!(trace.contains(field), "missing field {field}: {trace}");
+    }
+    for canary in [
+        "CANARY_VARIABLE_NAME",
+        "CANARY_VARIABLE_VALUE",
+        "CANARY_ENDPOINT_NAME",
+        "CANARY-ENDPOINT",
+        "CANARY_DATA_KEY",
+        "CANARY_DATA_VALUE",
+        "CANARY-CONTAINER-IMAGE",
+        "CANARY-MASK",
+        "CANARY-FILENAME",
+    ] {
+        assert!(!trace.contains(canary), "trace leaked {canary}: {trace}");
+    }
+}
 
 async fn setup() -> (MockServer, Arc<TokenManager>, watch::Sender<bool>) {
     let mock_server = MockServer::start().await;

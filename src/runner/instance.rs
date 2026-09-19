@@ -371,7 +371,7 @@ impl Runner {
             }
         };
 
-        debug!(%runner_request_id, %run_service_url, "parsed job request");
+        debug!(%runner_request_id, "parsed job request");
 
         if let Err(e) = broker.ack_job(&runner_request_id).await {
             error!(error = %e, "failed to ack job");
@@ -415,7 +415,7 @@ impl Runner {
         run_service_url: &str,
         cancel_token: CancellationToken,
     ) -> Result<()> {
-        info!(runner_request_id, run_service_url, "acquiring job");
+        info!(runner_request_id, "acquiring job");
 
         let mut job_client = JobClient::new(
             client.clone(),
@@ -429,29 +429,7 @@ impl Runner {
             .await
             .context("acquiring job manifest")?;
 
-        let var_names: Vec<&str> = manifest.variables.keys().map(|s| s.as_str()).collect();
-        let container_image = manifest
-            .job_container
-            .as_ref()
-            .map(|c| c.image.as_str())
-            .unwrap_or("none");
-        info!(
-            plan_id = %manifest.plan.plan_id,
-            job_id = %manifest.plan.job_id,
-            steps = manifest.steps.len(),
-            has_container = manifest.has_container(),
-            container_image,
-            has_services = manifest.has_services(),
-            mask_regexes = manifest.mask_regexes().len(),
-            files = ?manifest.file_table(),
-            variables = ?var_names,
-            "job acquired"
-        );
-
-        for ep in &manifest.resources.endpoints {
-            let data_keys: Vec<&str> = ep.data.keys().map(|s| s.as_str()).collect();
-            debug!(endpoint = %ep.name, url = %ep.url, data_keys = ?data_keys, "manifest endpoint");
-        }
+        log_job_acquired(&manifest);
 
         job_client
             .configure_from_manifest(&manifest)
@@ -888,6 +866,28 @@ impl Runner {
                 }
             }
         }
+    }
+}
+
+fn log_job_acquired(manifest: &JobManifest) {
+    info!(
+        plan_id = %manifest.plan.plan_id,
+        job_id = %manifest.plan.job_id,
+        steps = manifest.steps.len(),
+        variable_count = manifest.variables.len(),
+        endpoint_count = manifest.resources.endpoints.len(),
+        has_container = manifest.has_container(),
+        has_services = manifest.has_services(),
+        mask_hint_count = manifest.mask_regexes().len(),
+        "job acquired"
+    );
+
+    for (index, endpoint) in manifest.resources.endpoints.iter().enumerate() {
+        debug!(
+            index,
+            data_field_count = endpoint.data.len(),
+            "manifest endpoint"
+        );
     }
 }
 
