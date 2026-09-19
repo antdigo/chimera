@@ -397,10 +397,12 @@ impl Daemon {
             .await
             .context("initializing cache manager")?,
         );
+        let cache_authority = Arc::new(crate::cache::auth::CacheAuthority::new());
 
-        let cache_addr = cache_server::start(cache_manager, cache_config.cache_port)
-            .await
-            .context("starting cache server")?;
+        let cache_addr =
+            cache_server::start(cache_manager, cache_authority, cache_config.cache_port)
+                .await
+                .context("starting cache server")?;
         let cache_port = cache_addr.port();
 
         let state = Arc::new(DaemonState::new(&self.config.runners));

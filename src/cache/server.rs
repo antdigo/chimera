@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 use axum::Router;
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
-use axum::http::{HeaderMap, StatusCode, Uri};
+use axum::http::{HeaderMap, StatusCode, Uri, header::AUTHORIZATION};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, patch, post};
 use base64::Engine;
@@ -14,10 +14,17 @@ use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 use tracing::{debug, info, warn};
 
+use super::auth::{AuthorizedJob, CacheAuthError, CacheAuthority, CacheScope};
 use super::manager::CacheManager;
 use super::upload::parse_content_range;
 
 pub type SharedManager = Arc<CacheManager>;
+
+#[derive(Clone)]
+pub struct CacheServerState {
+    manager: SharedManager,
+    authority: Arc<CacheAuthority>,
+}
 
 /// Base64url-encode a scope string (repo or ref) for embedding in URL paths.
 pub fn encode_scope(s: &str) -> String {
@@ -32,14 +39,7 @@ pub fn decode_scope(s: &str) -> Result<String> {
     String::from_utf8(bytes).context("scope is not valid UTF-8")
 }
 
-/// Scope extracted from the URL path prefix: repo, ref, and default ref.
-struct CacheScope {
-    repo: String,
-    git_ref: String,
-    default_ref: String,
-}
-
-pub fn router(manager: SharedManager) -> Router {
+pub fn router(manager: SharedManager, authority: Arc<CacheAuthority>) -> Router {
     // @actions/cache uploads chunks up to 128MB (default 32MB).
     // Axum's default body limit is 2MB, which silently rejects uploads.
     const UPLOAD_BODY_LIMIT: usize = 256 * 1024 * 1024;
@@ -63,13 +63,17 @@ pub fn router(manager: SharedManager) -> Router {
         )
         .route("/download/{hash}", get(handle_download))
         .fallback(handle_unknown)
-        .with_state(manager)
+        .with_state(CacheServerState { manager, authority })
 }
 
 /// Start the cache server, binding to the given port.
 /// Returns the actual bound address (useful when port=0 for tests).
-pub async fn start(manager: SharedManager, port: u16) -> Result<SocketAddr> {
-    let app = router(manager);
+pub async fn start(
+    manager: SharedManager,
+    authority: Arc<CacheAuthority>,
+    port: u16,
+) -> Result<SocketAddr> {
+    let app = router(manager, authority);
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
     let listener = TcpListener::bind(addr).await?;
     let local_addr = listener.local_addr()?;
@@ -135,18 +139,54 @@ fn extract_scope(
     })
 }
 
+fn bearer_token(headers: &HeaderMap) -> Result<&str, StatusCode> {
+    let mut values = headers.get_all(AUTHORIZATION).iter();
+    let value = values.next().ok_or(StatusCode::UNAUTHORIZED)?;
+    if values.next().is_some() {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    let value = value.to_str().map_err(|_| StatusCode::UNAUTHORIZED)?;
+    let (scheme, token) = value.split_once(' ').ok_or(StatusCode::UNAUTHORIZED)?;
+    if !scheme.eq_ignore_ascii_case("Bearer")
+        || token.is_empty()
+        || token.contains(char::is_whitespace)
+    {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    Ok(token)
+}
+
+async fn authorize_request(
+    state: &CacheServerState,
+    headers: &HeaderMap,
+    encoded_scope: (&str, &str, &str),
+) -> Result<AuthorizedJob, StatusCode> {
+    let token = bearer_token(headers)?;
+    let scope = extract_scope(encoded_scope.0, encoded_scope.1, encoded_scope.2)?;
+    state
+        .authority
+        .authorize(token, &scope)
+        .await
+        .map_err(|error| match error {
+            CacheAuthError::ScopeMismatch => StatusCode::FORBIDDEN,
+            _ => StatusCode::UNAUTHORIZED,
+        })
+}
+
 // --- Handlers ---
 
 async fn handle_lookup(
-    State(manager): State<SharedManager>,
+    State(state): State<CacheServerState>,
     Path((scope_repo, scope_ref, default_ref)): Path<(String, String, String)>,
     headers: HeaderMap,
     Query(query): Query<LookupQuery>,
 ) -> Response {
-    let scope = match extract_scope(&scope_repo, &scope_ref, &default_ref) {
-        Ok(s) => s,
-        Err(status) => return status.into_response(),
-    };
+    let authorized =
+        match authorize_request(&state, &headers, (&scope_repo, &scope_ref, &default_ref)).await {
+            Ok(job) => job,
+            Err(status) => return status.into_response(),
+        };
+    let scope = authorized.scope();
 
     // @actions/cache encodes commas in keys with encodeURIComponent (%2C).
     // The HTTP client may re-encode the percent sign, producing %252C on the
@@ -167,7 +207,8 @@ async fn handle_lookup(
         "cache lookup"
     );
 
-    let entry = manager
+    let entry = state
+        .manager
         .lookup(
             &keys,
             &query.version,
@@ -199,14 +240,17 @@ async fn handle_lookup(
 }
 
 async fn handle_reserve(
-    State(manager): State<SharedManager>,
-    Path((scope_repo, scope_ref, _default_ref)): Path<(String, String, String)>,
+    State(state): State<CacheServerState>,
+    Path((scope_repo, scope_ref, default_ref)): Path<(String, String, String)>,
+    headers: HeaderMap,
     axum::Json(body): axum::Json<ReserveBody>,
 ) -> Response {
-    let scope = match extract_scope(&scope_repo, &scope_ref, &_default_ref) {
-        Ok(s) => s,
-        Err(status) => return status.into_response(),
-    };
+    let authorized =
+        match authorize_request(&state, &headers, (&scope_repo, &scope_ref, &default_ref)).await {
+            Ok(job) => job,
+            Err(status) => return status.into_response(),
+        };
+    let scope = authorized.scope();
 
     info!(
         key = %body.key,
@@ -216,8 +260,14 @@ async fn handle_reserve(
         "cache reserve"
     );
 
-    match manager
-        .reserve_upload(body.key, body.version, scope.repo, scope.git_ref)
+    match state
+        .manager
+        .reserve_upload(
+            body.key,
+            body.version,
+            scope.repo.clone(),
+            scope.git_ref.clone(),
+        )
         .await
     {
         Ok(id) => {
@@ -232,11 +282,18 @@ async fn handle_reserve(
 }
 
 async fn handle_upload_chunk(
-    State(manager): State<SharedManager>,
-    Path((_scope_repo, _scope_ref, _default_ref, id)): Path<(String, String, String, u64)>,
+    State(state): State<CacheServerState>,
+    Path((scope_repo, scope_ref, default_ref, id)): Path<(String, String, String, u64)>,
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
+    let authorized =
+        match authorize_request(&state, &headers, (&scope_repo, &scope_ref, &default_ref)).await {
+            Ok(job) => job,
+            Err(status) => return status.into_response(),
+        };
+    let scope = authorized.scope();
+
     let content_range = match headers.get("content-range").and_then(|v| v.to_str().ok()) {
         Some(cr) => cr,
         None => return StatusCode::BAD_REQUEST.into_response(),
@@ -255,10 +312,12 @@ async fn handle_upload_chunk(
         start,
         bytes = body.len(),
         content_range,
+        scope_repo = %scope.repo,
+        scope_ref = %scope.git_ref,
         "cache upload chunk"
     );
 
-    match manager.write_chunk(id, start, &body).await {
+    match state.manager.write_chunk(id, start, &body).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => {
             debug!(error = %e, id, "upload chunk failed");
@@ -268,13 +327,27 @@ async fn handle_upload_chunk(
 }
 
 async fn handle_commit(
-    State(manager): State<SharedManager>,
-    Path((_scope_repo, _scope_ref, _default_ref, id)): Path<(String, String, String, u64)>,
+    State(state): State<CacheServerState>,
+    Path((scope_repo, scope_ref, default_ref, id)): Path<(String, String, String, u64)>,
+    headers: HeaderMap,
     axum::Json(body): axum::Json<CommitBody>,
 ) -> Response {
-    info!(id, size = body.size, "cache commit");
+    let authorized =
+        match authorize_request(&state, &headers, (&scope_repo, &scope_ref, &default_ref)).await {
+            Ok(job) => job,
+            Err(status) => return status.into_response(),
+        };
+    let scope = authorized.scope();
 
-    match manager.commit_upload(id, body.size).await {
+    info!(
+        id,
+        size = body.size,
+        scope_repo = %scope.repo,
+        scope_ref = %scope.git_ref,
+        "cache commit"
+    );
+
+    match state.manager.commit_upload(id, body.size).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => {
             debug!(error = %e, id, "commit failed");
@@ -284,7 +357,7 @@ async fn handle_commit(
 }
 
 async fn handle_download(
-    State(manager): State<SharedManager>,
+    State(state): State<CacheServerState>,
     Path(hash): Path<String>,
 ) -> Response {
     // Validate hash to prevent path traversal attacks (e.g. "../../etc/passwd")
@@ -292,7 +365,7 @@ async fn handle_download(
         return StatusCode::BAD_REQUEST.into_response();
     }
 
-    let blob_path = match manager.blob_path(&hash) {
+    let blob_path = match state.manager.blob_path(&hash) {
         Ok(p) => p,
         Err(_) => return StatusCode::NOT_FOUND.into_response(),
     };
