@@ -402,8 +402,6 @@ pub async fn run_host_step(
 
     debug!(
         step_id = %step.id,
-        step_name = %step.display_name,
-        step_ref = %step.reference.name,
         "running host step"
     );
 
@@ -466,7 +464,6 @@ pub async fn run_container_step(
 
     debug!(
         step_id = %step.id,
-        step_name = %step.display_name,
         "running container step"
     );
 
@@ -1158,17 +1155,13 @@ pub(crate) async fn run_all_steps_with_masker(
             {
                 Ok(Some(collected)) => collected,
                 Ok(None) => continue,
-                Err(error) => {
+                Err(_) => {
                     // A local action only becomes resolvable once an earlier
                     // step (typically checkout) has materialized it, and a
                     // step behind a false condition may reference an action
                     // that never resolves at all: discovery failures must not
                     // fail the job before those steps can decide.
-                    warn!(
-                        step_id = %step.id,
-                        error = %error,
-                        "deferring action resolution to step execution"
-                    );
+                    warn!(step_id = %step.id, "deferring action resolution to step execution");
                     continue;
                 }
             };
@@ -1218,7 +1211,7 @@ pub(crate) async fn run_all_steps_with_masker(
             trackers[tracker_idx].resolve_name(&condition_ctx);
             if !super::expression::evaluate_condition(pre_step.condition.as_deref(), &condition_ctx)
             {
-                debug!(step = %pre_step.display_name, "skipping pre step (condition not met)");
+                debug!(step_id = %pre_step.id, "skipping pre step (condition not met)");
                 let now = format_timeline_timestamp(Utc::now());
                 trackers[tracker_idx].mark_started();
                 trackers[tracker_idx].mark_completed(ResultsConclusion::Skipped);
@@ -1322,7 +1315,7 @@ pub(crate) async fn run_all_steps_with_masker(
                 job_cancelled = true;
             } else if conclusion == StepConclusion::Failed {
                 if pre_step.continue_on_error {
-                    info!(step = %pre_step.display_name, "pre step failed but continue_on_error is set");
+                    info!(step_id = %pre_step.id, "pre step failed but continue_on_error is set");
                 } else {
                     job_failed = true;
                 }
@@ -1338,7 +1331,11 @@ pub(crate) async fn run_all_steps_with_masker(
         }
 
         if let Some(condition) = &step.condition {
-            debug!(step = %step.display_name, condition, "step has condition");
+            debug!(
+                step_id = %step.id,
+                has_condition = !condition.is_empty(),
+                "step has condition"
+            );
         }
 
         // Check condition before starting the step — skipped steps get no
@@ -1347,7 +1344,7 @@ pub(crate) async fn run_all_steps_with_masker(
         let condition_ctx = ExprContext::new(base_env, &job_state, job_failed, job_cancelled);
         trackers[idx].resolve_name(&condition_ctx);
         if !super::expression::evaluate_condition(step.condition.as_deref(), &condition_ctx) {
-            debug!(step = %step.display_name, "skipping step (condition not met)");
+            debug!(step_id = %step.id, "skipping step (condition not met)");
             let now = format_timeline_timestamp(Utc::now());
             trackers[idx].mark_started();
             trackers[idx].mark_completed(ResultsConclusion::Skipped);
@@ -1502,7 +1499,7 @@ pub(crate) async fn run_all_steps_with_masker(
             job_cancelled = true;
         } else if conclusion == StepConclusion::Failed {
             if step.continue_on_error {
-                info!(step = %step.display_name, "step failed but continue_on_error is set");
+                info!(step_id = %step.id, "step failed but continue_on_error is set");
             } else {
                 job_failed = true;
             }
@@ -1553,7 +1550,7 @@ pub(crate) async fn run_all_steps_with_masker(
                 post_step.condition.as_deref(),
                 &condition_ctx,
             ) {
-                debug!(step = %post_step.display_name, "skipping post step (condition not met)");
+                debug!(step_id = %post_step.id, "skipping post step (condition not met)");
                 let now = format_timeline_timestamp(Utc::now());
                 trackers[tracker_idx].mark_started();
                 trackers[tracker_idx].mark_completed(ResultsConclusion::Skipped);
@@ -1654,7 +1651,7 @@ pub(crate) async fn run_all_steps_with_masker(
 
             // Post steps don't affect job conclusion
             if conclusion == StepConclusion::Failed {
-                info!(step = %post_step.display_name, "post step failed (does not affect job conclusion)");
+                info!(step_id = %post_step.id, "post step failed (does not affect job conclusion)");
             }
         }
     }
@@ -1805,7 +1802,7 @@ async fn execute_step(
 
     log_sender.send_banner(runner_name, has_docker).await;
     debug!(
-        step = %step.display_name,
+        step_id = %step.id,
         is_script = step.is_script(),
         has_docker,
         "executing step"

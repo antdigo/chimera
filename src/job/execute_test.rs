@@ -698,6 +698,67 @@ async fn secrets_from_context_data_resolved() {
 }
 
 #[tokio::test]
+async fn step_diagnostics_omit_secret_bearing_manifest_fields() {
+    let (tmp, ws, client, _mock) = setup_execute().await;
+    let manifest: JobManifest = serde_json::from_value(serde_json::json!({
+        "plan": { "planId": "p", "jobId": "j", "timelineId": "t" },
+        "steps": [{
+            "id": "safe-step-id",
+            "displayName": "CANARY-STEP-DIAGNOSTIC",
+            "reference": { "name": "script", "type": "script" },
+            "inputs": { "script": "true" },
+            "condition": "'CANARY-STEP-DIAGNOSTIC' == 'different'",
+            "order": 1
+        }],
+        "variables": {
+            "TRACE_SECRET": { "value": "CANARY-STEP-DIAGNOSTIC", "isSecret": true }
+        },
+        "resources": { "endpoints": [] },
+        "contextData": {},
+        "jobContainer": null,
+        "serviceContainers": null
+    }))
+    .unwrap();
+    let (_resources, docker_config) = test_docker_config();
+    let base_env = host_base_env(&docker_config);
+    let action_cache = ActionCache::new(tmp.path().join("actions"), reqwest::Client::new());
+    let docker_action_builder = crate::docker::build::DockerActionBuilder::new();
+    let node_runtimes = crate::node::NodeRuntimes::single("node".into());
+    let execution = JobExecutionContext::new(&docker_config, None, &node_runtimes);
+    let captured = crate::testing::TracingWriter::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .with_ansi(false)
+        .without_time()
+        .with_writer(captured.clone())
+        .finish();
+    let dispatch = tracing::Dispatch::new(subscriber);
+    let _guard = tracing::dispatcher::set_default(&dispatch);
+
+    let result = run_all_steps(
+        &manifest,
+        &client,
+        &ws,
+        &base_env,
+        "test-runner",
+        &action_cache,
+        &docker_action_builder,
+        None,
+        "fake-token",
+        CancellationToken::new(),
+        &execution,
+        None,
+    )
+    .await
+    .unwrap();
+    let trace = captured.text();
+
+    assert_eq!(result.0, JobConclusion::Succeeded);
+    assert!(trace.contains("safe-step-id"), "{trace}");
+    assert!(!trace.contains("CANARY-STEP-DIAGNOSTIC"), "{trace}");
+}
+
+#[tokio::test]
 async fn cancel_token_returns_cancelled_between_steps() {
     let (tmp, ws, client, _mock) = setup_execute().await;
 
