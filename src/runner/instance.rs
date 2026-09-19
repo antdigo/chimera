@@ -266,6 +266,10 @@ pub struct Runner {
 }
 
 impl Runner {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the daemon's sole runner construction boundary keeps each shared dependency explicit"
+    )]
     pub fn with_state(
         name: String,
         credentials: RunnerCredentials,
@@ -690,6 +694,10 @@ impl Runner {
         .await
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the job lifecycle boundary keeps execution, cache scope, and cleanup ownership explicit"
+    )]
     async fn run_job_body(
         &self,
         manifest: &JobManifest,
