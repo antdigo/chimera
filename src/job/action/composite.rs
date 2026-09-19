@@ -68,7 +68,7 @@ pub fn run_composite_action<'a>(
 
 #[allow(clippy::too_many_arguments)]
 async fn run_composite_action_inner(
-    action_dir: &TrustedActionDirectory,
+    _action_dir: &TrustedActionDirectory,
     metadata: &ActionMetadata,
     step: &Step,
     job_state: &mut JobState,
@@ -130,17 +130,13 @@ async fn run_composite_action_inner(
             if !crate::job::expression::evaluate_condition(Some(condition), &cond_ctx) {
                 debug!(
                     composite_step = i,
-                    condition, "skipping composite sub-step (condition not met)"
+                    "skipping composite sub-step (condition not met)"
                 );
                 continue;
             }
         }
 
-        debug!(
-            composite_step = i,
-            action_dir = %action_dir.path().display(),
-            "running composite sub-step"
-        );
+        debug!(composite_step = i, "running composite sub-step");
 
         let result = if nested_obj.contains_key(ykey("uses")) {
             run_nested_action(

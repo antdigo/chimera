@@ -122,6 +122,56 @@ async fn node_action_executes_script() {
 }
 
 #[tokio::test]
+async fn node_action_diagnostics_omit_action_paths_and_script_names() {
+    let tmp = tempfile::tempdir().unwrap();
+    let workspace = make_test_workspace(&tmp);
+    let canary = "CANARY-NODE-DIAGNOSTIC";
+    let action_dir = tmp.path().join(canary);
+    std::fs::create_dir_all(&action_dir).unwrap();
+    let script_file = format!("{canary}.sh");
+    std::fs::write(action_dir.join(&script_file), "exit 0\n").unwrap();
+    let masker = crate::job::secret_masker::shared_masker_for_test(&[canary]);
+    let mut state = JobState::new(masker.clone(), HashMap::new(), serde_json::json!({}));
+    let logger = StepLogger::results_for_test(masker);
+    let docker_config = test_docker_config(&tmp);
+    let base_env = HashMap::from([(
+        DOCKER_CONFIG_ENV.to_string(),
+        docker_config.directory().to_string_lossy().into_owned(),
+    )]);
+    let node_runtimes = crate::node::NodeRuntimes::single("/bin/sh".into());
+    let execution = JobExecutionContext::new(&docker_config, None, &node_runtimes);
+    let captured = crate::testing::TracingWriter::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .with_ansi(false)
+        .without_time()
+        .with_writer(captured.clone())
+        .finish();
+    let dispatch = tracing::Dispatch::new(subscriber);
+    let _guard = tracing::dispatcher::set_default(&dispatch);
+
+    let result = run_node_action(
+        &action_dir,
+        &make_node_metadata(&script_file),
+        "main",
+        &make_action_step("Test"),
+        &mut state,
+        &workspace,
+        &base_env,
+        logger.sender(),
+        &CancellationToken::new(),
+        &execution,
+    )
+    .await
+    .unwrap();
+    let trace = captured.text();
+
+    assert_eq!(result.conclusion, StepConclusion::Succeeded);
+    assert!(trace.contains("running node action"), "{trace}");
+    assert!(!trace.contains(canary), "{trace}");
+}
+
+#[tokio::test]
 async fn input_env_vars_set() {
     let tmp = tempfile::tempdir().unwrap();
     let ws = make_test_workspace(&tmp);
