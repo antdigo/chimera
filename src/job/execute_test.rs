@@ -1234,7 +1234,10 @@ async fn concurrent_webhook_flows_get_private_absolute_tmp() {
         .await;
 
     let (log_tx, _log_rx) = tokio::sync::mpsc::channel(256);
-    let log_sender = LogSender::new_for_test(log_tx, Arc::new(RwLock::new(Vec::new())));
+    let log_sender = LogSender::new_for_test(
+        log_tx,
+        crate::job::secret_masker::shared_masker_for_test(&[]),
+    );
     let mut runs = Vec::new();
     for index in 0..JOBS {
         let config = root.create_docker_config().unwrap();
