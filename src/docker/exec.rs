@@ -8,7 +8,7 @@ use futures::StreamExt;
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
-use super::output::OutputProcessor;
+use super::output::{DockerLogFramer, OutputProcessor};
 use crate::job::execute::{JobState, StepConclusion, StepResult};
 use crate::job::logs::LogSender;
 
@@ -63,11 +63,23 @@ pub async fn docker_exec(
 
     let stream_processor = processor.clone();
     let stream_task = tokio::spawn(async move {
-        while let Some(Ok(output)) = output.next().await {
-            let text = output.to_string();
-            for line in text.lines() {
-                stream_processor.process_line(line).await;
+        let mut framer = DockerLogFramer::default();
+        loop {
+            match output.next().await {
+                Some(Ok(output)) => {
+                    for line in framer.push(output) {
+                        stream_processor.process_line(&line).await;
+                    }
+                }
+                Some(Err(error)) => {
+                    warn!(error = %error, "Docker exec log stream failed");
+                    return;
+                }
+                None => break,
             }
+        }
+        for line in framer.finish() {
+            stream_processor.process_line(&line).await;
         }
     });
     let stream_abort = stream_task.abort_handle();

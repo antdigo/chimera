@@ -1,8 +1,9 @@
 use std::collections::HashMap;
 
-use super::OutputProcessor;
+use super::{DockerLogFramer, LineFramer, OutputProcessor};
 use crate::job::execute::JobState;
 use crate::job::logs::{LogLine, LogSender};
+use bollard::container::LogOutput;
 
 fn make_processor(debug_enabled: bool) -> (OutputProcessor, tokio::sync::mpsc::Receiver<LogLine>) {
     let masks = crate::job::secret_masker::shared_masker_for_test(&[]);
@@ -15,6 +16,80 @@ fn make_processor(debug_enabled: bool) -> (OutputProcessor, tokio::sync::mpsc::R
 fn make_job_state() -> JobState {
     let masks = crate::job::secret_masker::shared_masker_for_test(&[]);
     JobState::new(masks, HashMap::new(), serde_json::json!({}))
+}
+
+#[test]
+fn line_framer_reassembles_secret_at_every_byte_split() {
+    let bytes = "safe=α-canary-secret\r\nnext=line\n".as_bytes();
+    for split in 0..=bytes.len() {
+        let mut framer = LineFramer::default();
+        let mut got = framer.push(&bytes[..split]);
+        got.extend(framer.push(&bytes[split..]));
+        got.extend(framer.finish());
+        assert_eq!(got, ["safe=α-canary-secret", "next=line"]);
+    }
+}
+
+#[test]
+fn line_framer_handles_empty_lf_split_crlf_and_repeated_finish() {
+    let mut framer = LineFramer::default();
+    assert!(framer.push(b"").is_empty());
+    assert!(framer.push(b"one\r").is_empty());
+    assert_eq!(framer.push(b"\ntwo\n"), ["one", "two"]);
+    assert_eq!(framer.finish(), None);
+    assert_eq!(framer.finish(), None);
+}
+
+#[test]
+fn line_framer_decodes_invalid_utf8_lossily_at_eof_once() {
+    let mut framer = LineFramer::default();
+    assert!(framer.push(b"bad-\xff").is_empty());
+    assert_eq!(framer.finish().as_deref(), Some("bad-�"));
+    assert_eq!(framer.finish(), None);
+}
+
+#[test]
+fn docker_log_framer_keeps_stdout_and_stderr_partial_lines_separate() {
+    let mut framer = DockerLogFramer::default();
+    assert!(
+        framer
+            .push(LogOutput::StdOut {
+                message: b"out-".to_vec().into(),
+            })
+            .is_empty()
+    );
+    assert!(
+        framer
+            .push(LogOutput::StdErr {
+                message: b"err-".to_vec().into(),
+            })
+            .is_empty()
+    );
+    assert_eq!(
+        framer.push(LogOutput::StdOut {
+            message: b"done\n".to_vec().into(),
+        }),
+        ["out-done"]
+    );
+    assert_eq!(
+        framer.push(LogOutput::StdErr {
+            message: b"done\n".to_vec().into(),
+        }),
+        ["err-done"]
+    );
+    assert!(framer.finish().is_empty());
+}
+
+#[tokio::test]
+async fn split_add_mask_command_is_processed_only_after_complete_line() {
+    let (processor, mut rx) = make_processor(false);
+    let mut framer = LineFramer::default();
+    assert!(framer.push(b"::add-mask::frame-").is_empty());
+    for line in framer.push(b"secret\nvalue=frame-secret\n") {
+        processor.process_line(&line).await;
+    }
+
+    assert_eq!(rx.recv().await.unwrap().content, "value=***");
 }
 
 #[tokio::test]

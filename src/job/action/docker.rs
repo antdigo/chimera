@@ -23,6 +23,7 @@ use crate::docker::build::{
     require_local_image,
 };
 use crate::docker::build_cache::{BudgetOutcome, within_budget};
+use crate::docker::output::DockerLogFramer;
 use crate::docker::output::OutputProcessor;
 use crate::docker::resources::JobDockerResources;
 use crate::job::docker_config::DOCKER_CONFIG_ENV;
@@ -857,10 +858,23 @@ async fn start_and_stream_logs(
                 ..Default::default()
             }),
         );
-        while let Some(Ok(output)) = stream.next().await {
-            for line in output.to_string().lines() {
-                processor_for_logs.process_line(line).await;
+        let mut framer = DockerLogFramer::default();
+        loop {
+            match stream.next().await {
+                Some(Ok(output)) => {
+                    for line in framer.push(output) {
+                        processor_for_logs.process_line(&line).await;
+                    }
+                }
+                Some(Err(error)) => {
+                    warn!(error = %error, "Docker action log stream failed");
+                    return;
+                }
+                None => break,
             }
+        }
+        for line in framer.finish() {
+            processor_for_logs.process_line(&line).await;
         }
     });
 

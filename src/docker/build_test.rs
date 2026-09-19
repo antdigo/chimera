@@ -32,6 +32,15 @@ async fn saturated_log_sender() -> (LogSender, tokio::sync::mpsc::Receiver<LogLi
     (logger, receiver)
 }
 
+fn format_complete_build_progress(info: BuildInfo, internal_tag: &str) -> Vec<String> {
+    let mut framer = crate::docker::output::LineFramer::default();
+    let mut messages = format_build_progress(info, internal_tag, &mut framer);
+    if let Some(tail) = framer.finish() {
+        messages.push(sanitize_build_progress(&tail, internal_tag));
+    }
+    messages
+}
+
 #[tokio::test]
 #[ignore]
 async fn engine_build_returns_verified_local_image_id() {
@@ -754,7 +763,7 @@ async fn same_daemon_reuse_skips_present_image_and_rebuilds_missing_image() {
 #[test]
 fn progress_formatter_redacts_internal_tag_from_stream_lines() {
     let internal_tag = "chimera-internal/action-cache:secret-key";
-    let messages = format_build_progress(
+    let messages = format_complete_build_progress(
         BuildInfo {
             stream: Some(format!(
                 "Successfully tagged {internal_tag}\nretagged {internal_tag}\n"
@@ -777,7 +786,7 @@ fn progress_formatter_redacts_internal_tag_from_stream_lines() {
 #[test]
 fn progress_formatter_redacts_internal_tag_from_status_and_progress() {
     let internal_tag = "chimera-internal/action-cache:secret-key";
-    let messages = format_build_progress(
+    let messages = format_complete_build_progress(
         BuildInfo {
             status: Some(format!("tagging {internal_tag}")),
             progress: Some(format!("progress for {internal_tag}")),
@@ -795,7 +804,7 @@ fn progress_formatter_redacts_internal_tag_from_status_and_progress() {
 #[test]
 fn progress_formatter_redacts_engine_ids_from_builder_v1_stream_records() {
     const SENTINEL_ENGINE_ID: &str = "deadbeefcaf0";
-    let messages = format_build_progress(
+    let messages = format_complete_build_progress(
         BuildInfo {
             stream: Some(format!(
                 "Successfully built {SENTINEL_ENGINE_ID}\n ---> {SENTINEL_ENGINE_ID}\n ---> Running in {SENTINEL_ENGINE_ID}\nRemoving intermediate container {SENTINEL_ENGINE_ID}\n{SENTINEL_ENGINE_ID}: Pulling fs layer\napplication output id={SENTINEL_ENGINE_ID}\n"
@@ -819,7 +828,7 @@ fn progress_formatter_redacts_engine_ids_from_builder_v1_stream_records() {
 #[test]
 fn progress_formatter_redacts_engine_ids_from_status_and_progress_records() {
     const SENTINEL_ENGINE_ID: &str = "0123456789ab";
-    let messages = format_build_progress(
+    let messages = format_complete_build_progress(
         BuildInfo {
             status: Some(format!("{SENTINEL_ENGINE_ID}: Pulling fs layer")),
             progress: Some(format!(" ---> {SENTINEL_ENGINE_ID}")),
@@ -836,7 +845,7 @@ fn progress_formatter_redacts_engine_ids_from_status_and_progress_records() {
 #[test]
 fn progress_formatter_keeps_ordinary_command_output_verbatim() {
     const COMMAND_OUTPUT: &str = "application generated object deadbeefcaf0";
-    let messages = format_build_progress(
+    let messages = format_complete_build_progress(
         BuildInfo {
             stream: Some(format!("{COMMAND_OUTPUT}\n")),
             ..Default::default()
@@ -857,9 +866,37 @@ fn progress_formatter_never_logs_build_info_id_or_aux() {
     }))
     .unwrap();
 
-    let messages = format_build_progress(info, "unused-internal-tag");
+    let messages = format_complete_build_progress(info, "unused-internal-tag");
 
     assert!(messages.is_empty());
+}
+
+#[tokio::test]
+async fn build_progress_reassembles_split_stream_before_masking() {
+    let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+    let masker = crate::job::secret_masker::shared_masker_for_test(&["frame-secret"]);
+    let sender = LogSender::new_for_test(tx, masker);
+    let mut framer = crate::docker::output::LineFramer::default();
+
+    for stream in ["token=frame-", "secret\n"] {
+        let messages = format_build_progress(
+            BuildInfo {
+                stream: Some(stream.to_string()),
+                ..Default::default()
+            },
+            "unused-internal-tag",
+            &mut framer,
+        );
+        for message in messages {
+            sender.send(message).await;
+        }
+    }
+    drop(sender);
+
+    let lines: Vec<String> = std::iter::from_fn(|| rx.try_recv().ok())
+        .map(|line| line.content)
+        .collect();
+    assert_eq!(lines, ["token=***"]);
 }
 
 #[tokio::test]

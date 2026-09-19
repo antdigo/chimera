@@ -1,9 +1,64 @@
 use std::sync::Arc;
 
+use bollard::container::LogOutput;
+
 use crate::job::commands::{WorkflowCommand, parse_command};
 use crate::job::execute::JobState;
 use crate::job::logs::LogSender;
 use crate::job::secret_masker::SharedSecretMasker;
+
+#[derive(Default)]
+pub(crate) struct LineFramer {
+    buffer: Vec<u8>,
+}
+
+impl LineFramer {
+    pub(crate) fn push(&mut self, chunk: &[u8]) -> Vec<String> {
+        self.buffer.extend_from_slice(chunk);
+        let Some(last_lf) = self.buffer.iter().rposition(|byte| *byte == b'\n') else {
+            return Vec::new();
+        };
+
+        let tail = self.buffer.split_off(last_lf + 1);
+        let mut complete = std::mem::replace(&mut self.buffer, tail);
+        complete.pop();
+        complete
+            .split(|byte| *byte == b'\n')
+            .map(|line| line.strip_suffix(b"\r").unwrap_or(line))
+            .map(|line| String::from_utf8_lossy(line).into_owned())
+            .collect()
+    }
+
+    pub(crate) fn finish(&mut self) -> Option<String> {
+        if self.buffer.is_empty() {
+            return None;
+        }
+        Some(String::from_utf8_lossy(&std::mem::take(&mut self.buffer)).into_owned())
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct DockerLogFramer {
+    stdout: LineFramer,
+    stderr: LineFramer,
+}
+
+impl DockerLogFramer {
+    pub(crate) fn push(&mut self, output: LogOutput) -> Vec<String> {
+        match output {
+            LogOutput::StdOut { message } => self.stdout.push(&message),
+            LogOutput::StdErr { message } => self.stderr.push(&message),
+            _ => Vec::new(),
+        }
+    }
+
+    pub(crate) fn finish(&mut self) -> Vec<String> {
+        [self.stdout.finish(), self.stderr.finish()]
+            .into_iter()
+            .flatten()
+            .collect()
+    }
+}
 
 /// Bundles the buffers and settings needed to process stdout/stderr output lines.
 ///
