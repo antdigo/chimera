@@ -13,7 +13,7 @@ use crate::daemon::{DaemonState, JobInfo, RunnerPhase};
 use crate::docker::build::DockerActionBuilder;
 use crate::docker::resources::{JobDockerResources, SetupParams};
 use crate::github::RUNNER_VERSION;
-use crate::github::auth::TokenManager;
+use crate::github::auth::{AuthError, TokenManager};
 use crate::github::broker::{AgentStatus, BrokerClient, BrokerError, BrokerMessage, MessageType};
 use crate::job::JobClient;
 use crate::job::action::ActionCache;
@@ -81,6 +81,29 @@ fn is_job_resource_cleanup_fatal(error: &anyhow::Error) -> bool {
     error
         .downcast_ref::<JobResourceCleanupFatalError>()
         .is_some()
+}
+
+/// Startup failures that plausibly heal on their own: transport errors and
+/// server-side trouble (5xx, 429) on either the token endpoint or the broker.
+/// A malformed success body is treated as transient on both endpoints too —
+/// a truncated 200 through flaky edge infra is a blip, and permanent
+/// misconfig reliably shows up as 4xx or a request-builder error instead.
+/// Those — auth rejections, malformed URLs, local setup failures — are
+/// permanent and must leave the runner Stopped instead of retrying forever.
+fn startup_error_is_transient(error: &anyhow::Error) -> bool {
+    if let Some(auth_error) = error.downcast_ref::<AuthError>() {
+        return match auth_error {
+            AuthError::InvalidEndpoint(_) => false,
+            AuthError::Send(_) | AuthError::BadResponse(_) => true,
+            AuthError::Status { status, .. } => status.is_server_error() || status.as_u16() == 429,
+        };
+    }
+    matches!(
+        error.downcast_ref::<BrokerError>(),
+        Some(BrokerError::ServerError(_))
+            | Some(BrokerError::Connection(_))
+            | Some(BrokerError::BadResponse(_))
+    )
 }
 
 async fn finish_job(
@@ -160,6 +183,71 @@ impl Runner {
         }
     }
 
+    /// Authenticate and create the broker session, retrying transient
+    /// failures with exponential backoff. Returns Ok(None) when shutdown
+    /// interrupts the retry loop; permanent failures bubble up so the runner
+    /// lands in Stopped.
+    async fn connect_with_retry(
+        &self,
+        client: &reqwest::Client,
+        token_manager: &Arc<TokenManager>,
+        shutdown_rx: &mut watch::Receiver<bool>,
+    ) -> Result<Option<BrokerClient>> {
+        let mut backoff = Duration::from_secs(1);
+        let max_backoff = Duration::from_secs(30);
+
+        loop {
+            if *shutdown_rx.borrow() {
+                return Ok(None);
+            }
+
+            let attempt = async {
+                token_manager
+                    .get_token()
+                    .await
+                    .context("getting initial OAuth token")?;
+                BrokerClient::connect(
+                    client.clone(),
+                    &self.credentials.info.server_url_v2,
+                    token_manager.clone(),
+                    self.credentials.info.agent_id,
+                    &self.credentials.info.agent_name,
+                )
+                .await
+                .context("creating broker session")
+            };
+
+            // Shutdown must interrupt an in-flight attempt too, not just the
+            // backoff sleep: the token POST is otherwise unbounded from the
+            // runner's perspective. Abandoning a mid-flight session POST can
+            // orphan a session the broker will reap on its own timeout.
+            let outcome = tokio::select! {
+                result = attempt => result,
+                _ = shutdown_rx.changed() => return Ok(None),
+            };
+
+            match outcome {
+                Ok(broker) => return Ok(Some(broker)),
+                Err(error) if !startup_error_is_transient(&error) => return Err(error),
+                Err(error) => {
+                    // Debug format carries the full anyhow chain — the warn
+                    // must show the actual cause while the runner keeps
+                    // retrying in Starting.
+                    warn!(
+                        error = ?error,
+                        backoff_secs = backoff.as_secs(),
+                        "startup attempt failed, retrying"
+                    );
+                    tokio::select! {
+                        _ = tokio::time::sleep(backoff) => {}
+                        _ = shutdown_rx.changed() => return Ok(None),
+                    }
+                    backoff = (backoff * 2).min(max_backoff);
+                }
+            }
+        }
+    }
+
     async fn report_running(&self, repo: &str, job_id: &str) {
         if let Some(ref state) = self.state {
             state
@@ -198,22 +286,18 @@ impl Runner {
             self.credentials.oauth.client_id.clone(),
         ));
 
-        token_manager
-            .get_token()
-            .await
-            .context("getting initial OAuth token")?;
+        let broker = match self
+            .connect_with_retry(&client, &token_manager, &mut shutdown_rx)
+            .await?
+        {
+            Some(broker) => broker,
+            None => {
+                info!("shutdown signal received during startup, exiting");
+                return Ok(());
+            }
+        };
+
         info!("authenticated successfully");
-
-        let broker = BrokerClient::connect(
-            client.clone(),
-            &self.credentials.info.server_url_v2,
-            token_manager.clone(),
-            self.credentials.info.agent_id,
-            &self.credentials.info.agent_name,
-        )
-        .await
-        .context("creating broker session")?;
-
         info!(session_id = %broker.session_id(), "broker session created");
         self.report_phase(RunnerPhase::Idle).await;
         info!("entering poll loop, waiting for jobs...");
