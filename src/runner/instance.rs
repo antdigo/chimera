@@ -541,6 +541,7 @@ impl Runner {
         finish_job(job_client, manifest, execution_result, cleanup_result).await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn run_job_body(
         &self,
         manifest: &JobManifest,
