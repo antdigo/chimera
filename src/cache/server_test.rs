@@ -487,6 +487,14 @@ async fn invalid_download_grants_return_not_found() {
         .body(Body::empty())
         .unwrap();
 
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    let req = Request::builder()
+        .uri("/download/%FF")
+        .body(Body::empty())
+        .unwrap();
+
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }

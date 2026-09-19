@@ -4,6 +4,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use axum::Router;
 use axum::body::Body;
+use axum::extract::rejection::PathRejection;
 use axum::extract::{DefaultBodyLimit, FromRequestParts, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, Uri, header::AUTHORIZATION, request::Parts};
 use axum::response::{IntoResponse, Response};
@@ -394,8 +395,12 @@ async fn handle_commit(
 
 async fn handle_download(
     State(state): State<CacheServerState>,
-    Path(grant): Path<String>,
+    grant: Result<Path<String>, PathRejection>,
 ) -> Response {
+    let grant = match grant {
+        Ok(Path(grant)) => grant,
+        Err(_) => return StatusCode::NOT_FOUND.into_response(),
+    };
     let grant = match Uuid::parse_str(&grant) {
         Ok(grant) => grant,
         Err(_) => return StatusCode::NOT_FOUND.into_response(),
