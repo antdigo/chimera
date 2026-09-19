@@ -107,6 +107,50 @@ async fn every_cache_api_handler_rejects_missing_bearer() {
 }
 
 #[tokio::test]
+async fn unauthenticated_requests_reject_before_parsing_or_body_buffering() {
+    let tmp = TempDir::new().unwrap();
+    let (app, _, _) = make_test_app(&tmp).await;
+    let prefix = scope_prefix(SCOPE_REPO, SCOPE_REF, DEFAULT_REF);
+    let cases = [
+        Request::builder()
+            .uri(format!("{prefix}/_apis/artifactcache/cache?keys=k"))
+            .body(Body::empty())
+            .unwrap(),
+        Request::builder()
+            .method("POST")
+            .uri(format!("{prefix}/_apis/artifactcache/caches"))
+            .header("content-type", "text/plain")
+            .body(Body::from("not json"))
+            .unwrap(),
+        Request::builder()
+            .method("POST")
+            .uri(format!("{prefix}/_apis/artifactcache/caches"))
+            .header("content-type", "application/json")
+            .body(Body::from("not json"))
+            .unwrap(),
+        Request::builder()
+            .method("PATCH")
+            .uri(format!("{prefix}/_apis/artifactcache/caches/not-a-number"))
+            .header("content-range", "bytes 0-0/*")
+            .body(Body::from("x"))
+            .unwrap(),
+        Request::builder()
+            .method("PATCH")
+            .uri(format!("{prefix}/_apis/artifactcache/caches/1"))
+            .header("content-range", "bytes 0-0/*")
+            .header("content-length", "268435457")
+            .body(Body::empty())
+            .unwrap(),
+    ];
+    for request in cases {
+        assert_eq!(
+            app.clone().oneshot(request).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED,
+        );
+    }
+}
+
+#[tokio::test]
 async fn duplicate_or_malformed_authorization_is_unauthorized() {
     let tmp = TempDir::new().unwrap();
     let (app, _, _) = make_test_app(&tmp).await;

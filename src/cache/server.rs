@@ -4,8 +4,8 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use axum::Router;
 use axum::body::Body;
-use axum::extract::{DefaultBodyLimit, Path, Query, State};
-use axum::http::{HeaderMap, StatusCode, Uri, header::AUTHORIZATION};
+use axum::extract::{DefaultBodyLimit, FromRequestParts, Path, Query, State};
+use axum::http::{HeaderMap, StatusCode, Uri, header::AUTHORIZATION, request::Parts};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, patch, post};
 use base64::Engine;
@@ -159,9 +159,10 @@ fn bearer_token(headers: &HeaderMap) -> Result<&str, StatusCode> {
 async fn authorize_request(
     state: &CacheServerState,
     headers: &HeaderMap,
-    encoded_scope: (&str, &str, &str),
+    path: &str,
 ) -> Result<AuthorizedJob, StatusCode> {
     let token = bearer_token(headers)?;
+    let encoded_scope = encoded_scope_from_path(path).ok_or(StatusCode::BAD_REQUEST)?;
     let scope = extract_scope(encoded_scope.0, encoded_scope.1, encoded_scope.2)?;
     state
         .authority
@@ -173,19 +174,37 @@ async fn authorize_request(
         })
 }
 
+fn encoded_scope_from_path(path: &str) -> Option<(&str, &str, &str)> {
+    let mut segments = path.split('/');
+    (segments.next()? == "").then_some(())?;
+    (segments.next()? == "cache").then_some(())?;
+    Some((segments.next()?, segments.next()?, segments.next()?))
+}
+
+struct AuthorizedCacheRequest(AuthorizedJob);
+
+impl FromRequestParts<CacheServerState> for AuthorizedCacheRequest {
+    type Rejection = StatusCode;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &CacheServerState,
+    ) -> Result<Self, Self::Rejection> {
+        authorize_request(state, &parts.headers, parts.uri.path())
+            .await
+            .map(Self)
+    }
+}
+
 // --- Handlers ---
 
 async fn handle_lookup(
+    AuthorizedCacheRequest(authorized): AuthorizedCacheRequest,
     State(state): State<CacheServerState>,
-    Path((scope_repo, scope_ref, default_ref)): Path<(String, String, String)>,
+    Path((_scope_repo, _scope_ref, _default_ref)): Path<(String, String, String)>,
     headers: HeaderMap,
     Query(query): Query<LookupQuery>,
 ) -> Response {
-    let authorized =
-        match authorize_request(&state, &headers, (&scope_repo, &scope_ref, &default_ref)).await {
-            Ok(job) => job,
-            Err(status) => return status.into_response(),
-        };
     let scope = authorized.scope();
 
     // @actions/cache encodes commas in keys with encodeURIComponent (%2C).
@@ -240,16 +259,11 @@ async fn handle_lookup(
 }
 
 async fn handle_reserve(
+    AuthorizedCacheRequest(authorized): AuthorizedCacheRequest,
     State(state): State<CacheServerState>,
-    Path((scope_repo, scope_ref, default_ref)): Path<(String, String, String)>,
-    headers: HeaderMap,
+    Path((_scope_repo, _scope_ref, _default_ref)): Path<(String, String, String)>,
     axum::Json(body): axum::Json<ReserveBody>,
 ) -> Response {
-    let authorized =
-        match authorize_request(&state, &headers, (&scope_repo, &scope_ref, &default_ref)).await {
-            Ok(job) => job,
-            Err(status) => return status.into_response(),
-        };
     let scope = authorized.scope();
 
     info!(
@@ -282,16 +296,12 @@ async fn handle_reserve(
 }
 
 async fn handle_upload_chunk(
+    AuthorizedCacheRequest(authorized): AuthorizedCacheRequest,
     State(state): State<CacheServerState>,
-    Path((scope_repo, scope_ref, default_ref, id)): Path<(String, String, String, u64)>,
+    Path((_scope_repo, _scope_ref, _default_ref, id)): Path<(String, String, String, u64)>,
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
-    let authorized =
-        match authorize_request(&state, &headers, (&scope_repo, &scope_ref, &default_ref)).await {
-            Ok(job) => job,
-            Err(status) => return status.into_response(),
-        };
     let scope = authorized.scope();
 
     let content_range = match headers.get("content-range").and_then(|v| v.to_str().ok()) {
@@ -327,16 +337,11 @@ async fn handle_upload_chunk(
 }
 
 async fn handle_commit(
+    AuthorizedCacheRequest(authorized): AuthorizedCacheRequest,
     State(state): State<CacheServerState>,
-    Path((scope_repo, scope_ref, default_ref, id)): Path<(String, String, String, u64)>,
-    headers: HeaderMap,
+    Path((_scope_repo, _scope_ref, _default_ref, id)): Path<(String, String, String, u64)>,
     axum::Json(body): axum::Json<CommitBody>,
 ) -> Response {
-    let authorized =
-        match authorize_request(&state, &headers, (&scope_repo, &scope_ref, &default_ref)).await {
-            Ok(job) => job,
-            Err(status) => return status.into_response(),
-        };
     let scope = authorized.scope();
 
     info!(
