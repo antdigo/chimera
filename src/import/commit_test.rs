@@ -1,6 +1,7 @@
 use std::cell::{Cell, RefCell};
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use crate::config::{load_config_if_exists, load_runner_credentials};
 use crate::import::target::{PreparedImport, prepare_import, prepare_import_locked};
@@ -21,6 +22,30 @@ fn prepare_locked_import(source: &Path, name: &str, root: &Path) -> (RootLock, P
     )
     .unwrap();
     (lock, prepared)
+}
+
+const LOCK_RELEASE_TIMEOUT: Duration = Duration::from_secs(5);
+
+// Other tests in this binary spawn child processes, and between fork and exec
+// such a child transiently duplicates this test's lock-holding open file
+// description, so TargetBusy can outlive drop(lock) by milliseconds.
+// import_official writes nothing before the root lock is acquired, so retrying
+// the whole call is safe; once the deadline passes the error is returned
+// unchanged and a genuinely held lock still fails the test.
+fn import_official_after_lock_release(
+    source: &Path,
+    name: &str,
+    root: &Path,
+) -> Result<ImportOutcome, ImportError> {
+    let deadline = Instant::now() + LOCK_RELEASE_TIMEOUT;
+    loop {
+        match crate::import::import_official(source, name, root, false) {
+            Err(ImportError::TargetBusy(_)) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            outcome => return outcome,
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -436,8 +461,7 @@ fn every_commit_checkpoint_is_recoverable_and_preserves_invariants() {
 
         drop(lock);
         let retry =
-            crate::import::import_official(source.path(), "local-runner", root.path(), false)
-                .unwrap();
+            import_official_after_lock_release(source.path(), "local-runner", root.path()).unwrap();
 
         assert_eq!(
             retry.status,
@@ -642,8 +666,8 @@ fn displaced_runners_after_staging_validation_prevents_credential_publish() {
     assert!(!root.path().join("config.toml").exists());
     drop(lock);
 
-    let retry = crate::import::import_official(&fixture_path(), "local-runner", root.path(), false)
-        .unwrap();
+    let retry =
+        import_official_after_lock_release(&fixture_path(), "local-runner", root.path()).unwrap();
 
     assert_eq!(retry.status, ImportStatus::Imported);
     assert_eq!(
@@ -682,8 +706,8 @@ fn displaced_runners_after_credential_publish_prevents_config_publish() {
     assert!(!root.path().join("config.toml").exists());
     drop(lock);
 
-    let retry = crate::import::import_official(&fixture_path(), "local-runner", root.path(), false)
-        .unwrap();
+    let retry =
+        import_official_after_lock_release(&fixture_path(), "local-runner", root.path()).unwrap();
 
     assert_eq!(retry.status, ImportStatus::Imported);
     assert_eq!(
@@ -723,8 +747,8 @@ fn displaced_runners_before_resume_config_publish_prevents_config_publish() {
     assert!(!root.path().join("config.toml").exists());
     drop(lock);
 
-    let retry = crate::import::import_official(&fixture_path(), "local-runner", root.path(), false)
-        .unwrap();
+    let retry =
+        import_official_after_lock_release(&fixture_path(), "local-runner", root.path()).unwrap();
 
     assert_eq!(retry.status, ImportStatus::Imported);
     assert_eq!(
@@ -1060,8 +1084,8 @@ fn failed_runners_durability_barrier_recovers_without_rewriting_credentials() {
     );
     drop(lock);
 
-    let retry = crate::import::import_official(&fixture_path(), "local-runner", root.path(), false)
-        .unwrap();
+    let retry =
+        import_official_after_lock_release(&fixture_path(), "local-runner", root.path()).unwrap();
 
     assert_eq!(retry.status, ImportStatus::Imported);
     assert_eq!(credential_snapshot(root.path(), "local-runner"), before);
@@ -1094,8 +1118,8 @@ fn failed_root_durability_barrier_recovers_without_rewriting_state() {
     let config_before = snapshot(&root.path().join("config.toml"));
     drop(lock);
 
-    let retry = crate::import::import_official(&fixture_path(), "local-runner", root.path(), false)
-        .unwrap();
+    let retry =
+        import_official_after_lock_release(&fixture_path(), "local-runner", root.path()).unwrap();
 
     assert_eq!(retry.status, ImportStatus::AlreadyImported);
     assert_eq!(
@@ -1464,8 +1488,8 @@ fn pre_config_root_durability_failure_prevents_config_and_retry_recovers() {
     let credentials_before = credential_snapshot(root.path(), "local-runner");
     drop(lock);
 
-    let retry = crate::import::import_official(&fixture_path(), "local-runner", root.path(), false)
-        .unwrap();
+    let retry =
+        import_official_after_lock_release(&fixture_path(), "local-runner", root.path()).unwrap();
 
     assert_eq!(retry.status, ImportStatus::Imported);
     assert!(credential_snapshot(root.path(), "local-runner") == credentials_before);
@@ -1497,8 +1521,8 @@ fn final_root_durability_failure_happens_after_config_publication() {
     let credentials_before = credential_snapshot(root.path(), "local-runner");
     drop(lock);
 
-    let retry = crate::import::import_official(&fixture_path(), "local-runner", root.path(), false)
-        .unwrap();
+    let retry =
+        import_official_after_lock_release(&fixture_path(), "local-runner", root.path()).unwrap();
 
     assert_eq!(retry.status, ImportStatus::AlreadyImported);
     assert!(snapshot(&root.path().join("config.toml")) == config_before);

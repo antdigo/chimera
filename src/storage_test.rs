@@ -9,7 +9,20 @@ fn second_writer_is_rejected_without_blocking() {
 
     assert!(matches!(error, RootLockError::Busy));
     drop(first);
-    RootLock::acquire(root.path()).unwrap();
+    // Other tests in this binary spawn child processes, and between fork and
+    // exec such a child transiently duplicates the lock-holding open file
+    // description, so reacquiring immediately can observe Busy. Poll until the
+    // lock is genuinely free.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        match RootLock::acquire(root.path()) {
+            Ok(_released) => break,
+            Err(RootLockError::Busy) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(error) => panic!("root lock not reacquirable after drop: {error:?}"),
+        }
+    }
 }
 
 #[cfg(unix)]
