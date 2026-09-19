@@ -101,7 +101,6 @@ impl CacheAuthority {
     }
 
     #[cfg(test)]
-    #[allow(dead_code)]
     pub(crate) fn with_clock(now: Arc<dyn Fn() -> DateTime<Utc> + Send + Sync>) -> Self {
         Self {
             state: RwLock::new(AuthorityState::default()),
@@ -123,9 +122,9 @@ impl CacheAuthority {
             return Err(CacheAuthError::EmptyToken);
         }
 
-        let now = self.now();
         let id = CapabilityId::from_token(token);
         let mut state = self.state.write().await;
+        let now = self.now();
         state
             .jobs
             .retain(|_, capability| !capability.revoked && capability.expires_at > now);
@@ -159,8 +158,8 @@ impl CacheAuthority {
         }
 
         let id = CapabilityId::from_token(token);
-        let now = self.now();
         let state = self.state.read().await;
+        let now = self.now();
         let capability = state.jobs.get(&id).ok_or(CacheAuthError::Unauthorized)?;
         if capability.revoked || capability.expires_at <= now {
             return Err(CacheAuthError::Unauthorized);
@@ -189,8 +188,8 @@ impl CacheAuthority {
         job: &AuthorizedJob,
         blob_hash: String,
     ) -> Result<Uuid, CacheAuthError> {
-        let now = self.now();
         let mut state = self.state.write().await;
+        let now = self.now();
         let parent = state
             .jobs
             .get(job.capability_id())
@@ -213,8 +212,8 @@ impl CacheAuthority {
     }
 
     pub async fn resolve_download(&self, grant: Uuid) -> Result<String, CacheAuthError> {
-        let now = self.now();
         let mut state = self.state.write().await;
+        let now = self.now();
         let Some(download) = state.downloads.get(&grant) else {
             return Err(CacheAuthError::DownloadNotFound);
         };

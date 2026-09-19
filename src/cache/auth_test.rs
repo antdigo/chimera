@@ -1,4 +1,7 @@
-use chrono::{Duration, Utc};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
+
+use chrono::{DateTime, Duration, TimeZone, Utc};
 
 use super::*;
 
@@ -15,6 +18,17 @@ fn claims(job_id: &str, repo: &str) -> JobCapabilityClaims {
         scope: scope(repo, "refs/heads/feature", "refs/heads/main"),
         job_id: job_id.into(),
     }
+}
+
+fn clock(at: DateTime<Utc>) -> (Arc<AtomicI64>, Arc<dyn Fn() -> DateTime<Utc> + Send + Sync>) {
+    let timestamp = Arc::new(AtomicI64::new(at.timestamp()));
+    let now_timestamp = timestamp.clone();
+    let now: Arc<dyn Fn() -> DateTime<Utc> + Send + Sync> = Arc::new(move || {
+        Utc.timestamp_opt(now_timestamp.load(Ordering::SeqCst), 0)
+            .single()
+            .unwrap()
+    });
+    (timestamp, now)
 }
 
 #[tokio::test]
@@ -86,6 +100,33 @@ async fn capability_expires_after_ghr_six_hours_plus_ten_minutes() {
             )
             .await
             .unwrap_err(),
+        CacheAuthError::Unauthorized,
+    );
+}
+
+#[tokio::test]
+async fn authorization_rechecks_expiration_after_waiting_for_lock() {
+    let issued_at = Utc.timestamp_opt(0, 0).single().unwrap();
+    let (timestamp, now) = clock(issued_at);
+    let authority = CacheAuthority::with_clock(now);
+    authority
+        .register_job("runtime-a", claims("job-a", "org/repo"), issued_at)
+        .await
+        .unwrap();
+
+    let lock = authority.state.write().await;
+    let requested_scope = scope("org/repo", "refs/heads/feature", "refs/heads/main");
+    let mut authorization = Box::pin(authority.authorize("runtime-a", &requested_scope));
+    assert!(futures::poll!(authorization.as_mut()).is_pending());
+
+    timestamp.store(
+        (issued_at + JOB_CAPABILITY_LIFETIME + Duration::seconds(1)).timestamp(),
+        Ordering::SeqCst,
+    );
+    drop(lock);
+
+    assert_eq!(
+        authorization.await.unwrap_err(),
         CacheAuthError::Unauthorized,
     );
 }
