@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use super::{DockerLogFramer, LineFramer, OutputProcessor};
+use super::{DockerErrorDiagnostic, DockerLogFramer, LineFramer, OutputProcessor};
 use crate::job::execute::JobState;
 use crate::job::logs::{LogLine, LogSender};
 use bollard::container::LogOutput;
@@ -78,6 +78,26 @@ fn docker_log_framer_keeps_stdout_and_stderr_partial_lines_separate() {
         ["err-done"]
     );
     assert!(framer.finish().is_empty());
+}
+
+#[test]
+fn docker_error_diagnostic_discards_daemon_payload() {
+    let response_error = bollard::errors::Error::DockerResponseServerError {
+        status_code: 500,
+        message: "CANARY-DOCKER-RESPONSE".into(),
+    };
+    let stream_error = bollard::errors::Error::DockerStreamError {
+        error: "CANARY-DOCKER-STREAM".into(),
+    };
+
+    let response = DockerErrorDiagnostic::from(&response_error);
+    let stream = DockerErrorDiagnostic::from(&stream_error);
+    let rendered = format!("{response:?} {stream:?}");
+
+    assert_eq!(response.kind, "response");
+    assert_eq!(response.status_code, Some(500));
+    assert_eq!(stream.kind, "stream");
+    assert!(!rendered.contains("CANARY-DOCKER"), "{rendered}");
 }
 
 #[tokio::test]

@@ -5,6 +5,7 @@ use anyhow::{Result, anyhow};
 use base64::Engine;
 use regex::Regex;
 use tokio::sync::RwLock;
+use tracing::warn;
 
 use super::schema::JobManifest;
 
@@ -60,7 +61,8 @@ impl SecretMasker {
             let kind = hint.get("type").and_then(serde_json::Value::as_str);
             let pattern = hint.get("value").and_then(serde_json::Value::as_str);
             if kind != Some("regex") {
-                return Err(anyhow!("unsupported mask hint at index {index}"));
+                warn!(index, "unsupported mask hint ignored");
+                continue;
             }
             let pattern = pattern.ok_or_else(|| anyhow!("invalid mask hint at index {index}"))?;
             let regex =
@@ -117,11 +119,11 @@ impl SecretMasker {
     pub(crate) fn mask(&self, input: &str) -> String {
         let mut ranges = Vec::new();
         for value in &self.values {
-            ranges.extend(
-                input
-                    .match_indices(value)
-                    .map(|(start, matched)| (start, start + matched.len())),
-            );
+            ranges.extend(input.char_indices().filter_map(|(start, _)| {
+                input[start..]
+                    .starts_with(value)
+                    .then_some((start, start + value.len()))
+            }));
         }
         for regex in &self.regexes {
             ranges.extend(
@@ -217,20 +219,37 @@ fn trim_double_quotes(value: &str) -> String {
 }
 
 fn powershell_pre_ampersand(value: &str) -> String {
-    let prefix = value.split_once('&').map_or(value, |(prefix, _)| prefix);
-    if prefix.len() >= 6 {
-        prefix.to_string()
+    let Some(last_ampersand) = value.rfind('&') else {
+        return String::new();
+    };
+    let end = value
+        .find("&+")
+        .map_or(last_ampersand + '&'.len_utf8(), |start| start + 2);
+    let section = &value[..end];
+    if section.encode_utf16().count() >= 6 {
+        section.to_string()
     } else {
-        value.to_string()
+        String::new()
     }
 }
 
 fn powershell_post_ampersand(value: &str) -> String {
-    let suffix = value.rsplit_once('&').map_or(value, |(_, suffix)| suffix);
-    if suffix.len() >= 6 {
-        suffix.to_string()
+    let Some(last_ampersand) = value.rfind('&') else {
+        return String::new();
+    };
+    let section = if let Some(start) = value.find("&+") {
+        let after_operator = &value[start + 2..];
+        let Some(first) = after_operator.chars().next() else {
+            return String::new();
+        };
+        &after_operator[first.len_utf8()..]
     } else {
-        value.to_string()
+        &value[last_ampersand + '&'.len_utf8()..]
+    };
+    if section.encode_utf16().count() >= 6 {
+        section.to_string()
+    } else {
+        String::new()
     }
 }
 

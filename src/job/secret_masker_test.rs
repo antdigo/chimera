@@ -1,5 +1,36 @@
 use super::SecretMasker;
 use crate::job::schema::JobManifest;
+use std::io::Write;
+use std::sync::{Arc, Mutex};
+use tracing_subscriber::fmt::MakeWriter;
+
+#[derive(Clone, Default)]
+struct CapturedWriter(Arc<Mutex<Vec<u8>>>);
+
+impl Write for CapturedWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'writer> MakeWriter<'writer> for CapturedWriter {
+    type Writer = Self;
+
+    fn make_writer(&'writer self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+impl CapturedWriter {
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+    }
+}
 
 #[test]
 fn masks_multiline_value_and_each_nonempty_trimmed_line() {
@@ -100,18 +131,27 @@ fn rejects_invalid_regex_without_echoing_type_or_pattern() {
 }
 
 #[test]
-fn unsupported_hint_reports_only_its_index() {
+fn unsupported_hint_is_ignored_with_safe_index_only_warning() {
     let manifest = manifest(serde_json::json!({
         "mask": [{ "type": "CANARY_TYPE", "value": "CANARY_PATTERN" }]
     }));
+    let captured = CapturedWriter::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::WARN)
+        .with_ansi(false)
+        .without_time()
+        .with_writer(captured.clone())
+        .finish();
+    let dispatch = tracing::Dispatch::new(subscriber);
+    let _guard = tracing::dispatcher::set_default(&dispatch);
 
-    let error = SecretMasker::from_manifest(&manifest)
-        .unwrap_err()
-        .to_string();
+    let masker = SecretMasker::from_manifest(&manifest).unwrap();
+    let warning = captured.text();
 
-    assert!(error.contains("mask hint at index 0"));
-    assert!(!error.contains("CANARY_TYPE"));
-    assert!(!error.contains("CANARY_PATTERN"));
+    assert_eq!(masker.mask("safe"), "safe");
+    assert!(warning.contains("index=0"), "{warning}");
+    assert!(!warning.contains("CANARY_TYPE"), "{warning}");
+    assert!(!warning.contains("CANARY_PATTERN"), "{warning}");
 }
 
 #[test]
@@ -122,6 +162,14 @@ fn merges_overlapping_and_adjacent_ranges_once() {
     masker.add_value("f");
 
     assert_eq!(masker.mask("abcdef"), "***");
+}
+
+#[test]
+fn merges_self_overlapping_literal_matches() {
+    let mut masker = SecretMasker::default();
+    masker.add_value("abab");
+
+    assert_eq!(masker.mask("value=ababab"), "value=***");
 }
 
 #[test]
@@ -160,12 +208,18 @@ fn trim_double_quotes_requires_more_than_eight_characters() {
 }
 
 #[test]
-fn powershell_ampersand_fragments_require_six_characters() {
+fn powershell_ampersand_fragments_match_official_runner_boundaries() {
     let mut masker = SecretMasker::default();
-    masker.add_value("before&after");
+    masker.add_value("alpha&bravo&charlie");
+    masker.add_value("before&+xafter-fragment");
 
-    assert_eq!(masker.mask("prefix=before"), "prefix=***");
-    assert_eq!(masker.mask("suffix=after"), "suffix=after");
+    assert_eq!(masker.mask("prefix=alpha&bravo&"), "prefix=***");
+    assert_eq!(masker.mask("suffix=charlie"), "suffix=***");
+    assert_eq!(masker.mask("special-prefix=before&+"), "special-prefix=***");
+    assert_eq!(
+        masker.mask("special-suffix=after-fragment"),
+        "special-suffix=***"
+    );
 }
 
 fn manifest(overrides: serde_json::Value) -> JobManifest {

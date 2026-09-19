@@ -16,6 +16,7 @@ use super::client::ensure_image;
 use super::container::{JobContainerSpec, ServiceContainerSpec};
 use super::network::{create_job_network, get_network_gateway, remove_network};
 use super::options::parse_options;
+use super::output::DockerErrorDiagnostic;
 
 const STOP_TIMEOUT_SECS: i64 = 5;
 const HEALTH_CHECK_TIMEOUT: Duration = Duration::from_secs(300);
@@ -107,7 +108,7 @@ impl JobDockerResources {
         // Resolve gateway IP so containers can reach host-bound services (e.g. cache server)
         match get_network_gateway(&self.docker, &network_name).await {
             Ok(gw) => self.host_gateway_ip = Some(gw),
-            Err(e) => warn!(error = %e, "could not resolve network gateway"),
+            Err(_) => warn!("could not resolve network gateway"),
         }
 
         // Start service containers
@@ -215,7 +216,6 @@ impl JobDockerResources {
 
             info!(
                 container = %container_name,
-                image = %svc.image,
                 alias = %alias,
                 "service container started"
             );
@@ -314,7 +314,6 @@ impl JobDockerResources {
 
             info!(
                 container = %container_name,
-                image = %spec.image,
                 "job container started"
             );
 
@@ -434,7 +433,15 @@ pub(crate) async fn stop_and_remove(docker: &Docker, container_id: &str, label: 
         t: STOP_TIMEOUT_SECS,
     };
     if let Err(e) = docker.stop_container(container_id, Some(stop_opts)).await {
-        debug!(container = %container_id, error = %e, "{label}: stop failed (may already be stopped)");
+        let diagnostic = DockerErrorDiagnostic::from(&e);
+        debug!(
+            container = %container_id,
+            error_kind = diagnostic.kind,
+            status_code = ?diagnostic.status_code,
+            error_code = ?diagnostic.error_code,
+            column = ?diagnostic.column,
+            "{label}: stop failed (may already be stopped)"
+        );
     }
 
     let remove_opts = RemoveContainerOptions {
@@ -446,7 +453,15 @@ pub(crate) async fn stop_and_remove(docker: &Docker, container_id: &str, label: 
         .remove_container(container_id, Some(remove_opts))
         .await
     {
-        warn!(container = %container_id, error = %e, "{label}: remove failed");
+        let diagnostic = DockerErrorDiagnostic::from(&e);
+        warn!(
+            container = %container_id,
+            error_kind = diagnostic.kind,
+            status_code = ?diagnostic.status_code,
+            error_code = ?diagnostic.error_code,
+            column = ?diagnostic.column,
+            "{label}: remove failed"
+        );
     } else {
         debug!(container = %container_id, "{label}: removed");
     }

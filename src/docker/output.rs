@@ -1,11 +1,68 @@
 use std::sync::Arc;
 
 use bollard::container::LogOutput;
+use bollard::errors::Error as DockerError;
 
 use crate::job::commands::{WorkflowCommand, parse_command};
 use crate::job::execute::JobState;
 use crate::job::logs::LogSender;
 use crate::job::secret_masker::SharedSecretMasker;
+
+/// A payload-free projection of a Bollard error suitable for global tracing.
+///
+/// Docker daemon messages and stream payloads are untrusted and can echo
+/// credentials, command arguments, or environment values. Keep only stable,
+/// structural fields here.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct DockerErrorDiagnostic {
+    pub(crate) kind: &'static str,
+    pub(crate) status_code: Option<u16>,
+    pub(crate) error_code: Option<i64>,
+    pub(crate) column: Option<usize>,
+}
+
+impl From<&DockerError> for DockerErrorDiagnostic {
+    fn from(error: &DockerError) -> Self {
+        match error {
+            DockerError::DockerResponseServerError { status_code, .. } => Self {
+                kind: "response",
+                status_code: Some(*status_code),
+                error_code: None,
+                column: None,
+            },
+            DockerError::DockerStreamError { .. } => Self {
+                kind: "stream",
+                status_code: None,
+                error_code: None,
+                column: None,
+            },
+            DockerError::DockerContainerWaitError { code, .. } => Self {
+                kind: "container_wait",
+                status_code: None,
+                error_code: Some(*code),
+                column: None,
+            },
+            DockerError::JsonDataError { column, .. } => Self {
+                kind: "json",
+                status_code: None,
+                error_code: None,
+                column: Some(*column),
+            },
+            DockerError::RequestTimeoutError => Self {
+                kind: "timeout",
+                status_code: None,
+                error_code: None,
+                column: None,
+            },
+            _ => Self {
+                kind: "client",
+                status_code: None,
+                error_code: None,
+                column: None,
+            },
+        }
+    }
+}
 
 #[derive(Default)]
 pub(crate) struct LineFramer {

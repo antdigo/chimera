@@ -8,7 +8,7 @@ use futures::StreamExt;
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
-use super::output::{DockerLogFramer, OutputProcessor};
+use super::output::{DockerErrorDiagnostic, DockerLogFramer, OutputProcessor};
 use crate::job::execute::{JobState, StepConclusion, StepResult};
 use crate::job::logs::LogSender;
 
@@ -72,7 +72,14 @@ pub async fn docker_exec(
                     }
                 }
                 Some(Err(error)) => {
-                    warn!(error = %error, "Docker exec log stream failed");
+                    let diagnostic = DockerErrorDiagnostic::from(&error);
+                    warn!(
+                        error_kind = diagnostic.kind,
+                        status_code = ?diagnostic.status_code,
+                        error_code = ?diagnostic.error_code,
+                        column = ?diagnostic.column,
+                        "Docker exec log stream failed"
+                    );
                     return;
                 }
                 None => break,

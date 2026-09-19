@@ -447,7 +447,6 @@ fn sentinel_resolved_args() -> Vec<String> {
 
 fn capture_docker_metadata_trace(
     selected_image: &SelectedDockerImage,
-    entry_point: &str,
     entrypoint: &Option<String>,
     resolved_arg_count: usize,
 ) -> String {
@@ -461,9 +460,40 @@ fn capture_docker_metadata_trace(
         .with_writer(move || TraceWriter(Arc::clone(&writer_output)))
         .finish();
     tracing::subscriber::with_default(subscriber, || {
-        trace_docker_metadata_action(selected_image, entry_point, entrypoint, resolved_arg_count);
+        trace_docker_metadata_action(selected_image, entrypoint.is_some(), resolved_arg_count);
     });
     String::from_utf8(captured_output.lock().unwrap().clone()).unwrap()
+}
+
+fn capture_inline_docker_trace(plan: &InlineActionPlan) -> String {
+    let captured_output = Arc::new(Mutex::new(Vec::new()));
+    let writer_output = Arc::clone(&captured_output);
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .without_time()
+        .with_ansi(false)
+        .with_target(false)
+        .with_writer(move || TraceWriter(Arc::clone(&writer_output)))
+        .finish();
+    tracing::subscriber::with_default(subscriber, || {
+        trace_inline_docker_action(plan);
+    });
+    String::from_utf8(captured_output.lock().unwrap().clone()).unwrap()
+}
+
+#[test]
+fn inline_trace_omits_resolved_entrypoint_and_arguments() {
+    let plan = InlineActionPlan {
+        env: HashMap::new(),
+        entrypoint: Some("CANARY-INLINE-ENTRYPOINT".into()),
+        args: vec!["CANARY-INLINE-ARG".into()],
+    };
+
+    let captured = capture_inline_docker_trace(&plan);
+
+    assert!(!captured.contains("CANARY-INLINE"), "{captured}");
+    assert!(captured.contains("has_entrypoint=true"), "{captured}");
+    assert!(captured.contains("resolved_arg_count=1"), "{captured}");
 }
 
 #[test]
@@ -473,8 +503,7 @@ fn built_image_trace_omits_arg_values_and_local_id() {
     let selected_image = SelectedDockerImage::Built(SENTINEL_IMAGE_ID.to_string());
     let entrypoint: Option<String> = None;
 
-    let captured =
-        capture_docker_metadata_trace(&selected_image, "main", &entrypoint, resolved_args.len());
+    let captured = capture_docker_metadata_trace(&selected_image, &entrypoint, resolved_args.len());
 
     assert!(!captured.contains(SENTINEL_IMAGE_ID), "{captured}");
     assert!(!captured.contains(TRACE_ARG_VALUE_SENTINEL), "{captured}");
@@ -486,17 +515,16 @@ fn built_image_trace_omits_arg_values_and_local_id() {
 }
 
 #[test]
-fn prebuilt_image_trace_omits_arg_values_and_keeps_reference() {
+fn prebuilt_image_trace_omits_arg_values_and_reference() {
     const IMAGE_REFERENCE: &str = "ghcr.io/owner/safe-action:v1";
     let resolved_args = sentinel_resolved_args();
     let selected_image = SelectedDockerImage::Prebuilt(IMAGE_REFERENCE.to_string());
     let entrypoint: Option<String> = None;
 
-    let captured =
-        capture_docker_metadata_trace(&selected_image, "main", &entrypoint, resolved_args.len());
+    let captured = capture_docker_metadata_trace(&selected_image, &entrypoint, resolved_args.len());
 
     assert!(!captured.contains(TRACE_ARG_VALUE_SENTINEL), "{captured}");
-    assert!(captured.contains(IMAGE_REFERENCE), "{captured}");
+    assert!(!captured.contains(IMAGE_REFERENCE), "{captured}");
     assert!(captured.contains("image_source=\"prebuilt\""), "{captured}");
     assert!(
         captured.contains("resolved_arg_count=1"),
