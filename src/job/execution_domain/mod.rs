@@ -17,6 +17,8 @@ mod docker_paths;
 mod error;
 mod filesystem;
 mod journal;
+#[cfg(target_os = "linux")]
+mod linux;
 
 #[cfg(test)]
 #[path = "contracts_test.rs"]

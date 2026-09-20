@@ -6,6 +6,46 @@ use uuid::Uuid;
 use super::ExecutionDomainError;
 use super::journal::{DomainLifecycle, DomainState};
 
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_initial_journal_refuses_symlinked_parent() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::create_dir(temp.path().join("outside")).unwrap();
+    fs::create_dir(temp.path().join("outside/attempt")).unwrap();
+    fs::write(temp.path().join("outside/canary"), b"keep").unwrap();
+    std::os::unix::fs::symlink(temp.path().join("outside"), temp.path().join("active")).unwrap();
+
+    assert!(DomainLifecycle::create(&temp.path().join("active/attempt"), Uuid::new_v4()).is_err());
+    assert!(!temp.path().join("outside/attempt/journal.json").exists());
+    assert_eq!(
+        fs::read(temp.path().join("outside/canary")).unwrap(),
+        b"keep"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_journal_refuses_hardlinked_or_oversized_record() {
+    for hardlink in [true, false] {
+        let temp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let canary = outside.path().join("canary");
+        let body =
+            br#"{"version":1,"attempt_id":"00000000-0000-0000-0000-000000000009","state":"ready"}"#;
+        fs::write(&canary, body).unwrap();
+        if hardlink {
+            fs::hard_link(&canary, temp.path().join("journal.json")).unwrap();
+        } else {
+            let mut oversized = body.to_vec();
+            oversized.extend(vec![b' '; 16 * 1024]);
+            fs::write(temp.path().join("journal.json"), oversized).unwrap();
+        }
+
+        assert!(DomainLifecycle::load(temp.path()).is_err());
+        assert_eq!(fs::read(canary).unwrap(), body);
+    }
+}
+
 #[test]
 fn accepts_the_normal_lifecycle() {
     let temp = tempfile::tempdir().unwrap();
