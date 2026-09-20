@@ -720,7 +720,10 @@ runs:
 async fn hadolint_pinned_sha_acceptance_on_rootless_engine() {
     let token = std::env::var("CHIMERA_GITHUB_TOKEN")
         .expect("CHIMERA_GITHUB_TOKEN is required for exact-pin acceptance");
-    let docker = chimera::docker::client::connect(None).unwrap();
+    let docker = chimera::docker::client::connect(
+        &chimera::docker::endpoint::DockerEndpoint::trusted_host(),
+    )
+    .unwrap();
     let info = docker.info().await.unwrap();
     let security = info
         .security_options

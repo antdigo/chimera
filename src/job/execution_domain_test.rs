@@ -22,6 +22,81 @@ fn execution_domain_owns_all_attempt_paths() {
     assert_ne!(domain.attempt_id(), uuid::Uuid::nil());
 }
 
+#[test]
+fn docker_runtime_paths_are_metadata_only_in_trusted_host() {
+    let (_temp, root) = prepared_root();
+    let domain = admitted_domain(&root).unwrap();
+    let paths = domain.docker_paths();
+
+    assert_eq!(paths.config_dir(), domain.docker_config_dir());
+    assert!(domain.config_file().is_file());
+    assert!(!paths.run_dir().exists());
+    assert!(!paths.socket_path().exists());
+    assert!(!paths.data_root().exists());
+    assert!(!paths.exec_root().exists());
+    let attempt = domain.attempt_dir().to_path_buf();
+    domain.destroy().unwrap();
+    assert!(!attempt.exists());
+}
+
+#[test]
+fn docker_endpoint_is_snapshotted_independently_per_child() {
+    for (case, docker_host) in [
+        (
+            "first",
+            std::ffi::OsString::from("unix:///absent/first.sock"),
+        ),
+        (
+            "second",
+            std::ffi::OsString::from("unix:///absent/second.sock"),
+        ),
+        (
+            "non-utf8",
+            std::ffi::OsString::from_vec(b"unix:///absent/\xff.sock".to_vec()),
+        ),
+    ] {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "job::execution_domain::execution_domain_test::docker_endpoint_snapshot_child",
+                "--nocapture",
+            ])
+            .env("CHIMERA_ENDPOINT_CHILD_CASE", case)
+            .env("DOCKER_HOST", docker_host)
+            .output()
+            .unwrap();
+
+        assert!(
+            output.status.success(),
+            "endpoint child {case} failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[test]
+fn docker_endpoint_snapshot_child() {
+    let Some(case) = std::env::var_os("CHIMERA_ENDPOINT_CHILD_CASE") else {
+        return;
+    };
+    let expected = match case.to_str().unwrap() {
+        "first" => "unix:///absent/first.sock",
+        "second" => "unix:///absent/second.sock",
+        "non-utf8" => "unix:///var/run/docker.sock",
+        other => panic!("unknown endpoint child case: {other}"),
+    };
+    let (_temp, root) = prepared_root();
+    let domain = admitted_domain(&root).unwrap();
+
+    assert_eq!(domain.docker_endpoint().socket_address(), expected);
+    assert_eq!(
+        domain.docker_config_dir(),
+        domain.attempt_dir().join("docker")
+    );
+    domain.destroy().unwrap();
+}
+
 fn admitted_domain(root: &ExecutionDomainRoot) -> Result<ExecutionDomain, ExecutionDomainError> {
     futures::executor::block_on(root.reserve())?.provision()
 }

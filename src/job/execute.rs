@@ -72,6 +72,17 @@ impl<'a> JobExecutionContext<'a> {
         self.docker_resources
     }
 
+    pub fn docker_endpoint(&self) -> &'a crate::docker::endpoint::DockerEndpoint {
+        self.domain.docker_endpoint()
+    }
+
+    pub fn docker_client(&self) -> anyhow::Result<bollard::Docker> {
+        match self.docker_resources {
+            Some(resources) => Ok(resources.docker().clone()),
+            None => crate::docker::client::connect(self.docker_endpoint()),
+        }
+    }
+
     pub fn node_runtimes(&self) -> &'a NodeRuntimes {
         self.node_runtimes
     }

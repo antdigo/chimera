@@ -3,10 +3,11 @@ mod common;
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, bail};
+use chimera::docker::endpoint::DockerEndpoint;
 use chimera::job::client::JobConclusion;
 use chimera::job::execution_domain::ExecutionDomainRoot;
 use chimera::job::schema::JobManifest;
@@ -326,45 +327,41 @@ fn buildx_setup_inputs_pin_local_artifacts_without_a_version_request() {
 }
 
 #[test]
-fn rootless_environment_requires_explicit_nonempty_values() {
-    for (docker_host, runtime_dir) in [
+fn acceptance_target_requires_explicit_coherent_unix_runtime() {
+    for (host, runtime) in [
         (None, Some("/run/user/1501")),
-        (Some(""), Some("/run/user/1501")),
         (Some("unix:///run/user/1501/docker.sock"), None),
-        (Some("unix:///run/user/1501/docker.sock"), Some("")),
+        (Some("tcp://127.0.0.1:2375"), Some("/run/user/1501")),
+        (Some("unix:///var/run/docker.sock"), Some("/run/user/1501")),
+        (
+            Some("unix:///run/user/1501/docker.sock"),
+            Some("/run/user/1501/../1501"),
+        ),
+        (
+            Some("unix:///run/user/1501/docker.sock"),
+            Some("/run/./user/1501"),
+        ),
+        (
+            Some("unix:///run/user/1501/docker.sock"),
+            Some("/run//user/1501"),
+        ),
     ] {
         assert!(
-            validate_rootless_environment(docker_host, runtime_dir).is_err(),
-            "accepted DOCKER_HOST={docker_host:?}, XDG_RUNTIME_DIR={runtime_dir:?}"
+            AcceptanceDockerTarget::from_values(host, runtime).is_err(),
+            "accepted DOCKER_HOST={host:?}, XDG_RUNTIME_DIR={runtime:?}"
         );
     }
-}
-
-#[test]
-fn rootless_environment_rejects_malformed_or_incoherent_endpoints() {
-    for docker_host in [
-        "tcp://127.0.0.1:2375",
-        "unix://relative/docker.sock",
-        "unix:///run/user/1501/other.sock",
-        "unix:///run/user/1502/docker.sock",
-    ] {
-        assert!(
-            validate_rootless_environment(Some(docker_host), Some("/run/user/1501")).is_err(),
-            "accepted {docker_host}"
-        );
-    }
-}
-
-#[test]
-fn rootless_environment_accepts_matching_unix_socket() {
-    let environment = validate_rootless_environment(
+    let target = AcceptanceDockerTarget::from_values(
         Some("unix:///run/user/1501/docker.sock"),
         Some("/run/user/1501"),
     )
     .unwrap();
 
-    assert_eq!(environment.docker_host, "unix:///run/user/1501/docker.sock");
-    assert_eq!(environment.xdg_runtime_dir, "/run/user/1501");
+    assert_eq!(
+        target.endpoint().socket_address(),
+        "unix:///run/user/1501/docker.sock"
+    );
+    assert_eq!(target.runtime_dir(), Path::new("/run/user/1501"));
 }
 
 #[test]
@@ -634,45 +631,51 @@ async fn configured_client_reports_local_action_post_completion() {
     .unwrap();
 }
 
-#[derive(Debug, PartialEq, Eq)]
-struct RootlessDockerEnvironment {
-    docker_host: String,
-    xdg_runtime_dir: String,
+#[derive(Debug)]
+struct AcceptanceDockerTarget {
+    endpoint: DockerEndpoint,
+    runtime_dir: PathBuf,
 }
 
-fn validate_rootless_environment(
-    docker_host: Option<&str>,
-    xdg_runtime_dir: Option<&str>,
-) -> Result<RootlessDockerEnvironment> {
-    let docker_host = docker_host
-        .filter(|value| !value.is_empty())
-        .context("DOCKER_HOST must be set explicitly to a non-empty rootless Unix endpoint")?;
-    let xdg_runtime_dir = xdg_runtime_dir
-        .filter(|value| !value.is_empty())
-        .context("XDG_RUNTIME_DIR must be set explicitly for the rootless Docker daemon")?;
-    let runtime_path = Path::new(xdg_runtime_dir);
-    if !runtime_path.is_absolute()
-        || runtime_path.components().any(|component| {
-            matches!(
-                component,
-                std::path::Component::CurDir | std::path::Component::ParentDir
-            )
+impl AcceptanceDockerTarget {
+    fn from_values(docker_host: Option<&str>, runtime_dir: Option<&str>) -> Result<Self> {
+        let docker_host = docker_host
+            .filter(|value| !value.is_empty())
+            .context("DOCKER_HOST must be set explicitly to a non-empty rootless Unix endpoint")?;
+        let runtime_dir = runtime_dir
+            .filter(|value| !value.is_empty())
+            .context("XDG_RUNTIME_DIR must be set explicitly for the rootless Docker daemon")?;
+        if !runtime_dir.starts_with('/')
+            || (runtime_dir != "/"
+                && runtime_dir[1..]
+                    .split('/')
+                    .any(|component| component.is_empty() || component == "." || component == ".."))
+        {
+            bail!("XDG_RUNTIME_DIR must be an absolute normalized path");
+        }
+        let runtime_dir = PathBuf::from(runtime_dir);
+
+        let socket = docker_host
+            .strip_prefix("unix://")
+            .context("DOCKER_HOST must use a Unix endpoint")?;
+        let endpoint = DockerEndpoint::unix_socket(Path::new(socket))?;
+        if Path::new(socket) != runtime_dir.join("docker.sock") {
+            bail!("DOCKER_HOST must target XDG_RUNTIME_DIR/docker.sock");
+        }
+
+        Ok(Self {
+            endpoint,
+            runtime_dir,
         })
-    {
-        bail!("XDG_RUNTIME_DIR must be an absolute normalized path");
     }
 
-    let socket = docker_host
-        .strip_prefix("unix://")
-        .context("DOCKER_HOST must use a Unix endpoint")?;
-    if Path::new(socket) != runtime_path.join("docker.sock") {
-        bail!("DOCKER_HOST must target XDG_RUNTIME_DIR/docker.sock");
+    fn endpoint(&self) -> &DockerEndpoint {
+        &self.endpoint
     }
 
-    Ok(RootlessDockerEnvironment {
-        docker_host: docker_host.to_string(),
-        xdg_runtime_dir: xdg_runtime_dir.to_string(),
-    })
+    fn runtime_dir(&self) -> &Path {
+        &self.runtime_dir
+    }
 }
 
 fn validate_rootless_security_options(output: &str) -> Result<()> {
@@ -684,12 +687,12 @@ fn validate_rootless_security_options(output: &str) -> Result<()> {
     Ok(())
 }
 
-async fn preflight_rootless_docker(docker_config: &Path) -> Result<RootlessDockerEnvironment> {
+async fn preflight_rootless_docker(docker_config: &Path) -> Result<AcceptanceDockerTarget> {
     let docker_host = std::env::var("DOCKER_HOST")
         .context("DOCKER_HOST must be explicitly available as UTF-8 for C-10")?;
     let xdg_runtime_dir = std::env::var("XDG_RUNTIME_DIR")
         .context("XDG_RUNTIME_DIR must be explicitly available as UTF-8 for C-10")?;
-    let environment = validate_rootless_environment(Some(&docker_host), Some(&xdg_runtime_dir))?;
+    let target = AcceptanceDockerTarget::from_values(Some(&docker_host), Some(&xdg_runtime_dir))?;
     let security_options = docker_output(
         &["info", "--format", "{{json .SecurityOptions}}"],
         docker_config,
@@ -698,7 +701,7 @@ async fn preflight_rootless_docker(docker_config: &Path) -> Result<RootlessDocke
     .await
     .context("querying Docker daemon rootless security information")?;
     validate_rootless_security_options(&security_options)?;
-    Ok(environment)
+    Ok(target)
 }
 
 fn validate_successful_post_records(updates: &[Vec<u8>], expected: &[String]) -> Result<()> {
@@ -1213,11 +1216,14 @@ async fn pinned_buildx_flow_uses_job_config_and_original_socket() {
     let expected = HashMap::from([
         (
             "EXPECTED_DOCKER_HOST".into(),
-            rootless_environment.docker_host,
+            rootless_environment.endpoint().socket_address().to_owned(),
         ),
         (
             "EXPECTED_XDG_RUNTIME_DIR".into(),
-            rootless_environment.xdg_runtime_dir,
+            rootless_environment
+                .runtime_dir()
+                .to_string_lossy()
+                .into_owned(),
         ),
         (
             "EXPECTED_PATH".into(),

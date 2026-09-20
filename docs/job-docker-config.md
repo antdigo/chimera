@@ -17,6 +17,16 @@ while each admitted `ExecutionDomain` owns one attempt and its Docker
 configuration. These names replace the former internal owners only; the Docker
 configuration behavior documented here is unchanged in `trusted-host`.
 
+Runner Docker API calls resolve the trusted-host Unix endpoint once for each
+attempt and pass that endpoint explicitly to job/service containers and Docker
+actions. Selection preserves the existing Unix DOCKER_HOST behavior; Docker
+contexts and TCP/TLS support are unchanged. Host shell and Node actions keep
+their existing Docker environment behavior. The domain also records deterministic
+Docker storage paths, but trusted-host does not create a private daemon, socket,
+data root, or exec root. The sandboxed profile remains unavailable. Daemon-free
+endpoint tests and the existing trusted-host rootless Buildx test do not establish
+sandbox isolation or satisfy the native sandbox release gate.
+
 Docker actions and job containers do not receive or mount this host path. Named
 contexts, credential helpers, CLI plugins, and credentials from `$HOME/.docker`
 are not imported.
