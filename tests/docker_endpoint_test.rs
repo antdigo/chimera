@@ -72,6 +72,25 @@ async fn absent_explicit_endpoint_does_not_fall_back_to_ambient_live_probe() {
 }
 
 #[tokio::test]
+async fn refused_explicit_endpoint_connects_lazily_then_ping_fails() {
+    let refused_dir = tempfile::Builder::new()
+        .prefix("ch-ep-refused-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let socket_path = refused_dir.path().join("docker.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+    drop(listener);
+    let explicit_endpoint = DockerEndpoint::unix_socket(&socket_path).unwrap();
+
+    let client = chimera::docker::client::connect(&explicit_endpoint).unwrap();
+    let ping = tokio::time::timeout(std::time::Duration::from_secs(2), client.ping())
+        .await
+        .expect("refused Docker ping must remain bounded");
+
+    assert!(ping.is_err());
+}
+
+#[tokio::test]
 async fn failing_image_probe_returns_a_synthetic_engine_error() {
     let probe = EngineProbe::start_failing_images().await.unwrap();
     let client = chimera::docker::client::connect(probe.endpoint()).unwrap();
