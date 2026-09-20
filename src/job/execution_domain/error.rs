@@ -3,10 +3,26 @@ use std::path::PathBuf;
 
 use uuid::Uuid;
 
-use super::journal::DomainState;
+use super::{
+    contracts::{FailureCategory, Stage},
+    journal::DomainState,
+};
 
 #[derive(Debug)]
 pub enum ExecutionDomainError {
+    InvalidAttemptIdentity,
+    InvalidStepFilesIdentity,
+    InvalidDomainPath,
+    ReservedDomainEnvironment {
+        key: String,
+        source: &'static str,
+    },
+    Backend {
+        attempt: Option<Uuid>,
+        stage: Stage,
+        category: FailureCategory,
+        errno: Option<i32>,
+    },
     // Lifecycle states are an internal runner contract, even though callers can
     // inspect the public error category and its redacted Display output.
     #[allow(private_interfaces)]
@@ -81,6 +97,26 @@ pub enum ExecutionDomainError {
 impl std::fmt::Display for ExecutionDomainError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::InvalidAttemptIdentity => {
+                formatter.write_str("invalid-attempt-identity: nil UUID is not allowed")
+            }
+            Self::InvalidStepFilesIdentity => {
+                formatter.write_str("invalid-step-files-identity: nil UUID is not allowed")
+            }
+            Self::InvalidDomainPath => formatter.write_str("invalid-domain-path"),
+            Self::ReservedDomainEnvironment { key, source } => write!(
+                formatter,
+                "reserved-domain-environment: {key} cannot be changed by {source}"
+            ),
+            Self::Backend {
+                attempt,
+                stage,
+                category,
+                errno,
+            } => write!(
+                formatter,
+                "execution-domain-backend: attempt={attempt:?} stage={stage:?} category={category:?} errno={errno:?}"
+            ),
             Self::InvalidTransition { from, to } => {
                 write!(formatter, "invalid-domain-transition: {from:?} to {to:?}")
             }

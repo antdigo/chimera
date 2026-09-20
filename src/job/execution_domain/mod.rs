@@ -12,10 +12,15 @@ use uuid::Uuid;
 use crate::docker::endpoint::DockerEndpoint;
 
 mod admission;
+mod contracts;
 mod docker_paths;
 mod error;
 mod filesystem;
 mod journal;
+
+#[cfg(test)]
+#[path = "contracts_test.rs"]
+mod contracts_test;
 
 use journal::{DomainLifecycle, DomainState};
 
@@ -26,6 +31,10 @@ mod journal_test;
 mod admission_test;
 
 pub use admission::DomainPermit;
+pub use contracts::{
+    AttemptIdentity, DomainEnvironment, DomainPath, DomainPaths, FailureCategory, Stage,
+    StepFilesId, StepStateSnapshot,
+};
 pub use docker_paths::DockerPaths;
 pub use error::{ExecutionDomainCleanupFatalError, ExecutionDomainError};
 
