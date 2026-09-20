@@ -621,8 +621,8 @@ impl Runner {
         secret_masker: &SharedSecretMasker,
     ) -> Result<()> {
         let cache_scope = cache_scope_for_job(manifest, repo);
-        let execution_domains = self.execution_domains.clone();
-        let domain = tokio::task::spawn_blocking(move || execution_domains.create_domain())
+        let permit = self.execution_domains.reserve().await?;
+        let domain = tokio::task::spawn_blocking(move || permit.provision())
             .await
             .context("joining per-job resource creation task")?
             .context("creating per-job Docker config")?;

@@ -1,13 +1,15 @@
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
+use std::num::NonZeroUsize;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use tokio::sync::watch;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 use uuid::Uuid;
 
+mod admission;
 mod error;
 mod filesystem;
 mod journal;
@@ -17,6 +19,10 @@ use journal::{DomainLifecycle, DomainState};
 #[cfg(test)]
 mod journal_test;
 
+#[cfg(test)]
+mod admission_test;
+
+pub use admission::DomainPermit;
 pub use error::{ExecutionDomainCleanupFatalError, ExecutionDomainError};
 
 use filesystem::{
@@ -70,6 +76,7 @@ pub struct ExecutionDomainRoot {
     canonical_path: PathBuf,
     identity: DirectoryIdentity,
     state: Arc<ExecutionDomainState>,
+    admission: Arc<Semaphore>,
 }
 
 #[derive(Debug)]
@@ -89,10 +96,11 @@ pub struct ExecutionDomain {
     work_dir_identity: DirectoryIdentity,
     destroyed: bool,
     lifecycle: DomainLifecycle,
+    admission_permit: Option<OwnedSemaphorePermit>,
 }
 
 impl ExecutionDomainRoot {
-    pub fn prepare(path: &Path) -> Result<Self, ExecutionDomainError> {
+    pub fn prepare(path: &Path, capacity: NonZeroUsize) -> Result<Self, ExecutionDomainError> {
         // Reject before any mutation: creating the directory first would leave
         // behind a non-UTF-8 path that fails every later start until removed
         // by hand.
@@ -127,6 +135,7 @@ impl ExecutionDomainRoot {
             canonical_path,
             identity,
             state: Arc::new(ExecutionDomainState::new()),
+            admission: Arc::new(Semaphore::new(capacity.get())),
         })
     }
 
@@ -142,11 +151,12 @@ impl ExecutionDomainRoot {
         self.state.poisoned.subscribe()
     }
 
-    pub fn create_domain(&self) -> Result<ExecutionDomain, ExecutionDomainError> {
-        self.create_with_id(Uuid::new_v4())
+    #[cfg(test)]
+    pub(crate) fn poison_for_test(&self) {
+        self.state.poison();
     }
 
-    fn create_with_id(&self, attempt_id: Uuid) -> Result<ExecutionDomain, ExecutionDomainError> {
+    fn create_domain_with_id(&self, attempt_id: Uuid) -> Result<ExecutionDomain, ExecutionDomainError> {
         self.create_with_id_and_sync(attempt_id, File::sync_all)
     }
 
@@ -258,6 +268,7 @@ impl ExecutionDomainRoot {
             work_dir_identity,
             destroyed: false,
             lifecycle,
+            admission_permit: None,
         })
     }
 }
@@ -417,6 +428,14 @@ impl ExecutionDomain {
         self.lifecycle.complete_destroyed()?;
         self.destroyed = true;
         Ok(())
+    }
+}
+
+impl Drop for ExecutionDomain {
+    fn drop(&mut self) {
+        if !self.destroyed {
+            self.state.poison();
+        }
     }
 }
 

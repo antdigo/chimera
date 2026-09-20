@@ -10,7 +10,7 @@ use super::*;
 #[test]
 fn execution_domain_owns_all_attempt_paths() {
     let (_temp, root) = prepared_root();
-    let domain = root.create_domain().unwrap();
+    let domain = admitted_domain(&root).unwrap();
 
     assert_eq!(
         domain.docker_config_dir().parent(),
@@ -19,6 +19,10 @@ fn execution_domain_owns_all_attempt_paths() {
     assert_eq!(domain.private_tmp().parent(), Some(domain.attempt_dir()));
     assert_eq!(domain.work_dir().parent(), Some(domain.attempt_dir()));
     assert_ne!(domain.attempt_id(), uuid::Uuid::nil());
+}
+
+fn admitted_domain(root: &ExecutionDomainRoot) -> Result<ExecutionDomain, ExecutionDomainError> {
+    futures::executor::block_on(root.reserve())?.provision()
 }
 
 fn mode(path: &std::path::Path) -> u32 {
@@ -30,9 +34,13 @@ fn mode(path: &std::path::Path) -> u32 {
 }
 
 fn prepared_root() -> (TempDir, ExecutionDomainRoot) {
+    prepared_root_with_capacity(1)
+}
+
+fn prepared_root_with_capacity(capacity: usize) -> (TempDir, ExecutionDomainRoot) {
     let temp = TempDir::new().unwrap();
     let path = temp.path().join("job-resources");
-    let root = ExecutionDomainRoot::prepare(&path).unwrap();
+    let root = ExecutionDomainRoot::prepare(&path, NonZeroUsize::new(capacity).unwrap()).unwrap();
     (temp, root)
 }
 
@@ -62,7 +70,7 @@ impl Drop for ChildGuard {
 fn creates_private_empty_config() {
     let (_temp, root) = prepared_root();
 
-    let config = root.create_domain().unwrap();
+    let config = admitted_domain(&root).unwrap();
     let private_tmp = config.attempt_dir().join("tmp");
 
     assert_eq!(mode(root.path()), 0o700);
@@ -77,13 +85,13 @@ fn creates_private_empty_config() {
 
 #[test]
 fn concurrent_configs_have_distinct_generated_ids() {
-    let (_temp, root) = prepared_root();
+    let (_temp, root) = prepared_root_with_capacity(2);
     let first_root = root.clone();
     let second_root = root.clone();
 
     let (first, second) = std::thread::scope(|scope| {
-        let first = scope.spawn(move || first_root.create_domain().unwrap());
-        let second = scope.spawn(move || second_root.create_domain().unwrap());
+        let first = scope.spawn(move || admitted_domain(&first_root).unwrap());
+        let second = scope.spawn(move || admitted_domain(&second_root).unwrap());
         (first.join().unwrap(), second.join().unwrap())
     });
 
@@ -96,7 +104,7 @@ fn concurrent_configs_have_distinct_generated_ids() {
 #[test]
 fn new_attempt_is_empty_after_previous_cleanup() {
     let (_temp, root) = prepared_root();
-    let first = root.create_domain().unwrap();
+    let first = admitted_domain(&root).unwrap();
     let first_path = first.docker_config_dir().to_path_buf();
     std::fs::write(
         first.config_file(),
@@ -107,7 +115,7 @@ fn new_attempt_is_empty_after_previous_cleanup() {
     std::fs::write(first.private_tmp().join("credential-canary"), "credential").unwrap();
     first.destroy().unwrap();
 
-    let second = root.create_domain().unwrap();
+    let second = admitted_domain(&root).unwrap();
 
     assert_ne!(first_path, second.docker_config_dir());
     assert_eq!(std::fs::read(second.config_file()).unwrap(), b"{}");
@@ -118,7 +126,7 @@ fn new_attempt_is_empty_after_previous_cleanup() {
 #[test]
 fn inserts_and_validates_reserved_host_environment() {
     let (_temp, root) = prepared_root();
-    let config = root.create_domain().unwrap();
+    let config = admitted_domain(&root).unwrap();
     let mut env = HashMap::new();
 
     config
@@ -142,9 +150,9 @@ fn inserts_and_validates_reserved_host_environment() {
 
 #[test]
 fn destroy_removes_owned_attempt_and_keeps_neighbor() {
-    let (_temp, root) = prepared_root();
-    let owned = root.create_domain().unwrap();
-    let neighbor = root.create_domain().unwrap();
+    let (_temp, root) = prepared_root_with_capacity(2);
+    let owned = admitted_domain(&root).unwrap();
+    let neighbor = admitted_domain(&root).unwrap();
     let owned_dir = owned.attempt_dir().to_path_buf();
     let neighbor_dir = neighbor.attempt_dir().to_path_buf();
 
@@ -157,8 +165,12 @@ fn destroy_removes_owned_attempt_and_keeps_neighbor() {
 #[test]
 fn cleanup_allows_symlinks_and_sockets_inside_private_tmp() {
     let temp = TempDir::new_in("/tmp").unwrap();
-    let root = ExecutionDomainRoot::prepare(&temp.path().join("job-resources")).unwrap();
-    let config = root.create_domain().unwrap();
+    let root = ExecutionDomainRoot::prepare(
+        &temp.path().join("job-resources"),
+        NonZeroUsize::new(1).unwrap(),
+    )
+    .unwrap();
+    let config = admitted_domain(&root).unwrap();
     let target = temp.path().join("outside-target");
     std::fs::write(&target, "preserve me").unwrap();
     std::os::unix::fs::symlink(&target, config.private_tmp().join("link")).unwrap();
@@ -176,8 +188,12 @@ fn cleanup_allows_symlinks_and_sockets_inside_private_tmp() {
 #[test]
 fn cleanup_handles_non_writable_directories_inside_private_tmp() {
     let temp = TempDir::new_in("/tmp").unwrap();
-    let root = ExecutionDomainRoot::prepare(&temp.path().join("job-resources")).unwrap();
-    let config = root.create_domain().unwrap();
+    let root = ExecutionDomainRoot::prepare(
+        &temp.path().join("job-resources"),
+        NonZeroUsize::new(1).unwrap(),
+    )
+    .unwrap();
+    let config = admitted_domain(&root).unwrap();
     let attempt = config.attempt_dir().to_path_buf();
     let private_tmp = config.private_tmp().to_path_buf();
     let locked = private_tmp.join("locked");
@@ -213,8 +229,12 @@ fn cleanup_removes_work_and_temp_when_workspace_leaf_is_missing() {
     use crate::job::workspace::Workspace;
 
     let temp = TempDir::new_in("/tmp").unwrap();
-    let root = ExecutionDomainRoot::prepare(&temp.path().join("job-resources")).unwrap();
-    let config = root.create_domain().unwrap();
+    let root = ExecutionDomainRoot::prepare(
+        &temp.path().join("job-resources"),
+        NonZeroUsize::new(1).unwrap(),
+    )
+    .unwrap();
+    let config = admitted_domain(&root).unwrap();
     let tool_cache = temp.path().join("tool-cache");
     let workspace = Workspace::create(
         config.work_dir(),
@@ -241,8 +261,12 @@ fn cleanup_removes_work_and_temp_when_workspace_leaf_is_missing() {
 #[test]
 fn cleanup_allows_workspace_symlinks_without_touching_their_targets() {
     let temp = TempDir::new_in("/tmp").unwrap();
-    let root = ExecutionDomainRoot::prepare(&temp.path().join("job-resources")).unwrap();
-    let config = root.create_domain().unwrap();
+    let root = ExecutionDomainRoot::prepare(
+        &temp.path().join("job-resources"),
+        NonZeroUsize::new(1).unwrap(),
+    )
+    .unwrap();
+    let config = admitted_domain(&root).unwrap();
     let target = temp.path().join("outside-workspace-target");
     std::fs::write(&target, "preserve me").unwrap();
     std::os::unix::fs::symlink(&target, config.work_dir().join("repository-link")).unwrap();
@@ -265,7 +289,7 @@ fn creation_refuses_replacement_root_before_mutation() {
     let attempt_id = Uuid::nil();
     let attempt_name = attempt_id.simple().to_string();
 
-    let error = root.create_with_id(attempt_id).unwrap_err();
+    let error = root.create_domain_with_id(attempt_id).unwrap_err();
 
     assert!(matches!(error, ExecutionDomainError::UnsafeEntry { .. }));
     assert!(!original_root.join(&attempt_name).exists());
@@ -278,7 +302,7 @@ fn creation_refuses_ancestor_symlink_before_mutation() {
     let original_parent = temp.path().join("resource-parent");
     std::fs::create_dir(&original_parent).unwrap();
     let root_path = original_parent.join("job-resources");
-    let root = ExecutionDomainRoot::prepare(&root_path).unwrap();
+    let root = ExecutionDomainRoot::prepare(&root_path, NonZeroUsize::new(1).unwrap()).unwrap();
     let moved_parent = temp.path().join("moved-resource-parent");
     std::fs::rename(&original_parent, &moved_parent).unwrap();
     std::os::unix::fs::symlink(&moved_parent, &original_parent).unwrap();
@@ -286,7 +310,7 @@ fn creation_refuses_ancestor_symlink_before_mutation() {
     let attempt_name = attempt_id.simple().to_string();
     let moved_root = moved_parent.join("job-resources");
 
-    let error = root.create_with_id(attempt_id).unwrap_err();
+    let error = root.create_domain_with_id(attempt_id).unwrap_err();
 
     assert!(matches!(error, ExecutionDomainError::UnsafeEntry { .. }));
     assert!(!root_path.join(&attempt_name).exists());
@@ -297,7 +321,7 @@ fn creation_refuses_ancestor_symlink_before_mutation() {
 fn cleanup_refuses_moved_root_replaced_by_symlink() {
     let (temp, root) = prepared_root();
     let original_root = root.path().to_path_buf();
-    let config = root.create_domain().unwrap();
+    let config = admitted_domain(&root).unwrap();
     let attempt_name = config.attempt_dir().file_name().unwrap().to_owned();
     let moved_root = temp.path().join("moved-job-resources");
     std::fs::rename(&original_root, &moved_root).unwrap();
@@ -318,7 +342,7 @@ fn cleanup_refuses_moved_root_replaced_by_symlink() {
 #[test]
 fn cleanup_refuses_replacement_attempt_at_same_path() {
     let (temp, root) = prepared_root();
-    let config = root.create_domain().unwrap();
+    let config = admitted_domain(&root).unwrap();
     let attempt_path = config.attempt_dir().to_path_buf();
     let moved_attempt = temp.path().join("moved-attempt");
     std::fs::rename(&attempt_path, &moved_attempt).unwrap();
@@ -340,7 +364,7 @@ fn cleanup_refuses_replacement_attempt_at_same_path() {
 #[test]
 fn cleanup_refuses_config_symlink_without_touching_target() {
     let (_temp, root) = prepared_root();
-    let config = root.create_domain().unwrap();
+    let config = admitted_domain(&root).unwrap();
     let attempt_dir = config.attempt_dir().to_path_buf();
     let outside = root.path().parent().unwrap().join("outside-config.json");
     std::fs::write(&outside, "synthetic-outside").unwrap();
@@ -361,9 +385,9 @@ fn cleanup_refuses_config_symlink_without_touching_target() {
 fn generated_id_collision_is_rejected() {
     let (_temp, root) = prepared_root();
     let id = Uuid::nil();
-    let first = root.create_with_id(id).unwrap();
+    let first = root.create_domain_with_id(id).unwrap();
 
-    let error = root.create_with_id(id).unwrap_err();
+    let error = root.create_domain_with_id(id).unwrap_err();
 
     assert!(matches!(
         error,
@@ -408,8 +432,12 @@ fn daemon_docker_config_child() {
         parent.join("daemon-docker")
     );
 
-    let root = ExecutionDomainRoot::prepare(&parent.join("job-resources")).unwrap();
-    let config = root.create_domain().unwrap();
+    let root = ExecutionDomainRoot::prepare(
+        &parent.join("job-resources"),
+        NonZeroUsize::new(1).unwrap(),
+    )
+    .unwrap();
+    let config = admitted_domain(&root).unwrap();
 
     assert_eq!(std::fs::read(config.config_file()).unwrap(), b"{}");
     assert_ne!(config.docker_config_dir(), parent.join("daemon-docker"));
@@ -418,7 +446,7 @@ fn daemon_docker_config_child() {
 #[test]
 fn stale_root_with_live_child_is_not_removed() {
     let (temp, root) = prepared_root();
-    let config = root.create_domain().unwrap();
+    let config = admitted_domain(&root).unwrap();
     let stale_dir = config.attempt_dir().to_path_buf();
     let work_canary = config.work_dir().join("workspace-canary");
     let temp_canary = config.private_tmp().join("checkout-credential-canary");
@@ -432,7 +460,7 @@ fn stale_root_with_live_child_is_not_removed() {
             .unwrap(),
     };
 
-    let result = ExecutionDomainRoot::prepare(root.path());
+    let result = ExecutionDomainRoot::prepare(root.path(), NonZeroUsize::new(1).unwrap());
 
     assert!(matches!(
         result,
@@ -448,7 +476,11 @@ fn stale_root_with_live_child_is_not_removed() {
     child.stop();
     config.destroy().unwrap();
     assert!(!stale_dir.exists());
-    ExecutionDomainRoot::prepare(&temp.path().join("job-resources")).unwrap();
+    ExecutionDomainRoot::prepare(
+        &temp.path().join("job-resources"),
+        NonZeroUsize::new(1).unwrap(),
+    )
+    .unwrap();
 }
 
 #[test]
@@ -483,10 +515,12 @@ fn umask_zero_child() {
     unsafe {
         libc::umask(0);
     }
-    let root =
-        ExecutionDomainRoot::prepare(&std::path::PathBuf::from(root_parent).join("job-resources"))
-            .unwrap();
-    root.create_domain().unwrap();
+    let root = ExecutionDomainRoot::prepare(
+        &std::path::PathBuf::from(root_parent).join("job-resources"),
+        NonZeroUsize::new(1).unwrap(),
+    )
+    .unwrap();
+    admitted_domain(&root).unwrap();
 }
 
 #[test]
@@ -494,7 +528,7 @@ fn read_only_root_fails_without_fallback() {
     let (_temp, root) = prepared_root();
     std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
 
-    let result = root.create_domain();
+    let result = admitted_domain(&root);
 
     std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     assert!(matches!(
@@ -527,7 +561,7 @@ fn prepare_rejects_non_utf8_path_before_creating_it() {
         .path()
         .join(std::ffi::OsString::from_vec(b"job-resources-\xff".to_vec()));
 
-    let error = ExecutionDomainRoot::prepare(&invalid).unwrap_err();
+    let error = ExecutionDomainRoot::prepare(&invalid, NonZeroUsize::new(1).unwrap()).unwrap_err();
 
     assert!(
         matches!(
@@ -549,7 +583,7 @@ fn prepare_rejects_non_utf8_canonical_root() {
     let invalid_name = std::ffi::OsString::from_vec(b"job-resources-\xff".to_vec());
     let path = temp.path().join(invalid_name);
 
-    let error = ExecutionDomainRoot::prepare(&path).unwrap_err();
+    let error = ExecutionDomainRoot::prepare(&path, NonZeroUsize::new(1).unwrap()).unwrap_err();
 
     assert!(
         matches!(
@@ -572,7 +606,7 @@ fn prepare_rejects_symlink_root() {
     let link = temp.path().join("job-resources");
     std::os::unix::fs::symlink(&target, &link).unwrap();
 
-    let result = ExecutionDomainRoot::prepare(&link);
+    let result = ExecutionDomainRoot::prepare(&link, NonZeroUsize::new(1).unwrap());
 
     assert!(matches!(
         result,
@@ -583,8 +617,12 @@ fn prepare_rejects_symlink_root() {
 #[test]
 fn cleanup_refuses_special_file() {
     let temp = TempDir::new_in("/tmp").unwrap();
-    let root = ExecutionDomainRoot::prepare(&temp.path().join("job-resources")).unwrap();
-    let config = root.create_domain().unwrap();
+    let root = ExecutionDomainRoot::prepare(
+        &temp.path().join("job-resources"),
+        NonZeroUsize::new(1).unwrap(),
+    )
+    .unwrap();
+    let config = admitted_domain(&root).unwrap();
     let attempt_dir = config.attempt_dir().to_path_buf();
     let socket_path = config.attempt_dir().join("unexpected.sock");
     let socket = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
@@ -604,9 +642,13 @@ fn cleanup_refuses_special_file() {
 #[test]
 fn cleanup_failure_poisoned_root_blocks_sibling_creation() {
     let temp = TempDir::new_in("/tmp").unwrap();
-    let root = ExecutionDomainRoot::prepare(&temp.path().join("job-resources")).unwrap();
+    let root = ExecutionDomainRoot::prepare(
+        &temp.path().join("job-resources"),
+        NonZeroUsize::new(1).unwrap(),
+    )
+    .unwrap();
     let sibling_root = root.clone();
-    let config = root.create_domain().unwrap();
+    let config = admitted_domain(&root).unwrap();
     let attempt_dir = config.attempt_dir().to_path_buf();
     let work_canary = config.work_dir().join("workspace-canary");
     let temp_canary = config.private_tmp().join("checkout-credential-canary");
@@ -616,7 +658,7 @@ fn cleanup_failure_poisoned_root_blocks_sibling_creation() {
     let socket = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
 
     config.destroy().unwrap_err();
-    let creation_error = sibling_root.create_domain().unwrap_err();
+    let creation_error = admitted_domain(&sibling_root).unwrap_err();
 
     assert!(
         creation_error
@@ -636,9 +678,13 @@ fn cleanup_failure_poisoned_root_blocks_sibling_creation() {
 #[test]
 fn injected_permission_cleanup_failure_preserves_canaries_and_blocks_reuse() {
     let temp = TempDir::new_in("/tmp").unwrap();
-    let root = ExecutionDomainRoot::prepare(&temp.path().join("job-resources")).unwrap();
+    let root = ExecutionDomainRoot::prepare(
+        &temp.path().join("job-resources"),
+        NonZeroUsize::new(1).unwrap(),
+    )
+    .unwrap();
     let sibling_root = root.clone();
-    let mut config = root.create_domain().unwrap();
+    let mut config = admitted_domain(&root).unwrap();
     let work_canary = config.work_dir().join("workspace-canary");
     let temp_canary = config.private_tmp().join("checkout-v6-credential-canary");
     std::fs::write(&work_canary, "workspace-secret").unwrap();
@@ -652,7 +698,7 @@ fn injected_permission_cleanup_failure_preserves_canaries_and_blocks_reuse() {
             ))
         })
         .unwrap_err();
-    let creation_error = sibling_root.create_domain().unwrap_err();
+    let creation_error = admitted_domain(&sibling_root).unwrap_err();
 
     assert!(matches!(
         cleanup_error,
@@ -683,7 +729,7 @@ fn injected_permission_cleanup_failure_preserves_canaries_and_blocks_reuse() {
 #[test]
 fn domain_lifecycle_persists_ready_running_cleaning_and_destroying() {
     let (_temp, root) = prepared_root();
-    let mut domain = root.create_domain().unwrap();
+    let mut domain = admitted_domain(&root).unwrap();
     assert_eq!(
         DomainLifecycle::load(domain.attempt_dir()).unwrap().state(),
         DomainState::Ready
@@ -714,7 +760,7 @@ fn domain_lifecycle_persists_ready_running_cleaning_and_destroying() {
 #[test]
 fn failed_quarantine_retains_original_cleanup_error_and_poisons_root() {
     let (_temp, root) = prepared_root();
-    let mut domain = root.create_domain().unwrap();
+    let mut domain = admitted_domain(&root).unwrap();
     let error = domain
         .destroy_with_remover(|path| {
             std::fs::write(path.join("journal.json.next"), "incomplete").unwrap();
@@ -729,7 +775,7 @@ fn failed_quarantine_retains_original_cleanup_error_and_poisons_root() {
         if matches!(&*cleanup, ExecutionDomainError::Cleanup { source, .. } if source.kind() == std::io::ErrorKind::PermissionDenied))
     );
     assert!(matches!(
-        root.create_domain(),
+        admitted_domain(&root),
         Err(ExecutionDomainError::PoisonedRoot { .. })
     ));
 }
@@ -783,7 +829,7 @@ fn failed_creation_root_sync_preserves_attempt_and_poisons_root() {
         DomainState::Ready
     );
     assert!(matches!(
-        root.create_domain(),
+        admitted_domain(&root),
         Err(ExecutionDomainError::PoisonedRoot { .. })
     ));
 }
@@ -792,7 +838,7 @@ fn failed_creation_root_sync_preserves_attempt_and_poisons_root() {
 fn removal_syncs_resource_root_before_completing_destroyed() {
     use std::os::unix::fs::MetadataExt;
     let (_temp, root) = prepared_root();
-    let mut domain = root.create_domain().unwrap();
+    let mut domain = admitted_domain(&root).unwrap();
     let attempt = domain.attempt_dir().to_path_buf();
     let called = std::cell::Cell::new(false);
     domain
@@ -823,7 +869,7 @@ fn removal_syncs_resource_root_before_completing_destroyed() {
 #[test]
 fn failed_removal_root_sync_keeps_destroying_and_poisons_root() {
     let (_temp, root) = prepared_root();
-    let mut domain = root.create_domain().unwrap();
+    let mut domain = admitted_domain(&root).unwrap();
     let error = domain
         .destroy_with_remover_and_sync(
             |path| std::fs::remove_dir_all(path),
@@ -844,7 +890,7 @@ fn failed_removal_root_sync_keeps_destroying_and_poisons_root() {
     assert!(!domain.destroyed);
     assert_eq!(domain.lifecycle.state(), DomainState::Destroying);
     assert!(matches!(
-        root.create_domain(),
+        admitted_domain(&root),
         Err(ExecutionDomainError::PoisonedRoot { .. })
     ));
 }
@@ -852,7 +898,7 @@ fn failed_removal_root_sync_keeps_destroying_and_poisons_root() {
 #[test]
 fn root_sync_refuses_replacement_without_touching_canary() {
     let (temp, root) = prepared_root();
-    let mut domain = root.create_domain().unwrap();
+    let mut domain = admitted_domain(&root).unwrap();
     let moved = temp.path().join("moved-root");
     let canary = root.path().join("canary");
     let error = domain
@@ -876,7 +922,7 @@ fn root_sync_refuses_replacement_without_touching_canary() {
     );
     assert_eq!(domain.lifecycle.state(), DomainState::Destroying);
     assert!(matches!(
-        root.create_domain(),
+        admitted_domain(&root),
         Err(ExecutionDomainError::PoisonedRoot { .. })
     ));
 }
@@ -907,7 +953,7 @@ fn creation_rechecks_root_identity_after_sync() {
         DomainState::Ready
     );
     assert!(matches!(
-        root.create_domain(),
+        admitted_domain(&root),
         Err(ExecutionDomainError::PoisonedRoot { .. })
     ));
 }

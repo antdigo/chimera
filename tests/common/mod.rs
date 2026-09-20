@@ -1,5 +1,7 @@
 #![allow(dead_code)]
 
+use std::num::NonZeroUsize;
+
 pub mod docker_registry;
 pub mod pinned_action;
 
@@ -46,7 +48,11 @@ impl TestEnv {
     pub async fn setup() -> Self {
         let tmp = tempfile::tempdir().unwrap();
         let execution_domains =
-            ExecutionDomainRoot::prepare(&tmp.path().join("job-resources")).unwrap();
+            ExecutionDomainRoot::prepare(
+                &tmp.path().join("job-resources"),
+                NonZeroUsize::new(1).unwrap(),
+            )
+            .unwrap();
         Self::setup_with_tmp(tmp, execution_domains).await
     }
 
@@ -127,7 +133,7 @@ impl TestEnv {
         access_token: &str,
         registry_auth: Option<&RegistryAuth>,
     ) -> anyhow::Result<ObservedRun> {
-        let domain = self.execution_domains.create_domain()?;
+        let domain = self.execution_domains.reserve().await?.provision()?;
         let docker_config_dir = domain.docker_config_dir().to_path_buf();
         let attempt_dir = domain.attempt_dir().to_path_buf();
         let run_result = match build_base_env(manifest, &self.workspace, "test-runner", &domain) {
@@ -270,7 +276,7 @@ impl TestEnv {
         manifest: &JobManifest,
         docker_resources: &JobDockerResources,
     ) -> anyhow::Result<(JobConclusion, HashMap<String, String>)> {
-        let domain = self.execution_domains.create_domain()?;
+        let domain = self.execution_domains.reserve().await?.provision()?;
         let base_env = build_container_env(manifest, &self.workspace, "test-runner");
         let action_cache = ActionCache::new(self.actions_dir.clone(), reqwest::Client::new());
         let node_runtimes =

@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -204,7 +205,10 @@ pub fn is_process_alive(pid: u32) -> bool {
     std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
-fn prepare_daemon_root(paths: &ChimeraPaths) -> Result<(PidLock, ExecutionDomainRoot)> {
+fn prepare_daemon_root(
+    paths: &ChimeraPaths,
+    capacity: NonZeroUsize,
+) -> Result<(PidLock, ExecutionDomainRoot)> {
     #[cfg(target_os = "linux")]
     {
         let lexical_root = lexical_absolute_path(&paths.root)?;
@@ -220,7 +224,7 @@ fn prepare_daemon_root(paths: &ChimeraPaths) -> Result<(PidLock, ExecutionDomain
     }
     reject_stale_legacy_job_data(paths)?;
     let pid_lock = PidLock::acquire(&paths.pid_file()).context("acquiring PID lock")?;
-    let execution_domains = ExecutionDomainRoot::prepare(&paths.job_resources_dir())?;
+    let execution_domains = ExecutionDomainRoot::prepare(&paths.job_resources_dir(), capacity)?;
     Ok((pid_lock, execution_domains))
 }
 
@@ -456,7 +460,8 @@ impl Daemon {
     }
 
     pub async fn run(self, mut shutdown_rx: watch::Receiver<bool>) -> Result<()> {
-        let (_pid_lock, execution_domains) = prepare_daemon_root(&self.paths)?;
+        let (_pid_lock, execution_domains) =
+            prepare_daemon_root(&self.paths, self.config.execution.max_active_domains)?;
 
         // Start cache server if configured
         let cache_config = self.config.cache.clone();

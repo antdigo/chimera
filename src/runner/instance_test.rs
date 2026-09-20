@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::io::Write;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -177,7 +178,10 @@ fn make_runner() -> (TempDir, Runner) {
     let temp = TempDir::new().unwrap();
     let paths = ChimeraPaths::new(temp.path().to_path_buf());
     let execution_domains =
-        crate::job::execution_domain::ExecutionDomainRoot::prepare(&paths.job_resources_dir())
+        crate::job::execution_domain::ExecutionDomainRoot::prepare(
+            &paths.job_resources_dir(),
+            NonZeroUsize::new(1).unwrap(),
+        )
             .unwrap();
 
     let runner = Runner {
@@ -223,7 +227,9 @@ fn make_runner() -> (TempDir, Runner) {
 #[test]
 fn runner_creates_workspace_inside_the_current_attempt() {
     let (_temp, runner) = make_runner();
-    let resources = runner.execution_domains.create_domain().unwrap();
+    let resources = futures::executor::block_on(runner.execution_domains.reserve())
+        .and_then(|permit| permit.provision())
+        .unwrap();
 
     let workspace = runner
         .create_job_workspace(&resources, "owner/repo")
@@ -262,7 +268,7 @@ async fn cancelled_job_removes_attempt_workspace_and_temp_canaries() {
 
     let (_temp, runner) = make_runner();
     cache_node_runtimes(&runner);
-    let domain = runner.execution_domains.create_domain().unwrap();
+    let domain = runner.execution_domains.reserve().await.unwrap().provision().unwrap();
     let workspace_canary = domain
         .work_dir()
         .join("test-runner/test-repo/test-repo/workspace-canary");
@@ -325,7 +331,7 @@ async fn cancelled_job_removes_attempt_workspace_and_temp_canaries() {
 
     let first_attempt = domain.attempt_dir().to_path_buf();
     domain.destroy().unwrap();
-    let next_attempt = runner.execution_domains.create_domain().unwrap();
+    let next_attempt = runner.execution_domains.reserve().await.unwrap().provision().unwrap();
     assert_ne!(next_attempt.attempt_dir(), first_attempt);
     assert!(!workspace_canary.exists());
     assert!(!temp_canary.exists());
@@ -640,7 +646,7 @@ async fn poll_loop_stops_when_job_resource_root_is_poisoned() {
     let poll = tokio::spawn(async move { runner.poll_loop(&broker, &mut rx).await });
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    let config = root.create_domain().unwrap();
+    let config = root.reserve().await.unwrap().provision().unwrap();
     let attempt_dir = config.attempt_dir().to_path_buf();
     let outside = root.path().parent().unwrap().join("outside");
     std::fs::write(&outside, "outside").unwrap();
@@ -663,7 +669,7 @@ async fn poll_loop_stops_when_job_resource_root_is_poisoned() {
 async fn poisoned_runner_refuses_job_before_acknowledgement() {
     let (mock_server, token_manager, _shutdown_tx) = setup().await;
     let (_temp, runner) = make_runner();
-    let resources = runner.execution_domains.create_domain().unwrap();
+    let resources = runner.execution_domains.reserve().await.unwrap().provision().unwrap();
     let attempt_dir = resources.attempt_dir().to_path_buf();
     let workspace_canary = resources.work_dir().join("workspace-canary");
     let credential_canary = resources
@@ -989,7 +995,10 @@ fn make_startup_runner(
     let temp = TempDir::new().unwrap();
     let paths = ChimeraPaths::new(temp.path().to_path_buf());
     let execution_domains =
-        crate::job::execution_domain::ExecutionDomainRoot::prepare(&paths.job_resources_dir())
+        crate::job::execution_domain::ExecutionDomainRoot::prepare(
+            &paths.job_resources_dir(),
+            NonZeroUsize::new(1).unwrap(),
+        )
             .unwrap();
 
     let rsa_params =

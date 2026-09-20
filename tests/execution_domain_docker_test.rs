@@ -1,6 +1,7 @@
 mod common;
 
 use std::collections::HashMap;
+use std::num::NonZeroUsize;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -922,7 +923,11 @@ async fn concurrent_logout_does_not_remove_other_job_credentials() {
     let sync = tempfile::tempdir().unwrap();
     let daemon_root = tempfile::tempdir().unwrap();
     let execution_domains =
-        ExecutionDomainRoot::prepare(&daemon_root.path().join("job-resources")).unwrap();
+        ExecutionDomainRoot::prepare(
+            &daemon_root.path().join("job-resources"),
+            NonZeroUsize::new(2).unwrap(),
+        )
+        .unwrap();
     let first = TestEnv::setup_with_job_resources(execution_domains.clone()).await;
     let second = TestEnv::setup_with_job_resources(execution_domains).await;
 
@@ -964,8 +969,12 @@ async fn concurrent_logout_does_not_remove_other_job_credentials() {
 async fn docker_cli_atomic_rewrite_stays_private() {
     let registry = AuthenticatedRegistry::start().await.unwrap();
     let root_parent = tempfile::tempdir().unwrap();
-    let root = ExecutionDomainRoot::prepare(&root_parent.path().join("job-resources")).unwrap();
-    let config = root.create_domain().unwrap();
+    let root = ExecutionDomainRoot::prepare(
+        &root_parent.path().join("job-resources"),
+        NonZeroUsize::new(1).unwrap(),
+    )
+    .unwrap();
+    let config = root.reserve().await.unwrap().provision().unwrap();
     let attempt = config.attempt_dir().to_path_buf();
 
     docker_output(

@@ -42,6 +42,9 @@ pub enum ExecutionDomainError {
     PoisonedRoot {
         path: PathBuf,
     },
+    AdmissionClosed {
+        path: PathBuf,
+    },
     AttemptCollision {
         attempt_id: Uuid,
     },
@@ -119,6 +122,11 @@ impl std::fmt::Display for ExecutionDomainError {
             Self::AttemptCollision { attempt_id } => write!(
                 formatter,
                 "job-resource-collision: generated attempt id already exists: {attempt_id}"
+            ),
+            Self::AdmissionClosed { path } => write!(
+                formatter,
+                "job-resource-admission-closed: refusing new jobs: {}",
+                path.display()
             ),
             Self::UnsafeEntry { path } => write!(
                 formatter,

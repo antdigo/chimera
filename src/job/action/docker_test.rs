@@ -1,3 +1,4 @@
+use std::num::NonZeroUsize;
 use std::collections::HashMap;
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -535,8 +536,12 @@ fn prebuilt_image_trace_omits_arg_values_and_reference() {
 // ── run_docker_metadata_action ──────────────────────────────────
 
 fn test_docker_config(tmp: &tempfile::TempDir) -> crate::job::execution_domain::ExecutionDomain {
-    let root = ExecutionDomainRoot::prepare(&tmp.path().join("job-resources")).unwrap();
-    root.create_domain().unwrap()
+    let root = ExecutionDomainRoot::prepare(
+        &tmp.path().join("job-resources"),
+        NonZeroUsize::new(1).unwrap(),
+    )
+    .unwrap();
+    futures::executor::block_on(root.reserve()).and_then(|permit| permit.provision()).unwrap()
 }
 
 #[tokio::test]

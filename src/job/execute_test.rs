@@ -1,3 +1,4 @@
+use std::num::NonZeroUsize;
 use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::PermissionsExt;
 
@@ -194,8 +195,14 @@ fn test_workspace() -> (tempfile::TempDir, Workspace) {
 
 fn test_docker_config() -> (tempfile::TempDir, ExecutionDomain) {
     let temp = tempfile::tempdir().unwrap();
-    let root = ExecutionDomainRoot::prepare(&temp.path().join("job-resources")).unwrap();
-    let config = root.create_domain().unwrap();
+    let root = ExecutionDomainRoot::prepare(
+        &temp.path().join("job-resources"),
+        NonZeroUsize::new(1).unwrap(),
+    )
+    .unwrap();
+    let config = futures::executor::block_on(root.reserve())
+        .and_then(|permit| permit.provision())
+        .unwrap();
     (temp, config)
 }
 
@@ -887,8 +894,14 @@ async fn cancel_token_kills_running_process() {
 fn host_command_rejects_default_docker_credential_helpers_on_effective_path() {
     for helper in ["docker-credential-pass", "docker-credential-secretservice"] {
         let temp = tempfile::tempdir().unwrap();
-        let root = ExecutionDomainRoot::prepare(&temp.path().join("job-resources")).unwrap();
-        let config = root.create_domain().unwrap();
+        let root = ExecutionDomainRoot::prepare(
+            &temp.path().join("job-resources"),
+            NonZeroUsize::new(1).unwrap(),
+        )
+        .unwrap();
+        let config = futures::executor::block_on(root.reserve())
+            .and_then(|permit| permit.provision())
+            .unwrap();
         let bin = temp.path().join("bin");
         std::fs::create_dir(&bin).unwrap();
         write_executable(&bin.join(helper));
@@ -905,8 +918,14 @@ fn host_command_rejects_default_docker_credential_helpers_on_effective_path() {
 #[test]
 fn host_command_allows_non_executable_default_credential_helper() {
     let temp = tempfile::tempdir().unwrap();
-    let root = ExecutionDomainRoot::prepare(&temp.path().join("job-resources")).unwrap();
-    let config = root.create_domain().unwrap();
+    let root = ExecutionDomainRoot::prepare(
+        &temp.path().join("job-resources"),
+        NonZeroUsize::new(1).unwrap(),
+    )
+    .unwrap();
+    let config = futures::executor::block_on(root.reserve())
+        .and_then(|permit| permit.provision())
+        .unwrap();
     let bin = temp.path().join("bin");
     std::fs::create_dir(&bin).unwrap();
     let helper = bin.join("docker-credential-pass");
@@ -949,8 +968,14 @@ fn host_command_path_precedence_child() {
         return;
     };
     let temp = tempfile::tempdir().unwrap();
-    let root = ExecutionDomainRoot::prepare(&temp.path().join("job-resources")).unwrap();
-    let config = root.create_domain().unwrap();
+    let root = ExecutionDomainRoot::prepare(
+        &temp.path().join("job-resources"),
+        NonZeroUsize::new(1).unwrap(),
+    )
+    .unwrap();
+    let config = futures::executor::block_on(root.reserve())
+        .and_then(|permit| permit.provision())
+        .unwrap();
     let mut explicit = host_base_env(&config);
     explicit.insert("PATH".into(), safe_dir.to_string_lossy().into_owned());
 
@@ -964,8 +989,14 @@ fn host_command_path_precedence_child() {
 #[test]
 fn host_command_rejects_missing_runner_owned_docker_config() {
     let temp = tempfile::tempdir().unwrap();
-    let root = ExecutionDomainRoot::prepare(&temp.path().join("job-resources")).unwrap();
-    let config = root.create_domain().unwrap();
+    let root = ExecutionDomainRoot::prepare(
+        &temp.path().join("job-resources"),
+        NonZeroUsize::new(1).unwrap(),
+    )
+    .unwrap();
+    let config = futures::executor::block_on(root.reserve())
+        .and_then(|permit| permit.provision())
+        .unwrap();
 
     let error =
         host_command("/usr/bin/true", &[], &HashMap::new(), temp.path(), &config).unwrap_err();
@@ -980,8 +1011,14 @@ fn host_command_rejects_missing_runner_owned_docker_config() {
 #[test]
 fn host_command_explicitly_overrides_inherited_docker_config() {
     let temp = tempfile::tempdir().unwrap();
-    let root = ExecutionDomainRoot::prepare(&temp.path().join("job-resources")).unwrap();
-    let config = root.create_domain().unwrap();
+    let root = ExecutionDomainRoot::prepare(
+        &temp.path().join("job-resources"),
+        NonZeroUsize::new(1).unwrap(),
+    )
+    .unwrap();
+    let config = futures::executor::block_on(root.reserve())
+        .and_then(|permit| permit.provision())
+        .unwrap();
     let env = host_base_env(&config);
 
     let command = host_command("/usr/bin/true", &[], &env, temp.path(), &config).unwrap();
@@ -1003,8 +1040,14 @@ fn host_command_rejects_credential_helper_from_private_tmp_path() {
         .unwrap_or_else(|| std::path::PathBuf::from("target"));
     std::fs::create_dir_all(&test_root).unwrap();
     let temp = tempfile::tempdir_in(test_root).unwrap();
-    let root = ExecutionDomainRoot::prepare(&temp.path().join("job-resources")).unwrap();
-    let config = root.create_domain().unwrap();
+    let root = ExecutionDomainRoot::prepare(
+        &temp.path().join("job-resources"),
+        NonZeroUsize::new(1).unwrap(),
+    )
+    .unwrap();
+    let config = futures::executor::block_on(root.reserve())
+        .and_then(|permit| permit.provision())
+        .unwrap();
     let directory_name = format!("chimera-helper-{}", uuid::Uuid::new_v4().simple());
     let private_bin = config.private_tmp().join(&directory_name);
     std::fs::create_dir(&private_bin).unwrap();
@@ -1030,8 +1073,14 @@ fn host_command_rejects_credential_helper_from_relative_private_tmp_path() {
         .unwrap_or_else(|| std::path::PathBuf::from("target"));
     std::fs::create_dir_all(&test_root).unwrap();
     let temp = tempfile::tempdir_in(test_root).unwrap();
-    let root = ExecutionDomainRoot::prepare(&temp.path().join("job-resources")).unwrap();
-    let config = root.create_domain().unwrap();
+    let root = ExecutionDomainRoot::prepare(
+        &temp.path().join("job-resources"),
+        NonZeroUsize::new(1).unwrap(),
+    )
+    .unwrap();
+    let config = futures::executor::block_on(root.reserve())
+        .and_then(|permit| permit.provision())
+        .unwrap();
     let directory_name = format!("chimera-helper-{}", uuid::Uuid::new_v4().simple());
     let private_bin = config.private_tmp().join(&directory_name);
     std::fs::create_dir(&private_bin).unwrap();
@@ -1058,8 +1107,14 @@ fn host_command_rejects_credential_helper_through_symlink_into_private_tmp() {
         .unwrap_or_else(|| std::path::PathBuf::from("target"));
     std::fs::create_dir_all(&test_root).unwrap();
     let temp = tempfile::tempdir_in(test_root).unwrap();
-    let root = ExecutionDomainRoot::prepare(&temp.path().join("job-resources")).unwrap();
-    let config = root.create_domain().unwrap();
+    let root = ExecutionDomainRoot::prepare(
+        &temp.path().join("job-resources"),
+        NonZeroUsize::new(1).unwrap(),
+    )
+    .unwrap();
+    let config = futures::executor::block_on(root.reserve())
+        .and_then(|permit| permit.provision())
+        .unwrap();
     let directory_name = format!("chimera-helper-{}", uuid::Uuid::new_v4().simple());
     let private_bin = config.private_tmp().join(&directory_name);
     std::fs::create_dir(&private_bin).unwrap();
@@ -1087,8 +1142,14 @@ fn host_command_rejects_credential_helper_through_symlink_within_private_tmp() {
         .unwrap_or_else(|| std::path::PathBuf::from("target"));
     std::fs::create_dir_all(&test_root).unwrap();
     let temp = tempfile::tempdir_in(test_root).unwrap();
-    let root = ExecutionDomainRoot::prepare(&temp.path().join("job-resources")).unwrap();
-    let config = root.create_domain().unwrap();
+    let root = ExecutionDomainRoot::prepare(
+        &temp.path().join("job-resources"),
+        NonZeroUsize::new(1).unwrap(),
+    )
+    .unwrap();
+    let config = futures::executor::block_on(root.reserve())
+        .and_then(|permit| permit.provision())
+        .unwrap();
     let real_name = format!("chimera-helper-real-{}", uuid::Uuid::new_v4().simple());
     let link_name = format!("chimera-helper-link-{}", uuid::Uuid::new_v4().simple());
     let private_bin = config.private_tmp().join(&real_name);
@@ -1120,8 +1181,14 @@ fn host_command_skips_inaccessible_path_entry() {
         .unwrap_or_else(|| std::path::PathBuf::from("target"));
     std::fs::create_dir_all(&test_root).unwrap();
     let temp = tempfile::tempdir_in(test_root).unwrap();
-    let root = ExecutionDomainRoot::prepare(&temp.path().join("job-resources")).unwrap();
-    let config = root.create_domain().unwrap();
+    let root = ExecutionDomainRoot::prepare(
+        &temp.path().join("job-resources"),
+        NonZeroUsize::new(1).unwrap(),
+    )
+    .unwrap();
+    let config = futures::executor::block_on(root.reserve())
+        .and_then(|permit| permit.provision())
+        .unwrap();
     let inaccessible = temp.path().join("inaccessible");
     std::fs::create_dir(&inaccessible).unwrap();
     std::fs::set_permissions(&inaccessible, std::fs::Permissions::from_mode(0o000)).unwrap();
@@ -1145,8 +1212,14 @@ fn host_command_resets_symlink_budget_after_working_directory_lookup() {
         .unwrap_or_else(|| std::path::PathBuf::from("target"));
     std::fs::create_dir_all(&test_root).unwrap();
     let temp = tempfile::tempdir_in(test_root).unwrap();
-    let root = ExecutionDomainRoot::prepare(&temp.path().join("job-resources")).unwrap();
-    let config = root.create_domain().unwrap();
+    let root = ExecutionDomainRoot::prepare(
+        &temp.path().join("job-resources"),
+        NonZeroUsize::new(1).unwrap(),
+    )
+    .unwrap();
+    let config = futures::executor::block_on(root.reserve())
+        .and_then(|permit| permit.provision())
+        .unwrap();
     let final_directory = temp.path().join("resolved-working-directory");
     let real_bin = final_directory.join("real-bin");
     std::fs::create_dir_all(&real_bin).unwrap();
@@ -1215,7 +1288,11 @@ async fn concurrent_webhook_flows_get_private_absolute_tmp() {
         .unwrap_or_else(|| std::path::PathBuf::from("target"));
     std::fs::create_dir_all(&test_root).unwrap();
     let temp = tempfile::tempdir_in(test_root).unwrap();
-    let root = ExecutionDomainRoot::prepare(&temp.path().join("job-resources")).unwrap();
+    let root = ExecutionDomainRoot::prepare(
+        &temp.path().join("job-resources"),
+        NonZeroUsize::new(JOBS).unwrap(),
+    )
+    .unwrap();
     let barrier = temp.path().join("barrier");
     std::fs::create_dir(&barrier).unwrap();
 
@@ -1240,7 +1317,7 @@ async fn concurrent_webhook_flows_get_private_absolute_tmp() {
     );
     let mut runs = Vec::new();
     for index in 0..JOBS {
-        let config = root.create_domain().unwrap();
+        let config = root.reserve().await.unwrap().provision().unwrap();
         let workspace_root = temp.path().join(format!("workspace-{index}"));
         let workspace = Workspace::create(
             &workspace_root.join("work"),
@@ -1335,12 +1412,12 @@ async fn concurrent_webhook_flows_get_private_absolute_tmp() {
         std::fs::write(barrier.join(format!("{phase}.release")), "go").unwrap();
     }
 
-    let mut completed = futures::future::join_all(runs)
+    let completed = futures::future::join_all(runs)
         .await
         .into_iter()
         .map(Result::unwrap)
         .collect::<Vec<_>>();
-    for (index, (result, outputs, config)) in completed.iter_mut().enumerate() {
+    for (index, (result, outputs, config)) in completed.into_iter().enumerate() {
         assert_eq!(
             result.as_ref().unwrap().conclusion,
             StepConclusion::Succeeded
@@ -1390,8 +1467,14 @@ fn host_command_fails_closed_when_private_tmp_is_missing() {
         .unwrap_or_else(|| std::path::PathBuf::from("target"));
     std::fs::create_dir_all(&test_root).unwrap();
     let temp = tempfile::tempdir_in(test_root).unwrap();
-    let root = ExecutionDomainRoot::prepare(&temp.path().join("job-resources")).unwrap();
-    let mut config = root.create_domain().unwrap();
+    let root = ExecutionDomainRoot::prepare(
+        &temp.path().join("job-resources"),
+        NonZeroUsize::new(1).unwrap(),
+    )
+    .unwrap();
+    let mut config = futures::executor::block_on(root.reserve())
+        .and_then(|permit| permit.provision())
+        .unwrap();
     let sentinel = temp.path().join("command-ran");
     let script = format!("touch '{}'", sentinel.display());
     let env = host_base_env(&config);
@@ -1436,8 +1519,12 @@ async fn private_tmp_mount_precedes_working_directory_lookup() {
         .unwrap_or_else(|| std::path::PathBuf::from("target"));
     std::fs::create_dir_all(&test_root).unwrap();
     let temp = tempfile::tempdir_in(test_root).unwrap();
-    let root = ExecutionDomainRoot::prepare(&temp.path().join("job-resources")).unwrap();
-    let mut config = root.create_domain().unwrap();
+    let root = ExecutionDomainRoot::prepare(
+        &temp.path().join("job-resources"),
+        NonZeroUsize::new(1).unwrap(),
+    )
+    .unwrap();
+    let mut config = root.reserve().await.unwrap().provision().unwrap();
     let env = host_base_env(&config);
     let directory_name = format!("chimera-cwd-{}", uuid::Uuid::new_v4().simple());
     let private_working_directory = std::path::PathBuf::from("/tmp").join(&directory_name);
@@ -1495,8 +1582,12 @@ async fn working_directory_tmp_does_not_write_to_host_tmp() {
         .unwrap_or_else(|| std::path::PathBuf::from("target"));
     std::fs::create_dir_all(&test_root).unwrap();
     let temp = tempfile::tempdir_in(test_root).unwrap();
-    let root = ExecutionDomainRoot::prepare(&temp.path().join("job-resources")).unwrap();
-    let mut config = root.create_domain().unwrap();
+    let root = ExecutionDomainRoot::prepare(
+        &temp.path().join("job-resources"),
+        NonZeroUsize::new(1).unwrap(),
+    )
+    .unwrap();
+    let mut config = root.reserve().await.unwrap().provision().unwrap();
     let env = host_base_env(&config);
     let file_name = format!("chimera-cwd-{}", uuid::Uuid::new_v4().simple());
     let host_path = std::path::Path::new("/tmp").join(&file_name);
@@ -1552,8 +1643,12 @@ async fn host_command_inheritance_child() {
     }
 
     let temp = tempfile::tempdir().unwrap();
-    let root = ExecutionDomainRoot::prepare(&temp.path().join("job-resources")).unwrap();
-    let config = root.create_domain().unwrap();
+    let root = ExecutionDomainRoot::prepare(
+        &temp.path().join("job-resources"),
+        NonZeroUsize::new(1).unwrap(),
+    )
+    .unwrap();
+    let config = root.reserve().await.unwrap().provision().unwrap();
     let job_config = config.docker_config_dir().to_path_buf();
     let env = HashMap::from([(
         DOCKER_CONFIG_ENV.to_string(),

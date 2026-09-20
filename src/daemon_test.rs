@@ -425,16 +425,46 @@ fn startup_preparation_rejects_stale_job_resources_without_deleting_them() {
     let temp = TempDir::new().unwrap();
     let paths = ChimeraPaths::new(temp.path().to_path_buf());
     std::fs::create_dir_all(&paths.root).unwrap();
-    let root =
-        crate::job::execution_domain::ExecutionDomainRoot::prepare(&paths.job_resources_dir())
-            .unwrap();
-    let stale = root.create_domain().unwrap();
+    let root = crate::job::execution_domain::ExecutionDomainRoot::prepare(
+        &paths.job_resources_dir(),
+        NonZeroUsize::new(1).unwrap(),
+    )
+    .unwrap();
+    let stale = futures::executor::block_on(root.reserve())
+        .and_then(|permit| permit.provision())
+        .unwrap();
     let stale_dir = stale.attempt_dir().to_path_buf();
 
-    let error = prepare_daemon_root(&paths).unwrap_err();
+    let error = prepare_daemon_root(&paths, NonZeroUsize::new(1).unwrap()).unwrap_err();
 
     assert!(error.to_string().contains("stale-job-resources"));
     assert!(stale_dir.exists());
+}
+
+#[tokio::test]
+async fn startup_preparation_uses_configured_domain_capacity() {
+    let test_root = std::env::var_os("CARGO_TARGET_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("target"));
+    std::fs::create_dir_all(&test_root).unwrap();
+    let temp = TempDir::new_in(test_root).unwrap();
+    let paths = ChimeraPaths::new(temp.path().to_path_buf());
+    let config = crate::config::ExecutionConfig {
+        max_active_domains: NonZeroUsize::new(2).unwrap(),
+        ..Default::default()
+    };
+    let (_lock, root) = prepare_daemon_root(&paths, config.max_active_domains).unwrap();
+    let first = root.reserve().await.unwrap();
+    let second = tokio::time::timeout(Duration::from_secs(1), root.reserve())
+        .await
+        .expect("configured second domain must be admitted")
+        .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), root.reserve())
+            .await
+            .is_err()
+    );
+    drop((first, second));
 }
 
 #[test]
@@ -451,7 +481,7 @@ fn startup_preparation_rejects_legacy_work_and_temp_canaries() {
         std::fs::create_dir_all(canary.parent().unwrap()).unwrap();
         std::fs::write(&canary, "secret from previous job").unwrap();
 
-        let error = prepare_daemon_root(&paths).unwrap_err();
+        let error = prepare_daemon_root(&paths, NonZeroUsize::new(1).unwrap()).unwrap_err();
 
         assert!(error.to_string().contains("stale-legacy-job-data"));
         assert!(canary.exists());
@@ -465,7 +495,7 @@ fn startup_rejects_chimera_root_under_host_tmp() {
     let temp = TempDir::new_in("/tmp").unwrap();
     let paths = ChimeraPaths::new(temp.path().to_path_buf());
 
-    let error = prepare_daemon_root(&paths).unwrap_err();
+    let error = prepare_daemon_root(&paths, NonZeroUsize::new(1).unwrap()).unwrap_err();
 
     assert!(error.to_string().contains("chimera-root-under-host-tmp"));
     assert!(!paths.job_resources_dir().exists());
@@ -486,7 +516,7 @@ fn startup_rejects_tmp_symlink_to_root_outside_host_tmp() {
     std::os::unix::fs::symlink(target.path(), &link).unwrap();
     let paths = ChimeraPaths::new(link.clone());
 
-    let result = prepare_daemon_root(&paths);
+    let result = prepare_daemon_root(&paths, NonZeroUsize::new(1).unwrap());
     let error = result.as_ref().err().map(ToString::to_string);
     drop(result);
     std::fs::remove_file(&link).unwrap();

@@ -1,3 +1,4 @@
+use std::num::NonZeroUsize;
 use std::collections::HashMap;
 
 use super::*;
@@ -9,8 +10,12 @@ use crate::job::workspace::Workspace;
 use tokio_util::sync::CancellationToken;
 
 fn test_docker_config(tmp: &tempfile::TempDir) -> crate::job::execution_domain::ExecutionDomain {
-    let root = ExecutionDomainRoot::prepare(&tmp.path().join("job-resources")).unwrap();
-    root.create_domain().unwrap()
+    let root = ExecutionDomainRoot::prepare(
+        &tmp.path().join("job-resources"),
+        NonZeroUsize::new(1).unwrap(),
+    )
+    .unwrap();
+    futures::executor::block_on(root.reserve()).and_then(|permit| permit.provision()).unwrap()
 }
 
 fn make_test_workspace(tmp: &tempfile::TempDir) -> Workspace {

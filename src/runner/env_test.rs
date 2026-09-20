@@ -1,3 +1,4 @@
+use std::num::NonZeroUsize;
 use super::*;
 use crate::job::execution_domain::{DOCKER_CONFIG_ENV, ExecutionDomain, ExecutionDomainRoot};
 use crate::job::schema::{JobManifest, JobVariable};
@@ -54,8 +55,14 @@ fn test_workspace() -> (tempfile::TempDir, Workspace) {
 
 fn test_docker_config() -> (tempfile::TempDir, ExecutionDomain) {
     let temp = tempfile::TempDir::new().unwrap();
-    let root = ExecutionDomainRoot::prepare(&temp.path().join("job-resources")).unwrap();
-    let config = root.create_domain().unwrap();
+    let root = ExecutionDomainRoot::prepare(
+        &temp.path().join("job-resources"),
+        NonZeroUsize::new(1).unwrap(),
+    )
+    .unwrap();
+    let config = futures::executor::block_on(root.reserve())
+        .and_then(|permit| permit.provision())
+        .unwrap();
     (temp, config)
 }
 
