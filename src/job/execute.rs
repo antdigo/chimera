@@ -793,6 +793,10 @@ pub async fn run_process(
     timeout: Duration,
     cancel_token: &CancellationToken,
 ) -> Result<StepResult> {
+    // All fallible host-to-domain mapping must complete before opening the
+    // single outstanding command-file transaction.
+    let env = domain.command_environment(env)?;
+    let target = domain.command_target(program, args, working_dir, &env)?;
     let state_id = prepare_step_transaction(domain, workspace).await?;
     let processor = OutputProcessor::new(
         log_sender.clone(),
@@ -800,9 +804,8 @@ pub async fn run_process(
         job_state.debug_enabled,
     );
     let (output, mut events) = mpsc::channel(32);
-    let env = domain.command_environment(env)?;
     let spec = CommandSpec {
-        target: domain.command_target(program, args, working_dir, &env)?,
+        target,
         env,
         timeout,
         state: Some(state_id.clone()),

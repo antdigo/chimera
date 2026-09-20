@@ -197,6 +197,8 @@ impl DomainCommandMapping {
                 .and_then(DomainPath::parse),
             #[cfg(target_os = "linux")]
             Self::Sandboxed(mappings) => {
+                let canonical = canonical_sandbox_path(path);
+                let path = canonical.as_path();
                 if mappings
                     .iter()
                     .any(|(_, target)| path.starts_with(target.as_str()))
@@ -230,6 +232,28 @@ impl DomainCommandMapping {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    fn executable_exists(&self, path: &DomainPath) -> bool {
+        let Self::Sandboxed(mappings) = self else {
+            return false;
+        };
+        let domain_path = Path::new(path.as_str());
+        let Some((source, target)) = mappings
+            .iter()
+            .filter(|(_, target)| domain_path.starts_with(target.as_str()))
+            .max_by_key(|(_, target)| Path::new(target.as_str()).components().count())
+        else {
+            return false;
+        };
+        let Ok(relative) = domain_path.strip_prefix(target.as_str()) else {
+            return false;
+        };
+        let Ok(metadata) = fs::metadata(source.join(relative)) else {
+            return false;
+        };
+        metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+    }
+
     fn target(
         &self,
         program: &OsStr,
@@ -258,10 +282,11 @@ impl DomainCommandMapping {
                         .into_iter()
                         .flat_map(|path| path.split(':'))
                         .filter(|path| !path.is_empty())
-                        .find_map(|directory| {
+                        .filter_map(|directory| {
                             self.map_path(Path::new(directory).join(program).as_path())
                                 .ok()
                         })
+                        .find(|candidate| self.executable_exists(candidate))
                         .ok_or(ExecutionDomainError::InvalidDomainPath)?
                 };
                 let args = args
@@ -323,13 +348,13 @@ impl DomainCommandMapping {
                     }
                 }
                 if let Some(path) = mapped.get("PATH").cloned() {
+                    let mut seen = std::collections::HashSet::new();
                     let path = path
                         .split(':')
                         .filter(|part| !part.is_empty())
-                        .map(|part| self.map_path(Path::new(part)))
-                        .collect::<Result<Vec<_>, _>>()?
-                        .into_iter()
+                        .filter_map(|part| self.map_path(Path::new(part)).ok())
                         .map(|part| part.as_str().to_owned())
+                        .filter(|part| seen.insert(part.clone()))
                         .collect::<Vec<_>>()
                         .join(":");
                     mapped.insert("PATH".into(), path);
@@ -338,6 +363,16 @@ impl DomainCommandMapping {
             }
         }
     }
+}
+
+#[cfg(target_os = "linux")]
+fn canonical_sandbox_path(path: &Path) -> PathBuf {
+    for (alias, canonical) in [("/bin", "/usr/bin"), ("/sbin", "/usr/sbin")] {
+        if let Ok(relative) = path.strip_prefix(alias) {
+            return Path::new(canonical).join(relative);
+        }
+    }
+    path.to_path_buf()
 }
 
 impl std::fmt::Debug for ExecutionDomain {

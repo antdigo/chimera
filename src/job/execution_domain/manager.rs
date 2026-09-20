@@ -47,6 +47,12 @@ pub(super) enum ManagerRequest {
         reply: oneshot::Sender<Result<DestroyReport, ExecutionDomainError>>,
     },
     #[cfg(test)]
+    BlockStateForTest {
+        started: std::sync::mpsc::Sender<()>,
+        proceed: std::sync::mpsc::Receiver<()>,
+        reply: oneshot::Sender<()>,
+    },
+    #[cfg(test)]
     Panic,
 }
 
@@ -239,10 +245,8 @@ impl DomainManager {
                 ) {
                     Ok(handle) => handle,
                     Err(error) => {
-                        let cleanup = backend_slot
-                            .as_mut()
-                            .expect("provisioned backend")
-                            .destroy();
+                        let cleanup =
+                            with_backend_blocking(&mut backend_slot, Backend::destroy).await;
                         if cleanup.is_ok() {
                             guard.confirmed_destroyed();
                         }
@@ -257,11 +261,9 @@ impl DomainManager {
                         handle.explicit_destroy = true;
                         handle.request.take();
                     }
-                    reader.revoke_and_wait();
-                    if backend_slot
-                        .as_mut()
-                        .expect("provisioned backend")
-                        .destroy()
+                    revoke_reader(reader.clone()).await;
+                    if with_backend_blocking(&mut backend_slot, Backend::destroy)
+                        .await
                         .is_ok()
                     {
                         guard.confirmed_destroyed();
@@ -269,7 +271,7 @@ impl DomainManager {
                     return;
                 }
                 manager_loop(
-                    backend_slot.as_mut().expect("provisioned backend"),
+                    &mut backend_slot,
                     &mut receiver,
                     &reader,
                     attempt,
@@ -284,10 +286,11 @@ impl DomainManager {
                 // The guard remains outside the unwind boundary, so cleanup
                 // authority and the permit survive a panic in the request loop.
                 state.poison();
-                reader.revoke_and_wait();
-                if backend_slot
-                    .as_mut()
-                    .is_some_and(|backend| backend.destroy().is_ok())
+                revoke_reader(reader.clone()).await;
+                if backend_slot.is_some()
+                    && with_backend_blocking(&mut backend_slot, Backend::destroy)
+                        .await
+                        .is_ok()
                 {
                     guard.confirmed_destroyed();
                 }
@@ -331,6 +334,40 @@ fn manager_runtime() -> Result<&'static tokio::runtime::Runtime, std::io::Error>
     RUNTIME
         .get()
         .ok_or_else(|| std::io::Error::other("manager runtime initialization lost"))
+}
+
+async fn run_blocking<T, F>(operation: F) -> T
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    tokio::task::spawn_blocking(operation)
+        .await
+        .expect("execution-domain blocking operation panicked")
+}
+
+async fn with_backend_blocking<T, F>(backend_slot: &mut Option<Backend>, operation: F) -> T
+where
+    T: Send + 'static,
+    F: FnOnce(&mut Backend) -> T + Send + 'static,
+{
+    let mut backend = backend_slot
+        .take()
+        .expect("manager backend must be present");
+    let (backend, result) = run_blocking(move || {
+        let result = std::panic::catch_unwind(AssertUnwindSafe(|| operation(&mut backend)));
+        (backend, result)
+    })
+    .await;
+    *backend_slot = Some(backend);
+    match result {
+        Ok(value) => value,
+        Err(payload) => std::panic::resume_unwind(payload),
+    }
+}
+
+async fn revoke_reader(reader: DomainWorkspaceReader) {
+    run_blocking(move || reader.revoke_and_wait()).await;
 }
 
 #[cfg_attr(
@@ -377,7 +414,7 @@ fn build_handle(
 }
 
 async fn manager_loop(
-    backend: &mut Backend,
+    backend_slot: &mut Option<Backend>,
     receiver: &mut mpsc::Receiver<ManagerRequest>,
     reader: &DomainWorkspaceReader,
     attempt: AttemptIdentity,
@@ -386,16 +423,26 @@ async fn manager_loop(
     while let Some(request) = receiver.recv().await {
         match request {
             ManagerRequest::BindWorkspace { paths, work, reply } => {
-                let result = reader
-                    .bind(work)
-                    .and_then(|()| backend.bind_workspace(paths));
+                let owned_reader = reader.clone();
+                let result = run_blocking(move || owned_reader.bind(work)).await;
+                let result = match result {
+                    Ok(()) => {
+                        with_backend_blocking(backend_slot, move |backend| {
+                            backend.bind_workspace(paths)
+                        })
+                        .await
+                    }
+                    Err(error) => Err(error),
+                };
                 let _ = reply.send(result);
             }
             ManagerRequest::MarkRunning { reply } => {
-                let _ = reply.send(backend.mark_running());
+                let result = with_backend_blocking(backend_slot, Backend::mark_running).await;
+                let _ = reply.send(result);
             }
             ManagerRequest::MarkCleaning { reply } => {
-                let _ = reply.send(backend.mark_cleaning());
+                let result = with_backend_blocking(backend_slot, Backend::mark_cleaning).await;
+                let _ = reply.send(result);
             }
             ManagerRequest::Run {
                 spec,
@@ -407,6 +454,9 @@ async fn manager_loop(
                 let mut destroy_reply = None;
                 let mut channel_closed = false;
                 let result = {
+                    let backend = backend_slot
+                        .as_mut()
+                        .expect("manager backend must be present");
                     let run = backend.run(spec, output, cancelled, manager_cancelled.clone());
                     tokio::pin!(run);
                     loop {
@@ -442,8 +492,8 @@ async fn manager_loop(
                 };
                 let _ = reply.send(result);
                 if let Some(reply) = destroy_reply {
-                    reader.revoke_and_wait();
-                    let result = backend.destroy();
+                    revoke_reader(reader.clone()).await;
+                    let result = with_backend_blocking(backend_slot, Backend::destroy).await;
                     if result.is_ok() {
                         guard.confirmed_destroyed();
                     }
@@ -456,17 +506,26 @@ async fn manager_loop(
                 }
             }
             ManagerRequest::PrepareStep { event, reply } => {
-                let _ = reply.send(backend.prepare_step(&event));
+                let result = with_backend_blocking(backend_slot, move |backend| {
+                    backend.prepare_step(&event)
+                })
+                .await;
+                let _ = reply.send(result);
             }
             ManagerRequest::ReadStep { id, reply } => {
-                let _ = reply.send(backend.read_step(id));
+                let result =
+                    with_backend_blocking(backend_slot, move |backend| backend.read_step(id)).await;
+                let _ = reply.send(result);
             }
             ManagerRequest::Cancel { reason, reply } => {
-                let _ = reply.send(backend.cancel(reason));
+                let result =
+                    with_backend_blocking(backend_slot, move |backend| backend.cancel(reason))
+                        .await;
+                let _ = reply.send(result);
             }
             ManagerRequest::Destroy { reply } => {
-                reader.revoke_and_wait();
-                let result = backend.destroy();
+                revoke_reader(reader.clone()).await;
+                let result = with_backend_blocking(backend_slot, Backend::destroy).await;
                 if result.is_ok() {
                     guard.confirmed_destroyed();
                 }
@@ -479,6 +538,19 @@ async fn manager_loop(
                 return;
             }
             #[cfg(test)]
+            ManagerRequest::BlockStateForTest {
+                started,
+                proceed,
+                reply,
+            } => {
+                run_blocking(move || {
+                    let _ = started.send(());
+                    let _ = proceed.recv();
+                })
+                .await;
+                let _ = reply.send(());
+            }
+            #[cfg(test)]
             ManagerRequest::Panic => panic!("injected execution-domain manager panic"),
         }
     }
@@ -486,8 +558,8 @@ async fn manager_loop(
     // Conservative dropped-handle policy: poison admission synchronously, then
     // revoke all read leases and perform idempotent cleanup before permit drop.
     guard.root_state.poison();
-    reader.revoke_and_wait();
-    let _ = backend.destroy();
+    revoke_reader(reader.clone()).await;
+    let _ = with_backend_blocking(backend_slot, Backend::destroy).await;
 }
 
 fn reject_while_running(request: ManagerRequest) {
@@ -512,6 +584,10 @@ fn reject_while_running(request: ManagerRequest) {
         }
         ManagerRequest::Destroy { reply } => {
             let _ = reply.send(Err(error()));
+        }
+        #[cfg(test)]
+        ManagerRequest::BlockStateForTest { reply, .. } => {
+            let _ = reply.send(());
         }
         #[cfg(test)]
         ManagerRequest::Panic => unreachable!("panic requests are handled before rejection"),
@@ -628,14 +704,11 @@ impl Backend {
     }
 
     fn cancel(&mut self, reason: CancelReason) -> Result<(), ExecutionDomainError> {
-        match self {
-            Self::Trusted(_) => {
-                let _ = reason;
-                Ok(())
-            }
-            #[cfg(target_os = "linux")]
-            Self::Linux(backend) => backend.cancel(reason),
-        }
+        // A command cancellation is meaningful only while `Run` owns a
+        // correlated command id. A late/idle cancellation is idempotent and
+        // must never be promoted to domain shutdown.
+        let _ = (self, reason);
+        Ok(())
     }
 
     fn destroy(&mut self) -> Result<(), ExecutionDomainError> {
@@ -828,9 +901,11 @@ impl LinuxBackend {
         }
     }
 
-    fn cancel(&mut self, reason: CancelReason) -> Result<(), ExecutionDomainError> {
+    fn shutdown(&mut self) -> Result<(), ExecutionDomainError> {
         use super::protocol::{Request, Response};
-        match self.kernel.control.request(Request::Shutdown { reason })? {
+        match self.kernel.control.request(Request::Shutdown {
+            reason: CancelReason::Shutdown,
+        })? {
             Response::ShuttingDown => Ok(()),
             Response::Rejected { category } => Err(backend_failure(category)),
             _ => Err(backend_failure(super::FailureCategory::Protocol)),
@@ -838,7 +913,7 @@ impl LinuxBackend {
     }
 
     fn destroy(&mut self) -> Result<(), ExecutionDomainError> {
-        let _ = self.cancel(CancelReason::Shutdown);
+        let _ = self.shutdown();
         if self
             .kernel
             .launcher

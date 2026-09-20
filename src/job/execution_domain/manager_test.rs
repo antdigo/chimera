@@ -255,27 +255,28 @@ async fn manager_panic_during_run_kills_the_trusted_process_group_before_cleanup
     let (output, _events) = tokio::sync::mpsc::channel(1);
     let run = domain.run(spec, output, tokio_util::sync::CancellationToken::new());
     let panic = async {
-        tokio::time::timeout(std::time::Duration::from_secs(1), async {
-            while !pid_file.exists() {
+        let pid = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if let Ok(contents) = std::fs::read_to_string(&pid_file)
+                    && let Ok(pid) = contents.trim().parse::<i32>()
+                {
+                    break pid;
+                }
                 tokio::task::yield_now().await;
             }
         })
         .await
         .unwrap();
         domain.panic_manager_for_test().await.unwrap();
+        pid
     };
-    let (run_result, ()) = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+    let (run_result, pid) = tokio::time::timeout(std::time::Duration::from_secs(3), async {
         tokio::join!(run, panic)
     })
     .await
     .unwrap();
     assert!(run_result.is_err());
 
-    let pid: i32 = std::fs::read_to_string(&pid_file)
-        .unwrap()
-        .trim()
-        .parse()
-        .unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
         loop {
             let alive = unsafe { libc::kill(pid, 0) } == 0;
@@ -449,6 +450,106 @@ async fn domain_cancel_interrupts_in_flight_trusted_command_but_allows_post_comm
 }
 
 #[tokio::test]
+async fn blocking_state_work_in_one_domain_does_not_stall_another_domain() {
+    let temp = tempfile::tempdir().unwrap();
+    let root =
+        ExecutionDomainRoot::prepare(&temp.path().join("domains"), NonZeroUsize::new(2).unwrap())
+            .unwrap();
+    let blocked = root
+        .reserve()
+        .await
+        .unwrap()
+        .provision(AttemptIdentity::new())
+        .await
+        .unwrap();
+    let responsive = root
+        .reserve()
+        .await
+        .unwrap()
+        .provision(AttemptIdentity::new())
+        .await
+        .unwrap();
+    let request = blocked.request.as_ref().unwrap().clone();
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (proceed_tx, proceed_rx) = std::sync::mpsc::channel();
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    request
+        .send(super::ManagerRequest::BlockStateForTest {
+            started: started_tx,
+            proceed: proceed_rx,
+            reply: reply_tx,
+        })
+        .await
+        .unwrap();
+    started_rx
+        .recv_timeout(std::time::Duration::from_secs(1))
+        .unwrap();
+
+    let cancel = tokio::time::timeout(
+        std::time::Duration::from_millis(500),
+        responsive.cancel(CancelReason::User),
+    )
+    .await;
+    proceed_tx.send(()).unwrap();
+    reply_rx.await.unwrap();
+
+    assert!(
+        cancel.is_ok(),
+        "one domain blocked the shared manager runtime"
+    );
+    blocked.destroy().await.unwrap();
+    responsive.destroy().await.unwrap();
+}
+
+#[tokio::test]
+async fn cancel_racing_with_command_finish_is_command_scoped_and_idempotent() {
+    let temp = tempfile::tempdir().unwrap();
+    let root =
+        ExecutionDomainRoot::prepare(&temp.path().join("domains"), NonZeroUsize::new(1).unwrap())
+            .unwrap();
+    let domain = root
+        .reserve()
+        .await
+        .unwrap()
+        .provision(AttemptIdentity::new())
+        .await
+        .unwrap();
+
+    for _ in 0..16 {
+        let (output, _events) = tokio::sync::mpsc::channel(1);
+        let run = domain.run(
+            trusted_spec(&domain, "exit 0"),
+            output,
+            tokio_util::sync::CancellationToken::new(),
+        );
+        let cancel = async {
+            tokio::task::yield_now().await;
+            domain.cancel(CancelReason::User).await
+        };
+        let (outcome, cancel) = tokio::join!(run, cancel);
+        assert!(cancel.is_ok());
+        assert!(matches!(
+            outcome.unwrap(),
+            CommandOutcome::Exited(0) | CommandOutcome::Cancelled
+        ));
+    }
+
+    let (output, _events) = tokio::sync::mpsc::channel(1);
+    assert_eq!(
+        domain
+            .run(
+                trusted_spec(&domain, "exit 0"),
+                output,
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+            .unwrap(),
+        CommandOutcome::Exited(0)
+    );
+    domain.destroy().await.unwrap();
+}
+
+#[tokio::test]
 async fn destroy_interrupts_in_flight_trusted_command_before_cleanup() {
     let temp = tempfile::tempdir().unwrap();
     let root =
@@ -594,6 +695,136 @@ fn sandbox_command_mapping_uses_domain_paths_and_rejects_non_utf8_argv() {
             )
             .is_err()
     );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn sandbox_path_filters_debian_aliases_and_resolves_first_executable() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let host_work = temp.path().join("host-work");
+    let host_sbin = temp.path().join("usr-sbin");
+    let host_bin = temp.path().join("usr-bin");
+    std::fs::create_dir_all(&host_work).unwrap();
+    std::fs::create_dir_all(&host_sbin).unwrap();
+    std::fs::create_dir_all(&host_bin).unwrap();
+    let earlier_non_executable = host_sbin.join("chimera-path-probe");
+    std::fs::write(&earlier_non_executable, "not executable").unwrap();
+    std::fs::set_permissions(
+        &earlier_non_executable,
+        std::fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+    let executable = host_bin.join("chimera-path-probe");
+    std::fs::write(&executable, "#!/bin/sh\n").unwrap();
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    let mapping = super::super::DomainCommandMapping::Sandboxed(vec![
+        (
+            host_work.clone(),
+            super::super::DomainPath::parse("/work").unwrap(),
+        ),
+        (
+            host_sbin,
+            super::super::DomainPath::parse("/usr/sbin").unwrap(),
+        ),
+        (
+            host_bin,
+            super::super::DomainPath::parse("/usr/bin").unwrap(),
+        ),
+    ]);
+    let supplied = std::collections::HashMap::from([(
+        "PATH".into(),
+        "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".into(),
+    )]);
+
+    let mapped = mapping
+        .environment(&supplied, &super::super::DomainEnvironment::sandboxed())
+        .unwrap();
+    assert_eq!(
+        mapped.get("PATH").map(String::as_str),
+        Some("/usr/sbin:/usr/bin")
+    );
+    assert!(!mapped["PATH"].contains(temp.path().to_str().unwrap()));
+    assert_eq!(
+        mapping
+            .target(
+                std::ffi::OsStr::new("chimera-path-probe"),
+                &[],
+                &host_work,
+                &mapped,
+            )
+            .unwrap(),
+        CommandTarget::Sandboxed {
+            program: super::super::DomainPath::parse("/usr/bin/chimera-path-probe").unwrap(),
+            args: vec![],
+            cwd: super::super::DomainPath::parse("/work").unwrap(),
+        }
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn sandbox_mapping_error_does_not_leave_a_prepared_step_transaction() {
+    let temp = tempfile::tempdir().unwrap();
+    let root =
+        ExecutionDomainRoot::prepare(&temp.path().join("domains"), NonZeroUsize::new(1).unwrap())
+            .unwrap();
+    let mut domain = root
+        .reserve()
+        .await
+        .unwrap()
+        .provision(AttemptIdentity::new())
+        .await
+        .unwrap();
+    let workspace = Workspace::create(
+        &temp.path().join("work"),
+        &temp.path().join("tmp"),
+        &temp.path().join("tools"),
+        "runner",
+        "owner/repo",
+    )
+    .unwrap();
+    domain.command_mapping = super::super::DomainCommandMapping::Sandboxed(vec![(
+        workspace.workspace_dir().to_path_buf(),
+        super::super::DomainPath::parse("/work").unwrap(),
+    )]);
+    let mut state = crate::job::execute::JobState::new(
+        crate::job::secret_masker::shared_masker_for_test(&[]),
+        std::collections::HashMap::new(),
+        serde_json::json!({}),
+    );
+    let (log_tx, _log_rx) = tokio::sync::mpsc::channel(8);
+    let log = crate::job::logs::LogSender::new_for_test(
+        log_tx,
+        crate::job::secret_masker::shared_masker_for_test(&[]),
+    );
+    let non_utf8 = std::ffi::OsString::from_vec(b"bad-\xff".to_vec());
+
+    let error = crate::job::execute::run_process(
+        workspace.workspace_dir().join("command").as_os_str(),
+        &[non_utf8.as_os_str()],
+        &std::collections::HashMap::new(),
+        workspace.workspace_dir(),
+        &workspace,
+        &domain,
+        &mut state,
+        &log,
+        std::time::Duration::from_secs(1),
+        &tokio_util::sync::CancellationToken::new(),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(
+        error.downcast_ref::<super::super::ExecutionDomainError>(),
+        Some(super::super::ExecutionDomainError::InvalidDomainPath)
+    ));
+
+    domain.bind_workspace(&workspace).await.unwrap();
+    let next = domain.prepare_step(b"{}").await.unwrap();
+    domain.read_step(next).await.unwrap();
+    domain.destroy().await.unwrap();
 }
 
 #[cfg(target_os = "linux")]
@@ -803,4 +1034,39 @@ async fn linux_backend_manager_cancel_sends_correlated_shutdown_reason() {
     );
     responder.join().unwrap();
     backend.destroy().unwrap();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn idle_linux_command_cancel_never_sends_domain_shutdown() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use super::super::protocol::{Message, Request, Response};
+
+    let (linux, mut peer) = linux_backend_for_test();
+    let mut backend = super::Backend::Linux(linux);
+    let observed_shutdown = std::sync::Arc::new(AtomicBool::new(false));
+    let responder_observed = observed_shutdown.clone();
+    let responder = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
+        if let Ok(message) = peer.receive(deadline) {
+            if matches!(message, Message::Request(Request::Shutdown { .. })) {
+                responder_observed.store(true, Ordering::SeqCst);
+                peer.send(Message::Response(Response::ShuttingDown), deadline)
+                    .unwrap();
+            } else {
+                panic!("idle command cancellation emitted an unexpected request: {message:?}");
+            }
+        }
+    });
+
+    backend.cancel(CancelReason::User).unwrap();
+    responder.join().unwrap();
+    assert!(!observed_shutdown.load(Ordering::SeqCst));
+
+    let super::Backend::Linux(mut linux) = backend else {
+        unreachable!()
+    };
+    linux.kernel.launcher.kill().unwrap();
+    linux.kernel.launcher.wait().unwrap();
 }
