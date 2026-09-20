@@ -10,6 +10,12 @@ use uuid::Uuid;
 
 mod error;
 mod filesystem;
+mod journal;
+
+use journal::{DomainLifecycle, DomainState};
+
+#[cfg(test)]
+mod journal_test;
 
 pub use error::{ExecutionDomainCleanupFatalError, ExecutionDomainError};
 
@@ -82,6 +88,7 @@ pub struct ExecutionDomain {
     work_dir: PathBuf,
     work_dir_identity: DirectoryIdentity,
     destroyed: bool,
+    lifecycle: DomainLifecycle,
 }
 
 impl ExecutionDomainRoot {
@@ -162,6 +169,7 @@ impl ExecutionDomainRoot {
         let creation = (|| {
             let attempt_identity =
                 directory_identity(&attempt_dir, "reading job attempt directory identity")?;
+            let mut lifecycle = DomainLifecycle::create(&attempt_dir, attempt_id)?;
             create_private_dir(&docker_config_dir, "creating Docker config directory")?;
             create_private_dir(&private_tmp, "creating private job temp directory")?;
             let private_tmp_identity =
@@ -190,10 +198,17 @@ impl ExecutionDomainRoot {
                     )
                 },
             )?;
-            Ok((attempt_identity, private_tmp_identity, work_dir_identity))
+            lifecycle.transition(DomainState::Ready)?;
+            Ok((
+                attempt_identity,
+                private_tmp_identity,
+                work_dir_identity,
+                lifecycle,
+            ))
         })();
 
-        let (attempt_identity, private_tmp_identity, work_dir_identity) = match creation {
+        let (attempt_identity, private_tmp_identity, work_dir_identity, lifecycle) = match creation
+        {
             Ok(identities) => identities,
             Err(create) => {
                 return match fs::remove_dir_all(&attempt_dir) {
@@ -225,11 +240,20 @@ impl ExecutionDomainRoot {
             work_dir,
             work_dir_identity,
             destroyed: false,
+            lifecycle,
         })
     }
 }
 
 impl ExecutionDomain {
+    pub(crate) fn mark_running(&mut self) -> Result<(), ExecutionDomainError> {
+        self.lifecycle.transition(DomainState::Running)
+    }
+
+    pub(crate) fn mark_cleaning(&mut self) -> Result<(), ExecutionDomainError> {
+        self.lifecycle.transition(DomainState::Cleaning)
+    }
+
     pub fn docker_config_dir(&self) -> &Path {
         &self.docker_config_dir
     }
@@ -298,7 +322,18 @@ impl ExecutionDomain {
         if result.is_err() {
             state.poison();
         }
-        result
+        match result {
+            Err(cleanup) if self.lifecycle.state() == DomainState::Destroying => {
+                match self.lifecycle.transition(DomainState::Quarantined) {
+                    Ok(()) => Err(cleanup),
+                    Err(quarantine) => Err(ExecutionDomainError::QuarantineFailed {
+                        cleanup: Box::new(cleanup),
+                        quarantine: Box::new(quarantine),
+                    }),
+                }
+            }
+            result => result,
+        }
     }
 
     fn destroy_locked<F>(&mut self, remove_attempt: F) -> Result<(), ExecutionDomainError>
@@ -313,10 +348,6 @@ impl ExecutionDomain {
         validate_bound_directory(&self.root, self.root_identity, &root_metadata)?;
 
         let attempt_metadata = match fs::symlink_metadata(&self.attempt_dir) {
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                self.destroyed = true;
-                return Ok(());
-            }
             Err(source) => {
                 return Err(ExecutionDomainError::Cleanup {
                     path: self.attempt_dir.clone(),
@@ -333,6 +364,10 @@ impl ExecutionDomain {
             });
         }
 
+        // Establish the bound paths before writing: replacements must never
+        // receive a journal or have their existing contents changed.
+        self.lifecycle.transition(DomainState::Destroying)?;
+
         validate_attempt_removal_tree(
             &self.attempt_dir,
             &self.private_tmp,
@@ -344,6 +379,7 @@ impl ExecutionDomain {
             path: self.attempt_dir.clone(),
             source,
         })?;
+        self.lifecycle.complete_destroyed()?;
         self.destroyed = true;
         Ok(())
     }

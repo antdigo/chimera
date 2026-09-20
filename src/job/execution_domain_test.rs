@@ -472,6 +472,7 @@ fn umask_zero_still_creates_private_paths() {
     assert_eq!(mode(&attempt), 0o700);
     assert_eq!(mode(&attempt.join("docker")), 0o700);
     assert_eq!(mode(&attempt.join("docker/config.json")), 0o600);
+    assert_eq!(mode(&attempt.join("journal.json")), 0o600);
 }
 
 #[test]
@@ -672,5 +673,63 @@ fn injected_permission_cleanup_failure_preserves_canaries_and_blocks_reuse() {
         "credential-secret"
     );
 
-    config.destroy().unwrap();
+    assert_eq!(
+        DomainLifecycle::load(config.attempt_dir()).unwrap().state(),
+        DomainState::Quarantined
+    );
+    std::fs::remove_dir_all(config.attempt_dir()).unwrap();
+}
+
+#[test]
+fn domain_lifecycle_persists_ready_running_cleaning_and_destroying() {
+    let (_temp, root) = prepared_root();
+    let mut domain = root.create_domain().unwrap();
+    assert_eq!(
+        DomainLifecycle::load(domain.attempt_dir()).unwrap().state(),
+        DomainState::Ready
+    );
+    domain.mark_running().unwrap();
+    assert_eq!(
+        DomainLifecycle::load(domain.attempt_dir()).unwrap().state(),
+        DomainState::Running
+    );
+    domain.mark_cleaning().unwrap();
+    assert_eq!(
+        DomainLifecycle::load(domain.attempt_dir()).unwrap().state(),
+        DomainState::Cleaning
+    );
+    domain
+        .destroy_with_remover(|path| {
+            assert_eq!(
+                DomainLifecycle::load(path).unwrap().state(),
+                DomainState::Destroying
+            );
+            std::fs::remove_dir_all(path)
+        })
+        .unwrap();
+    assert_eq!(domain.lifecycle.state(), DomainState::Destroyed);
+    assert!(!domain.attempt_dir().exists());
+}
+
+#[test]
+fn failed_quarantine_retains_original_cleanup_error_and_poisons_root() {
+    let (_temp, root) = prepared_root();
+    let mut domain = root.create_domain().unwrap();
+    let error = domain
+        .destroy_with_remover(|path| {
+            std::fs::write(path.join("journal.json.next"), "incomplete").unwrap();
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "cleanup failure",
+            ))
+        })
+        .unwrap_err();
+    assert!(
+        matches!(error, ExecutionDomainError::QuarantineFailed { cleanup, .. }
+        if matches!(&*cleanup, ExecutionDomainError::Cleanup { source, .. } if source.kind() == std::io::ErrorKind::PermissionDenied))
+    );
+    assert!(matches!(
+        root.create_domain(),
+        Err(ExecutionDomainError::PoisonedRoot { .. })
+    ));
 }

@@ -143,6 +143,12 @@ pub(super) fn validate_attempt_removal_tree(
             prepare_owned_directory_for_removal(&path, private_tmp_identity)?;
         } else if path == work_dir {
             prepare_owned_directory_for_removal(&path, work_dir_identity)?;
+        } else if entry.file_name() == "journal.json" {
+            let metadata = fs::symlink_metadata(&path)
+                .map_err(|source| io_error("reading journal cleanup metadata", &path, source))?;
+            if !metadata.is_file() || metadata.file_type().is_symlink() {
+                return Err(ExecutionDomainError::UnsafeEntry { path });
+            }
         } else {
             validate_removal_tree(&path)?;
         }

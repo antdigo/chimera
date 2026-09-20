@@ -3,8 +3,29 @@ use std::path::PathBuf;
 
 use uuid::Uuid;
 
+use super::journal::DomainState;
+
 #[derive(Debug)]
 pub enum ExecutionDomainError {
+    // Lifecycle states are an internal runner contract, even though callers can
+    // inspect the public error category and its redacted Display output.
+    #[allow(private_interfaces)]
+    InvalidTransition {
+        from: DomainState,
+        to: DomainState,
+    },
+    InvalidJournal {
+        path: PathBuf,
+        source: serde_json::Error,
+    },
+    UnsupportedJournalVersion {
+        path: PathBuf,
+        version: u32,
+    },
+    QuarantineFailed {
+        cleanup: Box<ExecutionDomainError>,
+        quarantine: Box<ExecutionDomainError>,
+    },
     StaleJobResources {
         path: PathBuf,
     },
@@ -52,6 +73,24 @@ pub enum ExecutionDomainError {
 impl std::fmt::Display for ExecutionDomainError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::InvalidTransition { from, to } => {
+                write!(formatter, "invalid-domain-transition: {from:?} to {to:?}")
+            }
+            Self::InvalidJournal { path, .. } => {
+                write!(formatter, "invalid-lifecycle-journal: {}", path.display())
+            }
+            Self::UnsupportedJournalVersion { path, version } => write!(
+                formatter,
+                "unsupported-lifecycle-journal-version: {version}: {}",
+                path.display()
+            ),
+            Self::QuarantineFailed {
+                cleanup,
+                quarantine,
+            } => write!(
+                formatter,
+                "{cleanup}; lifecycle quarantine failed: {quarantine}"
+            ),
             Self::StaleJobResources { path } => write!(
                 formatter,
                 "stale-job-resources: resource root is not empty: {}",
@@ -124,6 +163,8 @@ impl std::error::Error for ExecutionDomainError {
         match self {
             Self::Io { source, .. } | Self::Cleanup { source, .. } => Some(source),
             Self::CreationRollback { create, .. } => Some(create),
+            Self::InvalidJournal { source, .. } => Some(source),
+            Self::QuarantineFailed { cleanup, .. } => Some(cleanup),
             _ => None,
         }
     }
