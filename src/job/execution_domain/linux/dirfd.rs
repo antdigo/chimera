@@ -332,6 +332,59 @@ impl BoundDir {
         self.binding.fd.as_raw_fd()
     }
 
+    /// Roll back only a just-created transaction with a complete descriptor inventory.
+    /// Failure poison does not preclude proving these identities afresh for rollback.
+    pub(super) fn remove_created_child(
+        &self,
+        name: &CStr,
+        child: &Self,
+        files: &[(&CStr, &OwnedFd)],
+    ) -> Result<(), ExecutionDomainError> {
+        let result = (|| {
+            component(name)?;
+            verify_chain(&self.binding)?;
+            verify_chain(&child.binding)?;
+            let child_named = stat_at(self.fd(), name).map_err(io_failure)?;
+            if identity(&child_named) != child.binding.identity {
+                return Err(failure(FailureCategory::IdentityMismatch));
+            }
+            let mut count = 0;
+            for entry in directory_entries_stream(child.fd())? {
+                let entry = entry?;
+                count += 1;
+                if count > files.len() || !files.iter().any(|(name, _)| *name == entry.as_c_str()) {
+                    return Err(failure(FailureCategory::IdentityMismatch));
+                }
+            }
+            if count != files.len() {
+                return Err(failure(FailureCategory::IdentityMismatch));
+            }
+            let verify = |name: &CStr, fd: &OwnedFd| -> Result<(), ExecutionDomainError> {
+                let original = metadata(fd.as_raw_fd())?;
+                let current = stat_at(child.fd(), name).map_err(io_failure)?;
+                if identity(&current) != identity(&original)
+                    || current.stx_mode != original.stx_mode
+                    || current.stx_nlink != 1
+                {
+                    return Err(failure(FailureCategory::IdentityMismatch));
+                }
+                Ok(())
+            };
+            for (name, fd) in files {
+                verify(name, fd)?;
+            }
+            for (name, fd) in files {
+                verify_chain(&child.binding)?;
+                verify(name, fd)?;
+                checked(unsafe { libc::unlinkat(child.fd(), name.as_ptr(), 0) })?;
+            }
+            verify_chain(&child.binding)?;
+            checked(unsafe { libc::unlinkat(self.fd(), name.as_ptr(), libc::AT_REMOVEDIR) })?;
+            sync(self.fd(), SyncKind::Directory).map_err(io_failure)
+        })();
+        result.inspect_err(|_| self.poison())
+    }
+
     fn poison(&self) {
         self.poisoned.store(true, Ordering::Release);
     }
@@ -529,17 +582,14 @@ pub(super) fn directory_entries(fd: RawFd) -> Result<Vec<CString>, ExecutionDoma
     directory_entries_stream(fd)?.collect()
 }
 
-#[cfg(test)]
 pub(super) struct DirectoryEntries(*mut libc::DIR);
 
-#[cfg(test)]
 impl Drop for DirectoryEntries {
     fn drop(&mut self) {
         unsafe { libc::closedir(self.0) };
     }
 }
 
-#[cfg(test)]
 pub(super) fn directory_entries_stream(
     fd: RawFd,
 ) -> Result<DirectoryEntries, ExecutionDomainError> {
@@ -555,7 +605,6 @@ pub(super) fn directory_entries_stream(
     Ok(DirectoryEntries(directory))
 }
 
-#[cfg(test)]
 impl Iterator for DirectoryEntries {
     type Item = Result<CString, ExecutionDomainError>;
 

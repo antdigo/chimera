@@ -6,10 +6,13 @@ use std::path::Path;
 use super::super::{
     DomainEnvironment, ExecutionDomainError, FailureCategory, Stage, StepFilesId, StepStateSnapshot,
 };
-use super::dirfd::{BoundDir, metadata};
+use super::dirfd::{BoundDir, RESOLVE_POLICY, metadata, open_at};
 
 pub(super) const EVENT_LIMIT: usize = 4 * 1024 * 1024;
 const FIELD_LIMIT: usize = 1024 * 1024;
+// The protocol executes one foreground command. Spare transactions allow bounded
+// preparation without retaining one descriptor set for every completed step.
+const MAX_ACTIVE_PREPARED_STEPS: usize = 32;
 const NAMES: [&CStr; 6] = [
     c"env",
     c"path",
@@ -60,15 +63,36 @@ impl StepFiles {
         id: StepFilesId,
         event: &[u8],
     ) -> Result<(), ExecutionDomainError> {
+        if self.steps.len() >= MAX_ACTIVE_PREPARED_STEPS {
+            return Err(state_failure(FailureCategory::Unavailable));
+        }
         if event.len() > EVENT_LIMIT || self.steps.contains_key(&id.uuid()) {
             return Err(state_failure(FailureCategory::InvalidInput));
         }
         let name = CString::new(id.component())
             .map_err(|_| state_failure(FailureCategory::InvalidInput))?;
+        self.root.refuse_entry(&name)?;
+        // Reserve one descriptor so EMFILE cannot itself prevent rollback inventory.
+        let rollback_reserve = open_at(
+            self.root.fd(),
+            c".",
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            0,
+            RESOLVE_POLICY,
+        )?;
         let directory = self.root.create_child(&name, 0o700)?;
         let mut files = Vec::with_capacity(6);
-        for (index, name) in NAMES.iter().enumerate() {
-            files.push(directory.write_new(name, if index == 5 { event } else { &[] })?);
+        for (index, file_name) in NAMES.iter().enumerate() {
+            match directory.write_new(file_name, if index == 5 { event } else { &[] }) {
+                Ok(file) => files.push(file),
+                Err(error) => {
+                    drop(rollback_reserve);
+                    let inventory: Vec<_> = NAMES.iter().copied().zip(files.iter()).collect();
+                    self.root
+                        .remove_created_child(&name, &directory, &inventory)?;
+                    return Err(error);
+                }
+            }
         }
         self.steps
             .insert(id.uuid(), PreparedStep { directory, files });
@@ -103,10 +127,17 @@ impl StepFiles {
         Ok(env)
     }
 
-    pub(super) fn read(&self, id: &StepFilesId) -> Result<StepStateSnapshot, ExecutionDomainError> {
+    pub(super) fn discard(&mut self, id: &StepFilesId) {
+        self.steps.remove(&id.uuid());
+    }
+
+    pub(super) fn read(
+        &mut self,
+        id: &StepFilesId,
+    ) -> Result<StepStateSnapshot, ExecutionDomainError> {
         let step = self
             .steps
-            .get(&id.uuid())
+            .remove(&id.uuid())
             .ok_or_else(|| state_failure(FailureCategory::InvalidInput))?;
         step.verify()?;
         let mut values = Vec::with_capacity(5);

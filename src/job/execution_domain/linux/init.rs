@@ -110,6 +110,7 @@ pub(super) fn serve(
                                 connection,
                                 policy,
                                 active: None,
+                                ephemeral_step: None,
                                 outbound: OutboundQueue::new(),
                                 sending: false,
                                 connected: true,
@@ -171,6 +172,7 @@ struct InitRuntime {
     connection: ControlConnection,
     policy: ChildPolicy,
     active: Option<RunningCommand>,
+    ephemeral_step: Option<StepFilesId>,
     outbound: OutboundQueue,
     sending: bool,
     connected: bool,
@@ -208,6 +210,7 @@ impl InitRuntime {
             {
                 let command_id = command.id;
                 self.active = None;
+                self.discard_ephemeral_step();
                 if self.connected {
                     self.enqueue(Response::CommandFinished {
                         command_id,
@@ -263,14 +266,21 @@ impl InitRuntime {
                 return self.reject_command(id, FailureCategory::InvalidInput);
             }
             spec.state = Some(step);
+            self.ephemeral_step = spec.state.clone();
         }
         let prepared = match PreparedCommand::with_state(spec, &self.steps) {
             Ok(prepared) => prepared,
-            Err(_) => return self.reject_command(id, FailureCategory::InvalidInput),
+            Err(_) => {
+                self.discard_ephemeral_step();
+                return self.reject_command(id, FailureCategory::InvalidInput);
+            }
         };
         let command = match prepared.spawn(&self.policy, id) {
             Ok(command) => command,
-            Err(_) => return self.reject_command(id, FailureCategory::Unavailable),
+            Err(_) => {
+                self.discard_ephemeral_step();
+                return self.reject_command(id, FailureCategory::Unavailable);
+            }
         };
         self.last_command_id = id;
         self.active = Some(command);
@@ -285,6 +295,12 @@ impl InitRuntime {
         match &mut self.active {
             Some(command) if command.id == id => command.cancel(reason),
             _ => self.reject_command(id, FailureCategory::InvalidInput),
+        }
+    }
+
+    fn discard_ephemeral_step(&mut self) {
+        if let Some(id) = self.ephemeral_step.take() {
+            self.steps.discard(&id);
         }
     }
 

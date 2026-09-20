@@ -109,6 +109,9 @@ struct Fixture {
 
 impl Fixture {
     fn start() -> Self {
+        Self::start_with_limit(None)
+    }
+    fn start_with_limit(limit: Option<u64>) -> Self {
         let root = tempfile::tempdir().unwrap();
         let policy = fixture_policy(root.path());
         let attempt = AttemptIdentity::new();
@@ -117,12 +120,20 @@ impl Fixture {
         assert!(pid >= 0);
         if pid == 0 {
             drop(a);
+            if let Some(limit) = limit {
+                let limit = libc::rlimit {
+                    rlim_cur: limit,
+                    rlim_max: limit,
+                };
+                assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) }, 0);
+            }
             unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) };
             retain_init_capabilities().unwrap();
             let runtime = InitRuntime {
                 connection: ControlConnection::new(b, attempt).unwrap(),
                 policy,
                 active: None,
+                ephemeral_step: None,
                 outbound: OutboundQueue::new(),
                 sending: false,
                 connected: true,
@@ -243,11 +254,6 @@ fn native_state_protocol_roundtrip_and_command_binding() {
     let directory = fixture.root.path().join("steps").join(id.component());
     let env = format!("TOKEN={}\n", "x".repeat(100_000));
     std::fs::write(directory.join("env"), &env).unwrap();
-    let response = fixture
-        .connection
-        .request(Request::ReadStep { id: id.clone() })
-        .unwrap();
-    assert!(matches!(response, Response::StepSnapshot { snapshot, .. } if snapshot.env == env));
     fixture.send(Request::Run {
         command_id: 1,
         spec: CommandSpec {
@@ -271,6 +277,11 @@ fn native_state_protocol_roundtrip_and_command_binding() {
         stdout,
         format!("/run/chimera/steps/{}/env", id.component()).as_bytes()
     );
+    let response = fixture
+        .connection
+        .request(Request::ReadStep { id: id.clone() })
+        .unwrap();
+    assert!(matches!(response, Response::StepSnapshot { snapshot, .. } if snapshot.env == env));
     let next = StepFilesId::new();
     fixture
         .connection
@@ -284,6 +295,99 @@ fn native_state_protocol_roundtrip_and_command_binding() {
         .request(Request::ReadStep { id: next })
         .unwrap();
     assert!(matches!(response, Response::StepSnapshot { snapshot, .. } if snapshot.env.is_empty()));
+    fixture.shutdown();
+}
+
+#[test]
+#[ignore = "requires disposable user/mount namespaces and Landlock"]
+fn native_ephemeral_steps_release_fds_after_every_terminal_command() {
+    if !native_child(
+        "job::execution_domain::linux::init::init_test::native_ephemeral_steps_release_fds_after_every_terminal_command",
+    ) {
+        return;
+    }
+    let mut fixture = Fixture::start_with_limit(Some(128));
+    assert!(matches!(
+        fixture.connection.request(Request::Hello).unwrap(),
+        Response::KernelReady
+    ));
+    let count = |pid| {
+        std::fs::read_dir(format!("/proc/{pid}/fd"))
+            .unwrap()
+            .count()
+    };
+    let baseline = count(fixture.pid);
+    for id in 1..=64 {
+        fixture.run(id, "exit 0", Duration::from_secs(1));
+        assert!(
+            matches!(fixture.receive(), Response::CommandStarted { command_id } if command_id == id)
+        );
+        assert_eq!(fixture.finish(id).0, CommandOutcome::Exited(0));
+        assert!(count(fixture.pid) <= baseline + 1);
+        fixture.send(Request::Run {
+            command_id: 1000,
+            spec: CommandSpec {
+                target: CommandTarget::Sandboxed {
+                    program: DomainPath::parse("/bin/sh").unwrap(),
+                    args: vec![],
+                    cwd: DomainPath::parse("/").unwrap(),
+                },
+                env: HashMap::from([("HOME".into(), "/bad".into())]),
+                timeout: Duration::from_secs(1),
+                state: None,
+            },
+        });
+        assert!(matches!(
+            fixture.receive(),
+            Response::CommandRejected {
+                command_id: 1000,
+                ..
+            }
+        ));
+        assert!(count(fixture.pid) <= baseline + 1);
+    }
+    for command_id in 65..=128 {
+        let step = StepFilesId::new();
+        fixture
+            .connection
+            .request(Request::PrepareStep {
+                id: step.clone(),
+                event: b"{}".to_vec(),
+            })
+            .unwrap();
+        fixture.send(Request::Run {
+            command_id,
+            spec: CommandSpec {
+                target: CommandTarget::Sandboxed {
+                    program: DomainPath::parse("/bin/sh").unwrap(),
+                    args: vec!["-c".into(), "exit 0".into()],
+                    cwd: DomainPath::parse("/").unwrap(),
+                },
+                env: HashMap::new(),
+                timeout: Duration::from_secs(1),
+                state: Some(step.clone()),
+            },
+        });
+        assert!(
+            matches!(fixture.receive(), Response::CommandStarted { command_id: actual } if actual == command_id)
+        );
+        assert_eq!(fixture.finish(command_id).0, CommandOutcome::Exited(0));
+        assert!(matches!(
+            fixture
+                .connection
+                .request(Request::ReadStep { id: step.clone() })
+                .unwrap(),
+            Response::StepSnapshot { .. }
+        ));
+        assert!(matches!(
+            fixture
+                .connection
+                .request(Request::ReadStep { id: step })
+                .unwrap(),
+            Response::Rejected { .. }
+        ));
+        assert!(count(fixture.pid) <= baseline + 1);
+    }
     fixture.shutdown();
 }
 
