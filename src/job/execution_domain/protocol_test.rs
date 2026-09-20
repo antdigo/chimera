@@ -9,6 +9,67 @@ fn identity() -> AttemptIdentity {
     AttemptIdentity::from_uuid(uuid::Uuid::from_u128(7)).unwrap()
 }
 
+#[test]
+fn incremental_transport_services_partial_frames_without_waiting() {
+    let (a, mut b) = UnixStream::pair().unwrap();
+    let mut connection = ControlConnection::new(a, identity()).unwrap();
+    let bytes = encode(&hello(1)).unwrap();
+    b.write_all(&bytes[..7]).unwrap();
+    assert!(connection.try_receive().unwrap().is_none());
+    b.write_all(&bytes[7..]).unwrap();
+    let mut received = None;
+    for _ in 0..3 {
+        received = received.or(connection.try_receive().unwrap());
+    }
+    assert!(matches!(received, Some(Message::Request(Request::Hello))));
+    connection
+        .start_send(Message::Response(Response::KernelReady))
+        .unwrap();
+    assert!(
+        connection
+            .start_send(Message::Response(Response::KernelReady))
+            .is_err()
+    );
+    assert!(connection.try_flush().unwrap());
+    let mut peer = ControlConnection::new(b, identity()).unwrap();
+    assert!(matches!(
+        peer.receive(Instant::now() + Duration::from_secs(1))
+            .unwrap(),
+        Message::Response(Response::KernelReady)
+    ));
+}
+
+#[test]
+fn command_rejection_preserves_the_rejected_command_identity() {
+    let frame = Frame {
+        message: Message::Response(Response::CommandRejected {
+            command_id: 9,
+            category: super::FailureCategory::Unavailable,
+        }),
+        ..hello(1)
+    };
+    let decoded = decode(&encode(&frame).unwrap()).unwrap();
+    assert!(matches!(
+        decoded.message,
+        Message::Response(Response::CommandRejected { command_id: 9, .. })
+    ));
+    let (a, mut b) = UnixStream::pair().unwrap();
+    b.write_all(&encode(&frame).unwrap()).unwrap();
+    let Message::Request(Request::Run { spec, .. }) = command(Duration::from_secs(1)).message
+    else {
+        panic!()
+    };
+    assert!(
+        ControlConnection::new(a, identity())
+            .unwrap()
+            .request(Request::Run {
+                command_id: 8,
+                spec
+            })
+            .is_err()
+    );
+}
+
 fn hello(sequence: u64) -> Frame {
     Frame {
         version: 1,

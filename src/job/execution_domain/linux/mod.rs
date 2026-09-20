@@ -3,6 +3,8 @@ mod cgroup;
 #[cfg(all(target_os = "linux", test))]
 pub(super) mod dirfd;
 #[cfg(target_os = "linux")]
+mod hardening;
+#[cfg(target_os = "linux")]
 mod init;
 #[cfg(target_os = "linux")]
 pub(super) mod launcher;

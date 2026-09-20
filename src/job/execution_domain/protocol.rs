@@ -72,6 +72,10 @@ pub(super) enum Response {
     CommandStarted {
         command_id: u64,
     },
+    CommandRejected {
+        command_id: u64,
+        category: FailureCategory,
+    },
     Output {
         command_id: u64,
         #[serde(with = "EventWire")]
@@ -250,6 +254,7 @@ fn validate_message(message: &Message) -> Result<(), ExecutionDomainError> {
         )
         | Message::Response(
             Response::CommandStarted { command_id }
+            | Response::CommandRejected { command_id, .. }
             | Response::Output { command_id, .. }
             | Response::CommandFinished { command_id, .. },
         ) => Some(*command_id),
@@ -282,6 +287,8 @@ pub(super) struct ControlConnection {
     incoming: u64,
     failed: bool,
     interrupted: Option<&'static AtomicBool>,
+    received: Vec<u8>,
+    sending: Option<(Vec<u8>, usize)>,
 }
 
 impl ControlConnection {
@@ -303,7 +310,118 @@ impl ControlConnection {
             incoming: 1,
             failed: false,
             interrupted: None,
+            received: Vec::new(),
+            sending: None,
         })
+    }
+
+    // One nonblocking read per tick: a partial peer frame cannot monopolize init.
+    pub(super) fn try_receive(&mut self) -> Result<Option<Message>, ExecutionDomainError> {
+        if self.failed {
+            return Err(failure(FailureCategory::Protocol));
+        }
+        let result = self.try_receive_inner();
+        self.failed |= result.is_err();
+        result
+    }
+
+    fn try_receive_inner(&mut self) -> Result<Option<Message>, ExecutionDomainError> {
+        let wanted = if self.received.len() < HEADER_BYTES {
+            HEADER_BYTES
+        } else {
+            let (_, sequence, length) = header(&self.received)?;
+            if sequence != self.incoming {
+                return Err(failure(FailureCategory::Protocol));
+            }
+            HEADER_BYTES + length as usize
+        };
+        let mut buffer = [0u8; OUTPUT_CHUNK_BYTES];
+        let take = (wanted - self.received.len()).min(buffer.len());
+        if take > 0 {
+            match self.stream.read(&mut buffer[..take]) {
+                Ok(0) => return Err(failure(FailureCategory::Protocol)),
+                Ok(n) => self.received.extend_from_slice(&buffer[..n]),
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                    ) =>
+                {
+                    return Ok(None);
+                }
+                Err(error) => return Err(io_failure(error)),
+            }
+        }
+        if self.received.len() < HEADER_BYTES {
+            return Ok(None);
+        }
+        let (_, sequence, length) = header(&self.received)?;
+        if sequence != self.incoming {
+            return Err(failure(FailureCategory::Protocol));
+        }
+        if self.received.len() != HEADER_BYTES + length as usize {
+            return Ok(None);
+        }
+        let frame = decode(&self.received)?;
+        if frame.attempt != self.attempt {
+            return Err(failure(FailureCategory::IdentityMismatch));
+        }
+        self.incoming = self
+            .incoming
+            .checked_add(1)
+            .ok_or_else(|| failure(FailureCategory::Protocol))?;
+        self.received.clear();
+        Ok(Some(frame.message))
+    }
+
+    pub(super) fn start_send(&mut self, message: Message) -> Result<(), ExecutionDomainError> {
+        if self.failed || self.sending.is_some() {
+            return Err(failure(FailureCategory::Unavailable));
+        }
+        let bytes = encode(&Frame {
+            version: 1,
+            sequence: self.outgoing,
+            attempt: self.attempt,
+            message,
+        })?;
+        self.outgoing = self
+            .outgoing
+            .checked_add(1)
+            .ok_or_else(|| failure(FailureCategory::Protocol))?;
+        self.sending = Some((bytes, 0));
+        Ok(())
+    }
+
+    pub(super) fn try_flush(&mut self) -> Result<bool, ExecutionDomainError> {
+        if self.failed {
+            return Err(failure(FailureCategory::Protocol));
+        }
+        let Some((bytes, sent)) = &mut self.sending else {
+            return Ok(true);
+        };
+        match self.stream.write(&bytes[*sent..]) {
+            Ok(0) => {
+                self.failed = true;
+                return Err(failure(FailureCategory::Protocol));
+            }
+            Ok(n) => *sent += n,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                ) =>
+            {
+                return Ok(false);
+            }
+            Err(error) => {
+                self.failed = true;
+                return Err(io_failure(error));
+            }
+        }
+        if *sent == bytes.len() {
+            self.sending = None;
+        }
+        Ok(self.sending.is_none())
     }
 
     #[cfg(target_os = "linux")]
@@ -535,6 +653,8 @@ impl ExpectedResponse {
             | (Self::Hello, Response::KernelReady)
             | (Self::Shutdown, Response::ShuttingDown) => true,
             (Self::Started(expected), Response::CommandStarted { command_id })
+            | (Self::Started(expected), Response::CommandRejected { command_id, .. })
+            | (Self::Finished(expected), Response::CommandRejected { command_id, .. })
             | (Self::Finished(expected), Response::CommandFinished { command_id, .. }) => {
                 expected == command_id
             }
@@ -697,15 +817,11 @@ impl SnapshotAssembler {
     }
 }
 
-// Run/output producers are introduced in Task 7; keep this implementation staged
-// alongside their tests rather than add an artificial init consumer.
-#[cfg(test)]
 pub(super) struct OutboundQueue {
     control: std::collections::VecDeque<Message>,
     data: std::collections::VecDeque<Message>,
 }
 
-#[cfg(test)]
 impl OutboundQueue {
     pub(super) fn new() -> Self {
         Self {
@@ -736,6 +852,10 @@ impl OutboundQueue {
     }
     pub(super) fn pop(&mut self) -> Option<Message> {
         self.control.pop_front().or_else(|| self.data.pop_front())
+    }
+    #[cfg(target_os = "linux")]
+    pub(super) fn has_capacity(&self) -> bool {
+        self.data.len() < 30
     }
 }
 

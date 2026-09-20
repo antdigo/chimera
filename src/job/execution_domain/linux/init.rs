@@ -1,12 +1,29 @@
 use std::io;
+use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use super::super::protocol::{ControlConnection, Message, Request, Response, failure};
-use super::super::{AttemptIdentity, ExecutionDomainError, FailureCategory};
+use super::super::protocol::{
+    ControlConnection, Message, OutboundQueue, Request, Response, failure,
+};
+use super::super::{
+    AttemptIdentity, CancelReason, CommandSpec, ExecutionDomainError, FailureCategory,
+};
+use super::hardening::{ChildPolicy, retain_init_capabilities};
+#[path = "init_command.rs"]
+mod command;
+use command::{PreparedCommand, RunningCommand};
 
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+
+pub(super) fn decode_wait_status(status: i32) -> super::super::CommandOutcome {
+    if libc::WIFEXITED(status) {
+        super::super::CommandOutcome::Exited(libc::WEXITSTATUS(status))
+    } else {
+        super::super::CommandOutcome::Signalled(libc::WTERMSIG(status))
+    }
+}
 
 extern "C" fn signal_received(signal: i32) {
     if signal != libc::SIGCHLD {
@@ -64,7 +81,6 @@ pub(super) fn serve(
     }
     // A transport acknowledgement is deliberately distinct from kernel readiness.
     let mut bootstrap = Some(spec);
-    let mut rootfs_proof = None;
     connection.send(Message::Response(Response::Bootstrapped), deadline)?;
     loop {
         reap_orphans()?;
@@ -80,7 +96,27 @@ pub(super) fn serve(
                         connection.control_fd(),
                         &spec.hostname,
                     ) {
-                        Ok(proof) => rootfs_proof = Some(proof),
+                        Ok(proof) => {
+                            let policy = ChildPolicy::workflow(&proof)?;
+                            retain_init_capabilities()?;
+                            connection.send(
+                                Message::Response(Response::KernelReady),
+                                Instant::now() + super::launcher::STARTUP_TIMEOUT,
+                            )?;
+                            return InitRuntime {
+                                connection,
+                                policy,
+                                active: None,
+                                outbound: OutboundQueue::new(),
+                                sending: false,
+                                connected: true,
+                                stopping: false,
+                                write_deadline: None,
+                                terminal_error: None,
+                                last_command_id: 0,
+                            }
+                            .run();
+                        }
                         Err(_) => {
                             connection.send(
                                 Message::Response(Response::Rejected {
@@ -95,12 +131,8 @@ pub(super) fn serve(
                     }
                 }
                 (
-                    if rootfs_proof.is_some() {
-                        Response::KernelReady
-                    } else {
-                        Response::Rejected {
-                            category: FailureCategory::NotReady,
-                        }
+                    Response::Rejected {
+                        category: FailureCategory::NotReady,
                     },
                     false,
                 )
@@ -126,6 +158,235 @@ pub(super) fn serve(
         if finished {
             return Ok(());
         }
+    }
+}
+
+struct InitRuntime {
+    connection: ControlConnection,
+    policy: ChildPolicy,
+    active: Option<RunningCommand>,
+    outbound: OutboundQueue,
+    sending: bool,
+    connected: bool,
+    stopping: bool,
+    write_deadline: Option<Instant>,
+    terminal_error: Option<ExecutionDomainError>,
+    last_command_id: u64,
+}
+
+impl InitRuntime {
+    fn run(mut self) -> Result<(), ExecutionDomainError> {
+        loop {
+            self.reap()?;
+            if SHUTDOWN.load(Ordering::Relaxed) && !self.stopping {
+                self.stopping = true;
+                self.cancel_active(CancelReason::Shutdown)?;
+            }
+            if self.connected {
+                match self.connection.try_receive() {
+                    Ok(Some(message)) => {
+                        if let Err(error) = self.request(message) {
+                            self.disconnect(error)?;
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => self.disconnect(error)?,
+                }
+            }
+            self.output()?;
+            if let Some(command) = &mut self.active
+                && let Some(outcome) = command.tick()?
+            {
+                let command_id = command.id;
+                self.active = None;
+                if self.connected {
+                    self.enqueue(Response::CommandFinished {
+                        command_id,
+                        outcome,
+                    })?;
+                }
+            }
+            if self.connected
+                && let Err(error) = self.flush()
+            {
+                self.disconnect(error)?;
+            }
+            if self.stopping && self.active.is_none() && (!self.connected || !self.sending) {
+                return self.terminal_error.map_or(Ok(()), Err);
+            }
+            self.poll()?;
+        }
+    }
+
+    fn request(&mut self, message: Message) -> Result<(), ExecutionDomainError> {
+        match message {
+            Message::Request(Request::Run { command_id, spec }) if !self.stopping => {
+                self.run_command(command_id, spec)
+            }
+            Message::Request(Request::CancelCommand { command_id, reason }) => {
+                self.cancel_command(command_id, reason)
+            }
+            Message::Request(Request::Hello) => self.enqueue(Response::KernelReady),
+            Message::Request(Request::Shutdown { .. }) => {
+                self.stopping = true;
+                self.cancel_active(CancelReason::Shutdown)?;
+                self.enqueue(Response::ShuttingDown)
+            }
+            Message::Request(Request::PrepareStep { .. } | Request::ReadStep { .. }) => {
+                self.reject(FailureCategory::NotReady)
+            }
+            _ => self.reject(FailureCategory::Protocol),
+        }
+    }
+
+    fn run_command(&mut self, id: u64, spec: CommandSpec) -> Result<(), ExecutionDomainError> {
+        if self.active.is_some() {
+            return self.reject_command(id, FailureCategory::Unavailable);
+        }
+        if id == 0 || id <= self.last_command_id {
+            return self.reject_command(id, FailureCategory::Protocol);
+        }
+        let prepared = match PreparedCommand::new(spec) {
+            Ok(prepared) => prepared,
+            Err(_) => return self.reject_command(id, FailureCategory::InvalidInput),
+        };
+        let command = match prepared.spawn(&self.policy, id) {
+            Ok(command) => command,
+            Err(_) => return self.reject_command(id, FailureCategory::Unavailable),
+        };
+        self.last_command_id = id;
+        self.active = Some(command);
+        self.enqueue(Response::CommandStarted { command_id: id })
+    }
+
+    fn cancel_command(
+        &mut self,
+        id: u64,
+        reason: CancelReason,
+    ) -> Result<(), ExecutionDomainError> {
+        match &mut self.active {
+            Some(command) if command.id == id => command.cancel(reason),
+            _ => self.reject_command(id, FailureCategory::InvalidInput),
+        }
+    }
+
+    fn cancel_active(&mut self, reason: CancelReason) -> Result<(), ExecutionDomainError> {
+        if let Some(command) = &mut self.active {
+            command.cancel(reason)?;
+        }
+        Ok(())
+    }
+
+    fn disconnect(&mut self, error: ExecutionDomainError) -> Result<(), ExecutionDomainError> {
+        self.connected = false;
+        self.stopping = true;
+        self.outbound = OutboundQueue::new();
+        self.terminal_error = Some(error);
+        self.cancel_active(CancelReason::HandleDropped)
+    }
+
+    fn reject(&mut self, category: FailureCategory) -> Result<(), ExecutionDomainError> {
+        self.enqueue(Response::Rejected { category })
+    }
+    fn reject_command(
+        &mut self,
+        command_id: u64,
+        category: FailureCategory,
+    ) -> Result<(), ExecutionDomainError> {
+        self.enqueue(Response::CommandRejected {
+            command_id,
+            category,
+        })
+    }
+    fn enqueue(&mut self, response: Response) -> Result<(), ExecutionDomainError> {
+        self.outbound.push(Message::Response(response))
+    }
+
+    fn output(&mut self) -> Result<(), ExecutionDomainError> {
+        for stderr in [false, true] {
+            if self.connected && !self.outbound.has_capacity() {
+                break;
+            }
+            if let Some(command) = &mut self.active
+                && let Some(event) = command.output(stderr)?
+            {
+                let command_id = command.id;
+                if self.connected {
+                    self.enqueue(Response::Output { command_id, event })?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn flush(&mut self) -> Result<(), ExecutionDomainError> {
+        if self.sending && self.connection.try_flush()? {
+            self.sending = false;
+            self.write_deadline = None;
+        }
+        if !self.sending
+            && let Some(message) = self.outbound.pop()
+        {
+            self.connection.start_send(message)?;
+            self.sending = true;
+            self.write_deadline = Some(Instant::now() + Duration::from_secs(30));
+        }
+        if self
+            .write_deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            return Err(failure(FailureCategory::Timeout));
+        }
+        Ok(())
+    }
+
+    fn reap(&mut self) -> Result<(), ExecutionDomainError> {
+        // A continuous fork/exit workload must not starve cancellation or pipes.
+        for _ in 0..128 {
+            let mut status = 0;
+            let pid = unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG) };
+            if pid > 0 {
+                if let Some(command) = &mut self.active
+                    && command.pid == Some(pid)
+                {
+                    command.exited(status);
+                }
+                continue;
+            }
+            if pid == 0 || io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD) {
+                return Ok(());
+            }
+            if io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+                return Err(io_failure());
+            }
+        }
+        Ok(())
+    }
+
+    fn poll(&self) -> Result<(), ExecutionDomainError> {
+        let mut fds = Vec::with_capacity(3);
+        if self.connected {
+            fds.push(libc::pollfd {
+                fd: self.connection.control_fd().as_raw_fd(),
+                events: libc::POLLIN | if self.sending { libc::POLLOUT } else { 0 },
+                revents: 0,
+            });
+        }
+        if (!self.connected || self.outbound.has_capacity())
+            && let Some(command) = &self.active
+        {
+            fds.extend(command.poll_fds().map(|fd| libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            }));
+        }
+        if unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, 20) } < 0
+            && io::Error::last_os_error().kind() != io::ErrorKind::Interrupted
+        {
+            return Err(io_failure());
+        }
+        Ok(())
     }
 }
 
@@ -193,3 +454,7 @@ fn io_failure() -> ExecutionDomainError {
         errno: io::Error::last_os_error().raw_os_error(),
     }
 }
+
+#[cfg(test)]
+#[path = "init_test.rs"]
+mod init_test;

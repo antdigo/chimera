@@ -389,7 +389,17 @@ fn io_failure(error: io::Error) -> ExecutionDomainError {
 }
 
 pub(in crate::job::execution_domain::linux) struct RootfsProof {
-    _private: (),
+    workflow_paths: Vec<(String, bool)>,
+}
+
+impl RootfsProof {
+    pub(in crate::job::execution_domain::linux) fn workflow_paths(
+        &self,
+    ) -> impl Iterator<Item = (&str, bool)> {
+        self.workflow_paths
+            .iter()
+            .map(|(path, readonly)| (path.as_str(), *readonly))
+    }
 }
 
 struct MountLine {
@@ -663,7 +673,13 @@ pub(in crate::job::execution_domain::linux) fn assemble_and_pivot(
         pid_namespace,
         control.as_raw_fd(),
     )?;
-    Ok(RootfsProof { _private: () })
+    Ok(RootfsProof {
+        workflow_paths: plan
+            .inputs
+            .iter()
+            .map(|input| (input.target.as_str().to_owned(), input.readonly))
+            .collect(),
+    })
 }
 
 fn mount(
