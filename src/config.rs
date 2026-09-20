@@ -13,10 +13,15 @@ use serde::{Deserialize, Serialize};
 
 use crate::cache::config::CacheConfig;
 
+pub mod execution;
+pub use execution::{ExecutionConfig, ExecutionProfile};
+
 #[derive(Debug, Deserialize, Serialize, Default)]
 pub struct ChimeraConfig {
     #[serde(default)]
     pub daemon: DaemonConfig,
+    #[serde(default)]
+    pub execution: ExecutionConfig,
     #[serde(default)]
     pub cache: CacheConfig,
     #[serde(default)]

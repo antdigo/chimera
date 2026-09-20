@@ -23,10 +23,11 @@ use crate::github::broker::{AgentStatus, BrokerClient, BrokerError, BrokerMessag
 use crate::job::JobClient;
 use crate::job::action::ActionCache;
 use crate::job::client::JobConclusion;
-use crate::job::docker_config::{
-    JobDockerConfig, JobDockerConfigError, JobResourceCleanupFatalError, JobResourceRoot,
-};
 use crate::job::execute::{JobExecutionContext, run_all_steps_with_masker};
+use crate::job::execution_domain::{
+    DomainPermit, ExecutionDomain, ExecutionDomainCleanupFatalError, ExecutionDomainError,
+    ExecutionDomainRoot,
+};
 use crate::job::live_feed::LiveFeed;
 use crate::job::schema::JobManifest;
 use crate::job::secret_masker::{SecretMasker, SharedSecretMasker};
@@ -70,14 +71,14 @@ fn conclusion_after_cleanup_failure(conclusion: JobConclusion) -> JobConclusion 
 
 fn is_poisoned_job_resource_error(error: &anyhow::Error) -> bool {
     matches!(
-        error.downcast_ref::<JobDockerConfigError>(),
-        Some(JobDockerConfigError::PoisonedRoot { .. })
+        error.downcast_ref::<ExecutionDomainError>(),
+        Some(ExecutionDomainError::PoisonedRoot { .. })
     )
 }
 
 /// A job error the runner must not recover from by polling again: the job
-/// resource root is known-untrustworthy (poisoned) or a completion was already
-/// published after a failed cleanup. Classified by construction, not by the
+/// resource root is known-untrustworthy (poisoned) or completion was attempted
+/// after a failed cleanup. Classified by construction, not by the
 /// separate poisoning side effect.
 fn job_execution_error_is_terminal(error: &anyhow::Error) -> bool {
     is_poisoned_job_resource_error(error) || is_job_resource_cleanup_fatal(error)
@@ -85,7 +86,7 @@ fn job_execution_error_is_terminal(error: &anyhow::Error) -> bool {
 
 fn is_job_resource_cleanup_fatal(error: &anyhow::Error) -> bool {
     error
-        .downcast_ref::<JobResourceCleanupFatalError>()
+        .downcast_ref::<ExecutionDomainCleanupFatalError>()
         .is_some()
 }
 
@@ -205,11 +206,31 @@ where
     }
 }
 
+async fn transition_execution_domain<F>(
+    mut domain: ExecutionDomain,
+    transition: F,
+) -> Result<(
+    ExecutionDomain,
+    std::result::Result<(), ExecutionDomainError>,
+)>
+where
+    F: FnOnce(&mut ExecutionDomain) -> std::result::Result<(), ExecutionDomainError>
+        + Send
+        + 'static,
+{
+    tokio::task::spawn_blocking(move || {
+        let result = transition(&mut domain);
+        (domain, result)
+    })
+    .await
+    .context("joining execution domain lifecycle task")
+}
+
 async fn finish_job(
     job_client: &Arc<JobClient>,
     manifest: &JobManifest,
     execution_result: Result<JobExecutionOutcome>,
-    cleanup_result: std::result::Result<(), JobDockerConfigError>,
+    cleanup_result: std::result::Result<(), ExecutionDomainError>,
 ) -> Result<()> {
     let mut outcome = match execution_result {
         Ok(outcome) => outcome,
@@ -227,7 +248,7 @@ async fn finish_job(
     }
 
     let outputs = outputs_to_variable_values(&outcome.outputs);
-    job_client
+    let completion_result = job_client
         .complete_job(
             &manifest.plan.plan_id,
             &manifest.plan.job_id,
@@ -237,23 +258,33 @@ async fn finish_job(
         )
         .await
         .context("completing job")
-        .map_err(|source| anyhow::Error::new(CompletionPublicationError { source }))?;
+        .map_err(|source| anyhow::Error::new(CompletionPublicationError { source }));
 
     match cleanup_error {
-        Some(source) => Err(anyhow::Error::new(JobResourceCleanupFatalError { source })),
-        None => Ok(()),
+        Some(source) => {
+            let fatal = ExecutionDomainCleanupFatalError { source };
+            Err(match completion_result {
+                Ok(()) => anyhow::Error::new(fatal),
+                Err(publication_error) => publication_error.context(fatal),
+            })
+        }
+        None => completion_result,
     }
 }
 
-async fn finish_job_after_cache_revoke(
+async fn finish_job_after_cache_revoke_and_destroy<F>(
     capability: &mut JobCacheCapability,
+    destroy: F,
     job_client: &Arc<JobClient>,
     manifest: &JobManifest,
     execution_result: Result<JobExecutionOutcome>,
-    cleanup_result: std::result::Result<(), JobDockerConfigError>,
-) -> Result<()> {
+) -> Result<()>
+where
+    F: Future<Output = std::result::Result<(), ExecutionDomainError>>,
+{
     capability.revoke().await;
-    finish_job(job_client, manifest, execution_result, cleanup_result).await
+    let destroy_result = destroy.await;
+    finish_job(job_client, manifest, execution_result, destroy_result).await
 }
 
 pub struct Runner {
@@ -261,7 +292,7 @@ pub struct Runner {
     pub(super) credentials: RunnerCredentials,
     pub(super) paths: ChimeraPaths,
     pub(super) state: Option<Arc<DaemonState>>,
-    pub(super) job_resources: JobResourceRoot,
+    pub(super) execution_domains: ExecutionDomainRoot,
     pub(super) cache_port: u16,
     pub(super) cache_authority: Arc<CacheAuthority>,
     pub(super) docker_action_builder: Arc<DockerActionBuilder>,
@@ -277,7 +308,7 @@ impl Runner {
         credentials: RunnerCredentials,
         paths: ChimeraPaths,
         state: Arc<DaemonState>,
-        job_resources: JobResourceRoot,
+        execution_domains: ExecutionDomainRoot,
         cache_port: u16,
         cache_authority: Arc<CacheAuthority>,
         docker_action_builder: Arc<DockerActionBuilder>,
@@ -287,7 +318,7 @@ impl Runner {
             credentials,
             paths,
             state: Some(state),
-            job_resources,
+            execution_domains,
             cache_port,
             cache_authority,
             docker_action_builder,
@@ -382,7 +413,7 @@ impl Runner {
 
     pub async fn start(self, mut shutdown_rx: watch::Receiver<bool>) -> Result<()> {
         info!(runner = %self.name, "starting runner");
-        debug!(job_resource_root = %self.job_resources.path().display(), "using prepared job resource root");
+        debug!(job_resource_root = %self.execution_domains.path().display(), "using prepared job resource root");
 
         let private_key = rsa_params_to_private_key(&self.credentials.rsa_params)
             .context("reconstructing RSA private key")?;
@@ -421,6 +452,23 @@ impl Runner {
         let mut terminal_error = None;
 
         loop {
+            if *shutdown_rx.borrow() {
+                self.report_phase(RunnerPhase::Stopping).await;
+                break;
+            }
+            let permit = tokio::select! {
+                _ = shutdown_rx.changed() => {
+                    self.report_phase(RunnerPhase::Stopping).await;
+                    break;
+                }
+                permit = self.execution_domains.reserve() => match permit {
+                    Ok(permit) => permit,
+                    Err(error) => {
+                        terminal_error = Some(error.into());
+                        break;
+                    }
+                },
+            };
             let result = self.poll_loop(&broker, &mut shutdown_rx).await;
 
             match result {
@@ -432,7 +480,7 @@ impl Runner {
                     );
 
                     if let Err(error) = self
-                        .handle_job_message(&msg, &broker, &client, token_manager.clone())
+                        .handle_job_message(&msg, &broker, &client, token_manager.clone(), permit)
                         .await
                     {
                         terminal_error = Some(error);
@@ -479,6 +527,7 @@ impl Runner {
         broker: &BrokerClient,
         client: &reqwest::Client,
         token_manager: Arc<TokenManager>,
+        permit: DomainPermit,
     ) -> Result<()> {
         let (runner_request_id, run_service_url) = match msg.parse_job_request() {
             Ok(pair) => pair,
@@ -489,10 +538,11 @@ impl Runner {
         };
 
         debug!(%runner_request_id, "parsed job request");
-        self.job_resources.ensure_healthy()?;
+        self.execution_domains.ensure_healthy()?;
 
         if let Err(e) = broker.ack_job(&runner_request_id).await {
             error!(error = %e, "failed to ack job");
+            return Ok(());
         }
 
         let cancel_token = CancellationToken::new();
@@ -505,6 +555,7 @@ impl Runner {
                 &runner_request_id,
                 &run_service_url,
                 cancel_token.clone(),
+                permit,
             )
             .await;
 
@@ -521,7 +572,7 @@ impl Runner {
             error!("job execution failed");
         }
 
-        self.job_resources.ensure_healthy()?;
+        self.execution_domains.ensure_healthy()?;
         Ok(())
     }
 
@@ -532,6 +583,7 @@ impl Runner {
         runner_request_id: &str,
         run_service_url: &str,
         cancel_token: CancellationToken,
+        permit: DomainPermit,
     ) -> Result<()> {
         info!(runner_request_id, "acquiring job");
 
@@ -576,6 +628,7 @@ impl Runner {
                 cancel_token,
                 &repo,
                 &secret_masker,
+                permit,
             )
             .await;
 
@@ -588,7 +641,7 @@ impl Runner {
             }
             Err(error)
                 if error
-                    .downcast_ref::<JobResourceCleanupFatalError>()
+                    .downcast_ref::<ExecutionDomainCleanupFatalError>()
                     .is_some() =>
             {
                 let masked_error = mask_error_chain(&error, &secret_masker).await;
@@ -609,6 +662,10 @@ impl Runner {
         }
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the lifecycle owns the admission permit alongside job execution inputs"
+    )]
     async fn run_job(
         &self,
         manifest: &JobManifest,
@@ -617,15 +674,14 @@ impl Runner {
         cancel_token: CancellationToken,
         repo: &str,
         secret_masker: &SharedSecretMasker,
+        permit: DomainPermit,
     ) -> Result<()> {
         let cache_scope = cache_scope_for_job(manifest, repo);
-        let job_resources = self.job_resources.clone();
-        let mut docker_config =
-            tokio::task::spawn_blocking(move || job_resources.create_docker_config())
-                .await
-                .context("joining per-job resource creation task")?
-                .context("creating per-job Docker config")?;
-        let attempt_id = docker_config.attempt_id();
+        let domain = tokio::task::spawn_blocking(move || permit.provision())
+            .await
+            .context("joining execution domain provisioning task")?
+            .context("provisioning execution domain")?;
+        let attempt_id = domain.attempt_id();
         info!(%attempt_id, "created job Docker config");
 
         let capability_id = match register_job_cache_capability(
@@ -638,11 +694,11 @@ impl Runner {
         {
             Ok(capability_id) => capability_id,
             Err(registration_error) => {
-                let cleanup_path = docker_config.attempt_dir().to_path_buf();
-                let cleanup_result = tokio::task::spawn_blocking(move || docker_config.cleanup())
+                let cleanup_path = domain.attempt_dir().to_path_buf();
+                let cleanup_result = tokio::task::spawn_blocking(move || domain.destroy())
                     .await
                     .unwrap_or_else(|source| {
-                        Err(JobDockerConfigError::Cleanup {
+                        Err(ExecutionDomainError::Cleanup {
                             path: cleanup_path,
                             source: io::Error::other(format!(
                                 "per-job resource cleanup task failed: {source}"
@@ -676,58 +732,77 @@ impl Runner {
         let mut cache_capability =
             JobCacheCapability::new(Arc::clone(&self.cache_authority), capability_id);
 
-        let (execution_result, cleanup_result) =
-            run_with_cache_capability(&mut cache_capability, async {
-                let execution_result = self
-                    .run_job_body(
-                        manifest,
-                        job_client,
-                        client,
-                        cancel_token,
-                        repo,
-                        &cache_scope,
-                        &docker_config,
+        let (domain, running_result) =
+            transition_execution_domain(domain, ExecutionDomain::mark_running).await?;
+        let entered_running = running_result.is_ok();
+        let execution_result = run_with_cache_capability(&mut cache_capability, async {
+            running_result.context("marking execution domain running")?;
+            self.run_job_body(
+                manifest,
+                job_client,
+                client,
+                cancel_token,
+                repo,
+                &cache_scope,
+                &domain,
+                secret_masker,
+            )
+            .await
+        })
+        .await;
+        // A body that started always reaches Cleaning, including setup failures
+        // and cancellation. A failed Running transition goes directly to destroy.
+        // Keep lifecycle failure separate so it cannot replace the body's outcome.
+        let (domain, cleaning_result) = if entered_running {
+            transition_execution_domain(domain, ExecutionDomain::mark_cleaning).await?
+        } else {
+            (domain, Ok(()))
+        };
+        let destroy = async move {
+            let destroy_path = domain.attempt_dir().to_path_buf();
+            let cleanup_result = tokio::task::spawn_blocking(move || domain.destroy())
+                .await
+                .unwrap_or_else(|source| {
+                    Err(ExecutionDomainError::Cleanup {
+                        path: destroy_path,
+                        source: io::Error::other(format!(
+                            "execution domain destroy task failed: {source}"
+                        )),
+                    })
+                });
+            match &cleanup_result {
+                Ok(()) => info!(%attempt_id, "cleaned job Docker config"),
+                Err(cleanup_error) => {
+                    let masked_error = mask_error_chain(
+                        &anyhow::Error::msg(cleanup_error.to_string()),
                         secret_masker,
                     )
                     .await;
-
-                let cleanup_path = docker_config.attempt_dir().to_path_buf();
-                let cleanup_result = tokio::task::spawn_blocking(move || docker_config.cleanup())
-                    .await
-                    .unwrap_or_else(|source| {
-                        Err(JobDockerConfigError::Cleanup {
-                            path: cleanup_path,
-                            source: io::Error::other(format!(
-                                "per-job resource cleanup task failed: {source}"
-                            )),
-                        })
-                    });
-                match &cleanup_result {
-                    Ok(()) => info!(%attempt_id, "cleaned job Docker config"),
-                    Err(cleanup_error) => {
-                        let masked_error = mask_error_chain(
-                            &anyhow::Error::msg(cleanup_error.to_string()),
-                            secret_masker,
-                        )
-                        .await;
-                        error!(
-                            category = "job-resource-cleanup",
-                            %attempt_id,
-                            error = %masked_error,
-                            "job Docker config cleanup failed"
-                        );
-                    }
+                    error!(
+                        category = "job-resource-cleanup",
+                        %attempt_id,
+                        error = %masked_error,
+                        "job Docker config cleanup failed"
+                    );
                 }
-                (execution_result, cleanup_result)
-            })
-            .await;
+            }
+            match (cleaning_result, cleanup_result) {
+                (Ok(()), result) | (result, Ok(())) => result,
+                (Err(lifecycle), Err(destroy)) => {
+                    Err(ExecutionDomainError::LifecycleAndDestroyFailed {
+                        lifecycle: Box::new(lifecycle),
+                        destroy: Box::new(destroy),
+                    })
+                }
+            }
+        };
 
-        finish_job_after_cache_revoke(
+        finish_job_after_cache_revoke_and_destroy(
             &mut cache_capability,
+            destroy,
             job_client,
             manifest,
             execution_result,
-            cleanup_result,
         )
         .await
     }
@@ -744,10 +819,10 @@ impl Runner {
         cancel_token: CancellationToken,
         repo: &str,
         cache_scope: &CacheScope,
-        docker_config: &JobDockerConfig,
+        domain: &ExecutionDomain,
         secret_masker: &SharedSecretMasker,
     ) -> Result<JobExecutionOutcome> {
-        let workspace = self.create_job_workspace(docker_config, repo)?;
+        let workspace = self.create_job_workspace(domain, repo)?;
         let mut docker_resources = None;
 
         let execution_result = async {
@@ -805,7 +880,7 @@ impl Runner {
                 &workspace,
                 &node_runtimes,
                 &mut docker_resources,
-                docker_config,
+                domain,
                 secret_masker,
             )
             .await
@@ -823,14 +898,10 @@ impl Runner {
         execution_result
     }
 
-    fn create_job_workspace(
-        &self,
-        docker_config: &JobDockerConfig,
-        repo: &str,
-    ) -> Result<Workspace> {
+    fn create_job_workspace(&self, domain: &ExecutionDomain, repo: &str) -> Result<Workspace> {
         Workspace::create(
-            docker_config.work_dir(),
-            docker_config.private_tmp(),
+            domain.work_dir(),
+            domain.private_tmp(),
             &self.paths.tool_cache_dir(),
             &self.name,
             repo,
@@ -849,14 +920,14 @@ impl Runner {
         workspace: &Workspace,
         node_runtimes: &crate::node::NodeRuntimes,
         docker_resources: &mut Option<JobDockerResources>,
-        docker_config: &JobDockerConfig,
+        domain: &ExecutionDomain,
         secret_masker: &SharedSecretMasker,
     ) -> Result<JobExecutionOutcome> {
         // Choose env builder based on execution mode
         let mut base_env = if manifest.has_container() {
             build_container_env(manifest, workspace, &self.name)
         } else {
-            build_base_env(manifest, workspace, &self.name, docker_config)?
+            build_base_env(manifest, workspace, &self.name, domain)?
         };
 
         // Merge the Docker image's default PATH so tools installed via ENV in
@@ -927,8 +998,7 @@ impl Runner {
         let (heartbeat_handle, heartbeat_cancel) =
             job_client.start_heartbeat(manifest.plan.plan_id.clone(), manifest.plan.job_id.clone());
 
-        let execution =
-            JobExecutionContext::new(docker_config, docker_resources.as_ref(), node_runtimes);
+        let execution = JobExecutionContext::new(domain, docker_resources.as_ref(), node_runtimes);
         let job_result = run_all_steps_with_masker(
             manifest,
             job_client,
@@ -982,14 +1052,14 @@ impl Runner {
     ) -> Result<Option<BrokerMessage>> {
         let mut backoff = Duration::from_secs(1);
         let max_backoff = Duration::from_secs(30);
-        let mut poisoned_rx = self.job_resources.poisoned_receiver();
+        let mut poisoned_rx = self.execution_domains.poisoned_receiver();
         // Set when the previous iteration handled a 401 by refreshing the
         // token. A 401 on the very next poll means the fresh token is also
         // rejected (e.g. the registration was revoked) and must not loop.
         let mut token_just_refreshed = false;
 
         loop {
-            self.job_resources.ensure_healthy()?;
+            self.execution_domains.ensure_healthy()?;
             if *shutdown_rx.borrow() {
                 info!("shutdown signal received, exiting poll loop");
                 return Ok(None);
@@ -1002,7 +1072,7 @@ impl Runner {
                     return Ok(None);
                 }
                 _ = poisoned_rx.changed() => {
-                    self.job_resources.ensure_healthy()?;
+                    self.execution_domains.ensure_healthy()?;
                     continue;
                 }
                 result = broker.poll_message(AgentStatus::Online) => result,
@@ -1010,7 +1080,7 @@ impl Runner {
 
             match poll_result {
                 Ok(Some(msg)) => {
-                    self.job_resources.ensure_healthy()?;
+                    self.execution_domains.ensure_healthy()?;
                     // Any successful poll proves the token still works.
                     token_just_refreshed = false;
 
@@ -1081,7 +1151,7 @@ impl Runner {
                             return Ok(None);
                         }
                         _ = poisoned_rx.changed() => {
-                            self.job_resources.ensure_healthy()?;
+                            self.execution_domains.ensure_healthy()?;
                             continue;
                         }
                     }

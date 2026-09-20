@@ -10,10 +10,10 @@ use tracing::debug;
 use super::download::{ActionCache, TrustedActionDirectory};
 use super::metadata::ActionMetadata;
 use crate::docker::build::{DockerActionBuilder, DockerBuildScope, RegistryAuth};
-use crate::job::docker_config::DOCKER_CONFIG_ENV;
 use crate::job::execute::{
     JobExecutionContext, JobState, StepConclusion, StepResult, build_step_env, run_process,
 };
+use crate::job::execution_domain::DOCKER_CONFIG_ENV;
 use crate::job::expression::ExprContext;
 use crate::job::logs::LogSender;
 use crate::job::schema::Step;

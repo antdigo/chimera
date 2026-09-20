@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::io::Write;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -14,7 +15,7 @@ use crate::cache::auth::{CacheAuthError, CacheAuthority, CacheScope};
 use crate::config::ChimeraPaths;
 use crate::github::auth::TokenManager;
 use crate::github::broker::{BrokerClient, MessageType};
-use crate::job::docker_config::JobDockerConfigError;
+use crate::job::execution_domain::ExecutionDomainError;
 
 use super::*;
 
@@ -176,8 +177,11 @@ async fn setup() -> (MockServer, Arc<TokenManager>, watch::Sender<bool>) {
 fn make_runner() -> (TempDir, Runner) {
     let temp = TempDir::new().unwrap();
     let paths = ChimeraPaths::new(temp.path().to_path_buf());
-    let job_resources =
-        crate::job::docker_config::JobResourceRoot::prepare(&paths.job_resources_dir()).unwrap();
+    let execution_domains = crate::job::execution_domain::ExecutionDomainRoot::prepare(
+        &paths.job_resources_dir(),
+        NonZeroUsize::new(1).unwrap(),
+    )
+    .unwrap();
 
     let runner = Runner {
         name: "test-runner".into(),
@@ -210,7 +214,7 @@ fn make_runner() -> (TempDir, Runner) {
         },
         paths,
         state: None,
-        job_resources,
+        execution_domains,
         cache_port: 9999,
         cache_authority: Arc::new(CacheAuthority::new()),
         docker_action_builder: Arc::new(crate::docker::build::DockerActionBuilder::new()),
@@ -222,7 +226,9 @@ fn make_runner() -> (TempDir, Runner) {
 #[test]
 fn runner_creates_workspace_inside_the_current_attempt() {
     let (_temp, runner) = make_runner();
-    let resources = runner.job_resources.create_docker_config().unwrap();
+    let resources = futures::executor::block_on(runner.execution_domains.reserve())
+        .and_then(|permit| permit.provision())
+        .unwrap();
 
     let workspace = runner
         .create_job_workspace(&resources, "owner/repo")
@@ -236,6 +242,354 @@ fn runner_creates_workspace_inside_the_current_attempt() {
             .starts_with(runner.paths.work_dir())
     );
     assert!(!workspace.runner_temp().starts_with(runner.paths.tmp_dir()));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn lifecycle_transition_does_not_block_tokio_tasks_or_timers() {
+    let (_temp, runner) = make_runner();
+    let domain = runner
+        .execution_domains
+        .reserve()
+        .await
+        .unwrap()
+        .provision()
+        .unwrap();
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+
+    let (transition, ()) = tokio::join!(
+        transition_execution_domain(domain, move |domain| {
+            started_tx.send(()).unwrap();
+            release_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("Tokio task and timer must progress while the journal transition blocks");
+            domain.mark_running()
+        }),
+        async {
+            started_rx.await.unwrap();
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            release_tx.send(()).unwrap();
+        },
+    );
+
+    let (domain, result) = transition.unwrap();
+    result.unwrap();
+    domain.destroy().unwrap();
+}
+
+async fn assert_cleaning_failure_preserves_execution_outcome(
+    conclusion: JobConclusion,
+    destroy_fails: bool,
+) {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path_regex(r"/_apis/pipelines/workflows/.*/logs$"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"id": 1})))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path_regex(r"/_apis/pipelines/workflows/.*/logs/\d+"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+    Mock::given(method("PATCH"))
+        .and(path_regex(
+            r"/_apis/distributedtask/hubs/build/plans/.*/timelines/.*",
+        ))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/completejob"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+
+    let (_temp, runner) = make_runner();
+    cache_node_runtimes(&runner);
+    let mut value = finish_manifest_value(&server.uri());
+    let exit_code = if conclusion == JobConclusion::Failed {
+        7
+    } else {
+        0
+    };
+    value["steps"] = serde_json::json!([{
+        "id": "publish", "contextName": "publish", "order": 1,
+        "reference": { "type": "script" },
+        "inputs": { "script": format!(
+            "printf 'published=release-42\\n' >> \"$GITHUB_OUTPUT\"; \
+             printf JOURNAL-BODY-CANARY > \"$DOCKER_CONFIG/../journal.json.next\"; \
+             while [ ! -f \"$RUNNER_TEMP/release\" ]; do sleep 0.01; done; exit {exit_code}"
+        ) }
+    }]);
+    value["jobOutputs"] = serde_json::json!({
+        "published": "${{ steps.publish.outputs.published }}",
+        "step_conclusion": "${{ steps.publish.conclusion }}"
+    });
+    let manifest: JobManifest = serde_json::from_value(value).unwrap();
+    let client = finish_client(&server).await;
+    let http = reqwest::Client::new();
+    let scope = cache_scope_for_job(&manifest, "owner/test-repo");
+    let secret_masker = Arc::new(tokio::sync::RwLock::new(
+        SecretMasker::from_manifest(&manifest).unwrap(),
+    ));
+    let cancel = CancellationToken::new();
+    let permit = runner.execution_domains.reserve().await.unwrap();
+
+    let (result, attempt) = tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::join!(
+            runner.run_job(
+                &manifest,
+                &client,
+                &http,
+                cancel.clone(),
+                "owner/test-repo",
+                &secret_masker,
+                permit,
+            ),
+            async {
+                let attempt = loop {
+                    let attempt = std::fs::read_dir(runner.execution_domains.path())
+                        .unwrap()
+                        .next()
+                        .map(|entry| entry.unwrap().path());
+                    if let Some(attempt) = attempt
+                        && std::fs::read(attempt.join("journal.json.next"))
+                            .is_ok_and(|body| body == b"JOURNAL-BODY-CANARY")
+                    {
+                        break attempt;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                };
+                let authorized = runner
+                    .cache_authority
+                    .authorize("synthetic", &scope)
+                    .await
+                    .unwrap();
+                // Hold a real in-flight cache operation so revocation waits after
+                // Cleaning fails, giving this test a deterministic repair window.
+                let operation = runner.cache_authority.admit(&authorized).await.unwrap();
+                let grant = runner
+                    .cache_authority
+                    .issue_download(&authorized, "a".repeat(64))
+                    .await
+                    .unwrap();
+                if conclusion == JobConclusion::Cancelled {
+                    cancel.cancel();
+                } else {
+                    std::fs::write(attempt.join("tmp/test-runner/release"), "").unwrap();
+                }
+                while runner
+                    .cache_authority
+                    .authorize("synthetic", &scope)
+                    .await
+                    .is_ok()
+                {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                assert!(
+                    server
+                        .received_requests()
+                        .await
+                        .unwrap()
+                        .iter()
+                        .all(|request| request.url.path() != "/completejob")
+                );
+                if !destroy_fails {
+                    std::fs::remove_file(attempt.join("journal.json.next")).unwrap();
+                }
+                drop(operation);
+                assert_eq!(
+                    runner
+                        .cache_authority
+                        .resolve_download(grant)
+                        .await
+                        .unwrap_err(),
+                    CacheAuthError::DownloadNotFound
+                );
+                attempt
+            },
+        )
+    })
+    .await
+    .expect("job must reach the Cleaning boundary and finish");
+
+    let error = result.unwrap_err();
+    let requests = server.received_requests().await.unwrap();
+    let completions: Vec<_> = requests
+        .iter()
+        .filter(|request| request.url.path() == "/completejob")
+        .collect();
+    assert_eq!(
+        completions.len(),
+        1,
+        "Cleaning failure must still publish the execution outcome: {error:#}"
+    );
+    let body: serde_json::Value = serde_json::from_slice(&completions[0].body).unwrap();
+    assert_eq!(body["conclusion"], "failed");
+    let step_conclusion = match conclusion {
+        JobConclusion::Succeeded => "success",
+        JobConclusion::Failed => "failure",
+        JobConclusion::Cancelled => "cancelled",
+    };
+    assert_eq!(
+        body["outputs"],
+        serde_json::json!({
+            "published": { "value": "release-42" },
+            "step_conclusion": { "value": step_conclusion }
+        })
+    );
+    assert_eq!(
+        runner
+            .cache_authority
+            .authorize("synthetic", &scope)
+            .await
+            .unwrap_err(),
+        CacheAuthError::Unauthorized
+    );
+    assert!(job_execution_error_is_terminal(&error));
+    let fatal = error
+        .downcast_ref::<ExecutionDomainCleanupFatalError>()
+        .expect("completion after lifecycle failure must be typed and fatal");
+    if destroy_fails {
+        assert!(matches!(
+            runner.execution_domains.ensure_healthy(),
+            Err(ExecutionDomainError::PoisonedRoot { .. })
+        ));
+        let journal: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(attempt.join("journal.json")).unwrap()).unwrap();
+        assert_eq!(journal["state"], "running");
+        let ExecutionDomainError::LifecycleAndDestroyFailed { lifecycle, destroy } = &fatal.source
+        else {
+            panic!("both lifecycle and destruction errors must stay typed: {fatal:?}");
+        };
+        for cause in [lifecycle, destroy] {
+            assert!(
+                matches!(cause.as_ref(), ExecutionDomainError::UnsafeEntry { path } if path == &attempt.join("journal.json.next"))
+            );
+        }
+    } else {
+        assert!(
+            !attempt.exists(),
+            "destruction must run despite the Cleaning failure"
+        );
+        runner.execution_domains.ensure_healthy().unwrap();
+        assert!(
+            matches!(&fatal.source, ExecutionDomainError::UnsafeEntry { path } if path == &attempt.join("journal.json.next"))
+        );
+    }
+    assert!(!format!("{error:?}").contains("JOURNAL-BODY-CANARY"));
+}
+
+#[tokio::test]
+async fn cleaning_failure_preserves_successful_job_outputs() {
+    assert_cleaning_failure_preserves_execution_outcome(JobConclusion::Succeeded, true).await;
+}
+
+#[tokio::test]
+async fn cleaning_failure_preserves_failed_job_outputs() {
+    assert_cleaning_failure_preserves_execution_outcome(JobConclusion::Failed, true).await;
+}
+
+#[tokio::test]
+async fn cleaning_failure_preserves_cancelled_job_outputs() {
+    assert_cleaning_failure_preserves_execution_outcome(JobConclusion::Cancelled, true).await;
+}
+
+#[tokio::test]
+async fn cleaning_failure_remains_fatal_after_successful_destroy() {
+    assert_cleaning_failure_preserves_execution_outcome(JobConclusion::Succeeded, false).await;
+}
+
+#[tokio::test]
+async fn running_failure_revokes_capability_and_attempts_destroy_without_starting_workload() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let server = MockServer::start().await;
+    let (_temp, mut runner) = make_runner();
+    let root_path = runner.execution_domains.path().to_path_buf();
+    let inject_failure = AtomicBool::new(true);
+    // Capability registration consults its clock after provisioning and before
+    // Running. Use that existing test seam to create a real journal obstruction
+    // at the otherwise synchronous boundary, without racing filesystem polling.
+    runner.cache_authority = Arc::new(CacheAuthority::with_clock(Arc::new(move || {
+        if inject_failure.swap(false, Ordering::SeqCst) {
+            let attempt = std::fs::read_dir(&root_path)
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap()
+                .path();
+            std::fs::write(attempt.join("journal.json.next"), "JOURNAL-BODY-CANARY").unwrap();
+        }
+        Utc::now()
+    })));
+    let manifest = finish_manifest(&server.uri());
+    let client = finish_client(&server).await;
+    let scope = cache_scope_for_job(&manifest, "owner/test-repo");
+    let secret_masker = Arc::new(tokio::sync::RwLock::new(
+        SecretMasker::from_manifest(&manifest).unwrap(),
+    ));
+
+    let error = runner
+        .run_job(
+            &manifest,
+            &client,
+            &reqwest::Client::new(),
+            CancellationToken::new(),
+            "owner/test-repo",
+            &secret_masker,
+            runner.execution_domains.reserve().await.unwrap(),
+        )
+        .await
+        .unwrap_err();
+
+    let diagnostic = format!("{error:#}");
+    assert!(
+        diagnostic.contains("marking execution domain running"),
+        "{diagnostic}"
+    );
+    assert!(
+        !diagnostic.contains("invalid-domain-transition"),
+        "a failed Running transition must go straight to destruction: {diagnostic}"
+    );
+    assert_eq!(
+        runner
+            .cache_authority
+            .authorize("synthetic", &scope)
+            .await
+            .unwrap_err(),
+        CacheAuthError::Unauthorized
+    );
+    assert!(
+        server.received_requests().await.unwrap().is_empty(),
+        "the job body must not start or publish a normal outcome"
+    );
+    assert!(
+        !runner.paths.externals_dir().exists(),
+        "the job body must not try to prepare Node runtimes"
+    );
+    let attempt = std::fs::read_dir(runner.execution_domains.path())
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    assert_eq!(std::fs::read_dir(attempt.join("work")).unwrap().count(), 0);
+    assert_eq!(std::fs::read_dir(attempt.join("tmp")).unwrap().count(), 0);
+    let journal: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(attempt.join("journal.json")).unwrap()).unwrap();
+    assert_eq!(journal["state"], "ready");
+    assert!(matches!(
+        runner.execution_domains.ensure_healthy(),
+        Err(ExecutionDomainError::PoisonedRoot { .. })
+    ));
+    assert_eq!(
+        diagnostic.matches("unsafe-job-resource-path").count(),
+        2,
+        "both Running and destruction must have been attempted: {diagnostic}"
+    );
+    assert!(!format!("{error:?}").contains("JOURNAL-BODY-CANARY"));
 }
 
 #[tokio::test]
@@ -261,14 +615,20 @@ async fn cancelled_job_removes_attempt_workspace_and_temp_canaries() {
 
     let (_temp, runner) = make_runner();
     cache_node_runtimes(&runner);
-    let mut docker_config = runner.job_resources.create_docker_config().unwrap();
-    let workspace_canary = docker_config
+    let domain = runner
+        .execution_domains
+        .reserve()
+        .await
+        .unwrap()
+        .provision()
+        .unwrap();
+    let workspace_canary = domain
         .work_dir()
         .join("test-runner/test-repo/test-repo/workspace-canary");
-    let temp_canary = docker_config
+    let temp_canary = domain
         .private_tmp()
         .join("test-runner/checkout-v6-credential-canary");
-    let cancel_ready = docker_config.private_tmp().join("test-runner/cancel-ready");
+    let cancel_ready = domain.private_tmp().join("test-runner/cancel-ready");
     let mut manifest_value = finish_manifest_value(&server.uri());
     manifest_value["steps"] = serde_json::json!([{
         "id": "write-canaries",
@@ -302,7 +662,7 @@ async fn cancelled_job_removes_attempt_workspace_and_temp_canaries() {
             cancel,
             "owner/test-repo",
             &cache_scope,
-            &docker_config,
+            &domain,
             &secret_masker,
         ),
         async {
@@ -322,9 +682,15 @@ async fn cancelled_job_removes_attempt_workspace_and_temp_canaries() {
     assert!(!workspace_canary.exists());
     assert!(!temp_canary.exists());
 
-    let first_attempt = docker_config.attempt_dir().to_path_buf();
-    docker_config.cleanup().unwrap();
-    let mut next_attempt = runner.job_resources.create_docker_config().unwrap();
+    let first_attempt = domain.attempt_dir().to_path_buf();
+    domain.destroy().unwrap();
+    let next_attempt = runner
+        .execution_domains
+        .reserve()
+        .await
+        .unwrap()
+        .provision()
+        .unwrap();
     assert_ne!(next_attempt.attempt_dir(), first_attempt);
     assert!(!workspace_canary.exists());
     assert!(!temp_canary.exists());
@@ -338,7 +704,7 @@ async fn cancelled_job_removes_attempt_workspace_and_temp_canaries() {
             .count(),
         0
     );
-    next_attempt.cleanup().unwrap();
+    next_attempt.destroy().unwrap();
 }
 
 #[test]
@@ -399,13 +765,14 @@ async fn registration_failure_cleans_docker_config_without_revoking_existing_cap
             CancellationToken::new(),
             "owner/test-repo",
             &secret_masker,
+            runner.execution_domains.reserve().await.unwrap(),
         )
         .await
         .unwrap_err();
 
     assert!(format!("{error:#}").contains("active capability"));
     assert!(
-        std::fs::read_dir(runner.job_resources.path())
+        std::fs::read_dir(runner.execution_domains.path())
             .unwrap()
             .next()
             .is_none(),
@@ -634,19 +1001,20 @@ async fn poll_loop_stops_when_job_resource_root_is_poisoned() {
     );
 
     let (_temp, runner) = make_runner();
-    let root = runner.job_resources.clone();
+    let root = runner.execution_domains.clone();
     let mut rx = shutdown_tx.subscribe();
     let poll = tokio::spawn(async move { runner.poll_loop(&broker, &mut rx).await });
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    let mut config = root.create_docker_config().unwrap();
+    let config = root.reserve().await.unwrap().provision().unwrap();
+    let attempt_dir = config.attempt_dir().to_path_buf();
     let outside = root.path().parent().unwrap().join("outside");
     std::fs::write(&outside, "outside").unwrap();
     let symlink_path = config.attempt_dir().join("unexpected-link");
     std::os::unix::fs::symlink(&outside, &symlink_path).unwrap();
-    config.cleanup().unwrap_err();
+    config.destroy().unwrap_err();
     std::fs::remove_file(symlink_path).unwrap();
-    config.cleanup().unwrap();
+    std::fs::remove_dir_all(attempt_dir).unwrap();
 
     let error = tokio::time::timeout(Duration::from_secs(1), poll)
         .await
@@ -658,10 +1026,92 @@ async fn poll_loop_stops_when_job_resource_root_is_poisoned() {
 }
 
 #[tokio::test]
+async fn pre_provision_failures_release_capacity_without_creating_attempts() {
+    for failure in ["parse", "ack", "manifest"] {
+        let (server, token_manager, _shutdown) = setup().await;
+        let (_temp, runner) = make_runner();
+        Mock::given(method("POST"))
+            .and(path("/acknowledge"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(if failure == "manifest" { 1 } else { 0 })
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/acquirejob"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(if failure == "manifest" { 1 } else { 0 })
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/message"))
+            .respond_with(ResponseTemplate::new(202).set_delay(Duration::from_secs(1)))
+            .mount(&server)
+            .await;
+        let message = BrokerMessage {
+            message_id: 1,
+            message_type: MessageType::RunnerJobRequest,
+            body: Some(if failure == "parse" {
+                "invalid-json".into()
+            } else {
+                serde_json::json!({
+                    "runner_request_id": "request",
+                    "run_service_url": server.uri()
+                })
+                .to_string()
+            }),
+        };
+        let broker = BrokerClient::new(
+            reqwest::Client::new(),
+            if failure == "ack" {
+                "unsupported://broker".into()
+            } else {
+                server.uri()
+            },
+            "session".into(),
+            token_manager.clone(),
+        );
+        runner
+            .handle_job_message(
+                &message,
+                &broker,
+                &reqwest::Client::new(),
+                token_manager,
+                runner.execution_domains.reserve().await.unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_dir(runner.execution_domains.path())
+                .unwrap()
+                .count(),
+            0
+        );
+        let _returned =
+            tokio::time::timeout(Duration::from_secs(1), runner.execution_domains.reserve())
+                .await
+                .expect("unused admission capacity must be released")
+                .unwrap();
+    }
+}
+
+#[tokio::test]
 async fn poisoned_runner_refuses_job_before_acknowledgement() {
     let (mock_server, token_manager, _shutdown_tx) = setup().await;
-    let (_temp, runner) = make_runner();
-    let mut resources = runner.job_resources.create_docker_config().unwrap();
+    let (_temp, mut runner) = make_runner();
+    runner.execution_domains = ExecutionDomainRoot::prepare(
+        runner.execution_domains.path(),
+        NonZeroUsize::new(2).unwrap(),
+    )
+    .unwrap();
+    let permit = runner.execution_domains.reserve().await.unwrap();
+    let resources = runner
+        .execution_domains
+        .reserve()
+        .await
+        .unwrap()
+        .provision()
+        .unwrap();
+    let attempt_dir = resources.attempt_dir().to_path_buf();
     let workspace_canary = resources.work_dir().join("workspace-canary");
     let credential_canary = resources
         .private_tmp()
@@ -669,7 +1119,7 @@ async fn poisoned_runner_refuses_job_before_acknowledgement() {
     std::fs::write(&workspace_canary, "workspace-secret").unwrap();
     std::fs::write(&credential_canary, "credential-secret").unwrap();
     let outside = runner
-        .job_resources
+        .execution_domains
         .path()
         .parent()
         .unwrap()
@@ -678,7 +1128,7 @@ async fn poisoned_runner_refuses_job_before_acknowledgement() {
     let symlink_path = resources.attempt_dir().join("unexpected-link");
     std::os::unix::fs::symlink(&outside, &symlink_path).unwrap();
 
-    resources.cleanup().unwrap_err();
+    resources.destroy().unwrap_err();
 
     assert_eq!(
         std::fs::read_to_string(&workspace_canary).unwrap(),
@@ -705,7 +1155,13 @@ async fn poisoned_runner_refuses_job_before_acknowledgement() {
     );
 
     let error = runner
-        .handle_job_message(&message, &broker, &reqwest::Client::new(), token_manager)
+        .handle_job_message(
+            &message,
+            &broker,
+            &reqwest::Client::new(),
+            token_manager,
+            permit,
+        )
         .await
         .unwrap_err();
 
@@ -719,7 +1175,7 @@ async fn poisoned_runner_refuses_job_before_acknowledgement() {
     );
 
     std::fs::remove_file(symlink_path).unwrap();
-    resources.cleanup().unwrap();
+    std::fs::remove_dir_all(attempt_dir).unwrap();
 }
 
 #[tokio::test]
@@ -985,8 +1441,11 @@ fn make_startup_runner(
 ) -> (TempDir, Runner) {
     let temp = TempDir::new().unwrap();
     let paths = ChimeraPaths::new(temp.path().to_path_buf());
-    let job_resources =
-        crate::job::docker_config::JobResourceRoot::prepare(&paths.job_resources_dir()).unwrap();
+    let execution_domains = crate::job::execution_domain::ExecutionDomainRoot::prepare(
+        &paths.job_resources_dir(),
+        NonZeroUsize::new(1).unwrap(),
+    )
+    .unwrap();
 
     let rsa_params =
         crate::config::private_key_to_rsa_params(&crate::testing::test_private_key()).unwrap();
@@ -1013,7 +1472,7 @@ fn make_startup_runner(
         },
         paths,
         state,
-        job_resources,
+        execution_domains,
         cache_port: 9999,
         cache_authority: Arc::new(CacheAuthority::new()),
         docker_action_builder: Arc::new(crate::docker::build::DockerActionBuilder::new()),
@@ -1041,6 +1500,109 @@ async fn wait_for_phase(
         }
     })
     .await
+}
+
+#[tokio::test]
+async fn start_reserves_before_online_polling_and_shutdown_interrupts_admission() {
+    for (release_capacity, close_shutdown_channel) in [(false, false), (false, true), (true, false)]
+    {
+        let (server, _token_manager, _shutdown) = setup().await;
+        Mock::given(method("POST"))
+            .and(path("/session"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "sessionId": "session"
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/message"))
+            .and(query_param("status", "Online"))
+            .respond_with(ResponseTemplate::new(202).set_delay(Duration::from_secs(1)))
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path("/session"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let state = Arc::new(DaemonState::new(&["test-runner".into()]));
+        let (_temp, runner) = make_startup_runner(
+            Some(state.clone()),
+            format!("{}/oauth2/token", server.uri()),
+            server.uri(),
+        );
+        let root = runner.execution_domains.clone();
+        let occupied = root.reserve().await.unwrap();
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let start = tokio::spawn(runner.start(shutdown_rx));
+        wait_for_phase(&state, "test-runner", RunnerPhase::Idle)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .all(|request| request.url.path() != "/message")
+        );
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+
+        if release_capacity {
+            drop(occupied);
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    if server
+                        .received_requests()
+                        .await
+                        .unwrap()
+                        .iter()
+                        .any(|request| request.url.path() == "/message")
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("released capacity must permit Online polling");
+            assert!(
+                tokio::time::timeout(Duration::from_millis(20), root.reserve())
+                    .await
+                    .is_err()
+            );
+        } else {
+            // Keep admission saturated until the runner has exited.
+            if close_shutdown_channel {
+                drop(shutdown_tx);
+            } else {
+                shutdown_tx.send(true).unwrap();
+            }
+            tokio::time::timeout(Duration::from_secs(2), start)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                state.snapshot().await.runners["test-runner"].phase,
+                RunnerPhase::Stopping,
+            );
+            drop(occupied);
+            continue;
+        }
+        shutdown_tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), start)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let _returned = tokio::time::timeout(Duration::from_secs(1), root.reserve())
+            .await
+            .unwrap()
+            .unwrap();
+    }
 }
 
 #[tokio::test]
@@ -1645,14 +2207,14 @@ fn cleanup_failure_only_downgrades_success() {
 
 #[test]
 fn job_execution_error_is_terminal_covers_both_fatal_markers() {
-    let cleanup_fatal = anyhow::Error::new(JobResourceCleanupFatalError {
-        source: JobDockerConfigError::Cleanup {
+    let cleanup_fatal = anyhow::Error::new(ExecutionDomainCleanupFatalError {
+        source: ExecutionDomainError::Cleanup {
             path: "/synthetic/job-resources/attempt".into(),
             source: std::io::Error::other("synthetic cleanup failure"),
         },
     })
     .context("runner job path");
-    let poisoned = anyhow::Error::new(JobDockerConfigError::PoisonedRoot {
+    let poisoned = anyhow::Error::new(ExecutionDomainError::PoisonedRoot {
         path: "/synthetic/job-resources".into(),
     });
     let ordinary = anyhow::anyhow!("job execution failed for an ordinary reason");
@@ -1660,6 +2222,65 @@ fn job_execution_error_is_terminal_covers_both_fatal_markers() {
     assert!(job_execution_error_is_terminal(&cleanup_fatal));
     assert!(job_execution_error_is_terminal(&poisoned));
     assert!(!job_execution_error_is_terminal(&ordinary));
+}
+
+#[tokio::test]
+async fn completion_waits_for_capability_revoke_and_domain_destroy() {
+    let authority = Arc::new(CacheAuthority::new());
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/completejob"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let manifest = finish_manifest(&server.uri());
+    let scope = cache_scope_for_job(&manifest, "owner/test-repo");
+    let id = register_job_cache_capability(&authority, &manifest, scope.clone(), Utc::now())
+        .await
+        .unwrap();
+    let mut capability = JobCacheCapability::new(Arc::clone(&authority), id);
+    let client = finish_client(&server).await;
+    let (allow_destroy_tx, allow_destroy_rx) = tokio::sync::oneshot::channel();
+    let (destroy_started_tx, destroy_started_rx) = tokio::sync::oneshot::channel();
+    let destroy_authority = Arc::clone(&authority);
+    let destroy_scope = scope.clone();
+
+    let finish = tokio::spawn(async move {
+        finish_job_after_cache_revoke_and_destroy(
+            &mut capability,
+            async move {
+                assert_eq!(
+                    destroy_authority
+                        .authorize("synthetic", &destroy_scope)
+                        .await
+                        .unwrap_err(),
+                    CacheAuthError::Unauthorized,
+                );
+                destroy_started_tx.send(()).unwrap();
+                allow_destroy_rx.await.unwrap();
+                Ok(())
+            },
+            &client,
+            &manifest,
+            Ok(JobExecutionOutcome {
+                conclusion: JobConclusion::Succeeded,
+                outputs: HashMap::new(),
+            }),
+        )
+        .await
+    });
+
+    destroy_started_rx.await.unwrap();
+    assert_eq!(
+        authority.authorize("synthetic", &scope).await.unwrap_err(),
+        CacheAuthError::Unauthorized,
+    );
+    assert!(server.received_requests().await.unwrap().is_empty());
+
+    allow_destroy_tx.send(()).unwrap();
+    finish.await.unwrap().unwrap();
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
 }
 
 #[tokio::test]
@@ -1676,9 +2297,14 @@ async fn cache_capability_is_revoked_before_failure_is_reported() {
     let client = finish_client(&server).await;
     let mut capability = JobCacheCapability::new(Arc::clone(&authority), id);
 
-    let result =
-        finish_job_after_cache_revoke(&mut capability, &client, &manifest, execution, cleanup)
-            .await;
+    let result = finish_job_after_cache_revoke_and_destroy(
+        &mut capability,
+        async { cleanup },
+        &client,
+        &manifest,
+        execution,
+    )
+    .await;
 
     assert!(result.is_err());
     assert_eq!(
@@ -1716,21 +2342,72 @@ async fn successful_job_reports_failed_when_docker_config_cleanup_fails() {
         conclusion: JobConclusion::Succeeded,
         outputs: HashMap::new(),
     });
-    let cleanup = Err(JobDockerConfigError::UnsafeEntry {
+    let cleanup = Err(ExecutionDomainError::UnsafeEntry {
         path: "/synthetic/job-resource/entry".into(),
     });
     let mut capability = JobCacheCapability::new(Arc::clone(&authority), id);
 
-    let error =
-        finish_job_after_cache_revoke(&mut capability, &client, &manifest, execution, cleanup)
-            .await
-            .unwrap_err();
+    let error = finish_job_after_cache_revoke_and_destroy(
+        &mut capability,
+        async { cleanup },
+        &client,
+        &manifest,
+        execution,
+    )
+    .await
+    .unwrap_err();
 
     assert!(error.to_string().contains("job-resource-cleanup-fatal"));
     assert_eq!(
         authority.authorize("synthetic", &scope).await.unwrap_err(),
         CacheAuthError::Unauthorized,
     );
+}
+
+#[tokio::test]
+async fn cleanup_and_completion_failure_preserve_both_causes_and_fatal_classification() {
+    use wiremock::matchers::body_partial_json;
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/completejob"))
+        .and(body_partial_json(
+            serde_json::json!({ "conclusion": "failed" }),
+        ))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let client = finish_client(&server).await;
+    let manifest = finish_manifest(&server.uri());
+    let error = finish_job(
+        &client,
+        &manifest,
+        Ok(JobExecutionOutcome {
+            conclusion: JobConclusion::Succeeded,
+            outputs: HashMap::new(),
+        }),
+        Err(ExecutionDomainError::Cleanup {
+            path: "/synthetic/job-resource/attempt".into(),
+            source: io::Error::other("synthetic destroy failure"),
+        }),
+    )
+    .await
+    .unwrap_err();
+
+    assert!(job_execution_error_is_terminal(&error));
+    let fatal = error
+        .downcast_ref::<ExecutionDomainCleanupFatalError>()
+        .unwrap();
+    let ExecutionDomainError::Cleanup { source, .. } = &fatal.source else {
+        panic!("cleanup cause was not preserved: {fatal:?}");
+    };
+    assert_eq!(source.to_string(), "synthetic destroy failure");
+    assert!(error.downcast_ref::<CompletionPublicationError>().is_some());
+    let causes = format!("{error:#}");
+    assert!(causes.contains("job-resource-cleanup-fatal"), "{causes}");
+    assert!(causes.contains("completing job"), "{causes}");
+    assert!(causes.contains("500"), "{causes}");
 }
 
 #[tokio::test]
@@ -1776,15 +2453,20 @@ async fn execution_and_cleanup_errors_are_both_returned_without_early_completion
         .await
         .unwrap();
     let execution = Err(anyhow::anyhow!("job-execution-category"));
-    let cleanup = Err(JobDockerConfigError::UnsafeEntry {
+    let cleanup = Err(ExecutionDomainError::UnsafeEntry {
         path: "/synthetic/job-resource/entry".into(),
     });
     let mut capability = JobCacheCapability::new(Arc::clone(&authority), id);
 
-    let error =
-        finish_job_after_cache_revoke(&mut capability, &client, &manifest, execution, cleanup)
-            .await
-            .unwrap_err();
+    let error = finish_job_after_cache_revoke_and_destroy(
+        &mut capability,
+        async { cleanup },
+        &client,
+        &manifest,
+        execution,
+    )
+    .await
+    .unwrap_err();
 
     let chain = format!("{error:#}");
     assert!(chain.contains("job-execution-category"));
@@ -1832,9 +2514,15 @@ async fn cancelled_job_revokes_cache_capability_before_completion() {
     });
     let mut capability = JobCacheCapability::new(Arc::clone(&authority), id);
 
-    finish_job_after_cache_revoke(&mut capability, &client, &manifest, execution, Ok(()))
-        .await
-        .unwrap();
+    finish_job_after_cache_revoke_and_destroy(
+        &mut capability,
+        async { Ok(()) },
+        &client,
+        &manifest,
+        execution,
+    )
+    .await
+    .unwrap();
 
     assert_eq!(
         authority.authorize("synthetic", &scope).await.unwrap_err(),
@@ -1926,6 +2614,7 @@ async fn completion_failure_is_not_reported_as_a_setup_failure() {
                 "request",
                 &server.uri(),
                 CancellationToken::new(),
+                runner.execution_domains.reserve().await.unwrap(),
             )
             .await
             .is_err()

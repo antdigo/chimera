@@ -1,13 +1,14 @@
 mod common;
 
 use std::collections::HashMap;
+use std::num::NonZeroUsize;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, bail};
 use chimera::job::client::JobConclusion;
-use chimera::job::docker_config::JobResourceRoot;
+use chimera::job::execution_domain::ExecutionDomainRoot;
 use chimera::job::schema::JobManifest;
 use common::docker_registry::*;
 use common::pinned_action::*;
@@ -921,10 +922,13 @@ async fn concurrent_logout_does_not_remove_other_job_credentials() {
     assert_eq!(seeded, format!("{}/probe:seed", registry.address()));
     let sync = tempfile::tempdir().unwrap();
     let daemon_root = tempfile::tempdir().unwrap();
-    let job_resources =
-        JobResourceRoot::prepare(&daemon_root.path().join("job-resources")).unwrap();
-    let first = TestEnv::setup_with_job_resources(job_resources.clone()).await;
-    let second = TestEnv::setup_with_job_resources(job_resources).await;
+    let execution_domains = ExecutionDomainRoot::prepare(
+        &daemon_root.path().join("job-resources"),
+        NonZeroUsize::new(2).unwrap(),
+    )
+    .unwrap();
+    let first = TestEnv::setup_with_job_resources(execution_domains.clone()).await;
+    let second = TestEnv::setup_with_job_resources(execution_domains).await;
 
     let first_manifest = registry_login_manifest(
         ALICE_USER,
@@ -964,8 +968,12 @@ async fn concurrent_logout_does_not_remove_other_job_credentials() {
 async fn docker_cli_atomic_rewrite_stays_private() {
     let registry = AuthenticatedRegistry::start().await.unwrap();
     let root_parent = tempfile::tempdir().unwrap();
-    let root = JobResourceRoot::prepare(&root_parent.path().join("job-resources")).unwrap();
-    let mut config = root.create_docker_config().unwrap();
+    let root = ExecutionDomainRoot::prepare(
+        &root_parent.path().join("job-resources"),
+        NonZeroUsize::new(1).unwrap(),
+    )
+    .unwrap();
+    let config = root.reserve().await.unwrap().provision().unwrap();
     let attempt = config.attempt_dir().to_path_buf();
 
     docker_output(
@@ -976,7 +984,7 @@ async fn docker_cli_atomic_rewrite_stays_private() {
             "--password-stdin",
             registry.address(),
         ],
-        config.directory(),
+        config.docker_config_dir(),
         Some(ALICE_PASSWORD.as_bytes()),
     )
     .await
@@ -986,7 +994,7 @@ async fn docker_cli_atomic_rewrite_stays_private() {
     assert!(metadata.is_file());
     assert!(!metadata.file_type().is_symlink());
     assert_eq!(
-        std::fs::symlink_metadata(config.directory())
+        std::fs::symlink_metadata(config.docker_config_dir())
             .unwrap()
             .permissions()
             .mode()
@@ -1008,12 +1016,16 @@ async fn docker_cli_atomic_rewrite_stays_private() {
     )
     .unwrap();
 
-    docker_output(&["logout", registry.address()], config.directory(), None)
-        .await
-        .unwrap();
+    docker_output(
+        &["logout", registry.address()],
+        config.docker_config_dir(),
+        None,
+    )
+    .await
+    .unwrap();
     assert!(attempt.exists());
 
-    config.cleanup().unwrap();
+    config.destroy().unwrap();
     assert!(!attempt.exists());
 }
 

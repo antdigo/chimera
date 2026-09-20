@@ -1,5 +1,7 @@
 #![allow(dead_code)]
 
+use std::num::NonZeroUsize;
+
 pub mod docker_registry;
 pub mod pinned_action;
 
@@ -13,8 +15,8 @@ use chimera::docker::resources::{JobDockerResources, SetupParams};
 use chimera::github::auth::TokenManager;
 use chimera::job::action::ActionCache;
 use chimera::job::client::{JobClient, JobConclusion};
-use chimera::job::docker_config::JobResourceRoot;
 use chimera::job::execute::{JobExecutionContext, run_all_steps};
+use chimera::job::execution_domain::ExecutionDomainRoot;
 use chimera::job::schema::JobManifest;
 use chimera::job::workspace::Workspace;
 use chimera::runner::env::{build_base_env, build_container_env};
@@ -37,7 +39,7 @@ pub struct TestEnv {
     pub job_client: Arc<JobClient>,
     pub mock_server: MockServer,
     pub tmp: tempfile::TempDir,
-    pub job_resources: JobResourceRoot,
+    pub execution_domains: ExecutionDomainRoot,
     actions_dir: std::path::PathBuf,
     docker_action_builder: Arc<DockerActionBuilder>,
 }
@@ -45,15 +47,22 @@ pub struct TestEnv {
 impl TestEnv {
     pub async fn setup() -> Self {
         let tmp = tempfile::tempdir().unwrap();
-        let job_resources = JobResourceRoot::prepare(&tmp.path().join("job-resources")).unwrap();
-        Self::setup_with_tmp(tmp, job_resources).await
+        let execution_domains = ExecutionDomainRoot::prepare(
+            &tmp.path().join("job-resources"),
+            NonZeroUsize::new(1).unwrap(),
+        )
+        .unwrap();
+        Self::setup_with_tmp(tmp, execution_domains).await
     }
 
-    pub async fn setup_with_job_resources(job_resources: JobResourceRoot) -> Self {
-        Self::setup_with_tmp(tempfile::tempdir().unwrap(), job_resources).await
+    pub async fn setup_with_job_resources(execution_domains: ExecutionDomainRoot) -> Self {
+        Self::setup_with_tmp(tempfile::tempdir().unwrap(), execution_domains).await
     }
 
-    async fn setup_with_tmp(tmp: tempfile::TempDir, job_resources: JobResourceRoot) -> Self {
+    async fn setup_with_tmp(
+        tmp: tempfile::TempDir,
+        execution_domains: ExecutionDomainRoot,
+    ) -> Self {
         let work_dir = tmp.path().join("work");
         let tmp_dir = tmp.path().join("tmp");
         let tool_cache = tmp.path().join("tool-cache");
@@ -75,7 +84,7 @@ impl TestEnv {
             job_client,
             mock_server,
             tmp,
-            job_resources,
+            execution_domains,
             docker_action_builder: Arc::new(DockerActionBuilder::new()),
             actions_dir,
         }
@@ -123,34 +132,33 @@ impl TestEnv {
         access_token: &str,
         registry_auth: Option<&RegistryAuth>,
     ) -> anyhow::Result<ObservedRun> {
-        let mut docker_config = self.job_resources.create_docker_config()?;
-        let docker_config_dir = docker_config.directory().to_path_buf();
-        let attempt_dir = docker_config.attempt_dir().to_path_buf();
-        let run_result =
-            match build_base_env(manifest, &self.workspace, "test-runner", &docker_config) {
-                Ok(base_env) => {
-                    let action_cache =
-                        ActionCache::new(self.actions_dir.clone(), reqwest::Client::new());
-                    let execution = JobExecutionContext::new(&docker_config, None, node_runtimes);
-                    run_all_steps(
-                        manifest,
-                        &self.job_client,
-                        &self.workspace,
-                        &base_env,
-                        "test-runner",
-                        &action_cache,
-                        self.docker_action_builder.as_ref(),
-                        registry_auth,
-                        access_token,
-                        cancel_token,
-                        &execution,
-                        None,
-                    )
-                    .await
-                }
-                Err(error) => Err(error),
-            };
-        let cleanup_result = docker_config.cleanup();
+        let domain = self.execution_domains.reserve().await?.provision()?;
+        let docker_config_dir = domain.docker_config_dir().to_path_buf();
+        let attempt_dir = domain.attempt_dir().to_path_buf();
+        let run_result = match build_base_env(manifest, &self.workspace, "test-runner", &domain) {
+            Ok(base_env) => {
+                let action_cache =
+                    ActionCache::new(self.actions_dir.clone(), reqwest::Client::new());
+                let execution = JobExecutionContext::new(&domain, None, node_runtimes);
+                run_all_steps(
+                    manifest,
+                    &self.job_client,
+                    &self.workspace,
+                    &base_env,
+                    "test-runner",
+                    &action_cache,
+                    self.docker_action_builder.as_ref(),
+                    registry_auth,
+                    access_token,
+                    cancel_token,
+                    &execution,
+                    None,
+                )
+                .await
+            }
+            Err(error) => Err(error),
+        };
+        let cleanup_result = domain.destroy();
 
         let (conclusion, outputs) = match (run_result, cleanup_result) {
             (Ok(value), Ok(())) => value,
@@ -267,13 +275,12 @@ impl TestEnv {
         manifest: &JobManifest,
         docker_resources: &JobDockerResources,
     ) -> anyhow::Result<(JobConclusion, HashMap<String, String>)> {
-        let mut docker_config = self.job_resources.create_docker_config()?;
+        let domain = self.execution_domains.reserve().await?.provision()?;
         let base_env = build_container_env(manifest, &self.workspace, "test-runner");
         let action_cache = ActionCache::new(self.actions_dir.clone(), reqwest::Client::new());
         let node_runtimes =
             chimera::node::NodeRuntimes::single(docker_resources.node_path(None).into());
-        let execution =
-            JobExecutionContext::new(&docker_config, Some(docker_resources), &node_runtimes);
+        let execution = JobExecutionContext::new(&domain, Some(docker_resources), &node_runtimes);
         let run_result = run_all_steps(
             manifest,
             &self.job_client,
@@ -289,7 +296,7 @@ impl TestEnv {
             None,
         )
         .await;
-        let cleanup_result = docker_config.cleanup();
+        let cleanup_result = domain.destroy();
 
         match (run_result, cleanup_result) {
             (Ok(value), Ok(())) => Ok(value),

@@ -97,6 +97,10 @@ fn config_load_save_roundtrip() {
             log_format: "json".into(),
             shutdown_timeout_secs: 300,
         },
+        execution: ExecutionConfig {
+            profile: ExecutionProfile::Sandboxed,
+            max_active_domains: std::num::NonZeroUsize::new(40).unwrap(),
+        },
         runners: vec!["runner-0".into(), "runner-1".into()],
         ..Default::default()
     };
@@ -107,6 +111,8 @@ fn config_load_save_roundtrip() {
     assert_eq!(loaded.runners.len(), 2);
     assert_eq!(loaded.runners[0], "runner-0");
     assert_eq!(loaded.daemon.log_format, "json");
+    assert_eq!(loaded.execution.profile, ExecutionProfile::Sandboxed);
+    assert_eq!(loaded.execution.max_active_domains.get(), 40);
 }
 
 #[test]
@@ -123,11 +129,16 @@ fn load_config_creates_default_file_when_missing() {
     assert_eq!(config.daemon.shutdown_timeout_secs, 300);
     assert_eq!(config.cache.max_gb, 10);
     assert_eq!(config.cache.cache_port, 9999);
+    assert_eq!(config.execution.profile, ExecutionProfile::TrustedHost);
+    assert_eq!(config.execution.max_active_domains.get(), 1);
 
     // Verify the written file contains all sections
     let contents = std::fs::read_to_string(&config_path).unwrap();
     assert!(contents.contains("[daemon]"));
     assert!(contents.contains("[cache]"));
+    assert!(contents.contains("[execution]"));
+    assert!(contents.contains("profile = \"trusted-host\""));
+    assert!(contents.contains("max_active_domains = 1"));
     assert!(contents.contains("log_format"));
     assert!(contents.contains("shutdown_timeout_secs"));
     assert!(contents.contains("max_gb"));

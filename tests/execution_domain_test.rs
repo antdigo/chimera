@@ -1,13 +1,14 @@
 mod common;
 
 use std::collections::HashMap;
+use std::num::NonZeroUsize;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use chimera::job::client::JobConclusion;
-use chimera::job::docker_config::JobResourceRoot;
+use chimera::job::execution_domain::ExecutionDomainRoot;
 use chimera::job::workspace::Workspace;
 use common::*;
 use tokio_util::sync::CancellationToken;
@@ -241,12 +242,15 @@ fn assert_reserved_override_diagnostic(spy: &StepLogSpy) {
 #[tokio::test]
 async fn concurrent_jobs_use_distinct_configs() {
     let daemon_root = tempfile::tempdir().unwrap();
-    let job_resources =
-        JobResourceRoot::prepare(&daemon_root.path().join("job-resources")).unwrap();
-    let resource_root = job_resources.path().to_path_buf();
+    let execution_domains = ExecutionDomainRoot::prepare(
+        &daemon_root.path().join("job-resources"),
+        NonZeroUsize::new(2).unwrap(),
+    )
+    .unwrap();
+    let resource_root = execution_domains.path().to_path_buf();
     let release = daemon_root.path().join("release");
-    let first = TestEnv::setup_with_job_resources(job_resources.clone()).await;
-    let second = TestEnv::setup_with_job_resources(job_resources).await;
+    let first = TestEnv::setup_with_job_resources(execution_domains.clone()).await;
+    let second = TestEnv::setup_with_job_resources(execution_domains).await;
     let first_workspace = first.workspace.workspace_dir().to_path_buf();
     let second_workspace = second.workspace.workspace_dir().to_path_buf();
     let first_ready = first_workspace.join("ready");
@@ -396,13 +400,21 @@ async fn pre_main_post_share_config_until_post_finishes() {
 #[tokio::test]
 async fn cleanup_runs_for_all_job_outcomes() {
     let daemon_root = tempfile::tempdir().unwrap();
-    let job_resources =
-        JobResourceRoot::prepare(&daemon_root.path().join("job-resources")).unwrap();
-    let mut neighbor = job_resources.create_docker_config().unwrap();
+    let execution_domains = ExecutionDomainRoot::prepare(
+        &daemon_root.path().join("job-resources"),
+        NonZeroUsize::new(2).unwrap(),
+    )
+    .unwrap();
+    let neighbor = execution_domains
+        .reserve()
+        .await
+        .unwrap()
+        .provision()
+        .unwrap();
     let neighbor_dir = neighbor.attempt_dir().to_path_buf();
 
     for case in ["success", "failure", "cancelled", "pre-error"] {
-        let env = TestEnv::setup_with_job_resources(job_resources.clone()).await;
+        let env = TestEnv::setup_with_job_resources(execution_domains.clone()).await;
         let workspace_dir = env.workspace.workspace_dir().to_path_buf();
         let cancel = CancellationToken::new();
         let steps = match case {
@@ -476,7 +488,7 @@ async fn cleanup_runs_for_all_job_outcomes() {
         }
     }
 
-    neighbor.cleanup().unwrap();
+    neighbor.destroy().unwrap();
 }
 
 #[tokio::test]

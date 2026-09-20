@@ -365,7 +365,7 @@ Use this form while diagnosing C-10:
 ```bash
 run_in_chimera_test_container \
   cargo test --offline \
-  --test job_docker_config_docker_test \
+  --test execution_domain_docker_test \
   pinned_buildx_flow_uses_job_config_and_original_socket \
   -- --ignored --exact --nocapture
 ```
@@ -383,7 +383,7 @@ job_config_docker_tests=(
 for test_name in "${job_config_docker_tests[@]}"; do
   run_in_chimera_test_container \
     cargo test --offline \
-    --test job_docker_config_docker_test \
+    --test execution_domain_docker_test \
     "$test_name" \
     -- --ignored --exact --nocapture
 done
@@ -576,7 +576,7 @@ the preload step; do not set a tag or ask Buildx to pull implicitly.
 ### A pinned action cannot be installed
 
 The test process needs outbound HTTPS access to `codeload.github.com`. Verify the
-SHA constants at the top of `tests/job_docker_config_docker_test.rs`; do not switch
+SHA constants at the top of `tests/execution_domain_docker_test.rs`; do not switch
 to a branch or release tag. Global PAX metadata in codeload tarballs is covered by
 `pinned_action_extraction_accepts_global_pax_metadata`. If extraction regresses,
 run that unit test rather than modifying a downloaded archive.
@@ -588,7 +588,7 @@ Run the exact test with `--nocapture`, then inspect the rootless daemon:
 ```bash
 run_in_chimera_test_container \
   cargo test --offline \
-  --test job_docker_config_docker_test \
+  --test execution_domain_docker_test \
   TEST_NAME \
   -- --ignored --exact --nocapture
 
@@ -612,5 +612,5 @@ Treat the digests in this file as one verified set. When an update is necessary:
 4. Run the four focused job Docker-config tests and the complete ignored suite.
 5. Update this runbook and its verification evidence in the same change.
 
-Action SHAs remain defined by `tests/job_docker_config_docker_test.rs`; the values
+Action SHAs remain defined by `tests/execution_domain_docker_test.rs`; the values
 listed here must match that source exactly.

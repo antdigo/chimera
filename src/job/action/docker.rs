@@ -25,10 +25,10 @@ use crate::docker::build::{
 use crate::docker::build_cache::{BudgetOutcome, within_budget};
 use crate::docker::output::{DockerErrorDiagnostic, DockerLogFramer, OutputProcessor};
 use crate::docker::resources::JobDockerResources;
-use crate::job::docker_config::DOCKER_CONFIG_ENV;
 use crate::job::execute::{
     JobExecutionContext, JobState, StepConclusion, StepResult, build_step_env,
 };
+use crate::job::execution_domain::DOCKER_CONFIG_ENV;
 use crate::job::expression::ExprContext;
 use crate::job::logs::LogSender;
 use crate::job::schema::Step;

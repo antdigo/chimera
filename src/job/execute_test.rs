@@ -1,3 +1,4 @@
+use std::num::NonZeroUsize;
 use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::PermissionsExt;
 
@@ -5,8 +6,8 @@ use super::*;
 use crate::github::auth::TokenManager;
 use crate::job::action::ActionCache;
 use crate::job::client::JobConclusion;
-use crate::job::docker_config::{
-    DOCKER_CONFIG_ENV, JobDockerConfig, JobDockerConfigError, JobResourceRoot,
+use crate::job::execution_domain::{
+    DOCKER_CONFIG_ENV, ExecutionDomain, ExecutionDomainError, ExecutionDomainRoot,
 };
 use crate::job::schema::{StepReference, StepReferenceKind};
 use tokio_util::sync::CancellationToken;
@@ -192,10 +193,16 @@ fn test_workspace() -> (tempfile::TempDir, Workspace) {
     (temp, workspace)
 }
 
-fn test_docker_config() -> (tempfile::TempDir, JobDockerConfig) {
+fn test_docker_config() -> (tempfile::TempDir, ExecutionDomain) {
     let temp = tempfile::tempdir().unwrap();
-    let root = JobResourceRoot::prepare(&temp.path().join("job-resources")).unwrap();
-    let config = root.create_docker_config().unwrap();
+    let root = ExecutionDomainRoot::prepare(
+        &temp.path().join("job-resources"),
+        NonZeroUsize::new(1).unwrap(),
+    )
+    .unwrap();
+    let config = futures::executor::block_on(root.reserve())
+        .and_then(|permit| permit.provision())
+        .unwrap();
     (temp, config)
 }
 
@@ -205,10 +212,10 @@ fn step_with_environment(key: &str, value: &str) -> Step {
     step
 }
 
-fn host_base_env(config: &JobDockerConfig) -> HashMap<String, String> {
+fn host_base_env(config: &ExecutionDomain) -> HashMap<String, String> {
     HashMap::from([(
         DOCKER_CONFIG_ENV.to_string(),
-        config.directory().to_string_lossy().into_owned(),
+        config.docker_config_dir().to_string_lossy().into_owned(),
     )])
 }
 
@@ -228,8 +235,8 @@ fn step_environment_cannot_override_docker_config() {
     let error = build_step_env(&step, &state, &workspace, &base, Some(&config)).unwrap_err();
 
     assert!(matches!(
-        error.downcast_ref::<JobDockerConfigError>(),
-        Some(JobDockerConfigError::ReservedEnvironmentOverride {
+        error.downcast_ref::<ExecutionDomainError>(),
+        Some(ExecutionDomainError::ReservedEnvironmentOverride {
             source: "step environment"
         })
     ));
@@ -248,8 +255,8 @@ fn job_environment_cannot_override_docker_config() {
     let error = build_step_env(&test_step(), &state, &workspace, &base, Some(&config)).unwrap_err();
 
     assert!(matches!(
-        error.downcast_ref::<JobDockerConfigError>(),
-        Some(JobDockerConfigError::ReservedEnvironmentOverride {
+        error.downcast_ref::<ExecutionDomainError>(),
+        Some(ExecutionDomainError::ReservedEnvironmentOverride {
             source: "job environment"
         })
     ));
@@ -272,8 +279,8 @@ fn github_env_cannot_override_docker_config() {
     .unwrap_err();
 
     assert!(matches!(
-        error.downcast_ref::<JobDockerConfigError>(),
-        Some(JobDockerConfigError::ReservedEnvironmentOverride {
+        error.downcast_ref::<ExecutionDomainError>(),
+        Some(ExecutionDomainError::ReservedEnvironmentOverride {
             source: "GITHUB_ENV"
         })
     ));
@@ -283,7 +290,7 @@ fn github_env_cannot_override_docker_config() {
 fn matching_override_is_allowed() {
     let (_temp, workspace) = test_workspace();
     let (_resources, config) = test_docker_config();
-    let value = config.directory().to_string_lossy().into_owned();
+    let value = config.docker_config_dir().to_string_lossy().into_owned();
     let step = step_with_environment(DOCKER_CONFIG_ENV, &value);
     let base = HashMap::from([(DOCKER_CONFIG_ENV.to_string(), value.clone())]);
 
@@ -325,8 +332,8 @@ async fn echo_step_stdout_captured() {
         HashMap::new(),
         serde_json::json!({}),
     );
-    let (_resources, docker_config) = test_docker_config();
-    let base_env = host_base_env(&docker_config);
+    let (_resources, domain) = test_docker_config();
+    let base_env = host_base_env(&domain);
 
     let result = run_host_step(
         &step,
@@ -335,7 +342,7 @@ async fn echo_step_stdout_captured() {
         &base_env,
         logger.sender(),
         &CancellationToken::new(),
-        &docker_config,
+        &domain,
     )
     .await
     .unwrap();
@@ -356,8 +363,8 @@ async fn nonzero_exit_returns_failed() {
         HashMap::new(),
         serde_json::json!({}),
     );
-    let (_resources, docker_config) = test_docker_config();
-    let base_env = host_base_env(&docker_config);
+    let (_resources, domain) = test_docker_config();
+    let base_env = host_base_env(&domain);
 
     let result = run_host_step(
         &step,
@@ -366,7 +373,7 @@ async fn nonzero_exit_returns_failed() {
         &base_env,
         logger.sender(),
         &CancellationToken::new(),
-        &docker_config,
+        &domain,
     )
     .await
     .unwrap();
@@ -387,8 +394,8 @@ async fn set_env_updates_job_state() {
         HashMap::new(),
         serde_json::json!({}),
     );
-    let (_resources, docker_config) = test_docker_config();
-    let base_env = host_base_env(&docker_config);
+    let (_resources, domain) = test_docker_config();
+    let base_env = host_base_env(&domain);
 
     run_host_step(
         &step,
@@ -397,7 +404,7 @@ async fn set_env_updates_job_state() {
         &base_env,
         logger.sender(),
         &CancellationToken::new(),
-        &docker_config,
+        &domain,
     )
     .await
     .unwrap();
@@ -418,8 +425,8 @@ async fn add_path_updates_path() {
         HashMap::new(),
         serde_json::json!({}),
     );
-    let (_resources, docker_config) = test_docker_config();
-    let base_env = host_base_env(&docker_config);
+    let (_resources, domain) = test_docker_config();
+    let base_env = host_base_env(&domain);
 
     run_host_step(
         &step,
@@ -428,7 +435,7 @@ async fn add_path_updates_path() {
         &base_env,
         logger.sender(),
         &CancellationToken::new(),
-        &docker_config,
+        &domain,
     )
     .await
     .unwrap();
@@ -449,8 +456,8 @@ async fn set_output_populates_outputs() {
         HashMap::new(),
         serde_json::json!({}),
     );
-    let (_resources, docker_config) = test_docker_config();
-    let base_env = host_base_env(&docker_config);
+    let (_resources, domain) = test_docker_config();
+    let base_env = host_base_env(&domain);
 
     run_host_step(
         &step,
@@ -459,7 +466,7 @@ async fn set_output_populates_outputs() {
         &base_env,
         logger.sender(),
         &CancellationToken::new(),
-        &docker_config,
+        &domain,
     )
     .await
     .unwrap();
@@ -480,8 +487,8 @@ async fn env_propagation_across_steps() {
         HashMap::new(),
         serde_json::json!({}),
     );
-    let (_resources, docker_config) = test_docker_config();
-    let base_env = host_base_env(&docker_config);
+    let (_resources, domain) = test_docker_config();
+    let base_env = host_base_env(&domain);
 
     run_host_step(
         &step1,
@@ -490,7 +497,7 @@ async fn env_propagation_across_steps() {
         &base_env,
         logger.sender(),
         &CancellationToken::new(),
-        &docker_config,
+        &domain,
     )
     .await
     .unwrap();
@@ -503,7 +510,7 @@ async fn env_propagation_across_steps() {
         &base_env,
         logger.sender(),
         &CancellationToken::new(),
-        &docker_config,
+        &domain,
     )
     .await
     .unwrap();
@@ -550,12 +557,12 @@ async fn continue_on_error_works() {
     }"#;
 
     let manifest: crate::job::schema::JobManifest = serde_json::from_str(manifest_json).unwrap();
-    let (_resources, docker_config) = test_docker_config();
-    let base_env = host_base_env(&docker_config);
+    let (_resources, domain) = test_docker_config();
+    let base_env = host_base_env(&domain);
     let action_cache = ActionCache::new(tmp.path().join("actions"), reqwest::Client::new());
     let docker_action_builder = crate::docker::build::DockerActionBuilder::new();
     let node_runtimes = crate::node::NodeRuntimes::single("node".into());
-    let execution = JobExecutionContext::new(&docker_config, None, &node_runtimes);
+    let execution = JobExecutionContext::new(&domain, None, &node_runtimes);
 
     let result = run_all_steps(
         &manifest,
@@ -614,12 +621,12 @@ async fn failure_stops_remaining_steps() {
     }"#;
 
     let manifest: crate::job::schema::JobManifest = serde_json::from_str(manifest_json).unwrap();
-    let (_resources, docker_config) = test_docker_config();
-    let base_env = host_base_env(&docker_config);
+    let (_resources, domain) = test_docker_config();
+    let base_env = host_base_env(&domain);
     let action_cache = ActionCache::new(tmp.path().join("actions"), reqwest::Client::new());
     let docker_action_builder = crate::docker::build::DockerActionBuilder::new();
     let node_runtimes = crate::node::NodeRuntimes::single("node".into());
-    let execution = JobExecutionContext::new(&docker_config, None, &node_runtimes);
+    let execution = JobExecutionContext::new(&domain, None, &node_runtimes);
 
     let result = run_all_steps(
         &manifest,
@@ -671,12 +678,12 @@ async fn secrets_from_context_data_resolved() {
     }"#;
 
     let manifest: crate::job::schema::JobManifest = serde_json::from_str(manifest_json).unwrap();
-    let (_resources, docker_config) = test_docker_config();
-    let base_env = host_base_env(&docker_config);
+    let (_resources, domain) = test_docker_config();
+    let base_env = host_base_env(&domain);
     let action_cache = ActionCache::new(tmp.path().join("actions"), reqwest::Client::new());
     let docker_action_builder = crate::docker::build::DockerActionBuilder::new();
     let node_runtimes = crate::node::NodeRuntimes::single("node".into());
-    let execution = JobExecutionContext::new(&docker_config, None, &node_runtimes);
+    let execution = JobExecutionContext::new(&domain, None, &node_runtimes);
 
     let result = run_all_steps(
         &manifest,
@@ -725,12 +732,12 @@ async fn step_diagnostics_omit_secret_bearing_manifest_fields() {
         "serviceContainers": null
     }))
     .unwrap();
-    let (_resources, docker_config) = test_docker_config();
-    let base_env = host_base_env(&docker_config);
+    let (_resources, domain) = test_docker_config();
+    let base_env = host_base_env(&domain);
     let action_cache = ActionCache::new(tmp.path().join("actions"), reqwest::Client::new());
     let docker_action_builder = crate::docker::build::DockerActionBuilder::new();
     let node_runtimes = crate::node::NodeRuntimes::single("node".into());
-    let execution = JobExecutionContext::new(&docker_config, None, &node_runtimes);
+    let execution = JobExecutionContext::new(&domain, None, &node_runtimes);
     let captured = crate::testing::TracingWriter::default();
     let subscriber = tracing_subscriber::fmt()
         .with_max_level(tracing::Level::DEBUG)
@@ -809,12 +816,12 @@ async fn cancel_token_returns_cancelled_between_steps() {
     }"#;
 
     let manifest: crate::job::schema::JobManifest = serde_json::from_str(manifest_json).unwrap();
-    let (_resources, docker_config) = test_docker_config();
-    let base_env = host_base_env(&docker_config);
+    let (_resources, domain) = test_docker_config();
+    let base_env = host_base_env(&domain);
     let action_cache = ActionCache::new(tmp.path().join("actions"), reqwest::Client::new());
     let docker_action_builder = crate::docker::build::DockerActionBuilder::new();
     let node_runtimes = crate::node::NodeRuntimes::single("node".into());
-    let execution = JobExecutionContext::new(&docker_config, None, &node_runtimes);
+    let execution = JobExecutionContext::new(&domain, None, &node_runtimes);
 
     let cancel_token = CancellationToken::new();
     // Cancel immediately — step 1 may run but the conclusion should be "cancelled"
@@ -851,8 +858,8 @@ async fn cancel_token_kills_running_process() {
         HashMap::new(),
         serde_json::json!({}),
     );
-    let (_resources, docker_config) = test_docker_config();
-    let base_env = host_base_env(&docker_config);
+    let (_resources, domain) = test_docker_config();
+    let base_env = host_base_env(&domain);
 
     let cancel_token = CancellationToken::new();
     let cancel_clone = cancel_token.clone();
@@ -871,7 +878,7 @@ async fn cancel_token_kills_running_process() {
         &base_env,
         logger.sender(),
         &cancel_token,
-        &docker_config,
+        &domain,
     )
     .await
     .unwrap();
@@ -887,8 +894,14 @@ async fn cancel_token_kills_running_process() {
 fn host_command_rejects_default_docker_credential_helpers_on_effective_path() {
     for helper in ["docker-credential-pass", "docker-credential-secretservice"] {
         let temp = tempfile::tempdir().unwrap();
-        let root = JobResourceRoot::prepare(&temp.path().join("job-resources")).unwrap();
-        let config = root.create_docker_config().unwrap();
+        let root = ExecutionDomainRoot::prepare(
+            &temp.path().join("job-resources"),
+            NonZeroUsize::new(1).unwrap(),
+        )
+        .unwrap();
+        let config = futures::executor::block_on(root.reserve())
+            .and_then(|permit| permit.provision())
+            .unwrap();
         let bin = temp.path().join("bin");
         std::fs::create_dir(&bin).unwrap();
         write_executable(&bin.join(helper));
@@ -905,8 +918,14 @@ fn host_command_rejects_default_docker_credential_helpers_on_effective_path() {
 #[test]
 fn host_command_allows_non_executable_default_credential_helper() {
     let temp = tempfile::tempdir().unwrap();
-    let root = JobResourceRoot::prepare(&temp.path().join("job-resources")).unwrap();
-    let config = root.create_docker_config().unwrap();
+    let root = ExecutionDomainRoot::prepare(
+        &temp.path().join("job-resources"),
+        NonZeroUsize::new(1).unwrap(),
+    )
+    .unwrap();
+    let config = futures::executor::block_on(root.reserve())
+        .and_then(|permit| permit.provision())
+        .unwrap();
     let bin = temp.path().join("bin");
     std::fs::create_dir(&bin).unwrap();
     let helper = bin.join("docker-credential-pass");
@@ -949,8 +968,14 @@ fn host_command_path_precedence_child() {
         return;
     };
     let temp = tempfile::tempdir().unwrap();
-    let root = JobResourceRoot::prepare(&temp.path().join("job-resources")).unwrap();
-    let config = root.create_docker_config().unwrap();
+    let root = ExecutionDomainRoot::prepare(
+        &temp.path().join("job-resources"),
+        NonZeroUsize::new(1).unwrap(),
+    )
+    .unwrap();
+    let config = futures::executor::block_on(root.reserve())
+        .and_then(|permit| permit.provision())
+        .unwrap();
     let mut explicit = host_base_env(&config);
     explicit.insert("PATH".into(), safe_dir.to_string_lossy().into_owned());
 
@@ -964,8 +989,14 @@ fn host_command_path_precedence_child() {
 #[test]
 fn host_command_rejects_missing_runner_owned_docker_config() {
     let temp = tempfile::tempdir().unwrap();
-    let root = JobResourceRoot::prepare(&temp.path().join("job-resources")).unwrap();
-    let config = root.create_docker_config().unwrap();
+    let root = ExecutionDomainRoot::prepare(
+        &temp.path().join("job-resources"),
+        NonZeroUsize::new(1).unwrap(),
+    )
+    .unwrap();
+    let config = futures::executor::block_on(root.reserve())
+        .and_then(|permit| permit.provision())
+        .unwrap();
 
     let error =
         host_command("/usr/bin/true", &[], &HashMap::new(), temp.path(), &config).unwrap_err();
@@ -980,8 +1011,14 @@ fn host_command_rejects_missing_runner_owned_docker_config() {
 #[test]
 fn host_command_explicitly_overrides_inherited_docker_config() {
     let temp = tempfile::tempdir().unwrap();
-    let root = JobResourceRoot::prepare(&temp.path().join("job-resources")).unwrap();
-    let config = root.create_docker_config().unwrap();
+    let root = ExecutionDomainRoot::prepare(
+        &temp.path().join("job-resources"),
+        NonZeroUsize::new(1).unwrap(),
+    )
+    .unwrap();
+    let config = futures::executor::block_on(root.reserve())
+        .and_then(|permit| permit.provision())
+        .unwrap();
     let env = host_base_env(&config);
 
     let command = host_command("/usr/bin/true", &[], &env, temp.path(), &config).unwrap();
@@ -1003,8 +1040,14 @@ fn host_command_rejects_credential_helper_from_private_tmp_path() {
         .unwrap_or_else(|| std::path::PathBuf::from("target"));
     std::fs::create_dir_all(&test_root).unwrap();
     let temp = tempfile::tempdir_in(test_root).unwrap();
-    let root = JobResourceRoot::prepare(&temp.path().join("job-resources")).unwrap();
-    let config = root.create_docker_config().unwrap();
+    let root = ExecutionDomainRoot::prepare(
+        &temp.path().join("job-resources"),
+        NonZeroUsize::new(1).unwrap(),
+    )
+    .unwrap();
+    let config = futures::executor::block_on(root.reserve())
+        .and_then(|permit| permit.provision())
+        .unwrap();
     let directory_name = format!("chimera-helper-{}", uuid::Uuid::new_v4().simple());
     let private_bin = config.private_tmp().join(&directory_name);
     std::fs::create_dir(&private_bin).unwrap();
@@ -1015,8 +1058,8 @@ fn host_command_rejects_credential_helper_from_private_tmp_path() {
     let error = host_command("/usr/bin/true", &[], &env, temp.path(), &config).unwrap_err();
 
     assert!(matches!(
-        error.downcast_ref::<JobDockerConfigError>(),
-        Some(JobDockerConfigError::ImplicitCredentialStore {
+        error.downcast_ref::<ExecutionDomainError>(),
+        Some(ExecutionDomainError::ImplicitCredentialStore {
             helper: "docker-credential-pass"
         })
     ));
@@ -1030,8 +1073,14 @@ fn host_command_rejects_credential_helper_from_relative_private_tmp_path() {
         .unwrap_or_else(|| std::path::PathBuf::from("target"));
     std::fs::create_dir_all(&test_root).unwrap();
     let temp = tempfile::tempdir_in(test_root).unwrap();
-    let root = JobResourceRoot::prepare(&temp.path().join("job-resources")).unwrap();
-    let config = root.create_docker_config().unwrap();
+    let root = ExecutionDomainRoot::prepare(
+        &temp.path().join("job-resources"),
+        NonZeroUsize::new(1).unwrap(),
+    )
+    .unwrap();
+    let config = futures::executor::block_on(root.reserve())
+        .and_then(|permit| permit.provision())
+        .unwrap();
     let directory_name = format!("chimera-helper-{}", uuid::Uuid::new_v4().simple());
     let private_bin = config.private_tmp().join(&directory_name);
     std::fs::create_dir(&private_bin).unwrap();
@@ -1043,8 +1092,8 @@ fn host_command_rejects_credential_helper_from_relative_private_tmp_path() {
     let error = host_command("/usr/bin/true", &[], &env, &working_dir, &config).unwrap_err();
 
     assert!(matches!(
-        error.downcast_ref::<JobDockerConfigError>(),
-        Some(JobDockerConfigError::ImplicitCredentialStore {
+        error.downcast_ref::<ExecutionDomainError>(),
+        Some(ExecutionDomainError::ImplicitCredentialStore {
             helper: "docker-credential-secretservice"
         })
     ));
@@ -1058,8 +1107,14 @@ fn host_command_rejects_credential_helper_through_symlink_into_private_tmp() {
         .unwrap_or_else(|| std::path::PathBuf::from("target"));
     std::fs::create_dir_all(&test_root).unwrap();
     let temp = tempfile::tempdir_in(test_root).unwrap();
-    let root = JobResourceRoot::prepare(&temp.path().join("job-resources")).unwrap();
-    let config = root.create_docker_config().unwrap();
+    let root = ExecutionDomainRoot::prepare(
+        &temp.path().join("job-resources"),
+        NonZeroUsize::new(1).unwrap(),
+    )
+    .unwrap();
+    let config = futures::executor::block_on(root.reserve())
+        .and_then(|permit| permit.provision())
+        .unwrap();
     let directory_name = format!("chimera-helper-{}", uuid::Uuid::new_v4().simple());
     let private_bin = config.private_tmp().join(&directory_name);
     std::fs::create_dir(&private_bin).unwrap();
@@ -1072,8 +1127,8 @@ fn host_command_rejects_credential_helper_through_symlink_into_private_tmp() {
     let error = host_command("/usr/bin/true", &[], &env, temp.path(), &config).unwrap_err();
 
     assert!(matches!(
-        error.downcast_ref::<JobDockerConfigError>(),
-        Some(JobDockerConfigError::ImplicitCredentialStore {
+        error.downcast_ref::<ExecutionDomainError>(),
+        Some(ExecutionDomainError::ImplicitCredentialStore {
             helper: "docker-credential-pass"
         })
     ));
@@ -1087,8 +1142,14 @@ fn host_command_rejects_credential_helper_through_symlink_within_private_tmp() {
         .unwrap_or_else(|| std::path::PathBuf::from("target"));
     std::fs::create_dir_all(&test_root).unwrap();
     let temp = tempfile::tempdir_in(test_root).unwrap();
-    let root = JobResourceRoot::prepare(&temp.path().join("job-resources")).unwrap();
-    let config = root.create_docker_config().unwrap();
+    let root = ExecutionDomainRoot::prepare(
+        &temp.path().join("job-resources"),
+        NonZeroUsize::new(1).unwrap(),
+    )
+    .unwrap();
+    let config = futures::executor::block_on(root.reserve())
+        .and_then(|permit| permit.provision())
+        .unwrap();
     let real_name = format!("chimera-helper-real-{}", uuid::Uuid::new_v4().simple());
     let link_name = format!("chimera-helper-link-{}", uuid::Uuid::new_v4().simple());
     let private_bin = config.private_tmp().join(&real_name);
@@ -1105,8 +1166,8 @@ fn host_command_rejects_credential_helper_through_symlink_within_private_tmp() {
     let error = host_command("/usr/bin/true", &[], &env, temp.path(), &config).unwrap_err();
 
     assert!(matches!(
-        error.downcast_ref::<JobDockerConfigError>(),
-        Some(JobDockerConfigError::ImplicitCredentialStore {
+        error.downcast_ref::<ExecutionDomainError>(),
+        Some(ExecutionDomainError::ImplicitCredentialStore {
             helper: "docker-credential-secretservice"
         })
     ));
@@ -1120,8 +1181,14 @@ fn host_command_skips_inaccessible_path_entry() {
         .unwrap_or_else(|| std::path::PathBuf::from("target"));
     std::fs::create_dir_all(&test_root).unwrap();
     let temp = tempfile::tempdir_in(test_root).unwrap();
-    let root = JobResourceRoot::prepare(&temp.path().join("job-resources")).unwrap();
-    let config = root.create_docker_config().unwrap();
+    let root = ExecutionDomainRoot::prepare(
+        &temp.path().join("job-resources"),
+        NonZeroUsize::new(1).unwrap(),
+    )
+    .unwrap();
+    let config = futures::executor::block_on(root.reserve())
+        .and_then(|permit| permit.provision())
+        .unwrap();
     let inaccessible = temp.path().join("inaccessible");
     std::fs::create_dir(&inaccessible).unwrap();
     std::fs::set_permissions(&inaccessible, std::fs::Permissions::from_mode(0o000)).unwrap();
@@ -1145,8 +1212,14 @@ fn host_command_resets_symlink_budget_after_working_directory_lookup() {
         .unwrap_or_else(|| std::path::PathBuf::from("target"));
     std::fs::create_dir_all(&test_root).unwrap();
     let temp = tempfile::tempdir_in(test_root).unwrap();
-    let root = JobResourceRoot::prepare(&temp.path().join("job-resources")).unwrap();
-    let config = root.create_docker_config().unwrap();
+    let root = ExecutionDomainRoot::prepare(
+        &temp.path().join("job-resources"),
+        NonZeroUsize::new(1).unwrap(),
+    )
+    .unwrap();
+    let config = futures::executor::block_on(root.reserve())
+        .and_then(|permit| permit.provision())
+        .unwrap();
     let final_directory = temp.path().join("resolved-working-directory");
     let real_bin = final_directory.join("real-bin");
     std::fs::create_dir_all(&real_bin).unwrap();
@@ -1165,8 +1238,8 @@ fn host_command_resets_symlink_budget_after_working_directory_lookup() {
     let error = host_command("/usr/bin/true", &[], &env, &target, &config).unwrap_err();
 
     assert!(matches!(
-        error.downcast_ref::<JobDockerConfigError>(),
-        Some(JobDockerConfigError::ImplicitCredentialStore {
+        error.downcast_ref::<ExecutionDomainError>(),
+        Some(ExecutionDomainError::ImplicitCredentialStore {
             helper: "docker-credential-pass"
         })
     ));
@@ -1215,7 +1288,11 @@ async fn concurrent_webhook_flows_get_private_absolute_tmp() {
         .unwrap_or_else(|| std::path::PathBuf::from("target"));
     std::fs::create_dir_all(&test_root).unwrap();
     let temp = tempfile::tempdir_in(test_root).unwrap();
-    let root = JobResourceRoot::prepare(&temp.path().join("job-resources")).unwrap();
+    let root = ExecutionDomainRoot::prepare(
+        &temp.path().join("job-resources"),
+        NonZeroUsize::new(JOBS).unwrap(),
+    )
+    .unwrap();
     let barrier = temp.path().join("barrier");
     std::fs::create_dir(&barrier).unwrap();
 
@@ -1240,7 +1317,7 @@ async fn concurrent_webhook_flows_get_private_absolute_tmp() {
     );
     let mut runs = Vec::new();
     for index in 0..JOBS {
-        let config = root.create_docker_config().unwrap();
+        let config = root.reserve().await.unwrap().provision().unwrap();
         let workspace_root = temp.path().join(format!("workspace-{index}"));
         let workspace = Workspace::create(
             &workspace_root.join("work"),
@@ -1335,12 +1412,12 @@ async fn concurrent_webhook_flows_get_private_absolute_tmp() {
         std::fs::write(barrier.join(format!("{phase}.release")), "go").unwrap();
     }
 
-    let mut completed = futures::future::join_all(runs)
+    let completed = futures::future::join_all(runs)
         .await
         .into_iter()
         .map(Result::unwrap)
         .collect::<Vec<_>>();
-    for (index, (result, outputs, config)) in completed.iter_mut().enumerate() {
+    for (index, (result, outputs, config)) in completed.into_iter().enumerate() {
         assert_eq!(
             result.as_ref().unwrap().conclusion,
             StepConclusion::Succeeded
@@ -1356,7 +1433,7 @@ async fn concurrent_webhook_flows_get_private_absolute_tmp() {
             config.private_tmp().display()
         );
         let attempt_dir = config.attempt_dir().to_path_buf();
-        config.cleanup().unwrap();
+        config.destroy().unwrap();
         assert!(!attempt_dir.exists(), "job {index} cleanup");
     }
 
@@ -1390,8 +1467,14 @@ fn host_command_fails_closed_when_private_tmp_is_missing() {
         .unwrap_or_else(|| std::path::PathBuf::from("target"));
     std::fs::create_dir_all(&test_root).unwrap();
     let temp = tempfile::tempdir_in(test_root).unwrap();
-    let root = JobResourceRoot::prepare(&temp.path().join("job-resources")).unwrap();
-    let mut config = root.create_docker_config().unwrap();
+    let root = ExecutionDomainRoot::prepare(
+        &temp.path().join("job-resources"),
+        NonZeroUsize::new(1).unwrap(),
+    )
+    .unwrap();
+    let config = futures::executor::block_on(root.reserve())
+        .and_then(|permit| permit.provision())
+        .unwrap();
     let sentinel = temp.path().join("command-ran");
     let script = format!("touch '{}'", sentinel.display());
     let env = host_base_env(&config);
@@ -1409,7 +1492,7 @@ fn host_command_fails_closed_when_private_tmp_is_missing() {
 
     assert_eq!(error.raw_os_error(), Some(libc::ENOENT));
     assert!(!sentinel.exists());
-    config.cleanup().unwrap();
+    config.destroy().unwrap();
 }
 
 #[test]
@@ -1436,8 +1519,12 @@ async fn private_tmp_mount_precedes_working_directory_lookup() {
         .unwrap_or_else(|| std::path::PathBuf::from("target"));
     std::fs::create_dir_all(&test_root).unwrap();
     let temp = tempfile::tempdir_in(test_root).unwrap();
-    let root = JobResourceRoot::prepare(&temp.path().join("job-resources")).unwrap();
-    let mut config = root.create_docker_config().unwrap();
+    let root = ExecutionDomainRoot::prepare(
+        &temp.path().join("job-resources"),
+        NonZeroUsize::new(1).unwrap(),
+    )
+    .unwrap();
+    let config = root.reserve().await.unwrap().provision().unwrap();
     let env = host_base_env(&config);
     let directory_name = format!("chimera-cwd-{}", uuid::Uuid::new_v4().simple());
     let private_working_directory = std::path::PathBuf::from("/tmp").join(&directory_name);
@@ -1484,7 +1571,7 @@ async fn private_tmp_mount_precedes_working_directory_lookup() {
         .unwrap(),
         "private"
     );
-    config.cleanup().unwrap();
+    config.destroy().unwrap();
 }
 
 #[cfg(target_os = "linux")]
@@ -1495,8 +1582,12 @@ async fn working_directory_tmp_does_not_write_to_host_tmp() {
         .unwrap_or_else(|| std::path::PathBuf::from("target"));
     std::fs::create_dir_all(&test_root).unwrap();
     let temp = tempfile::tempdir_in(test_root).unwrap();
-    let root = JobResourceRoot::prepare(&temp.path().join("job-resources")).unwrap();
-    let mut config = root.create_docker_config().unwrap();
+    let root = ExecutionDomainRoot::prepare(
+        &temp.path().join("job-resources"),
+        NonZeroUsize::new(1).unwrap(),
+    )
+    .unwrap();
+    let config = root.reserve().await.unwrap().provision().unwrap();
     let env = host_base_env(&config);
     let file_name = format!("chimera-cwd-{}", uuid::Uuid::new_v4().simple());
     let host_path = std::path::Path::new("/tmp").join(&file_name);
@@ -1522,7 +1613,7 @@ async fn working_directory_tmp_does_not_write_to_host_tmp() {
     assert!(status.success());
     assert!(!host_file_existed, "relative write escaped to host /tmp");
     assert_eq!(std::fs::read_to_string(private_path).unwrap(), "private");
-    config.cleanup().unwrap();
+    config.destroy().unwrap();
 }
 
 #[test]
@@ -1552,9 +1643,13 @@ async fn host_command_inheritance_child() {
     }
 
     let temp = tempfile::tempdir().unwrap();
-    let root = JobResourceRoot::prepare(&temp.path().join("job-resources")).unwrap();
-    let config = root.create_docker_config().unwrap();
-    let job_config = config.directory().to_path_buf();
+    let root = ExecutionDomainRoot::prepare(
+        &temp.path().join("job-resources"),
+        NonZeroUsize::new(1).unwrap(),
+    )
+    .unwrap();
+    let config = root.reserve().await.unwrap().provision().unwrap();
+    let job_config = config.docker_config_dir().to_path_buf();
     let env = HashMap::from([(
         DOCKER_CONFIG_ENV.to_string(),
         job_config.to_string_lossy().into_owned(),

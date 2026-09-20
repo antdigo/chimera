@@ -10,7 +10,66 @@ use chrono::Utc;
 use tempfile::TempDir;
 
 use super::*;
+use crate::config::{ExecutionConfig, ExecutionProfile};
 use crate::storage::{RootLock, RootLockError};
+
+#[test]
+fn sandboxed_profile_is_rejected_before_runtime_start() {
+    let config = ChimeraConfig {
+        execution: ExecutionConfig {
+            profile: ExecutionProfile::Sandboxed,
+            max_active_domains: NonZeroUsize::new(20).unwrap(),
+        },
+        ..Default::default()
+    };
+
+    let error = validate_execution_profile(&config).unwrap_err();
+
+    assert_eq!(
+        error.to_string(),
+        "sandboxed execution profile is not available in this build"
+    );
+}
+
+#[tokio::test]
+async fn sandboxed_run_rejects_before_daemon_owned_side_effects() {
+    let root = TempDir::new().unwrap();
+    let paths = ChimeraPaths::new(root.path().to_path_buf());
+    let root_lock = RootLock::acquire(root.path()).unwrap();
+    let daemon = Daemon {
+        paths: paths.clone(),
+        config: ChimeraConfig {
+            execution: ExecutionConfig {
+                profile: ExecutionProfile::Sandboxed,
+                max_active_domains: NonZeroUsize::new(20).unwrap(),
+            },
+            ..Default::default()
+        },
+        _root_lock: root_lock,
+    };
+    let before = std::fs::read_dir(root.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect::<Vec<_>>();
+    let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+
+    let error = daemon.run(shutdown_rx).await.unwrap_err();
+
+    assert_eq!(
+        error.to_string(),
+        "sandboxed execution profile is not available in this build"
+    );
+    assert_eq!(
+        std::fs::read_dir(root.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>(),
+        before
+    );
+    assert!(!paths.pid_file().exists());
+    assert!(!paths.job_resources_dir().exists());
+    assert!(!paths.cache_entries_dir().exists());
+}
 
 #[test]
 fn daemon_load_refuses_busy_root_before_reading_config() {
@@ -425,15 +484,154 @@ fn startup_preparation_rejects_stale_job_resources_without_deleting_them() {
     let temp = TempDir::new().unwrap();
     let paths = ChimeraPaths::new(temp.path().to_path_buf());
     std::fs::create_dir_all(&paths.root).unwrap();
-    let root =
-        crate::job::docker_config::JobResourceRoot::prepare(&paths.job_resources_dir()).unwrap();
-    let stale = root.create_docker_config().unwrap();
+    let root = crate::job::execution_domain::ExecutionDomainRoot::prepare(
+        &paths.job_resources_dir(),
+        NonZeroUsize::new(1).unwrap(),
+    )
+    .unwrap();
+    let stale = futures::executor::block_on(root.reserve())
+        .and_then(|permit| permit.provision())
+        .unwrap();
     let stale_dir = stale.attempt_dir().to_path_buf();
 
-    let error = prepare_daemon_root(&paths).unwrap_err();
+    let error = prepare_daemon_root(&paths, NonZeroUsize::new(1).unwrap()).unwrap_err();
 
     assert!(error.to_string().contains("stale-job-resources"));
     assert!(stale_dir.exists());
+}
+
+#[tokio::test]
+async fn startup_preparation_enforces_supplied_domain_capacity() {
+    let test_root = std::env::var_os("CARGO_TARGET_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("target"));
+    std::fs::create_dir_all(&test_root).unwrap();
+    let temp = TempDir::new_in(test_root).unwrap();
+    let paths = ChimeraPaths::new(temp.path().to_path_buf());
+    let (_lock, root) = prepare_daemon_root(&paths, NonZeroUsize::new(2).unwrap()).unwrap();
+    let first = root.reserve().await.unwrap();
+    let second = tokio::time::timeout(Duration::from_secs(1), root.reserve())
+        .await
+        .expect("second domain must be admitted")
+        .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), root.reserve())
+            .await
+            .is_err()
+    );
+    drop((first, second));
+}
+
+#[tokio::test]
+async fn trusted_host_admits_every_runner_despite_sandboxed_capacity_limit() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let test_root = std::env::var_os("CARGO_TARGET_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("target"));
+    std::fs::create_dir_all(&test_root).unwrap();
+    let temp = TempDir::new_in(test_root).unwrap();
+    let paths = ChimeraPaths::new(temp.path().to_path_buf());
+    let config = ChimeraConfig {
+        runners: vec!["first".into(), "second".into()],
+        execution: crate::config::ExecutionConfig {
+            max_active_domains: NonZeroUsize::new(1).unwrap(),
+            ..Default::default()
+        },
+        cache: crate::cache::config::CacheConfig {
+            cache_port: 0,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    crate::config::save_config(&paths.config_file(), &config).unwrap();
+    let rsa_params =
+        crate::config::private_key_to_rsa_params(&crate::testing::test_private_key()).unwrap();
+    let mut servers = Vec::new();
+    for name in &config.runners {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/oauth2/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "test-token", "expires_in": 7200
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/session"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "sessionId": name
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/message"))
+            .respond_with(ResponseTemplate::new(202).set_delay(Duration::from_secs(1)))
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path("/session"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        crate::config::save_runner_credentials(
+            &paths.runners_dir(),
+            name,
+            &crate::config::RunnerCredentials {
+                info: crate::config::RunnerInfo {
+                    agent_id: 1,
+                    agent_name: name.clone(),
+                    pool_id: 1,
+                    server_url: server.uri(),
+                    server_url_v2: server.uri(),
+                    git_hub_url: server.uri(),
+                    work_folder: "_work".into(),
+                    use_v2_flow: true,
+                },
+                oauth: crate::config::OAuthCredentials {
+                    scheme: "OAuth".into(),
+                    client_id: name.clone(),
+                    authorization_url: format!("{}/oauth2/token", server.uri()),
+                },
+                rsa_params: rsa_params.clone(),
+            },
+        )
+        .unwrap();
+        servers.push(server);
+    }
+    let daemon = Daemon::load(paths).unwrap();
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let run = tokio::spawn(daemon.run(shutdown_rx));
+    let both_polling = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let mut polling = 0;
+            for server in &servers {
+                if server
+                    .received_requests()
+                    .await
+                    .unwrap()
+                    .iter()
+                    .any(|request| request.url.path() == "/message")
+                {
+                    polling += 1;
+                }
+            }
+            if polling == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    shutdown_tx.send(true).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), run)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    both_polling.expect("both trusted-host runners must poll despite sandboxed capacity of one");
 }
 
 #[test]
@@ -450,7 +648,7 @@ fn startup_preparation_rejects_legacy_work_and_temp_canaries() {
         std::fs::create_dir_all(canary.parent().unwrap()).unwrap();
         std::fs::write(&canary, "secret from previous job").unwrap();
 
-        let error = prepare_daemon_root(&paths).unwrap_err();
+        let error = prepare_daemon_root(&paths, NonZeroUsize::new(1).unwrap()).unwrap_err();
 
         assert!(error.to_string().contains("stale-legacy-job-data"));
         assert!(canary.exists());
@@ -464,7 +662,7 @@ fn startup_rejects_chimera_root_under_host_tmp() {
     let temp = TempDir::new_in("/tmp").unwrap();
     let paths = ChimeraPaths::new(temp.path().to_path_buf());
 
-    let error = prepare_daemon_root(&paths).unwrap_err();
+    let error = prepare_daemon_root(&paths, NonZeroUsize::new(1).unwrap()).unwrap_err();
 
     assert!(error.to_string().contains("chimera-root-under-host-tmp"));
     assert!(!paths.job_resources_dir().exists());
@@ -485,7 +683,7 @@ fn startup_rejects_tmp_symlink_to_root_outside_host_tmp() {
     std::os::unix::fs::symlink(target.path(), &link).unwrap();
     let paths = ChimeraPaths::new(link.clone());
 
-    let result = prepare_daemon_root(&paths);
+    let result = prepare_daemon_root(&paths, NonZeroUsize::new(1).unwrap());
     let error = result.as_ref().err().map(ToString::to_string);
     drop(result);
     std::fs::remove_file(&link).unwrap();
@@ -526,7 +724,7 @@ fn daemon_load_canonicalizes_root_with_intermediate_tmp_symlink() {
 
 #[test]
 fn poisoned_job_resource_error_requires_daemon_shutdown() {
-    let poisoned = anyhow::Error::new(JobDockerConfigError::PoisonedRoot {
+    let poisoned = anyhow::Error::new(ExecutionDomainError::PoisonedRoot {
         path: "/synthetic/job-resources".into(),
     });
     let unrelated = anyhow::anyhow!("unrelated runner failure");
@@ -537,8 +735,8 @@ fn poisoned_job_resource_error_requires_daemon_shutdown() {
 
 #[test]
 fn cleanup_fatal_error_requires_daemon_shutdown() {
-    let fatal = anyhow::Error::new(JobResourceCleanupFatalError {
-        source: JobDockerConfigError::Cleanup {
+    let fatal = anyhow::Error::new(ExecutionDomainCleanupFatalError {
+        source: ExecutionDomainError::Cleanup {
             path: "/synthetic/job-resources/attempt".into(),
             source: std::io::Error::other("synthetic cleanup failure"),
         },
@@ -549,7 +747,7 @@ fn cleanup_fatal_error_requires_daemon_shutdown() {
 
 #[test]
 fn fatal_job_resource_errors_are_detected_through_wrapping_context() {
-    let wrapped = anyhow::Error::new(JobDockerConfigError::PoisonedRoot {
+    let wrapped = anyhow::Error::new(ExecutionDomainError::PoisonedRoot {
         path: "/synthetic/job-resources".into(),
     })
     .context("runner exited");

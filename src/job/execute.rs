@@ -38,7 +38,7 @@ use super::workspace::Workspace;
 use crate::docker::build::{BuiltDockerImage, DockerActionBuilder, DockerBuildScope, RegistryAuth};
 use crate::docker::output::OutputProcessor;
 use crate::docker::resources::JobDockerResources;
-use crate::job::docker_config::{DOCKER_CONFIG_ENV, JobDockerConfig, JobDockerConfigError};
+use crate::job::execution_domain::{DOCKER_CONFIG_ENV, ExecutionDomain, ExecutionDomainError};
 use crate::node::NodeRuntimes;
 use crate::utils::{
     find_case_insensitive, format_results_timestamp, format_timeline_timestamp,
@@ -46,26 +46,26 @@ use crate::utils::{
 };
 
 pub struct JobExecutionContext<'a> {
-    docker_config: &'a JobDockerConfig,
+    domain: &'a ExecutionDomain,
     docker_resources: Option<&'a JobDockerResources>,
     node_runtimes: &'a NodeRuntimes,
 }
 
 impl<'a> JobExecutionContext<'a> {
     pub fn new(
-        docker_config: &'a JobDockerConfig,
+        domain: &'a ExecutionDomain,
         docker_resources: Option<&'a JobDockerResources>,
         node_runtimes: &'a NodeRuntimes,
     ) -> Self {
         Self {
-            docker_config,
+            domain,
             docker_resources,
             node_runtimes,
         }
     }
 
-    pub fn docker_config(&self) -> &'a JobDockerConfig {
-        self.docker_config
+    pub fn docker_config(&self) -> &'a ExecutionDomain {
+        self.domain
     }
 
     pub fn docker_resources(&self) -> Option<&'a JobDockerResources> {
@@ -76,11 +76,11 @@ impl<'a> JobExecutionContext<'a> {
         self.node_runtimes
     }
 
-    pub fn host_docker_config(&self) -> Option<&'a JobDockerConfig> {
+    pub fn host_docker_config(&self) -> Option<&'a ExecutionDomain> {
         self.docker_resources
             .and_then(JobDockerResources::job_container_id)
             .is_none()
-            .then_some(self.docker_config)
+            .then_some(self.domain)
     }
 }
 
@@ -383,14 +383,14 @@ pub async fn run_host_step(
     base_env: &HashMap<String, String>,
     log_sender: &LogSender,
     cancel_token: &CancellationToken,
-    docker_config: &JobDockerConfig,
+    domain: &ExecutionDomain,
 ) -> Result<StepResult> {
     let script_raw = step
         .inputs
         .get("script")
         .context("step has no 'script' input")?;
 
-    let env = build_step_env(step, job_state, workspace, base_env, Some(docker_config))?;
+    let env = build_step_env(step, job_state, workspace, base_env, Some(domain))?;
 
     let expr_ctx = ExprContext::new(&env, job_state, false, false);
     let script = super::expression::resolve_template(script_raw, &expr_ctx);
@@ -415,7 +415,7 @@ pub async fn run_host_step(
         &[OsStr::new("-e"), script_file.as_os_str()],
         &env,
         &working_dir,
-        docker_config,
+        domain,
         job_state,
         log_sender,
         timeout,
@@ -508,7 +508,7 @@ fn validate_host_docker_capabilities(
     env: &HashMap<String, String>,
     working_dir: &Path,
     private_tmp: &Path,
-) -> Result<(), JobDockerConfigError> {
+) -> Result<(), ExecutionDomainError> {
     let inherited_path = env
         .get("PATH")
         .is_none()
@@ -534,7 +534,7 @@ fn validate_host_docker_capabilities(
                 continue;
             };
             if !metadata.is_dir() && metadata.permissions().mode() & 0o111 != 0 {
-                return Err(JobDockerConfigError::ImplicitCredentialStore { helper });
+                return Err(ExecutionDomainError::ImplicitCredentialStore { helper });
             }
         }
     }
@@ -547,7 +547,7 @@ fn host_credential_helper_path(
     helper: &str,
     working_dir: &Path,
     private_tmp: &Path,
-) -> Result<PathBuf, JobDockerConfigError> {
+) -> Result<PathBuf, ExecutionDomainError> {
     let child_candidate = if path_entry.is_absolute() {
         path_entry.join(helper)
     } else {
@@ -563,7 +563,7 @@ fn host_credential_helper_path(
     helper: &str,
     working_dir: &Path,
     _private_tmp: &Path,
-) -> Result<PathBuf, JobDockerConfigError> {
+) -> Result<PathBuf, ExecutionDomainError> {
     let directory = if path_entry.as_os_str().is_empty() {
         working_dir.to_path_buf()
     } else if path_entry.is_absolute() {
@@ -575,17 +575,17 @@ fn host_credential_helper_path(
 }
 
 #[cfg(target_os = "linux")]
-fn host_capability_path_is_unavailable(error: &JobDockerConfigError) -> bool {
+fn host_capability_path_is_unavailable(error: &ExecutionDomainError) -> bool {
     matches!(
         error,
-        JobDockerConfigError::Io { source, .. }
+        ExecutionDomainError::Io { source, .. }
             if source.kind() == io::ErrorKind::PermissionDenied
                 || source.raw_os_error() == Some(libc::ELOOP)
     )
 }
 
 #[cfg(not(target_os = "linux"))]
-fn host_capability_path_is_unavailable(_error: &JobDockerConfigError) -> bool {
+fn host_capability_path_is_unavailable(_error: &ExecutionDomainError) -> bool {
     false
 }
 
@@ -593,7 +593,7 @@ fn host_capability_path_is_unavailable(_error: &JobDockerConfigError) -> bool {
 fn host_path_for_private_tmp(
     child_path: &Path,
     private_tmp: &Path,
-) -> Result<PathBuf, JobDockerConfigError> {
+) -> Result<PathBuf, ExecutionDomainError> {
     let resolved = resolve_child_path(child_path, private_tmp)?;
     Ok(project_private_tmp_path(&resolved, private_tmp))
 }
@@ -602,12 +602,12 @@ fn host_path_for_private_tmp(
 fn resolve_child_path(
     child_path: &Path,
     private_tmp: &Path,
-) -> Result<PathBuf, JobDockerConfigError> {
+) -> Result<PathBuf, ExecutionDomainError> {
     let absolute = if child_path.is_absolute() {
         child_path.to_path_buf()
     } else {
         std::env::current_dir()
-            .map_err(|source| JobDockerConfigError::Io {
+            .map_err(|source| ExecutionDomainError::Io {
                 operation: "resolving host capability path",
                 path: child_path.to_path_buf(),
                 source,
@@ -630,14 +630,14 @@ fn resolve_child_path(
             Ok(metadata) if metadata.file_type().is_symlink() => {
                 symlink_hops += 1;
                 if symlink_hops > 40 {
-                    return Err(JobDockerConfigError::Io {
+                    return Err(ExecutionDomainError::Io {
                         operation: "resolving host capability symlink",
                         path: child_path.to_path_buf(),
                         source: io::Error::from_raw_os_error(libc::ELOOP),
                     });
                 }
                 let target = std::fs::read_link(&host_candidate).map_err(|source| {
-                    JobDockerConfigError::Io {
+                    ExecutionDomainError::Io {
                         operation: "reading host capability symlink",
                         path: host_candidate,
                         source,
@@ -663,7 +663,7 @@ fn resolve_child_path(
                 resolved.push(component);
             }
             Err(source) => {
-                return Err(JobDockerConfigError::Io {
+                return Err(ExecutionDomainError::Io {
                     operation: "resolving host capability path",
                     path: host_candidate,
                     source,
@@ -700,18 +700,18 @@ fn build_host_command(
     args: &[&OsStr],
     env: &HashMap<String, String>,
     working_dir: &Path,
-    docker_config: &JobDockerConfig,
+    domain: &ExecutionDomain,
 ) -> Result<Command> {
     let configured = env
         .get(DOCKER_CONFIG_ENV)
         .context("host step is missing runner-owned DOCKER_CONFIG")?;
-    docker_config.validate_override(configured, "host spawn")?;
+    domain.validate_override(configured, "host spawn")?;
 
     let mut command = Command::new(program);
     command.args(args);
 
     #[cfg(target_os = "linux")]
-    configure_private_tmp(&mut command, docker_config.private_tmp(), working_dir)?;
+    configure_private_tmp(&mut command, domain.private_tmp(), working_dir)?;
 
     #[cfg(not(target_os = "linux"))]
     command.current_dir(working_dir);
@@ -730,10 +730,10 @@ fn host_command(
     args: &[&OsStr],
     env: &HashMap<String, String>,
     working_dir: &Path,
-    docker_config: &JobDockerConfig,
+    domain: &ExecutionDomain,
 ) -> Result<Command> {
-    validate_host_docker_capabilities(env, working_dir, docker_config.private_tmp())?;
-    build_host_command(program, args, env, working_dir, docker_config)
+    validate_host_docker_capabilities(env, working_dir, domain.private_tmp())?;
+    build_host_command(program, args, env, working_dir, domain)
 }
 
 async fn host_command_for_process(
@@ -741,11 +741,11 @@ async fn host_command_for_process(
     args: &[&OsStr],
     env: &HashMap<String, String>,
     working_dir: &Path,
-    docker_config: &JobDockerConfig,
+    domain: &ExecutionDomain,
 ) -> Result<Command> {
     let validation_env = env.clone();
     let validation_working_dir = working_dir.to_path_buf();
-    let validation_private_tmp = docker_config.private_tmp().to_path_buf();
+    let validation_private_tmp = domain.private_tmp().to_path_buf();
     tokio::task::spawn_blocking(move || {
         validate_host_docker_capabilities(
             &validation_env,
@@ -756,7 +756,7 @@ async fn host_command_for_process(
     .await
     .context("joining host capability validation task")??;
 
-    build_host_command(program, args, env, working_dir, docker_config)
+    build_host_command(program, args, env, working_dir, domain)
 }
 
 #[cfg(target_os = "linux")]
@@ -873,13 +873,13 @@ pub async fn run_process(
     args: &[&OsStr],
     env: &HashMap<String, String>,
     working_dir: &Path,
-    docker_config: &JobDockerConfig,
+    domain: &ExecutionDomain,
     job_state: &mut JobState,
     log_sender: &LogSender,
     timeout: Duration,
     cancel_token: &CancellationToken,
 ) -> Result<StepResult> {
-    let mut child = host_command_for_process(program, args, env, working_dir, docker_config)
+    let mut child = host_command_for_process(program, args, env, working_dir, domain)
         .await?
         .spawn()
         .map_err(|source| {
@@ -954,22 +954,16 @@ pub fn build_step_env(
     job_state: &JobState,
     workspace: &Workspace,
     base_env: &HashMap<String, String>,
-    docker_config: Option<&JobDockerConfig>,
+    domain: Option<&ExecutionDomain>,
 ) -> Result<HashMap<String, String>> {
     let mut env = base_env.clone();
-    merge_checked(&mut env, &job_state.env, docker_config, "job environment")?;
+    merge_checked(&mut env, &job_state.env, domain, "job environment")?;
 
     if let Some(step_env) = &step.environment {
         for (key, value) in step_env {
             let context = ExprContext::new(&env, job_state, false, false);
             let resolved = super::expression::resolve_expression(value, &context);
-            insert_checked(
-                &mut env,
-                key.clone(),
-                resolved,
-                docker_config,
-                "step environment",
-            )?;
+            insert_checked(&mut env, key.clone(), resolved, domain, "step environment")?;
         }
     }
 
@@ -985,7 +979,7 @@ pub fn build_step_env(
     }
 
     if let Ok(file_env) = workspace.read_env_file() {
-        merge_checked(&mut env, &file_env, docker_config, "GITHUB_ENV")?;
+        merge_checked(&mut env, &file_env, domain, "GITHUB_ENV")?;
     }
 
     if let Ok(extra_paths) = workspace.read_path_file() {
@@ -1008,11 +1002,11 @@ fn insert_checked(
     env: &mut HashMap<String, String>,
     key: String,
     value: String,
-    docker_config: Option<&JobDockerConfig>,
+    domain: Option<&ExecutionDomain>,
     source: &'static str,
 ) -> Result<()> {
     if key == DOCKER_CONFIG_ENV
-        && let Some(config) = docker_config
+        && let Some(config) = domain
     {
         config.validate_override(&value, source)?;
     }
@@ -1023,11 +1017,11 @@ fn insert_checked(
 fn merge_checked(
     env: &mut HashMap<String, String>,
     values: &HashMap<String, String>,
-    docker_config: Option<&JobDockerConfig>,
+    domain: Option<&ExecutionDomain>,
     source: &'static str,
 ) -> Result<()> {
     for (key, value) in values {
-        insert_checked(env, key.clone(), value.clone(), docker_config, source)?;
+        insert_checked(env, key.clone(), value.clone(), domain, source)?;
     }
     Ok(())
 }

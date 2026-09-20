@@ -1,7 +1,8 @@
 use super::*;
-use crate::job::docker_config::{DOCKER_CONFIG_ENV, JobDockerConfig, JobResourceRoot};
+use crate::job::execution_domain::{DOCKER_CONFIG_ENV, ExecutionDomain, ExecutionDomainRoot};
 use crate::job::schema::{JobManifest, JobVariable};
 use serde_json::json;
+use std::num::NonZeroUsize;
 
 fn minimal_manifest() -> JobManifest {
     serde_json::from_value(json!({
@@ -52,10 +53,16 @@ fn test_workspace() -> (tempfile::TempDir, Workspace) {
     (tmp, ws)
 }
 
-fn test_docker_config() -> (tempfile::TempDir, JobDockerConfig) {
+fn test_docker_config() -> (tempfile::TempDir, ExecutionDomain) {
     let temp = tempfile::TempDir::new().unwrap();
-    let root = JobResourceRoot::prepare(&temp.path().join("job-resources")).unwrap();
-    let config = root.create_docker_config().unwrap();
+    let root = ExecutionDomainRoot::prepare(
+        &temp.path().join("job-resources"),
+        NonZeroUsize::new(1).unwrap(),
+    )
+    .unwrap();
+    let config = futures::executor::block_on(root.reserve())
+        .and_then(|permit| permit.provision())
+        .unwrap();
     (temp, config)
 }
 
@@ -293,7 +300,10 @@ fn host_env_sets_runner_owned_docker_config() {
 
     let env = build_base_env(&manifest, &ws, "test-runner", &config).unwrap();
 
-    assert_eq!(env[DOCKER_CONFIG_ENV], config.directory().to_string_lossy());
+    assert_eq!(
+        env[DOCKER_CONFIG_ENV],
+        config.docker_config_dir().to_string_lossy()
+    );
     drop(resources);
 }
 

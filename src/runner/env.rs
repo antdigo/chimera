@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use anyhow::Result;
 
-use crate::job::docker_config::{DOCKER_CONFIG_ENV, JobDockerConfig};
+use crate::job::execution_domain::{DOCKER_CONFIG_ENV, ExecutionDomain};
 use crate::job::schema::JobManifest;
 use crate::job::workspace::Workspace;
 use crate::utils::{arch_label, os_label};
@@ -12,17 +12,17 @@ pub fn build_base_env(
     manifest: &JobManifest,
     workspace: &Workspace,
     runner_name: &str,
-    docker_config: &JobDockerConfig,
+    domain: &ExecutionDomain,
 ) -> Result<HashMap<String, String>> {
     for (key, variable) in &manifest.variables {
         let env_key = key.replace('.', "_").to_uppercase();
         if env_key == DOCKER_CONFIG_ENV {
-            docker_config.validate_override(&variable.value, "job environment")?;
+            domain.validate_override(&variable.value, "job environment")?;
         }
     }
 
     let mut env = build_common_env(manifest, workspace, runner_name);
-    docker_config.insert_into_host_env(&mut env, "job environment")?;
+    domain.insert_into_host_env(&mut env, "job environment")?;
     Ok(env)
 }
 

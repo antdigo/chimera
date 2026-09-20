@@ -77,11 +77,11 @@ jobs:
               --test matrix_test --test needs_test --test secrets_test
               --test step_names_test --test timeout_test
           - name: shard-2
-            # job_docker_config_docker_test also carries 36 non-ignored tests
+            # execution_domain_docker_test also carries 36 non-ignored tests
             # that run on the host like any other suite; the ignored ones are
             # re-run inside the container by the docker job-config shard.
             suite-args: >-
-              --test job_docker_config_test --test job_docker_config_docker_test
+              --test execution_domain_test --test execution_domain_docker_test
               --test basics_test --test composite_test --test conditions_test
               --test job_logs_test --test runner_context_test
               --test workflow_commands_test --test working_directory_test
@@ -146,7 +146,7 @@ jobs:
           - name: engine
             suite-args: --test docker_test
           - name: job-config
-            suite-args: --test job_docker_config_docker_test --test composite_test
+            suite-args: --test execution_domain_docker_test --test composite_test
           - name: lib
             suite-args: --lib
     steps:
