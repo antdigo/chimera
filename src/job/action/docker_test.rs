@@ -135,7 +135,7 @@ async fn run_engine_test_container(
         "owner/repo",
     )
     .unwrap();
-    let masks = Arc::new(tokio::sync::RwLock::new(Vec::new()));
+    let masks = crate::job::secret_masker::shared_masker_for_test(&[]);
     let (log_tx, _log_rx) = tokio::sync::mpsc::channel(32);
     let log_sender = LogSender::new_for_test(log_tx, Arc::clone(&masks));
     let mut job_state = JobState::new(masks, HashMap::new(), serde_json::json!({}));
@@ -279,7 +279,7 @@ async fn cancellation_after_build_publication_does_not_launch_container() {
     )
     .unwrap();
     let action_dir = TrustedActionDirectory::resolve(action.path(), Path::new(".")).unwrap();
-    let masks = Arc::new(tokio::sync::RwLock::new(Vec::new()));
+    let masks = crate::job::secret_masker::shared_masker_for_test(&[]);
     let (log_tx, _log_rx) = tokio::sync::mpsc::channel(64);
     let log_sender = LogSender::new_for_test(log_tx, masks);
     let builder = DockerActionBuilder::new();
@@ -447,7 +447,6 @@ fn sentinel_resolved_args() -> Vec<String> {
 
 fn capture_docker_metadata_trace(
     selected_image: &SelectedDockerImage,
-    entry_point: &str,
     entrypoint: &Option<String>,
     resolved_arg_count: usize,
 ) -> String {
@@ -461,9 +460,40 @@ fn capture_docker_metadata_trace(
         .with_writer(move || TraceWriter(Arc::clone(&writer_output)))
         .finish();
     tracing::subscriber::with_default(subscriber, || {
-        trace_docker_metadata_action(selected_image, entry_point, entrypoint, resolved_arg_count);
+        trace_docker_metadata_action(selected_image, entrypoint.is_some(), resolved_arg_count);
     });
     String::from_utf8(captured_output.lock().unwrap().clone()).unwrap()
+}
+
+fn capture_inline_docker_trace(plan: &InlineActionPlan) -> String {
+    let captured_output = Arc::new(Mutex::new(Vec::new()));
+    let writer_output = Arc::clone(&captured_output);
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .without_time()
+        .with_ansi(false)
+        .with_target(false)
+        .with_writer(move || TraceWriter(Arc::clone(&writer_output)))
+        .finish();
+    tracing::subscriber::with_default(subscriber, || {
+        trace_inline_docker_action(plan);
+    });
+    String::from_utf8(captured_output.lock().unwrap().clone()).unwrap()
+}
+
+#[test]
+fn inline_trace_omits_resolved_entrypoint_and_arguments() {
+    let plan = InlineActionPlan {
+        env: HashMap::new(),
+        entrypoint: Some("CANARY-INLINE-ENTRYPOINT".into()),
+        args: vec!["CANARY-INLINE-ARG".into()],
+    };
+
+    let captured = capture_inline_docker_trace(&plan);
+
+    assert!(!captured.contains("CANARY-INLINE"), "{captured}");
+    assert!(captured.contains("has_entrypoint=true"), "{captured}");
+    assert!(captured.contains("resolved_arg_count=1"), "{captured}");
 }
 
 #[test]
@@ -473,8 +503,7 @@ fn built_image_trace_omits_arg_values_and_local_id() {
     let selected_image = SelectedDockerImage::Built(SENTINEL_IMAGE_ID.to_string());
     let entrypoint: Option<String> = None;
 
-    let captured =
-        capture_docker_metadata_trace(&selected_image, "main", &entrypoint, resolved_args.len());
+    let captured = capture_docker_metadata_trace(&selected_image, &entrypoint, resolved_args.len());
 
     assert!(!captured.contains(SENTINEL_IMAGE_ID), "{captured}");
     assert!(!captured.contains(TRACE_ARG_VALUE_SENTINEL), "{captured}");
@@ -486,17 +515,16 @@ fn built_image_trace_omits_arg_values_and_local_id() {
 }
 
 #[test]
-fn prebuilt_image_trace_omits_arg_values_and_keeps_reference() {
+fn prebuilt_image_trace_omits_arg_values_and_reference() {
     const IMAGE_REFERENCE: &str = "ghcr.io/owner/safe-action:v1";
     let resolved_args = sentinel_resolved_args();
     let selected_image = SelectedDockerImage::Prebuilt(IMAGE_REFERENCE.to_string());
     let entrypoint: Option<String> = None;
 
-    let captured =
-        capture_docker_metadata_trace(&selected_image, "main", &entrypoint, resolved_args.len());
+    let captured = capture_docker_metadata_trace(&selected_image, &entrypoint, resolved_args.len());
 
     assert!(!captured.contains(TRACE_ARG_VALUE_SENTINEL), "{captured}");
-    assert!(captured.contains(IMAGE_REFERENCE), "{captured}");
+    assert!(!captured.contains(IMAGE_REFERENCE), "{captured}");
     assert!(captured.contains("image_source=\"prebuilt\""), "{captured}");
     assert!(
         captured.contains("resolved_arg_count=1"),
@@ -528,7 +556,7 @@ async fn build_timeout_log_send_never_blocks_on_a_full_log_channel() {
 
     // A capacity-1 channel already holding one line has no room for the
     // timeout notice, and nothing drains it for the lifetime of the test.
-    let masks = Arc::new(tokio::sync::RwLock::new(Vec::new()));
+    let masks = crate::job::secret_masker::shared_masker_for_test(&[]);
     let (log_tx, _log_rx) = tokio::sync::mpsc::channel(1);
     let log_sender = LogSender::new_for_test(log_tx, Arc::clone(&masks));
     log_sender.send("filler line".into()).await;
@@ -717,7 +745,7 @@ fn action_workspace() -> (tempfile::TempDir, Workspace) {
 
 fn action_job_state() -> JobState {
     JobState::new(
-        std::sync::Arc::new(tokio::sync::RwLock::new(Vec::new())),
+        crate::job::secret_masker::shared_masker_for_test(&[]),
         HashMap::new(),
         serde_json::json!({}),
     )
@@ -930,7 +958,7 @@ async fn engine_action_contents_come_from_pinned_context_after_root_replacement(
     )
     .unwrap();
 
-    let masks = Arc::new(tokio::sync::RwLock::new(Vec::new()));
+    let masks = crate::job::secret_masker::shared_masker_for_test(&[]);
     let (log_tx, _log_rx) = tokio::sync::mpsc::channel(32);
     let log_sender = LogSender::new_for_test(log_tx, Arc::clone(&masks));
     let mut job_state = JobState::new(masks, HashMap::new(), serde_json::json!({}));
@@ -1037,7 +1065,7 @@ async fn engine_action_contents_come_from_pinned_context_after_symlink_root_repl
     .unwrap();
     symlink(&replacement, &source_root).unwrap();
 
-    let masks = Arc::new(tokio::sync::RwLock::new(Vec::new()));
+    let masks = crate::job::secret_masker::shared_masker_for_test(&[]);
     let (log_tx, _log_rx) = tokio::sync::mpsc::channel(32);
     let log_sender = LogSender::new_for_test(log_tx, Arc::clone(&masks));
     let mut job_state = JobState::new(masks, HashMap::new(), serde_json::json!({}));

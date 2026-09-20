@@ -101,9 +101,7 @@ pub async fn run_node_action(
         env.insert("GITHUB_ACTION_PATH".into(), container_action_dir);
 
         debug!(
-            action_dir = %action_dir.display(),
-            container_script = %container_script,
-            script = script_file,
+            step_id = %step.id,
             entry_point,
             "running node action in container"
         );
@@ -133,8 +131,7 @@ pub async fn run_node_action(
     );
 
     debug!(
-        action_dir = %action_dir.display(),
-        script = script_file,
+        step_id = %step.id,
         entry_point,
         "running node action"
     );

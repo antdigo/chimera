@@ -1,9 +1,121 @@
 use std::sync::Arc;
 
+use bollard::container::LogOutput;
+use bollard::errors::Error as DockerError;
+
 use crate::job::commands::{WorkflowCommand, parse_command};
 use crate::job::execute::JobState;
 use crate::job::logs::LogSender;
-use crate::job::masking::SharedSecretMasker;
+use crate::job::secret_masker::SharedSecretMasker;
+
+/// A payload-free projection of a Bollard error suitable for global tracing.
+///
+/// Docker daemon messages and stream payloads are untrusted and can echo
+/// credentials, command arguments, or environment values. Keep only stable,
+/// structural fields here.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct DockerErrorDiagnostic {
+    pub(crate) kind: &'static str,
+    pub(crate) status_code: Option<u16>,
+    pub(crate) error_code: Option<i64>,
+    pub(crate) column: Option<usize>,
+}
+
+impl From<&DockerError> for DockerErrorDiagnostic {
+    fn from(error: &DockerError) -> Self {
+        match error {
+            DockerError::DockerResponseServerError { status_code, .. } => Self {
+                kind: "response",
+                status_code: Some(*status_code),
+                error_code: None,
+                column: None,
+            },
+            DockerError::DockerStreamError { .. } => Self {
+                kind: "stream",
+                status_code: None,
+                error_code: None,
+                column: None,
+            },
+            DockerError::DockerContainerWaitError { code, .. } => Self {
+                kind: "container_wait",
+                status_code: None,
+                error_code: Some(*code),
+                column: None,
+            },
+            DockerError::JsonDataError { column, .. } => Self {
+                kind: "json",
+                status_code: None,
+                error_code: None,
+                column: Some(*column),
+            },
+            DockerError::RequestTimeoutError => Self {
+                kind: "timeout",
+                status_code: None,
+                error_code: None,
+                column: None,
+            },
+            _ => Self {
+                kind: "client",
+                status_code: None,
+                error_code: None,
+                column: None,
+            },
+        }
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct LineFramer {
+    buffer: Vec<u8>,
+}
+
+impl LineFramer {
+    pub(crate) fn push(&mut self, chunk: &[u8]) -> Vec<String> {
+        self.buffer.extend_from_slice(chunk);
+        let Some(last_lf) = self.buffer.iter().rposition(|byte| *byte == b'\n') else {
+            return Vec::new();
+        };
+
+        let tail = self.buffer.split_off(last_lf + 1);
+        let mut complete = std::mem::replace(&mut self.buffer, tail);
+        complete.pop();
+        complete
+            .split(|byte| *byte == b'\n')
+            .map(|line| line.strip_suffix(b"\r").unwrap_or(line))
+            .map(|line| String::from_utf8_lossy(line).into_owned())
+            .collect()
+    }
+
+    pub(crate) fn finish(&mut self) -> Option<String> {
+        if self.buffer.is_empty() {
+            return None;
+        }
+        Some(String::from_utf8_lossy(&std::mem::take(&mut self.buffer)).into_owned())
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct DockerLogFramer {
+    stdout: LineFramer,
+    stderr: LineFramer,
+}
+
+impl DockerLogFramer {
+    pub(crate) fn push(&mut self, output: LogOutput) -> Vec<String> {
+        match output {
+            LogOutput::StdOut { message } => self.stdout.push(&message),
+            LogOutput::StdErr { message } => self.stderr.push(&message),
+            _ => Vec::new(),
+        }
+    }
+
+    pub(crate) fn finish(&mut self) -> Vec<String> {
+        [self.stdout.finish(), self.stderr.finish()]
+            .into_iter()
+            .flatten()
+            .collect()
+    }
+}
 
 /// Bundles the buffers and settings needed to process stdout/stderr output lines.
 ///
@@ -12,7 +124,7 @@ use crate::job::masking::SharedSecretMasker;
 #[derive(Clone)]
 pub struct OutputProcessor {
     sender: LogSender,
-    masks: SharedSecretMasker,
+    secret_masker: SharedSecretMasker,
     env_buf: Arc<tokio::sync::Mutex<Vec<(String, String)>>>,
     path_buf: Arc<tokio::sync::Mutex<Vec<String>>>,
     output_buf: Arc<tokio::sync::Mutex<Vec<(String, String)>>>,
@@ -21,10 +133,14 @@ pub struct OutputProcessor {
 }
 
 impl OutputProcessor {
-    pub fn new(sender: LogSender, masks: SharedSecretMasker, debug_enabled: bool) -> Self {
+    pub(crate) fn new(
+        sender: LogSender,
+        secret_masker: SharedSecretMasker,
+        debug_enabled: bool,
+    ) -> Self {
         Self {
             sender,
-            masks,
+            secret_masker,
             env_buf: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             path_buf: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             output_buf: Arc::new(tokio::sync::Mutex::new(Vec::new())),
@@ -47,7 +163,7 @@ impl OutputProcessor {
                     self.output_buf.lock().await.push((name, value));
                 }
                 WorkflowCommand::AddMask(secret) => {
-                    crate::job::masking::add_value(&self.masks, &secret).await;
+                    self.secret_masker.write().await.add_value(&secret);
                 }
                 WorkflowCommand::Debug(msg) => {
                     if self.debug_enabled {

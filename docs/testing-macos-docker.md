@@ -36,6 +36,13 @@ interface. Do not replace this with macOS port publishing, `--network host`, or
 `host.docker.internal`; those configurations do not exercise the required
 rootless endpoint consistently.
 
+The Linux test runner also disables its outer AppArmor and seccomp profiles.
+Chimera's host-step isolation creates an unprivileged user and mount namespace
+before `exec`; Docker's default outer profile blocks that `unshare` with
+`EPERM`. These options apply only to the disposable test-runner container. The
+nested daemon remains rootless and must still pass the security-marker check
+below.
+
 ## Security boundary
 
 The C-10 test may download source only for these public actions at their exact
@@ -277,6 +284,8 @@ access to the three pinned codeload archives.
 run_in_chimera_test_container() {
   docker run --rm \
     --user 1000:1000 \
+    --security-opt apparmor=unconfined \
+    --security-opt seccomp=unconfined \
     --network "container:$DIND_NAME" \
     -v "$DIND_RUNTIME_VOLUME:/run/user/1000" \
     -v "$DIND_TMP_VOLUME:/chimera-tmp" \
@@ -391,14 +400,6 @@ run_in_chimera_test_container cargo test --offline -- --ignored --test-threads=2
 `--offline` applies to Cargo only. The first full run may still download the
 existing tag-based Docker test images listed in the security section. C-10 may
 also download its three action archives at the exact SHA pins.
-
-Known issue (pre-dates the Dockerfile-actions branch): the C-10 test
-`pinned_buildx_flow_uses_job_config_and_original_socket` fails with
-`HTTP 401 Unauthorized` — the harness requests the pinned public archives from
-api.github.com with the fake job token, which GitHub rejects even for public
-repositories. It was added after the fork's last CI run and had never executed
-before this runbook first reached its binary; fix belongs to the job Docker
-config lineage.
 
 `--test-threads=2` is a macOS-only accommodation: the nested rootless daemon
 builds `linux/amd64` images through QEMU emulation on the arm64 Docker Desktop

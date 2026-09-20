@@ -59,8 +59,8 @@ pub fn evaluate_condition(condition: Option<&str>, ctx: &ExprContext) -> bool {
 
     match parse_and_eval(expr_str, ctx) {
         Ok(val) => val.is_truthy(),
-        Err(e) => {
-            debug!(condition = expr_str, error = %e, "condition parse error, defaulting to success()");
+        Err(_) => {
+            debug!("condition evaluation failed, defaulting to success()");
             !ctx.job_failed && !ctx.job_cancelled
         }
     }
@@ -77,8 +77,8 @@ pub fn resolve_expression(expr: &str, ctx: &ExprContext) -> String {
     {
         match parse_and_eval(inner.trim(), ctx) {
             Ok(val) => return val.to_display(),
-            Err(e) => {
-                debug!(expression = inner.trim(), error = %e, "failed to resolve expression");
+            Err(_) => {
+                debug!("failed to resolve expression");
             }
         }
     }
@@ -99,8 +99,8 @@ pub fn resolve_template(template: &str, ctx: &ExprContext) -> String {
             let expr = after_open[..end].trim();
             match parse_and_eval(expr, ctx) {
                 Ok(val) => result.push_str(&val.to_display()),
-                Err(e) => {
-                    debug!(expression = expr, error = %e, "failed to resolve template expression");
+                Err(_) => {
+                    debug!("failed to resolve template expression");
                 }
             }
             rest = &after_open[end + 2..];

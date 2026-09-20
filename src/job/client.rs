@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use chrono::Utc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -59,7 +59,7 @@ impl JobClient {
             self.pipelines_url = Some(pipelines_url.to_string());
         }
         if let Some(results_url) = manifest.results_endpoint() {
-            tracing::info!(results_url, "using Results twirp API for timeline/logs");
+            tracing::info!("using Results twirp API for timeline/logs");
             self.results_url = Some(results_url.to_string());
         } else {
             tracing::info!("no results_endpoint, using legacy VSS API for timeline/logs");
@@ -106,7 +106,7 @@ impl JobClient {
             "runnerOS": "Linux",
         });
 
-        debug!(url = %url, "acquiring job");
+        debug!("acquiring job");
 
         let resp = self
             .client
@@ -121,24 +121,29 @@ impl JobClient {
         let status = resp.status();
         let body_text = resp.text().await.unwrap_or_default();
         if !status.is_success() {
-            bail!("acquire job failed ({status}): {body_text}");
+            bail!(
+                "acquire job failed ({status}, response body {} bytes)",
+                body_text.len()
+            );
         }
 
         debug!(manifest_length = body_text.len(), "received job manifest");
 
-        let raw: serde_json::Value =
-            serde_json::from_str(&body_text).context("parsing raw job manifest JSON")?;
+        let raw: serde_json::Value = serde_json::from_str(&body_text).map_err(|error| {
+            anyhow!(
+                "parsing raw job manifest JSON failed ({:?} at line {}, column {})",
+                error.classify(),
+                error.line(),
+                error.column()
+            )
+        })?;
         let normalized = manifest::normalize_manifest(&raw);
 
-        debug!(normalized = %normalized, "normalized manifest");
-
-        serde_json::from_value(normalized).with_context(|| {
-            let preview = if body_text.len() > 2000 {
-                format!("{}...(truncated)", &body_text[..2000])
-            } else {
-                body_text.clone()
-            };
-            format!("deserializing normalized manifest: {preview}")
+        serde_json::from_value(normalized).map_err(|error| {
+            anyhow!(
+                "deserializing normalized job manifest failed ({:?})",
+                error.classify()
+            )
         })
     }
 
@@ -164,7 +169,7 @@ impl JobClient {
         let status = resp.status();
         if !status.is_success() {
             let body_text = resp.text().await.unwrap_or_default();
-            warn!("renew job failed ({status}): {body_text}");
+            warn!(%status, response_body_bytes = body_text.len(), "renew job failed");
         }
 
         Ok(())
@@ -209,7 +214,10 @@ impl JobClient {
         let status = resp.status();
         if !status.is_success() {
             let body_text = resp.text().await.unwrap_or_default();
-            bail!("complete job failed ({status}): {body_text}");
+            bail!(
+                "complete job failed ({status}, response body {} bytes)",
+                body_text.len()
+            );
         }
 
         Ok(())
@@ -251,7 +259,7 @@ impl JobClient {
         let status = resp.status();
         if !status.is_success() {
             let body_text = resp.text().await.unwrap_or_default();
-            warn!("update steps failed ({status}): {body_text}");
+            warn!(%status, response_body_bytes = body_text.len(), "update steps failed");
         }
 
         Ok(())
@@ -315,9 +323,13 @@ impl JobClient {
             .send()
             .await
             .context("creating append blob")?;
-        if !resp.status().is_success() {
+        let status = resp.status();
+        if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
-            bail!("create append blob failed: {body}");
+            bail!(
+                "create append blob failed ({status}, response body {} bytes)",
+                body.len()
+            );
         }
         Ok(())
     }
@@ -335,9 +347,13 @@ impl JobClient {
             .send()
             .await
             .context("appending blob block")?;
-        if !resp.status().is_success() {
+        let status = resp.status();
+        if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
-            bail!("append blob block failed: {body}");
+            bail!(
+                "append blob block failed ({status}, response body {} bytes)",
+                body.len()
+            );
         }
         Ok(())
     }
@@ -354,9 +370,10 @@ impl JobClient {
             .send()
             .await
             .context("sealing blob")?;
-        if !resp.status().is_success() {
+        let status = resp.status();
+        if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
-            warn!("seal blob failed: {body}");
+            warn!(%status, response_body_bytes = body.len(), "seal blob failed");
         }
         Ok(())
     }
@@ -427,7 +444,10 @@ impl JobClient {
         let status = resp.status();
         if !status.is_success() {
             let body_text = resp.text().await.unwrap_or_default();
-            bail!("get signed URL failed ({status}): {body_text}");
+            bail!(
+                "get signed URL failed ({status}, response body {} bytes)",
+                body_text.len()
+            );
         }
 
         let signed: SignedUrlResponse = resp.json().await.context("parsing signed URL response")?;
@@ -455,9 +475,10 @@ impl JobClient {
             .await
             .context("creating log metadata")?;
 
-        if !resp.status().is_success() {
+        let status = resp.status();
+        if !status.is_success() {
             let body_text = resp.text().await.unwrap_or_default();
-            warn!("create log metadata failed: {body_text}");
+            warn!(%status, response_body_bytes = body_text.len(), "create log metadata failed");
         }
 
         Ok(())
@@ -485,7 +506,10 @@ impl JobClient {
         let status = resp.status();
         if !status.is_success() {
             let body_text = resp.text().await.unwrap_or_default();
-            bail!("create log failed ({status}): {body_text}");
+            bail!(
+                "create log failed ({status}, response body {} bytes)",
+                body_text.len()
+            );
         }
 
         let log_resp: CreateLogResponse =
@@ -512,7 +536,7 @@ impl JobClient {
         let status = resp.status();
         if !status.is_success() {
             let body_text = resp.text().await.unwrap_or_default();
-            warn!("upload log lines failed ({status}): {body_text}");
+            warn!(%status, response_body_bytes = body_text.len(), "upload log lines failed");
         }
 
         Ok(())
@@ -547,7 +571,7 @@ impl JobClient {
         let status = resp.status();
         if !status.is_success() {
             let body_text = resp.text().await.unwrap_or_default();
-            warn!("update timeline failed ({status}): {body_text}");
+            warn!(%status, response_body_bytes = body_text.len(), "update timeline failed");
         }
 
         Ok(())

@@ -1268,6 +1268,34 @@ fn resolve_template_with_format_wrapping_hashfiles() {
 }
 
 #[test]
+fn expression_failure_trace_omits_evaluated_secret() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = HashMap::from([(
+        "GITHUB_WORKSPACE".to_string(),
+        dir.path().to_string_lossy().into_owned(),
+    )]);
+    let secrets = HashMap::from([("TOKEN".to_string(), "CANARY-EXPR-TRACE".to_string())]);
+    let mut ctx = ctx_with_env(&env);
+    ctx.secrets = &secrets;
+    let captured = crate::testing::TracingWriter::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .with_ansi(false)
+        .without_time()
+        .with_writer(captured.clone())
+        .finish();
+    let dispatch = tracing::Dispatch::new(subscriber);
+    let _guard = tracing::dispatcher::set_default(&dispatch);
+
+    let resolved = resolve_template("${{ hashFiles(format('{0}[', secrets.TOKEN)) }}", &ctx);
+    let trace = captured.text();
+
+    assert_eq!(resolved, "");
+    assert!(trace.contains("failed to resolve template expression"));
+    assert!(!trace.contains("CANARY-EXPR-TRACE"), "{trace}");
+}
+
+#[test]
 fn find_closing_braces_skips_braces_inside_strings() {
     use super::find_closing_braces;
 

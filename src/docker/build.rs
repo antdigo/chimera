@@ -19,6 +19,7 @@ use super::build_context::{
     PREPARATION_CANCELLED, PREPARATION_DEADLINE_EXCEEDED, PreparationBudget, PreparedBuildContext,
     prepare_build_context_with_budget,
 };
+use super::output::LineFramer;
 use crate::job::action::TrustedActionDirectory;
 use crate::job::logs::LogSender;
 
@@ -318,6 +319,7 @@ async fn build_archive(
         ..Default::default()
     };
     let mut stream = docker.build_image(options, registry_auth, Some(prepared.archive.into()));
+    let mut stream_framer = LineFramer::default();
 
     while let Some(item) = stream.next().await {
         #[cfg(test)]
@@ -334,7 +336,12 @@ async fn build_archive(
                 DockerActionBuildFailure(Box::new(std::io::Error::other(engine_error))).into(),
             );
         }
-        send_build_progress(log_sender, info, internal_tag).await;
+        send_build_progress(log_sender, info, internal_tag, &mut stream_framer).await;
+    }
+    if let Some(message) = stream_framer.finish() {
+        log_sender
+            .send(sanitize_build_progress(&message, internal_tag))
+            .await;
     }
 
     let expected_fingerprint = cache_key.fingerprint();
@@ -367,8 +374,13 @@ async fn build_archive(
     Ok(image_id)
 }
 
-async fn send_build_progress(log_sender: &LogSender, info: BuildInfo, internal_tag: &str) {
-    for message in format_build_progress(info, internal_tag) {
+async fn send_build_progress(
+    log_sender: &LogSender,
+    info: BuildInfo,
+    internal_tag: &str,
+    stream_framer: &mut LineFramer,
+) {
+    for message in format_build_progress(info, internal_tag, stream_framer) {
         log_sender.send(message).await;
     }
 }
@@ -391,11 +403,16 @@ fn engine_error_source(error: DockerError) -> Box<dyn std::error::Error + Send +
     }
 }
 
-fn format_build_progress(info: BuildInfo, internal_tag: &str) -> Vec<String> {
+fn format_build_progress(
+    info: BuildInfo,
+    internal_tag: &str,
+    stream_framer: &mut LineFramer,
+) -> Vec<String> {
     if let Some(stream) = info.stream {
-        return stream
-            .lines()
-            .map(|line| sanitize_build_progress(line, internal_tag))
+        return stream_framer
+            .push(stream.as_bytes())
+            .into_iter()
+            .map(|line| sanitize_build_progress(&line, internal_tag))
             .collect();
     }
 
