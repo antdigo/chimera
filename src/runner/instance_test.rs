@@ -244,6 +244,354 @@ fn runner_creates_workspace_inside_the_current_attempt() {
     assert!(!workspace.runner_temp().starts_with(runner.paths.tmp_dir()));
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn lifecycle_transition_does_not_block_tokio_tasks_or_timers() {
+    let (_temp, runner) = make_runner();
+    let domain = runner
+        .execution_domains
+        .reserve()
+        .await
+        .unwrap()
+        .provision()
+        .unwrap();
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+
+    let (transition, ()) = tokio::join!(
+        transition_execution_domain(domain, move |domain| {
+            started_tx.send(()).unwrap();
+            release_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("Tokio task and timer must progress while the journal transition blocks");
+            domain.mark_running()
+        }),
+        async {
+            started_rx.await.unwrap();
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            release_tx.send(()).unwrap();
+        },
+    );
+
+    let (domain, result) = transition.unwrap();
+    result.unwrap();
+    domain.destroy().unwrap();
+}
+
+async fn assert_cleaning_failure_preserves_execution_outcome(
+    conclusion: JobConclusion,
+    destroy_fails: bool,
+) {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path_regex(r"/_apis/pipelines/workflows/.*/logs$"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"id": 1})))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path_regex(r"/_apis/pipelines/workflows/.*/logs/\d+"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+    Mock::given(method("PATCH"))
+        .and(path_regex(
+            r"/_apis/distributedtask/hubs/build/plans/.*/timelines/.*",
+        ))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/completejob"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+
+    let (_temp, runner) = make_runner();
+    cache_node_runtimes(&runner);
+    let mut value = finish_manifest_value(&server.uri());
+    let exit_code = if conclusion == JobConclusion::Failed {
+        7
+    } else {
+        0
+    };
+    value["steps"] = serde_json::json!([{
+        "id": "publish", "contextName": "publish", "order": 1,
+        "reference": { "type": "script" },
+        "inputs": { "script": format!(
+            "printf 'published=release-42\\n' >> \"$GITHUB_OUTPUT\"; \
+             printf JOURNAL-BODY-CANARY > \"$DOCKER_CONFIG/../journal.json.next\"; \
+             while [ ! -f \"$RUNNER_TEMP/release\" ]; do sleep 0.01; done; exit {exit_code}"
+        ) }
+    }]);
+    value["jobOutputs"] = serde_json::json!({
+        "published": "${{ steps.publish.outputs.published }}",
+        "step_conclusion": "${{ steps.publish.conclusion }}"
+    });
+    let manifest: JobManifest = serde_json::from_value(value).unwrap();
+    let client = finish_client(&server).await;
+    let http = reqwest::Client::new();
+    let scope = cache_scope_for_job(&manifest, "owner/test-repo");
+    let secret_masker = Arc::new(tokio::sync::RwLock::new(
+        SecretMasker::from_manifest(&manifest).unwrap(),
+    ));
+    let cancel = CancellationToken::new();
+    let permit = runner.execution_domains.reserve().await.unwrap();
+
+    let (result, attempt) = tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::join!(
+            runner.run_job(
+                &manifest,
+                &client,
+                &http,
+                cancel.clone(),
+                "owner/test-repo",
+                &secret_masker,
+                permit,
+            ),
+            async {
+                let attempt = loop {
+                    let attempt = std::fs::read_dir(runner.execution_domains.path())
+                        .unwrap()
+                        .next()
+                        .map(|entry| entry.unwrap().path());
+                    if let Some(attempt) = attempt
+                        && std::fs::read(attempt.join("journal.json.next"))
+                            .is_ok_and(|body| body == b"JOURNAL-BODY-CANARY")
+                    {
+                        break attempt;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                };
+                let authorized = runner
+                    .cache_authority
+                    .authorize("synthetic", &scope)
+                    .await
+                    .unwrap();
+                // Hold a real in-flight cache operation so revocation waits after
+                // Cleaning fails, giving this test a deterministic repair window.
+                let operation = runner.cache_authority.admit(&authorized).await.unwrap();
+                let grant = runner
+                    .cache_authority
+                    .issue_download(&authorized, "a".repeat(64))
+                    .await
+                    .unwrap();
+                if conclusion == JobConclusion::Cancelled {
+                    cancel.cancel();
+                } else {
+                    std::fs::write(attempt.join("tmp/test-runner/release"), "").unwrap();
+                }
+                while runner
+                    .cache_authority
+                    .authorize("synthetic", &scope)
+                    .await
+                    .is_ok()
+                {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                assert!(
+                    server
+                        .received_requests()
+                        .await
+                        .unwrap()
+                        .iter()
+                        .all(|request| request.url.path() != "/completejob")
+                );
+                if !destroy_fails {
+                    std::fs::remove_file(attempt.join("journal.json.next")).unwrap();
+                }
+                drop(operation);
+                assert_eq!(
+                    runner
+                        .cache_authority
+                        .resolve_download(grant)
+                        .await
+                        .unwrap_err(),
+                    CacheAuthError::DownloadNotFound
+                );
+                attempt
+            },
+        )
+    })
+    .await
+    .expect("job must reach the Cleaning boundary and finish");
+
+    let error = result.unwrap_err();
+    let requests = server.received_requests().await.unwrap();
+    let completions: Vec<_> = requests
+        .iter()
+        .filter(|request| request.url.path() == "/completejob")
+        .collect();
+    assert_eq!(
+        completions.len(),
+        1,
+        "Cleaning failure must still publish the execution outcome: {error:#}"
+    );
+    let body: serde_json::Value = serde_json::from_slice(&completions[0].body).unwrap();
+    assert_eq!(body["conclusion"], "failed");
+    let step_conclusion = match conclusion {
+        JobConclusion::Succeeded => "success",
+        JobConclusion::Failed => "failure",
+        JobConclusion::Cancelled => "cancelled",
+    };
+    assert_eq!(
+        body["outputs"],
+        serde_json::json!({
+            "published": { "value": "release-42" },
+            "step_conclusion": { "value": step_conclusion }
+        })
+    );
+    assert_eq!(
+        runner
+            .cache_authority
+            .authorize("synthetic", &scope)
+            .await
+            .unwrap_err(),
+        CacheAuthError::Unauthorized
+    );
+    assert!(job_execution_error_is_terminal(&error));
+    let fatal = error
+        .downcast_ref::<ExecutionDomainCleanupFatalError>()
+        .expect("completion after lifecycle failure must be typed and fatal");
+    if destroy_fails {
+        assert!(matches!(
+            runner.execution_domains.ensure_healthy(),
+            Err(ExecutionDomainError::PoisonedRoot { .. })
+        ));
+        let journal: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(attempt.join("journal.json")).unwrap()).unwrap();
+        assert_eq!(journal["state"], "running");
+        let ExecutionDomainError::LifecycleAndDestroyFailed { lifecycle, destroy } = &fatal.source
+        else {
+            panic!("both lifecycle and destruction errors must stay typed: {fatal:?}");
+        };
+        for cause in [lifecycle, destroy] {
+            assert!(
+                matches!(cause.as_ref(), ExecutionDomainError::UnsafeEntry { path } if path == &attempt.join("journal.json.next"))
+            );
+        }
+    } else {
+        assert!(
+            !attempt.exists(),
+            "destruction must run despite the Cleaning failure"
+        );
+        runner.execution_domains.ensure_healthy().unwrap();
+        assert!(
+            matches!(&fatal.source, ExecutionDomainError::UnsafeEntry { path } if path == &attempt.join("journal.json.next"))
+        );
+    }
+    assert!(!format!("{error:?}").contains("JOURNAL-BODY-CANARY"));
+}
+
+#[tokio::test]
+async fn cleaning_failure_preserves_successful_job_outputs() {
+    assert_cleaning_failure_preserves_execution_outcome(JobConclusion::Succeeded, true).await;
+}
+
+#[tokio::test]
+async fn cleaning_failure_preserves_failed_job_outputs() {
+    assert_cleaning_failure_preserves_execution_outcome(JobConclusion::Failed, true).await;
+}
+
+#[tokio::test]
+async fn cleaning_failure_preserves_cancelled_job_outputs() {
+    assert_cleaning_failure_preserves_execution_outcome(JobConclusion::Cancelled, true).await;
+}
+
+#[tokio::test]
+async fn cleaning_failure_remains_fatal_after_successful_destroy() {
+    assert_cleaning_failure_preserves_execution_outcome(JobConclusion::Succeeded, false).await;
+}
+
+#[tokio::test]
+async fn running_failure_revokes_capability_and_attempts_destroy_without_starting_workload() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let server = MockServer::start().await;
+    let (_temp, mut runner) = make_runner();
+    let root_path = runner.execution_domains.path().to_path_buf();
+    let inject_failure = AtomicBool::new(true);
+    // Capability registration consults its clock after provisioning and before
+    // Running. Use that existing test seam to create a real journal obstruction
+    // at the otherwise synchronous boundary, without racing filesystem polling.
+    runner.cache_authority = Arc::new(CacheAuthority::with_clock(Arc::new(move || {
+        if inject_failure.swap(false, Ordering::SeqCst) {
+            let attempt = std::fs::read_dir(&root_path)
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap()
+                .path();
+            std::fs::write(attempt.join("journal.json.next"), "JOURNAL-BODY-CANARY").unwrap();
+        }
+        Utc::now()
+    })));
+    let manifest = finish_manifest(&server.uri());
+    let client = finish_client(&server).await;
+    let scope = cache_scope_for_job(&manifest, "owner/test-repo");
+    let secret_masker = Arc::new(tokio::sync::RwLock::new(
+        SecretMasker::from_manifest(&manifest).unwrap(),
+    ));
+
+    let error = runner
+        .run_job(
+            &manifest,
+            &client,
+            &reqwest::Client::new(),
+            CancellationToken::new(),
+            "owner/test-repo",
+            &secret_masker,
+            runner.execution_domains.reserve().await.unwrap(),
+        )
+        .await
+        .unwrap_err();
+
+    let diagnostic = format!("{error:#}");
+    assert!(
+        diagnostic.contains("marking execution domain running"),
+        "{diagnostic}"
+    );
+    assert!(
+        !diagnostic.contains("invalid-domain-transition"),
+        "a failed Running transition must go straight to destruction: {diagnostic}"
+    );
+    assert_eq!(
+        runner
+            .cache_authority
+            .authorize("synthetic", &scope)
+            .await
+            .unwrap_err(),
+        CacheAuthError::Unauthorized
+    );
+    assert!(
+        server.received_requests().await.unwrap().is_empty(),
+        "the job body must not start or publish a normal outcome"
+    );
+    assert!(
+        !runner.paths.externals_dir().exists(),
+        "the job body must not try to prepare Node runtimes"
+    );
+    let attempt = std::fs::read_dir(runner.execution_domains.path())
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    assert_eq!(std::fs::read_dir(attempt.join("work")).unwrap().count(), 0);
+    assert_eq!(std::fs::read_dir(attempt.join("tmp")).unwrap().count(), 0);
+    let journal: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(attempt.join("journal.json")).unwrap()).unwrap();
+    assert_eq!(journal["state"], "ready");
+    assert!(matches!(
+        runner.execution_domains.ensure_healthy(),
+        Err(ExecutionDomainError::PoisonedRoot { .. })
+    ));
+    assert_eq!(
+        diagnostic.matches("unsafe-job-resource-path").count(),
+        2,
+        "both Running and destruction must have been attempted: {diagnostic}"
+    );
+    assert!(!format!("{error:?}").contains("JOURNAL-BODY-CANARY"));
+}
+
 #[tokio::test]
 async fn cancelled_job_removes_attempt_workspace_and_temp_canaries() {
     let server = MockServer::start().await;

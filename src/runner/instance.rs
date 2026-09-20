@@ -206,6 +206,26 @@ where
     }
 }
 
+async fn transition_execution_domain<F>(
+    mut domain: ExecutionDomain,
+    transition: F,
+) -> Result<(
+    ExecutionDomain,
+    std::result::Result<(), ExecutionDomainError>,
+)>
+where
+    F: FnOnce(&mut ExecutionDomain) -> std::result::Result<(), ExecutionDomainError>
+        + Send
+        + 'static,
+{
+    tokio::task::spawn_blocking(move || {
+        let result = transition(&mut domain);
+        (domain, result)
+    })
+    .await
+    .context("joining execution domain lifecycle task")
+}
+
 async fn finish_job(
     job_client: &Arc<JobClient>,
     manifest: &JobManifest,
@@ -657,7 +677,7 @@ impl Runner {
         permit: DomainPermit,
     ) -> Result<()> {
         let cache_scope = cache_scope_for_job(manifest, repo);
-        let mut domain = tokio::task::spawn_blocking(move || permit.provision())
+        let domain = tokio::task::spawn_blocking(move || permit.provision())
             .await
             .context("joining execution domain provisioning task")?
             .context("provisioning execution domain")?;
@@ -712,10 +732,11 @@ impl Runner {
         let mut cache_capability =
             JobCacheCapability::new(Arc::clone(&self.cache_authority), capability_id);
 
+        let (domain, running_result) =
+            transition_execution_domain(domain, ExecutionDomain::mark_running).await?;
+        let entered_running = running_result.is_ok();
         let execution_result = run_with_cache_capability(&mut cache_capability, async {
-            domain
-                .mark_running()
-                .context("marking execution domain running")?;
+            running_result.context("marking execution domain running")?;
             self.run_job_body(
                 manifest,
                 job_client,
@@ -729,16 +750,13 @@ impl Runner {
             .await
         })
         .await;
-        // Always transition to Cleaning after the body returns, including setup
-        // failures and cancellation, and still destroy if the journal write fails.
-        let execution_result = match domain.mark_cleaning() {
-            Ok(()) => execution_result,
-            Err(error) => match execution_result {
-                Ok(_) => {
-                    Err(anyhow::Error::new(error).context("marking execution domain cleaning"))
-                }
-                Err(execution_error) => Err(execution_error.context(error.to_string())),
-            },
+        // A body that started always reaches Cleaning, including setup failures
+        // and cancellation. A failed Running transition goes directly to destroy.
+        // Keep lifecycle failure separate so it cannot replace the body's outcome.
+        let (domain, cleaning_result) = if entered_running {
+            transition_execution_domain(domain, ExecutionDomain::mark_cleaning).await?
+        } else {
+            (domain, Ok(()))
         };
         let destroy = async move {
             let destroy_path = domain.attempt_dir().to_path_buf();
@@ -768,7 +786,15 @@ impl Runner {
                     );
                 }
             }
-            cleanup_result
+            match (cleaning_result, cleanup_result) {
+                (Ok(()), result) | (result, Ok(())) => result,
+                (Err(lifecycle), Err(destroy)) => {
+                    Err(ExecutionDomainError::LifecycleAndDestroyFailed {
+                        lifecycle: Box::new(lifecycle),
+                        destroy: Box::new(destroy),
+                    })
+                }
+            }
         };
 
         finish_job_after_cache_revoke_and_destroy(

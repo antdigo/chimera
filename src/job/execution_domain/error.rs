@@ -26,6 +26,10 @@ pub enum ExecutionDomainError {
         cleanup: Box<ExecutionDomainError>,
         quarantine: Box<ExecutionDomainError>,
     },
+    LifecycleAndDestroyFailed {
+        lifecycle: Box<ExecutionDomainError>,
+        destroy: Box<ExecutionDomainError>,
+    },
     StaleJobResources {
         path: PathBuf,
         entries: usize,
@@ -94,6 +98,10 @@ impl std::fmt::Display for ExecutionDomainError {
             } => write!(
                 formatter,
                 "{cleanup}; lifecycle quarantine failed: {quarantine}"
+            ),
+            Self::LifecycleAndDestroyFailed { lifecycle, destroy } => write!(
+                formatter,
+                "lifecycle transition failed: {lifecycle}; domain destroy failed: {destroy}"
             ),
             Self::StaleJobResources { path, entries } => write!(
                 formatter,
@@ -174,14 +182,14 @@ impl std::error::Error for ExecutionDomainError {
             Self::CreationRollback { create, .. } => Some(create),
             Self::InvalidJournal { source, .. } => Some(source),
             Self::QuarantineFailed { cleanup, .. } => Some(cleanup),
+            Self::LifecycleAndDestroyFailed { lifecycle, .. } => Some(lifecycle),
             _ => None,
         }
     }
 }
 
-/// Execution-domain cleanup failed and job completion was attempted.
-/// Terminal for the runner: the resource root is no longer trustworthy,
-/// so the daemon must stop instead of taking new jobs.
+/// An execution-domain lifecycle transition or cleanup failed and job completion
+/// was attempted. Terminal for the runner even if subsequent destruction succeeds.
 #[derive(Debug)]
 pub struct ExecutionDomainCleanupFatalError {
     pub source: ExecutionDomainError,
