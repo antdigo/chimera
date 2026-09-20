@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::super::{ExecutionDomainError, FailureCategory, Stage};
 
-const RESOLVE_POLICY: u64 = libc::RESOLVE_BENEATH
+pub(super) const RESOLVE_POLICY: u64 = libc::RESOLVE_BENEATH
     | libc::RESOLVE_NO_SYMLINKS
     | libc::RESOLVE_NO_MAGICLINKS
     | libc::RESOLVE_NO_XDEV;
@@ -296,7 +296,7 @@ impl BoundDir {
         result.inspect_err(|_| self.poison())
     }
 
-    fn fd(&self) -> RawFd {
+    pub(super) fn fd(&self) -> RawFd {
         self.binding.fd.as_raw_fd()
     }
 
@@ -312,7 +312,7 @@ impl BoundDir {
         }
     }
 
-    fn verify_entry(
+    pub(super) fn verify_entry(
         &self,
         name: &CStr,
         expected: &libc::statx,
@@ -493,7 +493,7 @@ enum RemovalEntry {
 }
 
 #[cfg(test)]
-fn directory_entries(fd: RawFd) -> Result<Vec<CString>, ExecutionDomainError> {
+pub(super) fn directory_entries(fd: RawFd) -> Result<Vec<CString>, ExecutionDomainError> {
     use std::os::fd::IntoRawFd;
 
     struct DirectoryStream(*mut libc::DIR);
@@ -558,11 +558,11 @@ fn component(name: &CStr) -> Result<(), ExecutionDomainError> {
     Ok(())
 }
 
-fn metadata(fd: RawFd) -> Result<libc::statx, ExecutionDomainError> {
+pub(super) fn metadata(fd: RawFd) -> Result<libc::statx, ExecutionDomainError> {
     stat_at(fd, c"").map_err(io_failure)
 }
 
-fn stat_at(fd: RawFd, name: &CStr) -> io::Result<libc::statx> {
+pub(super) fn stat_at(fd: RawFd, name: &CStr) -> io::Result<libc::statx> {
     let mut value = std::mem::MaybeUninit::<libc::statx>::zeroed();
     let requested = libc::STATX_BASIC_STATS | libc::STATX_MNT_ID;
     let result = unsafe {
@@ -592,7 +592,7 @@ fn identity(metadata: &libc::statx) -> Identity {
     }
 }
 
-fn open_at(
+pub(super) fn open_at(
     fd: RawFd,
     name: &CStr,
     flags: i32,
