@@ -314,6 +314,10 @@ impl TrustedBackend {
             .spawn()
             .map_err(|error| io_failure(Stage::Command, error))?;
         let process_group = child.id().map(|id| id as i32);
+        // Keep the group as an unwind-only cleanup authority. Normal trusted-host
+        // cancellation preserves the legacy self-hosted contract: it kills the
+        // foreground child, bounds pipe draining, and leaves detached descendants
+        // for the existing attempt-cleanup diagnostics.
         let mut process_group_guard = ProcessGroupGuard::new(process_group);
         let stdout = child
             .stdout
@@ -330,27 +334,23 @@ impl TrustedBackend {
         let (outcome, drain_output) = tokio::select! {
             result = child.wait() => (status_outcome(result.map_err(|error| io_failure(Stage::Command, error))?), true),
             _ = cancelled.cancelled() => {
-                terminate_process_group(process_group);
                 let _ = child.kill().await;
                 let _ = child.wait().await;
                 (CommandOutcome::Cancelled, false)
             }
             _ = manager_cancelled.cancelled() => {
                 let _reason = manager_cancelled.reason();
-                terminate_process_group(process_group);
                 let _ = child.kill().await;
                 let _ = child.wait().await;
                 (CommandOutcome::Cancelled, false)
             }
             _ = receiver_closed.cancelled() => {
                 let _reason = CancelReason::HandleDropped;
-                terminate_process_group(process_group);
                 let _ = child.kill().await;
                 let _ = child.wait().await;
                 (CommandOutcome::Cancelled, false)
             }
             _ = tokio::time::sleep(spec.timeout) => {
-                terminate_process_group(process_group);
                 let _ = child.kill().await;
                 let _ = child.wait().await;
                 (CommandOutcome::TimedOut, false)
@@ -373,7 +373,6 @@ impl TrustedBackend {
             })
             .await;
             if drained.is_err() {
-                terminate_process_group(process_group);
                 stdout_task.abort();
                 stderr_task.abort();
                 let _ = stdout_task.await;
