@@ -10,7 +10,66 @@ use chrono::Utc;
 use tempfile::TempDir;
 
 use super::*;
+use crate::config::{ExecutionConfig, ExecutionProfile};
 use crate::storage::{RootLock, RootLockError};
+
+#[test]
+fn sandboxed_profile_is_rejected_before_runtime_start() {
+    let config = ChimeraConfig {
+        execution: ExecutionConfig {
+            profile: ExecutionProfile::Sandboxed,
+            max_active_domains: NonZeroUsize::new(20).unwrap(),
+        },
+        ..Default::default()
+    };
+
+    let error = validate_execution_profile(&config).unwrap_err();
+
+    assert_eq!(
+        error.to_string(),
+        "sandboxed execution profile is not available in this build"
+    );
+}
+
+#[tokio::test]
+async fn sandboxed_run_rejects_before_daemon_owned_side_effects() {
+    let root = TempDir::new().unwrap();
+    let paths = ChimeraPaths::new(root.path().to_path_buf());
+    let root_lock = RootLock::acquire(root.path()).unwrap();
+    let daemon = Daemon {
+        paths: paths.clone(),
+        config: ChimeraConfig {
+            execution: ExecutionConfig {
+                profile: ExecutionProfile::Sandboxed,
+                max_active_domains: NonZeroUsize::new(20).unwrap(),
+            },
+            ..Default::default()
+        },
+        _root_lock: root_lock,
+    };
+    let before = std::fs::read_dir(root.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect::<Vec<_>>();
+    let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+
+    let error = daemon.run(shutdown_rx).await.unwrap_err();
+
+    assert_eq!(
+        error.to_string(),
+        "sandboxed execution profile is not available in this build"
+    );
+    assert_eq!(
+        std::fs::read_dir(root.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>(),
+        before
+    );
+    assert!(!paths.pid_file().exists());
+    assert!(!paths.job_resources_dir().exists());
+    assert!(!paths.cache_entries_dir().exists());
+}
 
 #[test]
 fn daemon_load_refuses_busy_root_before_reading_config() {

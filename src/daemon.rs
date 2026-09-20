@@ -13,7 +13,9 @@ use tracing::{Instrument, error, info, warn};
 
 use crate::cache::manager::CacheManager;
 use crate::cache::server as cache_server;
-use crate::config::{ChimeraConfig, ChimeraPaths, load_config, load_runner_credentials};
+use crate::config::{
+    ChimeraConfig, ChimeraPaths, ExecutionProfile, load_config, load_runner_credentials,
+};
 use crate::job::execution_domain::{
     ExecutionDomainCleanupFatalError, ExecutionDomainError, ExecutionDomainRoot,
 };
@@ -428,6 +430,15 @@ fn is_fatal_job_resource_error(error: &anyhow::Error) -> bool {
     poisoned || cleanup_fatal
 }
 
+fn validate_execution_profile(config: &ChimeraConfig) -> Result<()> {
+    match config.execution.profile {
+        ExecutionProfile::TrustedHost => Ok(()),
+        ExecutionProfile::Sandboxed => {
+            bail!("sandboxed execution profile is not available in this build")
+        }
+    }
+}
+
 // --- Daemon ---
 
 pub struct Daemon {
@@ -460,6 +471,8 @@ impl Daemon {
     }
 
     pub async fn run(self, mut shutdown_rx: watch::Receiver<bool>) -> Result<()> {
+        validate_execution_profile(&self.config)?;
+
         // Trusted-host keeps one slot per runner identity. The configured
         // execution limit is reserved for sandboxed admission.
         let trusted_capacity = NonZeroUsize::new(self.config.runners.len().max(1)).unwrap();

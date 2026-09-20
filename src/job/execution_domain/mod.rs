@@ -119,14 +119,15 @@ impl ExecutionDomainRoot {
         utf8_path(&canonical_path)?;
         let mut entries = fs::read_dir(&canonical_path)
             .map_err(|source| io_error("reading job resource root", &canonical_path, source))?;
-        if entries
-            .next()
-            .transpose()
-            .map_err(|source| io_error("reading job resource entry", &canonical_path, source))?
-            .is_some()
-        {
+        let stale_entries = entries.try_fold(0usize, |count, entry| {
+            entry
+                .map_err(|source| io_error("reading job resource entry", &canonical_path, source))
+                .map(|_| count + 1)
+        })?;
+        if stale_entries != 0 {
             return Err(ExecutionDomainError::StaleJobResources {
                 path: canonical_path,
+                entries: stale_entries,
             });
         }
 

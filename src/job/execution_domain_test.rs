@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::os::unix::ffi::OsStringExt;
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::PermissionsExt;
 
 use tempfile::TempDir;
@@ -481,6 +482,97 @@ fn stale_root_with_live_child_is_not_removed() {
         NonZeroUsize::new(1).unwrap(),
     )
     .unwrap();
+}
+
+fn assert_stale_journal_is_untouched(
+    root_path: &std::path::Path,
+    attempt: &std::path::Path,
+    journal: &std::path::Path,
+    expected_journal_bytes: &[u8],
+) {
+    let expected_attempt_identity = {
+        let metadata = std::fs::symlink_metadata(attempt).unwrap();
+        (metadata.dev(), metadata.ino())
+    };
+    let expected_journal_identity = {
+        let metadata = std::fs::symlink_metadata(journal).unwrap();
+        (metadata.dev(), metadata.ino())
+    };
+
+    let error = ExecutionDomainRoot::prepare(root_path, NonZeroUsize::new(1).unwrap()).unwrap_err();
+
+    match &error {
+        ExecutionDomainError::StaleJobResources { path, entries } => {
+            assert_eq!(path, &root_path);
+            assert_eq!(*entries, 1);
+        }
+        other => panic!("unexpected stale-root error: {other}"),
+    }
+    let diagnostic = error.to_string();
+    assert!(diagnostic.contains(&root_path.display().to_string()));
+    assert!(diagnostic.contains('1'));
+    assert!(!diagnostic.contains("journal-secret"));
+    assert_eq!(std::fs::read(journal).unwrap(), expected_journal_bytes);
+    let attempt_metadata = std::fs::symlink_metadata(attempt).unwrap();
+    assert_eq!(
+        (attempt_metadata.dev(), attempt_metadata.ino()),
+        expected_attempt_identity
+    );
+    let journal_metadata = std::fs::symlink_metadata(journal).unwrap();
+    assert_eq!(
+        (journal_metadata.dev(), journal_metadata.ino()),
+        expected_journal_identity
+    );
+}
+
+#[test]
+fn stale_journal_is_not_read_or_removed_during_root_prepare() {
+    let (temp, root) = prepared_root();
+    let root_path = root.path().to_path_buf();
+    let attempt = root_path.join("stale-attempt");
+    let journal = attempt.join("journal.json");
+    let body =
+        br#"{"version":1,"attempt_id":"00000000-0000-0000-0000-000000000001","state":"ready"}"#;
+    std::fs::create_dir(&attempt).unwrap();
+    std::fs::write(&journal, body).unwrap();
+
+    assert_stale_journal_is_untouched(&root_path, &attempt, &journal, body);
+    drop((root, temp));
+}
+
+#[test]
+fn stale_journal_truncation_is_not_removed_during_root_prepare() {
+    let (temp, root) = prepared_root();
+    let root_path = root.path().to_path_buf();
+    let attempt = root_path.join("stale-attempt");
+    let journal = attempt.join("journal.json");
+    let body = b"{\"version\":1,\"note\":\"journal-secret\"";
+    std::fs::create_dir(&attempt).unwrap();
+    std::fs::write(&journal, body).unwrap();
+
+    assert_stale_journal_is_untouched(&root_path, &attempt, &journal, body);
+    drop((root, temp));
+}
+
+#[test]
+fn stale_journal_symlink_is_not_followed_or_removed_during_root_prepare() {
+    let (temp, root) = prepared_root();
+    let root_path = root.path().to_path_buf();
+    let attempt = root_path.join("stale-attempt");
+    let journal = attempt.join("journal.json");
+    let target = temp.path().join("journal-target");
+    let body = b"journal-secret";
+    std::fs::create_dir(&attempt).unwrap();
+    std::fs::write(&target, body).unwrap();
+    std::os::unix::fs::symlink(&target, &journal).unwrap();
+
+    assert_stale_journal_is_untouched(&root_path, &attempt, &journal, body);
+    assert!(std::fs::symlink_metadata(&journal)
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    assert_eq!(std::fs::read(&target).unwrap(), body);
+    drop((root, temp));
 }
 
 #[test]

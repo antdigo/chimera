@@ -28,6 +28,7 @@ pub enum ExecutionDomainError {
     },
     StaleJobResources {
         path: PathBuf,
+        entries: usize,
     },
     StaleLegacyJobData {
         path: PathBuf,
@@ -94,10 +95,10 @@ impl std::fmt::Display for ExecutionDomainError {
                 formatter,
                 "{cleanup}; lifecycle quarantine failed: {quarantine}"
             ),
-            Self::StaleJobResources { path } => write!(
+            Self::StaleJobResources { path, entries } => write!(
                 formatter,
-                "stale-job-resources: resource root is not empty: {}",
-                path.display()
+                "stale-job-resources: resource root has {entries} stale entries: {}",
+                path.display(),
             ),
             Self::StaleLegacyJobData { path } => write!(
                 formatter,
