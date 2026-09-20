@@ -426,9 +426,11 @@ payloads, registry auth, Docker config и response bodies не логируют�
   capability, но не paths/sockets других modules.
 - Daemon создаёт один admission controller и один domain root, общие для runners.
 
-Новый production mode не включается частично. Несколько implementation PR могут
-быть скрыты за неактивируемым internal feature, но `profile = "sandboxed"` не
-принимается конфигурацией до прохождения полного release gate.
+Новый production mode не включается частично. `profile = "sandboxed"`
+принимается и валидируется конфигурацией, чтобы Plan A мог единообразно
+отклонить его fail-closed при старте — до подготовки domain root, cache
+listeners, runner construction или sessions. До прохождения Plans B–E и полного
+release gate S-01…S-16 этот профиль не активируется и не запускает job.
 
 ## 15. Проверка и release gate
 
