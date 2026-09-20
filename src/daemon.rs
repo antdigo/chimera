@@ -460,8 +460,10 @@ impl Daemon {
     }
 
     pub async fn run(self, mut shutdown_rx: watch::Receiver<bool>) -> Result<()> {
-        let (_pid_lock, execution_domains) =
-            prepare_daemon_root(&self.paths, self.config.execution.max_active_domains)?;
+        // Trusted-host keeps one slot per runner identity. The configured
+        // execution limit is reserved for sandboxed admission.
+        let trusted_capacity = NonZeroUsize::new(self.config.runners.len().max(1)).unwrap();
+        let (_pid_lock, execution_domains) = prepare_daemon_root(&self.paths, trusted_capacity)?;
 
         // Start cache server if configured
         let cache_config = self.config.cache.clone();

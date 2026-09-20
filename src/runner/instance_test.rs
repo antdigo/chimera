@@ -177,12 +177,11 @@ async fn setup() -> (MockServer, Arc<TokenManager>, watch::Sender<bool>) {
 fn make_runner() -> (TempDir, Runner) {
     let temp = TempDir::new().unwrap();
     let paths = ChimeraPaths::new(temp.path().to_path_buf());
-    let execution_domains =
-        crate::job::execution_domain::ExecutionDomainRoot::prepare(
-            &paths.job_resources_dir(),
-            NonZeroUsize::new(1).unwrap(),
-        )
-            .unwrap();
+    let execution_domains = crate::job::execution_domain::ExecutionDomainRoot::prepare(
+        &paths.job_resources_dir(),
+        NonZeroUsize::new(1).unwrap(),
+    )
+    .unwrap();
 
     let runner = Runner {
         name: "test-runner".into(),
@@ -268,7 +267,13 @@ async fn cancelled_job_removes_attempt_workspace_and_temp_canaries() {
 
     let (_temp, runner) = make_runner();
     cache_node_runtimes(&runner);
-    let domain = runner.execution_domains.reserve().await.unwrap().provision().unwrap();
+    let domain = runner
+        .execution_domains
+        .reserve()
+        .await
+        .unwrap()
+        .provision()
+        .unwrap();
     let workspace_canary = domain
         .work_dir()
         .join("test-runner/test-repo/test-repo/workspace-canary");
@@ -331,7 +336,13 @@ async fn cancelled_job_removes_attempt_workspace_and_temp_canaries() {
 
     let first_attempt = domain.attempt_dir().to_path_buf();
     domain.destroy().unwrap();
-    let next_attempt = runner.execution_domains.reserve().await.unwrap().provision().unwrap();
+    let next_attempt = runner
+        .execution_domains
+        .reserve()
+        .await
+        .unwrap()
+        .provision()
+        .unwrap();
     assert_ne!(next_attempt.attempt_dir(), first_attempt);
     assert!(!workspace_canary.exists());
     assert!(!temp_canary.exists());
@@ -406,6 +417,7 @@ async fn registration_failure_cleans_docker_config_without_revoking_existing_cap
             CancellationToken::new(),
             "owner/test-repo",
             &secret_masker,
+            runner.execution_domains.reserve().await.unwrap(),
         )
         .await
         .unwrap_err();
@@ -666,10 +678,91 @@ async fn poll_loop_stops_when_job_resource_root_is_poisoned() {
 }
 
 #[tokio::test]
+async fn pre_provision_failures_release_capacity_without_creating_attempts() {
+    for failure in ["parse", "ack", "manifest"] {
+        let (server, token_manager, _shutdown) = setup().await;
+        let (_temp, runner) = make_runner();
+        Mock::given(method("POST"))
+            .and(path("/acknowledge"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(if failure == "manifest" { 1 } else { 0 })
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/acquirejob"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(if failure == "manifest" { 1 } else { 0 })
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/message"))
+            .respond_with(ResponseTemplate::new(202).set_delay(Duration::from_secs(1)))
+            .mount(&server)
+            .await;
+        let message = BrokerMessage {
+            message_id: 1,
+            message_type: MessageType::RunnerJobRequest,
+            body: Some(if failure == "parse" {
+                "invalid-json".into()
+            } else {
+                serde_json::json!({
+                    "runner_request_id": "request",
+                    "run_service_url": server.uri()
+                })
+                .to_string()
+            }),
+        };
+        let broker = BrokerClient::new(
+            reqwest::Client::new(),
+            if failure == "ack" {
+                "unsupported://broker".into()
+            } else {
+                server.uri()
+            },
+            "session".into(),
+            token_manager.clone(),
+        );
+        runner
+            .handle_job_message(
+                &message,
+                &broker,
+                &reqwest::Client::new(),
+                token_manager,
+                runner.execution_domains.reserve().await.unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_dir(runner.execution_domains.path())
+                .unwrap()
+                .count(),
+            0
+        );
+        let _returned =
+            tokio::time::timeout(Duration::from_secs(1), runner.execution_domains.reserve())
+                .await
+                .expect("unused admission capacity must be released")
+                .unwrap();
+    }
+}
+
+#[tokio::test]
 async fn poisoned_runner_refuses_job_before_acknowledgement() {
     let (mock_server, token_manager, _shutdown_tx) = setup().await;
-    let (_temp, runner) = make_runner();
-    let resources = runner.execution_domains.reserve().await.unwrap().provision().unwrap();
+    let (_temp, mut runner) = make_runner();
+    runner.execution_domains = ExecutionDomainRoot::prepare(
+        runner.execution_domains.path(),
+        NonZeroUsize::new(2).unwrap(),
+    )
+    .unwrap();
+    let permit = runner.execution_domains.reserve().await.unwrap();
+    let resources = runner
+        .execution_domains
+        .reserve()
+        .await
+        .unwrap()
+        .provision()
+        .unwrap();
     let attempt_dir = resources.attempt_dir().to_path_buf();
     let workspace_canary = resources.work_dir().join("workspace-canary");
     let credential_canary = resources
@@ -714,7 +807,13 @@ async fn poisoned_runner_refuses_job_before_acknowledgement() {
     );
 
     let error = runner
-        .handle_job_message(&message, &broker, &reqwest::Client::new(), token_manager)
+        .handle_job_message(
+            &message,
+            &broker,
+            &reqwest::Client::new(),
+            token_manager,
+            permit,
+        )
         .await
         .unwrap_err();
 
@@ -994,12 +1093,11 @@ fn make_startup_runner(
 ) -> (TempDir, Runner) {
     let temp = TempDir::new().unwrap();
     let paths = ChimeraPaths::new(temp.path().to_path_buf());
-    let execution_domains =
-        crate::job::execution_domain::ExecutionDomainRoot::prepare(
-            &paths.job_resources_dir(),
-            NonZeroUsize::new(1).unwrap(),
-        )
-            .unwrap();
+    let execution_domains = crate::job::execution_domain::ExecutionDomainRoot::prepare(
+        &paths.job_resources_dir(),
+        NonZeroUsize::new(1).unwrap(),
+    )
+    .unwrap();
 
     let rsa_params =
         crate::config::private_key_to_rsa_params(&crate::testing::test_private_key()).unwrap();
@@ -1054,6 +1152,100 @@ async fn wait_for_phase(
         }
     })
     .await
+}
+
+#[tokio::test]
+async fn start_reserves_before_online_polling_and_shutdown_interrupts_admission() {
+    for release_capacity in [false, true] {
+        let (server, _token_manager, _shutdown) = setup().await;
+        Mock::given(method("POST"))
+            .and(path("/session"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "sessionId": "session"
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/message"))
+            .and(query_param("status", "Online"))
+            .respond_with(ResponseTemplate::new(202).set_delay(Duration::from_secs(1)))
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path("/session"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let state = Arc::new(DaemonState::new(&["test-runner".into()]));
+        let (_temp, runner) = make_startup_runner(
+            Some(state.clone()),
+            format!("{}/oauth2/token", server.uri()),
+            server.uri(),
+        );
+        let root = runner.execution_domains.clone();
+        let occupied = root.reserve().await.unwrap();
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let start = tokio::spawn(runner.start(shutdown_rx));
+        wait_for_phase(&state, "test-runner", RunnerPhase::Idle)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .all(|request| request.url.path() != "/message")
+        );
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+
+        if release_capacity {
+            drop(occupied);
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    if server
+                        .received_requests()
+                        .await
+                        .unwrap()
+                        .iter()
+                        .any(|request| request.url.path() == "/message")
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("released capacity must permit Online polling");
+            assert!(
+                tokio::time::timeout(Duration::from_millis(20), root.reserve())
+                    .await
+                    .is_err()
+            );
+        } else {
+            // Keep admission saturated until the runner has exited.
+            shutdown_tx.send(true).unwrap();
+            tokio::time::timeout(Duration::from_secs(2), start)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            drop(occupied);
+            continue;
+        }
+        shutdown_tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), start)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let _returned = tokio::time::timeout(Duration::from_secs(1), root.reserve())
+            .await
+            .unwrap()
+            .unwrap();
+    }
 }
 
 #[tokio::test]
@@ -1676,6 +1868,65 @@ fn job_execution_error_is_terminal_covers_both_fatal_markers() {
 }
 
 #[tokio::test]
+async fn completion_waits_for_capability_revoke_and_domain_destroy() {
+    let authority = Arc::new(CacheAuthority::new());
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/completejob"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let manifest = finish_manifest(&server.uri());
+    let scope = cache_scope_for_job(&manifest, "owner/test-repo");
+    let id = register_job_cache_capability(&authority, &manifest, scope.clone(), Utc::now())
+        .await
+        .unwrap();
+    let mut capability = JobCacheCapability::new(Arc::clone(&authority), id);
+    let client = finish_client(&server).await;
+    let (allow_destroy_tx, allow_destroy_rx) = tokio::sync::oneshot::channel();
+    let (destroy_started_tx, destroy_started_rx) = tokio::sync::oneshot::channel();
+    let destroy_authority = Arc::clone(&authority);
+    let destroy_scope = scope.clone();
+
+    let finish = tokio::spawn(async move {
+        finish_job_after_cache_revoke_and_destroy(
+            &mut capability,
+            async move {
+                assert_eq!(
+                    destroy_authority
+                        .authorize("synthetic", &destroy_scope)
+                        .await
+                        .unwrap_err(),
+                    CacheAuthError::Unauthorized,
+                );
+                destroy_started_tx.send(()).unwrap();
+                allow_destroy_rx.await.unwrap();
+                Ok(())
+            },
+            &client,
+            &manifest,
+            Ok(JobExecutionOutcome {
+                conclusion: JobConclusion::Succeeded,
+                outputs: HashMap::new(),
+            }),
+        )
+        .await
+    });
+
+    destroy_started_rx.await.unwrap();
+    assert_eq!(
+        authority.authorize("synthetic", &scope).await.unwrap_err(),
+        CacheAuthError::Unauthorized,
+    );
+    assert!(server.received_requests().await.unwrap().is_empty());
+
+    allow_destroy_tx.send(()).unwrap();
+    finish.await.unwrap().unwrap();
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+}
+
+#[tokio::test]
 async fn cache_capability_is_revoked_before_failure_is_reported() {
     let authority = Arc::new(CacheAuthority::new());
     let server = MockServer::start().await;
@@ -1689,9 +1940,14 @@ async fn cache_capability_is_revoked_before_failure_is_reported() {
     let client = finish_client(&server).await;
     let mut capability = JobCacheCapability::new(Arc::clone(&authority), id);
 
-    let result =
-        finish_job_after_cache_revoke(&mut capability, &client, &manifest, execution, cleanup)
-            .await;
+    let result = finish_job_after_cache_revoke_and_destroy(
+        &mut capability,
+        async { cleanup },
+        &client,
+        &manifest,
+        execution,
+    )
+    .await;
 
     assert!(result.is_err());
     assert_eq!(
@@ -1734,10 +1990,15 @@ async fn successful_job_reports_failed_when_docker_config_cleanup_fails() {
     });
     let mut capability = JobCacheCapability::new(Arc::clone(&authority), id);
 
-    let error =
-        finish_job_after_cache_revoke(&mut capability, &client, &manifest, execution, cleanup)
-            .await
-            .unwrap_err();
+    let error = finish_job_after_cache_revoke_and_destroy(
+        &mut capability,
+        async { cleanup },
+        &client,
+        &manifest,
+        execution,
+    )
+    .await
+    .unwrap_err();
 
     assert!(error.to_string().contains("job-resource-cleanup-fatal"));
     assert_eq!(
@@ -1794,10 +2055,15 @@ async fn execution_and_cleanup_errors_are_both_returned_without_early_completion
     });
     let mut capability = JobCacheCapability::new(Arc::clone(&authority), id);
 
-    let error =
-        finish_job_after_cache_revoke(&mut capability, &client, &manifest, execution, cleanup)
-            .await
-            .unwrap_err();
+    let error = finish_job_after_cache_revoke_and_destroy(
+        &mut capability,
+        async { cleanup },
+        &client,
+        &manifest,
+        execution,
+    )
+    .await
+    .unwrap_err();
 
     let chain = format!("{error:#}");
     assert!(chain.contains("job-execution-category"));
@@ -1845,9 +2111,15 @@ async fn cancelled_job_revokes_cache_capability_before_completion() {
     });
     let mut capability = JobCacheCapability::new(Arc::clone(&authority), id);
 
-    finish_job_after_cache_revoke(&mut capability, &client, &manifest, execution, Ok(()))
-        .await
-        .unwrap();
+    finish_job_after_cache_revoke_and_destroy(
+        &mut capability,
+        async { Ok(()) },
+        &client,
+        &manifest,
+        execution,
+    )
+    .await
+    .unwrap();
 
     assert_eq!(
         authority.authorize("synthetic", &scope).await.unwrap_err(),
@@ -1939,6 +2211,7 @@ async fn completion_failure_is_not_reported_as_a_setup_failure() {
                 "request",
                 &server.uri(),
                 CancellationToken::new(),
+                runner.execution_domains.reserve().await.unwrap(),
             )
             .await
             .is_err()

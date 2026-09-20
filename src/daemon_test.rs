@@ -442,22 +442,18 @@ fn startup_preparation_rejects_stale_job_resources_without_deleting_them() {
 }
 
 #[tokio::test]
-async fn startup_preparation_uses_configured_domain_capacity() {
+async fn startup_preparation_enforces_supplied_domain_capacity() {
     let test_root = std::env::var_os("CARGO_TARGET_DIR")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| std::path::PathBuf::from("target"));
     std::fs::create_dir_all(&test_root).unwrap();
     let temp = TempDir::new_in(test_root).unwrap();
     let paths = ChimeraPaths::new(temp.path().to_path_buf());
-    let config = crate::config::ExecutionConfig {
-        max_active_domains: NonZeroUsize::new(2).unwrap(),
-        ..Default::default()
-    };
-    let (_lock, root) = prepare_daemon_root(&paths, config.max_active_domains).unwrap();
+    let (_lock, root) = prepare_daemon_root(&paths, NonZeroUsize::new(2).unwrap()).unwrap();
     let first = root.reserve().await.unwrap();
     let second = tokio::time::timeout(Duration::from_secs(1), root.reserve())
         .await
-        .expect("configured second domain must be admitted")
+        .expect("second domain must be admitted")
         .unwrap();
     assert!(
         tokio::time::timeout(Duration::from_millis(20), root.reserve())
@@ -465,6 +461,118 @@ async fn startup_preparation_uses_configured_domain_capacity() {
             .is_err()
     );
     drop((first, second));
+}
+
+#[tokio::test]
+async fn trusted_host_admits_every_runner_despite_sandboxed_capacity_limit() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let test_root = std::env::var_os("CARGO_TARGET_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("target"));
+    std::fs::create_dir_all(&test_root).unwrap();
+    let temp = TempDir::new_in(test_root).unwrap();
+    let paths = ChimeraPaths::new(temp.path().to_path_buf());
+    let config = ChimeraConfig {
+        runners: vec!["first".into(), "second".into()],
+        execution: crate::config::ExecutionConfig {
+            max_active_domains: NonZeroUsize::new(1).unwrap(),
+            ..Default::default()
+        },
+        cache: crate::cache::config::CacheConfig {
+            cache_port: 0,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    crate::config::save_config(&paths.config_file(), &config).unwrap();
+    let rsa_params =
+        crate::config::private_key_to_rsa_params(&crate::testing::test_private_key()).unwrap();
+    let mut servers = Vec::new();
+    for name in &config.runners {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/oauth2/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "test-token", "expires_in": 7200
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/session"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "sessionId": name
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/message"))
+            .respond_with(ResponseTemplate::new(202).set_delay(Duration::from_secs(1)))
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path("/session"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        crate::config::save_runner_credentials(
+            &paths.runners_dir(),
+            name,
+            &crate::config::RunnerCredentials {
+                info: crate::config::RunnerInfo {
+                    agent_id: 1,
+                    agent_name: name.clone(),
+                    pool_id: 1,
+                    server_url: server.uri(),
+                    server_url_v2: server.uri(),
+                    git_hub_url: server.uri(),
+                    work_folder: "_work".into(),
+                    use_v2_flow: true,
+                },
+                oauth: crate::config::OAuthCredentials {
+                    scheme: "OAuth".into(),
+                    client_id: name.clone(),
+                    authorization_url: format!("{}/oauth2/token", server.uri()),
+                },
+                rsa_params: rsa_params.clone(),
+            },
+        )
+        .unwrap();
+        servers.push(server);
+    }
+    let daemon = Daemon::load(paths).unwrap();
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let run = tokio::spawn(daemon.run(shutdown_rx));
+    let both_polling = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let mut polling = 0;
+            for server in &servers {
+                if server
+                    .received_requests()
+                    .await
+                    .unwrap()
+                    .iter()
+                    .any(|request| request.url.path() == "/message")
+                {
+                    polling += 1;
+                }
+            }
+            if polling == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    shutdown_tx.send(true).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), run)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    both_polling.expect("both trusted-host runners must poll despite sandboxed capacity of one");
 }
 
 #[test]
