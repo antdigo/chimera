@@ -337,8 +337,19 @@ fn acceptance_target_requires_explicit_coherent_unix_runtime() {
             Some("unix:///run/user/1501/docker.sock"),
             Some("/run/user/1501/../1501"),
         ),
+        (
+            Some("unix:///run/user/1501/docker.sock"),
+            Some("/run/./user/1501"),
+        ),
+        (
+            Some("unix:///run/user/1501/docker.sock"),
+            Some("/run//user/1501"),
+        ),
     ] {
-        assert!(AcceptanceDockerTarget::from_values(host, runtime).is_err());
+        assert!(
+            AcceptanceDockerTarget::from_values(host, runtime).is_err(),
+            "accepted DOCKER_HOST={host:?}, XDG_RUNTIME_DIR={runtime:?}"
+        );
     }
     let target = AcceptanceDockerTarget::from_values(
         Some("unix:///run/user/1501/docker.sock"),
@@ -634,17 +645,15 @@ impl AcceptanceDockerTarget {
         let runtime_dir = runtime_dir
             .filter(|value| !value.is_empty())
             .context("XDG_RUNTIME_DIR must be set explicitly for the rootless Docker daemon")?;
-        let runtime_dir = PathBuf::from(runtime_dir);
-        if !runtime_dir.is_absolute()
-            || runtime_dir.components().any(|component| {
-                matches!(
-                    component,
-                    std::path::Component::CurDir | std::path::Component::ParentDir
-                )
-            })
+        if !runtime_dir.starts_with('/')
+            || (runtime_dir != "/"
+                && runtime_dir[1..]
+                    .split('/')
+                    .any(|component| component.is_empty() || component == "." || component == ".."))
         {
             bail!("XDG_RUNTIME_DIR must be an absolute normalized path");
         }
+        let runtime_dir = PathBuf::from(runtime_dir);
 
         let socket = docker_host
             .strip_prefix("unix://")
