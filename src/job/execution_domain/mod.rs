@@ -32,8 +32,9 @@ mod admission_test;
 
 pub use admission::DomainPermit;
 pub use contracts::{
-    AttemptIdentity, DomainEnvironment, DomainPath, DomainPaths, FailureCategory, Stage,
-    StepFilesId, StepStateSnapshot,
+    AttemptIdentity, CancelReason, CommandEvent, CommandOutcome, CommandSpec, CommandTarget,
+    DestroyReport, DomainEnvironment, DomainPath, DomainPaths, FailureCategory, Stage, StepFilesId,
+    StepStateSnapshot,
 };
 pub use docker_paths::DockerPaths;
 pub use error::{ExecutionDomainCleanupFatalError, ExecutionDomainError};

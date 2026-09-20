@@ -1,5 +1,8 @@
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::fmt;
+use std::path::PathBuf;
+use std::time::Duration;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 use uuid::Uuid;
@@ -251,6 +254,75 @@ impl<'de> Deserialize<'de> for StepFilesId {
     {
         Self::from_uuid(Uuid::deserialize(deserializer)?).map_err(D::Error::custom)
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CancelReason {
+    User,
+    Timeout,
+    Shutdown,
+    HandleDropped,
+    ProtocolFailure,
+}
+
+#[derive(Clone, Eq, PartialEq)]
+pub enum CommandTarget {
+    Trusted {
+        program: OsString,
+        args: Vec<OsString>,
+        cwd: PathBuf,
+    },
+    Sandboxed {
+        program: DomainPath,
+        args: Vec<String>,
+        cwd: DomainPath,
+    },
+}
+
+impl fmt::Debug for CommandTarget {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("CommandTarget")
+    }
+}
+
+#[derive(Clone, Eq, PartialEq)]
+pub struct CommandSpec {
+    pub target: CommandTarget,
+    pub env: HashMap<String, String>,
+    pub timeout: Duration,
+    pub state: Option<StepFilesId>,
+}
+
+impl fmt::Debug for CommandSpec {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("CommandSpec")
+    }
+}
+
+#[derive(Clone, Eq, PartialEq)]
+pub enum CommandEvent {
+    Stdout(Vec<u8>),
+    Stderr(Vec<u8>),
+}
+
+impl fmt::Debug for CommandEvent {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("CommandEvent")
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CommandOutcome {
+    Exited(i32),
+    Signalled(i32),
+    Cancelled,
+    TimedOut,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DestroyReport {
+    pub attempt: AttemptIdentity,
+    pub forced_kill: bool,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]

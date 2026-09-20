@@ -1,12 +1,18 @@
 use std::collections::HashMap;
+use std::ffi::OsString;
+use std::path::PathBuf;
+use std::time::Duration;
 
 use serde_json::json;
 use uuid::Uuid;
 
-use super::ExecutionDomainError;
 use super::contracts::{
     AttemptIdentity, DomainEnvironment, DomainPath, DomainPaths, FailureCategory, Stage,
     StepFilesId, StepStateSnapshot,
+};
+use super::{
+    CancelReason, CommandEvent, CommandOutcome, CommandSpec, CommandTarget, DestroyReport,
+    ExecutionDomainError,
 };
 
 #[test]
@@ -166,4 +172,111 @@ fn backend_error_reports_only_structured_safe_fields() {
     assert!(rendered.contains("Launch"));
     assert!(rendered.contains("Unavailable"));
     assert!(rendered.contains(&libc::EAGAIN.to_string()));
+}
+
+#[cfg(unix)]
+#[test]
+fn trusted_command_target_preserves_native_values_without_debug_leaks() {
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+    let program = OsString::from_vec(b"/opt/CANARY_PROGRAM\xff".to_vec());
+    let argument = OsString::from_vec(b"CANARY_ARGUMENT\xfe".to_vec());
+    let cwd = PathBuf::from(OsString::from_vec(b"/work/CANARY_CWD\xfd".to_vec()));
+    let target = CommandTarget::Trusted {
+        program: program.clone(),
+        args: vec![argument.clone()],
+        cwd: cwd.clone(),
+    };
+
+    assert_eq!(format!("{target:?}"), "CommandTarget");
+    match target {
+        CommandTarget::Trusted {
+            program: actual_program,
+            args,
+            cwd: actual_cwd,
+        } => {
+            assert_eq!(
+                actual_program.as_os_str().as_bytes(),
+                program.as_os_str().as_bytes()
+            );
+            assert_eq!(
+                args[0].as_os_str().as_bytes(),
+                argument.as_os_str().as_bytes()
+            );
+            assert_eq!(
+                actual_cwd.as_os_str().as_bytes(),
+                cwd.as_os_str().as_bytes()
+            );
+        }
+        CommandTarget::Sandboxed { .. } => panic!("trusted target changed variant"),
+    }
+}
+
+#[test]
+fn sandboxed_command_target_retains_validated_paths_and_utf8_arguments() {
+    let program = DomainPath::parse("/usr/bin/sh").unwrap();
+    let cwd = DomainPath::parse("/work/project").unwrap();
+    let target = CommandTarget::Sandboxed {
+        program: program.clone(),
+        args: vec!["-c".to_owned(), "printf CANARY_ARGUMENT".to_owned()],
+        cwd: cwd.clone(),
+    };
+
+    assert_eq!(format!("{target:?}"), "CommandTarget");
+    assert_eq!(
+        target,
+        CommandTarget::Sandboxed {
+            program,
+            args: vec!["-c".to_owned(), "printf CANARY_ARGUMENT".to_owned()],
+            cwd,
+        }
+    );
+}
+
+#[test]
+fn command_spec_debug_redacts_target_arguments_and_environment() {
+    let spec = CommandSpec {
+        target: CommandTarget::Sandboxed {
+            program: DomainPath::parse("/opt/CANARY_PROGRAM").unwrap(),
+            args: vec!["CANARY_ARGUMENT".to_owned()],
+            cwd: DomainPath::parse("/work").unwrap(),
+        },
+        env: HashMap::from([("TOKEN".to_owned(), "CANARY_SECRET".to_owned())]),
+        timeout: Duration::from_secs(7),
+        state: Some(StepFilesId::new()),
+    };
+
+    assert_eq!(format!("{spec:?}"), "CommandSpec");
+}
+
+#[test]
+fn command_events_redact_raw_output_while_outcomes_remain_comparable() {
+    let event = CommandEvent::Stdout(b"CANARY_SECRET".to_vec());
+
+    assert_eq!(format!("{event:?}"), "CommandEvent");
+    assert_eq!(event, CommandEvent::Stdout(b"CANARY_SECRET".to_vec()));
+    assert_ne!(event, CommandEvent::Stderr(b"CANARY_SECRET".to_vec()));
+    assert_eq!(CommandOutcome::Exited(7), CommandOutcome::Exited(7));
+    assert_eq!(CommandOutcome::Signalled(9), CommandOutcome::Signalled(9));
+    assert_ne!(CommandOutcome::Cancelled, CommandOutcome::TimedOut);
+}
+
+#[test]
+fn cancellation_and_destroy_reports_are_typed_values() {
+    let reasons = [
+        CancelReason::User,
+        CancelReason::Timeout,
+        CancelReason::Shutdown,
+        CancelReason::HandleDropped,
+        CancelReason::ProtocolFailure,
+    ];
+    assert_eq!(reasons[0], CancelReason::User);
+
+    let attempt = AttemptIdentity::from_uuid(Uuid::from_u128(19)).unwrap();
+    let report = DestroyReport {
+        attempt,
+        forced_kill: true,
+    };
+    assert_eq!(report.attempt, attempt);
+    assert!(report.forced_kill);
 }
