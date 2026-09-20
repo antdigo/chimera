@@ -3,7 +3,7 @@ use std::num::NonZeroUsize;
 
 use super::*;
 use crate::job::execute::{JobExecutionContext, JobState, StepConclusion};
-use crate::job::execution_domain::{DOCKER_CONFIG_ENV, ExecutionDomainRoot};
+use crate::job::execution_domain::{AttemptIdentity, DOCKER_CONFIG_ENV, ExecutionDomainRoot};
 use crate::job::logs::StepLogger;
 use crate::job::schema::{Step, StepReference};
 use crate::job::workspace::Workspace;
@@ -15,9 +15,13 @@ fn test_docker_config(tmp: &tempfile::TempDir) -> crate::job::execution_domain::
         NonZeroUsize::new(1).unwrap(),
     )
     .unwrap();
-    futures::executor::block_on(root.reserve())
-        .and_then(|permit| permit.provision())
-        .unwrap()
+    futures::executor::block_on(async {
+        root.reserve()
+            .await?
+            .provision(AttemptIdentity::new())
+            .await
+    })
+    .unwrap()
 }
 
 fn make_test_workspace(tmp: &tempfile::TempDir) -> Workspace {

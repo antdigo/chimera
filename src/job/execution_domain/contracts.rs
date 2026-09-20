@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
@@ -154,6 +154,34 @@ impl DomainPaths {
         }
     }
 
+    pub(crate) fn trusted(
+        work: &Path,
+        tmp: &Path,
+        attempt: &Path,
+        docker_config: &Path,
+    ) -> Result<Self, ExecutionDomainError> {
+        let parse = |path: &Path| {
+            path.to_str()
+                .ok_or(ExecutionDomainError::Backend {
+                    attempt: None,
+                    stage: Stage::Preflight,
+                    category: FailureCategory::InvalidInput,
+                    errno: None,
+                })
+                .and_then(DomainPath::parse)
+        };
+        Ok(Self {
+            work: parse(work)?,
+            tmp: parse(tmp)?,
+            home: parse(attempt)?,
+            run: parse(attempt)?,
+            docker_config: parse(docker_config)?,
+            docker_data: parse(attempt)?,
+            docker_exec: parse(attempt)?,
+            docker_socket: parse(&attempt.join("docker.sock"))?,
+        })
+    }
+
     pub(crate) fn docker_socket(&self) -> &DomainPath {
         &self.docker_socket
     }
@@ -180,6 +208,12 @@ impl DomainEnvironment {
                     format!("unix://{}", paths.docker_socket().as_str()),
                 ),
             ]),
+        }
+    }
+
+    pub(crate) fn trusted(docker_config: String) -> Self {
+        Self {
+            values: HashMap::from([("DOCKER_CONFIG".to_owned(), docker_config)]),
         }
     }
 

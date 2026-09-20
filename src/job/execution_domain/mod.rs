@@ -6,7 +6,7 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
+use tokio::sync::{Semaphore, watch};
 use uuid::Uuid;
 
 use crate::docker::endpoint::DockerEndpoint;
@@ -19,6 +19,7 @@ mod filesystem;
 mod journal;
 #[cfg(any(target_os = "linux", test))]
 mod linux;
+mod manager;
 #[cfg(any(target_os = "linux", test))]
 mod protocol;
 #[cfg(test)]
@@ -28,6 +29,11 @@ mod state_bridge;
 #[cfg(test)]
 #[path = "state_bridge_test.rs"]
 mod state_bridge_test;
+mod trusted;
+mod workspace_reader;
+
+#[cfg(test)]
+pub(crate) use trusted::validate_host_docker_capabilities;
 
 /// Dispatch reserved bootstrap modes before constructing any async runtime.
 pub fn internal_entry() -> Option<i32> {
@@ -65,6 +71,7 @@ pub use contracts::{
 pub use docker_paths::DockerPaths;
 pub use error::{ExecutionDomainCleanupFatalError, ExecutionDomainError};
 pub use state_bridge::ParsedStepState;
+pub use workspace_reader::DomainWorkspaceReader;
 
 use filesystem::{
     DirectoryIdentity, create_private_dir, directory_identity, io_error, sync_bound_directory,
@@ -118,13 +125,24 @@ pub struct ExecutionDomainRoot {
     identity: DirectoryIdentity,
     state: Arc<ExecutionDomainState>,
     admission: Arc<Semaphore>,
+    manager_tasks: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+    #[cfg(test)]
+    provision_pause: Arc<Mutex<Option<ProvisionPause>>>,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct ProvisionPause {
+    started: tokio::sync::oneshot::Sender<()>,
+    proceed: tokio::sync::oneshot::Receiver<()>,
 }
 
 #[derive(Debug)]
-pub struct ExecutionDomain {
+pub(crate) struct TrustedBackend {
     root: PathBuf,
     root_identity: DirectoryIdentity,
     state: Arc<ExecutionDomainState>,
+    #[cfg(test)]
     attempt_id: Uuid,
     attempt_dir: PathBuf,
     attempt_identity: DirectoryIdentity,
@@ -138,7 +156,35 @@ pub struct ExecutionDomain {
     work_dir_identity: DirectoryIdentity,
     destroyed: bool,
     lifecycle: DomainLifecycle,
-    admission_permit: Option<OwnedSemaphorePermit>,
+    workspace: Option<trusted::TrustedStateStore>,
+    prepared_step: Option<StepFilesId>,
+}
+
+pub struct ExecutionDomain {
+    request: Option<tokio::sync::mpsc::Sender<manager::ManagerRequest>>,
+    state: Arc<ExecutionDomainState>,
+    root: PathBuf,
+    attempt_id: AttemptIdentity,
+    docker_endpoint: DockerEndpoint,
+    docker_paths: DockerPaths,
+    docker_config_dir_env: String,
+    docker_config_file: PathBuf,
+    private_tmp: PathBuf,
+    work_dir: PathBuf,
+    attempt_dir: PathBuf,
+    paths: DomainPaths,
+    environment: DomainEnvironment,
+    workspace_reader: DomainWorkspaceReader,
+    explicit_destroy: bool,
+}
+
+impl std::fmt::Debug for ExecutionDomain {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ExecutionDomain")
+            .field("attempt_id", &self.attempt_id)
+            .finish_non_exhaustive()
+    }
 }
 
 impl ExecutionDomainRoot {
@@ -179,6 +225,9 @@ impl ExecutionDomainRoot {
             identity,
             state: Arc::new(ExecutionDomainState::new()),
             admission: Arc::new(Semaphore::new(capacity.get())),
+            manager_tasks: Arc::new(Mutex::new(Vec::new())),
+            #[cfg(test)]
+            provision_pause: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -194,6 +243,55 @@ impl ExecutionDomainRoot {
         self.state.poisoned.subscribe()
     }
 
+    pub(crate) fn register_manager(&self, handle: tokio::task::JoinHandle<()>) {
+        let mut handles = self
+            .manager_tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        handles.retain(|handle| !handle.is_finished());
+        handles.push(handle);
+    }
+
+    pub(crate) async fn drain_managers(&self) {
+        let handles = {
+            let mut handles = self
+                .manager_tasks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            std::mem::take(&mut *handles)
+        };
+        for handle in handles {
+            let _ = handle.await;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pause_after_provision_for_test(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (started, started_rx) = tokio::sync::oneshot::channel();
+        let (proceed, proceed_rx) = tokio::sync::oneshot::channel();
+        *self
+            .provision_pause
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(ProvisionPause {
+            started,
+            proceed: proceed_rx,
+        });
+        (started_rx, proceed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn take_provision_pause_for_test(&self) -> Option<ProvisionPause> {
+        self.provision_pause
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    }
+
     #[cfg(test)]
     pub(crate) fn poison_for_test(&self) {
         self.state.poison();
@@ -202,7 +300,7 @@ impl ExecutionDomainRoot {
     fn create_domain_with_id(
         &self,
         attempt_id: Uuid,
-    ) -> Result<ExecutionDomain, ExecutionDomainError> {
+    ) -> Result<TrustedBackend, ExecutionDomainError> {
         self.create_with_id_and_sync(attempt_id, File::sync_all)
     }
 
@@ -210,7 +308,7 @@ impl ExecutionDomainRoot {
         &self,
         attempt_id: Uuid,
         sync_root: F,
-    ) -> Result<ExecutionDomain, ExecutionDomainError>
+    ) -> Result<TrustedBackend, ExecutionDomainError>
     where
         F: FnOnce(&File) -> io::Result<()>,
     {
@@ -300,10 +398,11 @@ impl ExecutionDomainRoot {
         sync_bound_directory(&self.canonical_path, self.identity, sync_root)
             .inspect_err(|_| self.state.poison())?;
 
-        Ok(ExecutionDomain {
+        Ok(TrustedBackend {
             root: self.canonical_path.clone(),
             root_identity: self.identity,
             state: Arc::clone(&self.state),
+            #[cfg(test)]
             attempt_id,
             attempt_dir,
             attempt_identity,
@@ -317,12 +416,13 @@ impl ExecutionDomainRoot {
             work_dir_identity,
             destroyed: false,
             lifecycle,
-            admission_permit: None,
+            workspace: None,
+            prepared_step: None,
         })
     }
 }
 
-impl ExecutionDomain {
+impl TrustedBackend {
     pub(crate) fn mark_running(&mut self) -> Result<(), ExecutionDomainError> {
         self.lifecycle.transition(DomainState::Running)
     }
@@ -331,50 +431,52 @@ impl ExecutionDomain {
         self.lifecycle.transition(DomainState::Cleaning)
     }
 
-    pub fn docker_config_dir(&self) -> &Path {
+    #[cfg(test)]
+    pub(crate) fn docker_config_dir(&self) -> &Path {
         self.docker_paths.config_dir()
     }
-
-    pub fn docker_endpoint(&self) -> &DockerEndpoint {
+    #[cfg(test)]
+    pub(crate) fn docker_endpoint(&self) -> &DockerEndpoint {
         &self.docker_endpoint
     }
-
-    pub fn docker_paths(&self) -> &DockerPaths {
+    #[cfg(test)]
+    pub(crate) fn docker_paths(&self) -> &DockerPaths {
         &self.docker_paths
     }
-
-    pub fn config_file(&self) -> &Path {
+    #[cfg(test)]
+    pub(crate) fn config_file(&self) -> &Path {
         &self.docker_config_file
     }
-
-    pub fn private_tmp(&self) -> &Path {
+    #[cfg(test)]
+    pub(crate) fn private_tmp(&self) -> &Path {
         &self.private_tmp
     }
-
-    pub fn work_dir(&self) -> &Path {
+    #[cfg(test)]
+    pub(crate) fn work_dir(&self) -> &Path {
         &self.work_dir
     }
-
-    pub fn attempt_dir(&self) -> &Path {
+    #[cfg(test)]
+    pub(crate) fn attempt_dir(&self) -> &Path {
         &self.attempt_dir
     }
-
-    pub fn attempt_id(&self) -> Uuid {
+    #[cfg(test)]
+    pub(crate) fn attempt_id(&self) -> Uuid {
         self.attempt_id
     }
-
-    pub fn validate_override(
+    #[cfg(test)]
+    pub(crate) fn validate_override(
         &self,
         value: &str,
         source: &'static str,
     ) -> Result<(), ExecutionDomainError> {
-        if value == self.docker_config_dir_env.as_str() {
-            return Ok(());
+        if value == self.docker_config_dir_env {
+            Ok(())
+        } else {
+            Err(ExecutionDomainError::ReservedEnvironmentOverride { source })
         }
-        Err(ExecutionDomainError::ReservedEnvironmentOverride { source })
     }
-
-    pub fn insert_into_host_env(
+    #[cfg(test)]
+    pub(crate) fn insert_into_host_env(
         &self,
         env: &mut HashMap<String, String>,
         source: &'static str,
@@ -383,13 +485,18 @@ impl ExecutionDomain {
             self.validate_override(existing, source)?;
         }
         env.insert(
-            DOCKER_CONFIG_ENV.to_string(),
+            DOCKER_CONFIG_ENV.to_owned(),
             self.docker_config_dir_env.clone(),
         );
         Ok(())
     }
 
-    pub fn destroy(mut self) -> Result<(), ExecutionDomainError> {
+    #[cfg(test)]
+    fn destroy(mut self) -> Result<(), ExecutionDomainError> {
+        self.destroy_with_remover(|path| fs::remove_dir_all(path))
+    }
+
+    fn destroy_in_place(&mut self) -> Result<(), ExecutionDomainError> {
         self.destroy_with_remover(|path| fs::remove_dir_all(path))
     }
 
@@ -488,7 +595,250 @@ impl ExecutionDomain {
     }
 }
 
+impl ExecutionDomain {
+    fn sender(
+        &self,
+    ) -> Result<&tokio::sync::mpsc::Sender<manager::ManagerRequest>, ExecutionDomainError> {
+        self.request
+            .as_ref()
+            .ok_or_else(|| ExecutionDomainError::AdmissionClosed {
+                path: self.root.clone(),
+            })
+    }
+
+    pub async fn bind_workspace(
+        &self,
+        workspace: &crate::job::workspace::Workspace,
+    ) -> Result<(), ExecutionDomainError> {
+        let (reply, response) = tokio::sync::oneshot::channel();
+        self.sender()?
+            .send(manager::ManagerRequest::BindWorkspace {
+                paths: workspace.state_paths(),
+                work: workspace.workspace_dir().to_path_buf(),
+                reply,
+            })
+            .await
+            .map_err(|_| ExecutionDomainError::PoisonedRoot {
+                path: self.root.clone(),
+            })?;
+        response
+            .await
+            .map_err(|_| ExecutionDomainError::PoisonedRoot {
+                path: self.root.clone(),
+            })?
+    }
+
+    pub(crate) async fn mark_running(&self) -> Result<(), ExecutionDomainError> {
+        let (reply, response) = tokio::sync::oneshot::channel();
+        self.sender()?
+            .send(manager::ManagerRequest::MarkRunning { reply })
+            .await
+            .map_err(|_| ExecutionDomainError::PoisonedRoot {
+                path: self.root.clone(),
+            })?;
+        response
+            .await
+            .map_err(|_| ExecutionDomainError::PoisonedRoot {
+                path: self.root.clone(),
+            })?
+    }
+
+    pub(crate) async fn mark_cleaning(&self) -> Result<(), ExecutionDomainError> {
+        let (reply, response) = tokio::sync::oneshot::channel();
+        self.sender()?
+            .send(manager::ManagerRequest::MarkCleaning { reply })
+            .await
+            .map_err(|_| ExecutionDomainError::PoisonedRoot {
+                path: self.root.clone(),
+            })?;
+        response
+            .await
+            .map_err(|_| ExecutionDomainError::PoisonedRoot {
+                path: self.root.clone(),
+            })?
+    }
+
+    pub async fn run(
+        &self,
+        spec: CommandSpec,
+        output: tokio::sync::mpsc::Sender<CommandEvent>,
+        cancelled: tokio_util::sync::CancellationToken,
+    ) -> Result<CommandOutcome, ExecutionDomainError> {
+        let (reply, response) = tokio::sync::oneshot::channel();
+        self.sender()?
+            .send(manager::ManagerRequest::Run {
+                spec,
+                output,
+                cancelled,
+                reply,
+            })
+            .await
+            .map_err(|_| ExecutionDomainError::PoisonedRoot {
+                path: self.root.clone(),
+            })?;
+        response
+            .await
+            .map_err(|_| ExecutionDomainError::PoisonedRoot {
+                path: self.root.clone(),
+            })?
+    }
+
+    pub async fn prepare_step(&self, event: &[u8]) -> Result<StepFilesId, ExecutionDomainError> {
+        let (reply, response) = tokio::sync::oneshot::channel();
+        self.sender()?
+            .send(manager::ManagerRequest::PrepareStep {
+                event: event.to_vec(),
+                reply,
+            })
+            .await
+            .map_err(|_| ExecutionDomainError::PoisonedRoot {
+                path: self.root.clone(),
+            })?;
+        response
+            .await
+            .map_err(|_| ExecutionDomainError::PoisonedRoot {
+                path: self.root.clone(),
+            })?
+    }
+
+    pub async fn read_step(
+        &self,
+        id: StepFilesId,
+    ) -> Result<StepStateSnapshot, ExecutionDomainError> {
+        let (reply, response) = tokio::sync::oneshot::channel();
+        self.sender()?
+            .send(manager::ManagerRequest::ReadStep { id, reply })
+            .await
+            .map_err(|_| ExecutionDomainError::PoisonedRoot {
+                path: self.root.clone(),
+            })?;
+        response
+            .await
+            .map_err(|_| ExecutionDomainError::PoisonedRoot {
+                path: self.root.clone(),
+            })?
+    }
+
+    pub async fn cancel(&self, reason: CancelReason) -> Result<(), ExecutionDomainError> {
+        let (reply, response) = tokio::sync::oneshot::channel();
+        self.sender()?
+            .send(manager::ManagerRequest::Cancel { reason, reply })
+            .await
+            .map_err(|_| ExecutionDomainError::PoisonedRoot {
+                path: self.root.clone(),
+            })?;
+        response
+            .await
+            .map_err(|_| ExecutionDomainError::PoisonedRoot {
+                path: self.root.clone(),
+            })?
+    }
+
+    #[cfg(test)]
+    async fn panic_manager_for_test(&self) -> Result<(), ExecutionDomainError> {
+        self.sender()?
+            .send(manager::ManagerRequest::Panic)
+            .await
+            .map_err(|_| ExecutionDomainError::PoisonedRoot {
+                path: self.root.clone(),
+            })
+    }
+
+    pub async fn destroy(mut self) -> Result<DestroyReport, ExecutionDomainError> {
+        let (reply, response) = tokio::sync::oneshot::channel();
+        let sender = self
+            .request
+            .take()
+            .ok_or_else(|| ExecutionDomainError::AdmissionClosed {
+                path: self.root.clone(),
+            })?;
+        self.explicit_destroy = true;
+        sender
+            .send(manager::ManagerRequest::Destroy { reply })
+            .await
+            .map_err(|_| ExecutionDomainError::PoisonedRoot {
+                path: self.root.clone(),
+            })?;
+        drop(sender);
+        response
+            .await
+            .map_err(|_| ExecutionDomainError::PoisonedRoot {
+                path: self.root.clone(),
+            })?
+    }
+
+    pub fn paths(&self) -> &DomainPaths {
+        &self.paths
+    }
+    pub fn environment(&self) -> &DomainEnvironment {
+        &self.environment
+    }
+    pub fn workspace_reader(&self) -> DomainWorkspaceReader {
+        self.workspace_reader.clone()
+    }
+    pub fn docker_config_dir(&self) -> &Path {
+        self.docker_paths.config_dir()
+    }
+    pub fn docker_endpoint(&self) -> &DockerEndpoint {
+        &self.docker_endpoint
+    }
+    pub fn docker_paths(&self) -> &DockerPaths {
+        &self.docker_paths
+    }
+    pub fn config_file(&self) -> &Path {
+        &self.docker_config_file
+    }
+    pub fn private_tmp(&self) -> &Path {
+        &self.private_tmp
+    }
+    pub fn work_dir(&self) -> &Path {
+        &self.work_dir
+    }
+    pub fn attempt_dir(&self) -> &Path {
+        &self.attempt_dir
+    }
+    pub fn attempt_id(&self) -> Uuid {
+        self.attempt_id.uuid()
+    }
+
+    pub fn validate_override(
+        &self,
+        value: &str,
+        source: &'static str,
+    ) -> Result<(), ExecutionDomainError> {
+        if value == self.docker_config_dir_env {
+            Ok(())
+        } else {
+            Err(ExecutionDomainError::ReservedEnvironmentOverride { source })
+        }
+    }
+
+    pub fn insert_into_host_env(
+        &self,
+        env: &mut HashMap<String, String>,
+        source: &'static str,
+    ) -> Result<(), ExecutionDomainError> {
+        if let Some(existing) = env.get(DOCKER_CONFIG_ENV) {
+            self.validate_override(existing, source)?;
+        }
+        env.insert(
+            DOCKER_CONFIG_ENV.to_owned(),
+            self.docker_config_dir_env.clone(),
+        );
+        Ok(())
+    }
+}
+
 impl Drop for ExecutionDomain {
+    fn drop(&mut self) {
+        if !self.explicit_destroy {
+            self.state.poison();
+            self.request.take();
+        }
+    }
+}
+
+impl Drop for TrustedBackend {
     fn drop(&mut self) {
         if !self.destroyed {
             self.state.poison();

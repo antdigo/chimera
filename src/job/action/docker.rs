@@ -27,6 +27,7 @@ use crate::docker::output::{DockerErrorDiagnostic, DockerLogFramer, OutputProces
 use crate::docker::resources::JobDockerResources;
 use crate::job::execute::{
     JobExecutionContext, JobState, StepConclusion, StepResult, build_step_env,
+    finish_step_transaction, is_reserved_command_file_env, prepare_step_transaction,
 };
 use crate::job::execution_domain::DOCKER_CONFIG_ENV;
 use crate::job::expression::ExprContext;
@@ -53,6 +54,7 @@ pub async fn run_docker_image_action(
 
     let docker = execution.docker_client()?;
 
+    let state_id = prepare_step_transaction(execution.docker_config(), workspace).await?;
     let result = run_docker_container(RunDockerParams {
         docker: &docker,
         image,
@@ -68,9 +70,12 @@ pub async fn run_docker_image_action(
         docker_resources: execution.docker_resources(),
     })
     .await;
+    let snapshot = finish_step_transaction(execution.docker_config(), state_id, job_state).await;
+    let result = result?;
+    snapshot?;
 
     rekey_action_state(job_state, step);
-    result
+    Ok(result)
 }
 
 /// Case 2: Repo action with `runs.using: docker` — has action.yml with Docker fields.
@@ -160,6 +165,7 @@ pub(crate) async fn run_docker_metadata_action(
 
     trace_docker_metadata_action(&selected_image, entrypoint.is_some(), resolved_args.len());
 
+    let state_id = prepare_step_transaction(execution.docker_config(), workspace).await?;
     let result = run_docker_container(RunDockerParams {
         docker: &docker,
         image: selected_image.image(),
@@ -175,9 +181,12 @@ pub(crate) async fn run_docker_metadata_action(
         docker_resources: execution.docker_resources(),
     })
     .await;
+    let snapshot = finish_step_transaction(execution.docker_config(), state_id, job_state).await;
+    let result = result?;
+    snapshot?;
 
     rekey_action_state(job_state, step);
-    result
+    Ok(result)
 }
 
 // ── Env assembly ────────────────────────────────────────────────
@@ -258,7 +267,7 @@ fn build_metadata_action_env(
     let mut env = build_docker_action_env(step, job_state, workspace, base_env)?;
     let expr_ctx = ExprContext::new(&env, job_state, false, false);
     env.extend(build_action_inputs(metadata, step, &expr_ctx));
-    merge_action_env(&mut env, metadata, job_state);
+    merge_action_env(&mut env, metadata, job_state)?;
     inject_post_state(&mut env, entry_point, step, job_state);
 
     let resolved_args = resolve_args(args, &env, job_state);
@@ -352,14 +361,18 @@ fn merge_action_env(
     env: &mut HashMap<String, String>,
     metadata: &ActionMetadata,
     job_state: &JobState,
-) {
+) -> Result<()> {
     if let Some(action_env) = &metadata.runs.env {
         for (k, v) in action_env {
+            if is_reserved_command_file_env(k) {
+                anyhow::bail!("reserved workflow command-file environment variable");
+            }
             let ctx = ExprContext::new(env, job_state, false, false);
             let resolved = crate::job::expression::resolve_expression(v, &ctx);
             env.insert(k.clone(), resolved);
         }
     }
+    Ok(())
 }
 
 fn inject_post_state(

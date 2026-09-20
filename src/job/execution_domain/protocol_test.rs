@@ -216,13 +216,22 @@ fn command_wire_timeout_is_checked_and_trusted_commands_are_refused() {
     assert!(decode(&raw_frame(&serde_json::to_vec(&value).unwrap(), 1)).is_err());
     let mut frame = command(Duration::from_secs(1));
     if let Message::Request(Request::Run { spec, .. }) = &mut frame.message {
+        use std::os::unix::ffi::OsStringExt;
         spec.target = CommandTarget::Trusted {
             program: "sh".into(),
-            args: vec![],
+            args: vec![std::ffi::OsString::from_vec(b"CANARY-\xff".to_vec())],
             cwd: "/".into(),
         };
     }
-    assert!(encode(&frame).is_err());
+    let error = encode(&frame).unwrap_err();
+    assert!(matches!(
+        &error,
+        super::ExecutionDomainError::Backend {
+            category: super::FailureCategory::Protocol,
+            ..
+        }
+    ));
+    assert!(!error.to_string().contains("CANARY"));
 }
 
 #[test]

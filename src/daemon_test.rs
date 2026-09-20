@@ -523,9 +523,13 @@ fn startup_preparation_rejects_stale_job_resources_without_deleting_them() {
         NonZeroUsize::new(1).unwrap(),
     )
     .unwrap();
-    let stale = futures::executor::block_on(root.reserve())
-        .and_then(|permit| permit.provision())
-        .unwrap();
+    let stale = futures::executor::block_on(async {
+        root.reserve()
+            .await?
+            .provision(crate::job::execution_domain::AttemptIdentity::new())
+            .await
+    })
+    .unwrap();
     let stale_dir = stale.attempt_dir().to_path_buf();
 
     let error = prepare_daemon_root(&paths, NonZeroUsize::new(1).unwrap()).unwrap_err();

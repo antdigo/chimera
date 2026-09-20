@@ -550,9 +550,13 @@ fn test_docker_config(tmp: &tempfile::TempDir) -> crate::job::execution_domain::
         NonZeroUsize::new(1).unwrap(),
     )
     .unwrap();
-    futures::executor::block_on(root.reserve())
-        .and_then(|permit| permit.provision())
-        .unwrap()
+    futures::executor::block_on(async {
+        root.reserve()
+            .await?
+            .provision(crate::job::execution_domain::AttemptIdentity::new())
+            .await
+    })
+    .unwrap()
 }
 
 const DOCKER_ACTION_ENDPOINT_CHILD_CASE: &str = "CHIMERA_DOCKER_ACTION_ENDPOINT_CHILD_CASE";

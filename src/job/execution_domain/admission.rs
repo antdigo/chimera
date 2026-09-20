@@ -1,9 +1,7 @@
 use std::sync::Arc;
 
+use super::{AttemptIdentity, ExecutionDomain, ExecutionDomainError, ExecutionDomainRoot};
 use tokio::sync::OwnedSemaphorePermit;
-use uuid::Uuid;
-
-use super::{ExecutionDomain, ExecutionDomainError, ExecutionDomainRoot};
 
 /// Reserved capacity that is returned if provisioning is cancelled or fails.
 #[derive(Debug)]
@@ -13,10 +11,11 @@ pub struct DomainPermit {
 }
 
 impl DomainPermit {
-    pub fn provision(self) -> Result<ExecutionDomain, ExecutionDomainError> {
-        let mut domain = self.root.create_domain_with_id(Uuid::new_v4())?;
-        domain.admission_permit = Some(self.permit);
-        Ok(domain)
+    pub async fn provision(
+        self,
+        attempt: AttemptIdentity,
+    ) -> Result<ExecutionDomain, ExecutionDomainError> {
+        super::manager::DomainManager::spawn(self.root, self.permit, attempt).await
     }
 }
 

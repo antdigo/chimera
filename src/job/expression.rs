@@ -14,6 +14,8 @@ use parser::Parser;
 use token::tokenize;
 use value::Value;
 
+use crate::job::execution_domain::DomainWorkspaceReader;
+
 /// All data available for evaluating GitHub Actions expressions.
 pub struct ExprContext<'a> {
     pub env: &'a HashMap<String, String>,
@@ -27,6 +29,9 @@ pub struct ExprContext<'a> {
     /// GITHUB_WORKSPACE points to the container path (/github/workspace), but
     /// hashFiles runs on the host and needs the real path.
     pub workspace_path: Option<String>,
+    /// Descriptor-bound workspace capability supplied by the execution domain.
+    /// When present, hashFiles() must not construct a host path from workflow text.
+    pub workspace_reader: Option<DomainWorkspaceReader>,
 }
 
 impl<'a> ExprContext<'a> {
@@ -45,6 +50,7 @@ impl<'a> ExprContext<'a> {
             job_failed,
             job_cancelled,
             workspace_path: job_state.host_workspace.clone(),
+            workspace_reader: job_state.workspace_reader.clone(),
         }
     }
 }

@@ -270,11 +270,24 @@ pub(super) struct LaunchSpec {
     pub network: NetworkLaunch,
 }
 
-#[cfg(test)]
-pub(super) struct KernelDomain {
+pub(in crate::job::execution_domain) struct KernelDomain {
     pub control: super::super::protocol::ControlConnection,
     pub launcher: std::process::Child,
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "retained cleanup authority is consumed by Task 10"
+        )
+    )]
     pub pidfd: OwnedFd,
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "startup deadline is consumed by the private activation path"
+        )
+    )]
     pub deadline: std::time::Instant,
 }
 

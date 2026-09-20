@@ -113,10 +113,23 @@ impl std::fmt::Display for ExecutionDomainError {
                 stage,
                 category,
                 errno,
-            } => write!(
-                formatter,
-                "execution-domain-backend: attempt={attempt:?} stage={stage:?} category={category:?} errno={errno:?}"
-            ),
+            } => {
+                #[cfg(target_os = "linux")]
+                if attempt.is_none()
+                    && *stage == super::Stage::Command
+                    && *category == super::FailureCategory::Io
+                    && *errno == Some(libc::EPERM)
+                {
+                    return write!(
+                        formatter,
+                        "execution-domain-backend: trusted private user/mount namespace setup failed with EPERM; on Ubuntu 24.04 this is commonly the unprivileged-userns AppArmor restriction, while containers may also deny it through seccomp/AppArmor (see README.md#private-tmp-for-linux-host-jobs)"
+                    );
+                }
+                write!(
+                    formatter,
+                    "execution-domain-backend: attempt={attempt:?} stage={stage:?} category={category:?} errno={errno:?}"
+                )
+            }
             Self::InvalidTransition { from, to } => {
                 write!(formatter, "invalid-domain-transition: {from:?} to {to:?}")
             }

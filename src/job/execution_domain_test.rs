@@ -97,8 +97,8 @@ fn docker_endpoint_snapshot_child() {
     domain.destroy().unwrap();
 }
 
-fn admitted_domain(root: &ExecutionDomainRoot) -> Result<ExecutionDomain, ExecutionDomainError> {
-    futures::executor::block_on(root.reserve())?.provision()
+fn admitted_domain(root: &ExecutionDomainRoot) -> Result<TrustedBackend, ExecutionDomainError> {
+    root.create_domain_with_id(Uuid::new_v4())
 }
 
 fn mode(path: &std::path::Path) -> u32 {

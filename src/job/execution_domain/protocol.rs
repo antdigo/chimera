@@ -16,7 +16,6 @@ use super::{
 pub(super) const MAX_FRAME_BYTES: u32 = 1024 * 1024;
 pub(super) const OUTPUT_CHUNK_BYTES: usize = 32 * 1024;
 const HEADER_BYTES: usize = 14;
-#[cfg(test)]
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub(super) struct Frame {
@@ -459,13 +458,11 @@ impl ControlConnection {
     }
 
     // The supervisor is promoted together with its manager in Task 9.
-    #[cfg(test)]
     pub(super) fn request(&mut self, request: Request) -> Result<Response, ExecutionDomainError> {
         let deadline = Instant::now() + STARTUP_TIMEOUT;
         self.request_until(request, deadline)
     }
 
-    #[cfg(test)]
     pub(super) fn request_until(
         &mut self,
         request: Request,
@@ -657,7 +654,6 @@ impl ControlConnection {
     }
 }
 
-#[cfg(test)]
 enum ExpectedResponse {
     Bootstrap,
     Hello,
@@ -668,7 +664,6 @@ enum ExpectedResponse {
     Shutdown,
 }
 
-#[cfg(test)]
 impl ExpectedResponse {
     fn for_request(request: &Request) -> Self {
         match request {
@@ -704,7 +699,6 @@ impl ExpectedResponse {
 
 const EVENT_LIMIT: usize = 4 * 1024 * 1024;
 
-#[cfg(test)]
 pub(super) fn event_chunks(
     request_id: u64,
     id: &StepFilesId,
@@ -844,7 +838,6 @@ pub(super) fn snapshot_chunks(
     Ok(result)
 }
 
-#[cfg(test)]
 pub(super) struct SnapshotAssembler {
     request_id: u64,
     id: StepFilesId,
@@ -856,7 +849,6 @@ pub(super) struct SnapshotAssembler {
     failed: bool,
 }
 
-#[cfg(test)]
 impl SnapshotAssembler {
     pub(super) fn new(request_id: u64, id: StepFilesId) -> Self {
         Self {

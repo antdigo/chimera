@@ -226,9 +226,15 @@ fn make_runner() -> (TempDir, Runner) {
 #[test]
 fn runner_creates_workspace_inside_the_current_attempt() {
     let (_temp, runner) = make_runner();
-    let resources = futures::executor::block_on(runner.execution_domains.reserve())
-        .and_then(|permit| permit.provision())
-        .unwrap();
+    let resources = futures::executor::block_on(async {
+        runner
+            .execution_domains
+            .reserve()
+            .await?
+            .provision(AttemptIdentity::new())
+            .await
+    })
+    .unwrap();
 
     let workspace = runner
         .create_job_workspace(&resources, "owner/repo")
@@ -252,29 +258,13 @@ async fn lifecycle_transition_does_not_block_tokio_tasks_or_timers() {
         .reserve()
         .await
         .unwrap()
-        .provision()
+        .provision(AttemptIdentity::new())
+        .await
         .unwrap();
-    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
-    let (release_tx, release_rx) = std::sync::mpsc::channel();
-
-    let (transition, ()) = tokio::join!(
-        transition_execution_domain(domain, move |domain| {
-            started_tx.send(()).unwrap();
-            release_rx
-                .recv_timeout(Duration::from_secs(2))
-                .expect("Tokio task and timer must progress while the journal transition blocks");
-            domain.mark_running()
-        }),
-        async {
-            started_rx.await.unwrap();
-            tokio::time::sleep(Duration::from_millis(10)).await;
-            release_tx.send(()).unwrap();
-        },
-    );
-
-    let (domain, result) = transition.unwrap();
-    result.unwrap();
-    domain.destroy().unwrap();
+    let timer = tokio::spawn(async { tokio::time::sleep(Duration::from_millis(10)).await });
+    domain.mark_running().await.unwrap();
+    timer.await.unwrap();
+    domain.destroy().await.unwrap();
 }
 
 async fn assert_cleaning_failure_preserves_execution_outcome(
@@ -620,7 +610,8 @@ async fn cancelled_job_removes_attempt_workspace_and_temp_canaries() {
         .reserve()
         .await
         .unwrap()
-        .provision()
+        .provision(AttemptIdentity::new())
+        .await
         .unwrap();
     let workspace_canary = domain
         .work_dir()
@@ -683,13 +674,14 @@ async fn cancelled_job_removes_attempt_workspace_and_temp_canaries() {
     assert!(!temp_canary.exists());
 
     let first_attempt = domain.attempt_dir().to_path_buf();
-    domain.destroy().unwrap();
+    domain.destroy().await.unwrap();
     let next_attempt = runner
         .execution_domains
         .reserve()
         .await
         .unwrap()
-        .provision()
+        .provision(AttemptIdentity::new())
+        .await
         .unwrap();
     assert_ne!(next_attempt.attempt_dir(), first_attempt);
     assert!(!workspace_canary.exists());
@@ -704,7 +696,7 @@ async fn cancelled_job_removes_attempt_workspace_and_temp_canaries() {
             .count(),
         0
     );
-    next_attempt.destroy().unwrap();
+    next_attempt.destroy().await.unwrap();
 }
 
 #[test]
@@ -1006,13 +998,19 @@ async fn poll_loop_stops_when_job_resource_root_is_poisoned() {
     let poll = tokio::spawn(async move { runner.poll_loop(&broker, &mut rx).await });
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    let config = root.reserve().await.unwrap().provision().unwrap();
+    let config = root
+        .reserve()
+        .await
+        .unwrap()
+        .provision(AttemptIdentity::new())
+        .await
+        .unwrap();
     let attempt_dir = config.attempt_dir().to_path_buf();
     let outside = root.path().parent().unwrap().join("outside");
     std::fs::write(&outside, "outside").unwrap();
     let symlink_path = config.attempt_dir().join("unexpected-link");
     std::os::unix::fs::symlink(&outside, &symlink_path).unwrap();
-    config.destroy().unwrap_err();
+    config.destroy().await.unwrap_err();
     std::fs::remove_file(symlink_path).unwrap();
     std::fs::remove_dir_all(attempt_dir).unwrap();
 
@@ -1109,7 +1107,8 @@ async fn poisoned_runner_refuses_job_before_acknowledgement() {
         .reserve()
         .await
         .unwrap()
-        .provision()
+        .provision(AttemptIdentity::new())
+        .await
         .unwrap();
     let attempt_dir = resources.attempt_dir().to_path_buf();
     let workspace_canary = resources.work_dir().join("workspace-canary");
@@ -1128,7 +1127,7 @@ async fn poisoned_runner_refuses_job_before_acknowledgement() {
     let symlink_path = resources.attempt_dir().join("unexpected-link");
     std::os::unix::fs::symlink(&outside, &symlink_path).unwrap();
 
-    resources.destroy().unwrap_err();
+    resources.destroy().await.unwrap_err();
 
     assert_eq!(
         std::fs::read_to_string(&workspace_canary).unwrap(),

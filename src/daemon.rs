@@ -634,6 +634,19 @@ impl Daemon {
             }
         }
 
+        if tokio::time::timeout(
+            Duration::from_secs(shutdown_timeout),
+            execution_domains.drain_managers(),
+        )
+        .await
+        .is_err()
+        {
+            warn!(
+                timeout_secs = shutdown_timeout,
+                "shutdown timeout exceeded while draining execution-domain managers"
+            );
+        }
+
         // Stop state writer
         writer_handle.abort();
         let _ = writer_handle.await;

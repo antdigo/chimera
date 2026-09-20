@@ -3,6 +3,7 @@ mod common;
 use std::collections::HashMap;
 
 use chimera::job::client::JobConclusion;
+use chimera::job::execution_domain::AttemptIdentity;
 use common::*;
 use wiremock::matchers::{body_json, method, path};
 use wiremock::{Mock, ResponseTemplate};
@@ -671,7 +672,8 @@ async fn cancel_token_cancels_job() {
         .reserve()
         .await
         .unwrap()
-        .provision()
+        .provision(AttemptIdentity::new())
+        .await
         .unwrap();
     let base_env =
         chimera::runner::env::build_base_env(&manifest, &env.workspace, "test-runner", &domain)
@@ -701,7 +703,7 @@ async fn cancel_token_cancels_job() {
         None,
     )
     .await;
-    domain.destroy().unwrap();
+    domain.destroy().await.unwrap();
 
     let (conclusion, _) = result.unwrap();
     assert_eq!(conclusion, JobConclusion::Cancelled);

@@ -1,4 +1,7 @@
 use std::collections::HashMap;
+use std::fs::OpenOptions;
+use std::io::Read;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -16,7 +19,27 @@ pub struct Workspace {
     event_file: PathBuf,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct WorkspaceStatePaths {
+    pub(crate) env: PathBuf,
+    pub(crate) path: PathBuf,
+    pub(crate) output: PathBuf,
+    pub(crate) state: PathBuf,
+    pub(crate) summary: PathBuf,
+    pub(crate) event: PathBuf,
+}
+
 impl Workspace {
+    pub(crate) fn state_paths(&self) -> WorkspaceStatePaths {
+        WorkspaceStatePaths {
+            env: self.env_file.clone(),
+            path: self.path_file.clone(),
+            output: self.output_file.clone(),
+            state: self.state_file.clone(),
+            summary: self.step_summary_file.clone(),
+            event: self.event_file.clone(),
+        }
+    }
     pub fn create(
         work_dir: &Path,
         tmp_dir: &Path,
@@ -129,6 +152,44 @@ impl Workspace {
 
     pub fn event_file(&self) -> &Path {
         &self.event_file
+    }
+
+    /// Read the runner-owned event payload without following a replaced name
+    /// or blocking on a workflow-created FIFO.
+    pub(crate) fn read_event_file_bounded(&self) -> Result<Vec<u8>> {
+        const EVENT_LIMIT: u64 = 4 * 1024 * 1024;
+        let mut file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(&self.event_file)
+            .with_context(|| format!("opening event file {}", self.event_file.display()))?;
+        let before = file
+            .metadata()
+            .with_context(|| format!("inspecting event file {}", self.event_file.display()))?;
+        if !before.is_file() || before.nlink() != 1 || before.len() > EVENT_LIMIT {
+            anyhow::bail!("unsafe or oversized runner-owned event file");
+        }
+        let mut bytes = Vec::with_capacity(before.len() as usize);
+        file.by_ref()
+            .take(EVENT_LIMIT + 1)
+            .read_to_end(&mut bytes)
+            .with_context(|| format!("reading event file {}", self.event_file.display()))?;
+        let after = file
+            .metadata()
+            .with_context(|| format!("rechecking event file {}", self.event_file.display()))?;
+        if bytes.len() as u64 > EVENT_LIMIT
+            || after.len() > EVENT_LIMIT
+            || before.dev() != after.dev()
+            || before.ino() != after.ino()
+            || before.len() != after.len()
+            || before.mtime() != after.mtime()
+            || before.mtime_nsec() != after.mtime_nsec()
+            || before.ctime() != after.ctime()
+            || before.ctime_nsec() != after.ctime_nsec()
+        {
+            anyhow::bail!("runner-owned event file changed while reading");
+        }
+        Ok(bytes)
     }
 
     /// Write the GitHub event payload JSON to the event file.

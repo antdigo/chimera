@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::future::Future;
+#[cfg(test)]
 use std::io;
 use std::panic::{AssertUnwindSafe, resume_unwind};
 use std::sync::Arc;
@@ -25,8 +26,8 @@ use crate::job::action::ActionCache;
 use crate::job::client::JobConclusion;
 use crate::job::execute::{JobExecutionContext, run_all_steps_with_masker};
 use crate::job::execution_domain::{
-    DomainPermit, ExecutionDomain, ExecutionDomainCleanupFatalError, ExecutionDomainError,
-    ExecutionDomainRoot,
+    AttemptIdentity, DomainPermit, ExecutionDomain, ExecutionDomainCleanupFatalError,
+    ExecutionDomainError, ExecutionDomainRoot,
 };
 use crate::job::live_feed::LiveFeed;
 use crate::job::schema::JobManifest;
@@ -204,26 +205,6 @@ where
             resume_unwind(panic)
         }
     }
-}
-
-async fn transition_execution_domain<F>(
-    mut domain: ExecutionDomain,
-    transition: F,
-) -> Result<(
-    ExecutionDomain,
-    std::result::Result<(), ExecutionDomainError>,
-)>
-where
-    F: FnOnce(&mut ExecutionDomain) -> std::result::Result<(), ExecutionDomainError>
-        + Send
-        + 'static,
-{
-    tokio::task::spawn_blocking(move || {
-        let result = transition(&mut domain);
-        (domain, result)
-    })
-    .await
-    .context("joining execution domain lifecycle task")
 }
 
 async fn finish_job(
@@ -677,9 +658,9 @@ impl Runner {
         permit: DomainPermit,
     ) -> Result<()> {
         let cache_scope = cache_scope_for_job(manifest, repo);
-        let domain = tokio::task::spawn_blocking(move || permit.provision())
+        let domain = permit
+            .provision(AttemptIdentity::new())
             .await
-            .context("joining execution domain provisioning task")?
             .context("provisioning execution domain")?;
         let attempt_id = domain.attempt_id();
         info!(%attempt_id, "created job Docker config");
@@ -694,17 +675,7 @@ impl Runner {
         {
             Ok(capability_id) => capability_id,
             Err(registration_error) => {
-                let cleanup_path = domain.attempt_dir().to_path_buf();
-                let cleanup_result = tokio::task::spawn_blocking(move || domain.destroy())
-                    .await
-                    .unwrap_or_else(|source| {
-                        Err(ExecutionDomainError::Cleanup {
-                            path: cleanup_path,
-                            source: io::Error::other(format!(
-                                "per-job resource cleanup task failed: {source}"
-                            )),
-                        })
-                    });
+                let cleanup_result = domain.destroy().await.map(|_| ());
                 match &cleanup_result {
                     Ok(()) => info!(%attempt_id, "cleaned job Docker config"),
                     Err(cleanup_error) => {
@@ -732,8 +703,7 @@ impl Runner {
         let mut cache_capability =
             JobCacheCapability::new(Arc::clone(&self.cache_authority), capability_id);
 
-        let (domain, running_result) =
-            transition_execution_domain(domain, ExecutionDomain::mark_running).await?;
+        let running_result = domain.mark_running().await;
         let entered_running = running_result.is_ok();
         let execution_result = run_with_cache_capability(&mut cache_capability, async {
             running_result.context("marking execution domain running")?;
@@ -753,23 +723,13 @@ impl Runner {
         // A body that started always reaches Cleaning, including setup failures
         // and cancellation. A failed Running transition goes directly to destroy.
         // Keep lifecycle failure separate so it cannot replace the body's outcome.
-        let (domain, cleaning_result) = if entered_running {
-            transition_execution_domain(domain, ExecutionDomain::mark_cleaning).await?
+        let cleaning_result = if entered_running {
+            domain.mark_cleaning().await
         } else {
-            (domain, Ok(()))
+            Ok(())
         };
         let destroy = async move {
-            let destroy_path = domain.attempt_dir().to_path_buf();
-            let cleanup_result = tokio::task::spawn_blocking(move || domain.destroy())
-                .await
-                .unwrap_or_else(|source| {
-                    Err(ExecutionDomainError::Cleanup {
-                        path: destroy_path,
-                        source: io::Error::other(format!(
-                            "execution domain destroy task failed: {source}"
-                        )),
-                    })
-                });
+            let cleanup_result = domain.destroy().await.map(|_| ());
             match &cleanup_result {
                 Ok(()) => info!(%attempt_id, "cleaned job Docker config"),
                 Err(cleanup_error) => {
@@ -823,6 +783,10 @@ impl Runner {
         secret_masker: &SharedSecretMasker,
     ) -> Result<JobExecutionOutcome> {
         let workspace = self.create_job_workspace(domain, repo)?;
+        domain
+            .bind_workspace(&workspace)
+            .await
+            .context("binding workspace to execution domain")?;
         let mut docker_resources = None;
 
         let execution_result = async {

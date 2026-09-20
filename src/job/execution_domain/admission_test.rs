@@ -1,7 +1,7 @@
 use std::num::NonZeroUsize;
 use std::time::Duration;
 
-use super::{ExecutionDomainError, ExecutionDomainRoot};
+use super::{AttemptIdentity, ExecutionDomainError, ExecutionDomainRoot};
 
 fn prepared_root_with_capacity(temp: &tempfile::TempDir, capacity: usize) -> ExecutionDomainRoot {
     ExecutionDomainRoot::prepare(
@@ -15,7 +15,13 @@ fn prepared_root_with_capacity(temp: &tempfile::TempDir, capacity: usize) -> Exe
 async fn second_reservation_waits_until_first_domain_is_destroyed() {
     let temp = tempfile::tempdir().unwrap();
     let root = prepared_root_with_capacity(&temp, 1);
-    let first = root.reserve().await.unwrap().provision().unwrap();
+    let first = root
+        .reserve()
+        .await
+        .unwrap()
+        .provision(AttemptIdentity::new())
+        .await
+        .unwrap();
     let mut waiting = Box::pin(root.reserve());
 
     assert!(
@@ -23,7 +29,7 @@ async fn second_reservation_waits_until_first_domain_is_destroyed() {
             .await
             .is_err()
     );
-    first.destroy().unwrap();
+    first.destroy().await.unwrap();
     tokio::time::timeout(Duration::from_secs(1), waiting)
         .await
         .unwrap()
@@ -72,7 +78,13 @@ async fn poisoning_wakes_blocked_waiter() {
 async fn dropping_undestroyed_domain_poisons_root() {
     let temp = tempfile::tempdir().unwrap();
     let root = prepared_root_with_capacity(&temp, 1);
-    let domain = root.reserve().await.unwrap().provision().unwrap();
+    let domain = root
+        .reserve()
+        .await
+        .unwrap()
+        .provision(AttemptIdentity::new())
+        .await
+        .unwrap();
     let attempt = domain.attempt_dir().to_path_buf();
     drop(domain);
     let error = root.reserve().await.unwrap_err();
@@ -109,7 +121,7 @@ async fn reservation_cannot_provision_after_root_is_poisoned() {
     let held = root.reserve().await.unwrap();
     root.poison_for_test();
     assert!(matches!(
-        held.provision(),
+        held.provision(AttemptIdentity::new()).await,
         Err(ExecutionDomainError::PoisonedRoot { .. })
     ));
     assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);

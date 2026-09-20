@@ -8,7 +8,7 @@ use crate::github::auth::TokenManager;
 use crate::job::action::ActionCache;
 use crate::job::client::JobConclusion;
 use crate::job::execution_domain::{
-    DOCKER_CONFIG_ENV, ExecutionDomain, ExecutionDomainError, ExecutionDomainRoot,
+    AttemptIdentity, DOCKER_CONFIG_ENV, ExecutionDomain, ExecutionDomainError, ExecutionDomainRoot,
 };
 use crate::job::schema::{StepReference, StepReferenceKind};
 use tokio_util::sync::CancellationToken;
@@ -203,10 +203,24 @@ fn test_docker_config() -> (tempfile::TempDir, ExecutionDomain) {
         NonZeroUsize::new(1).unwrap(),
     )
     .unwrap();
-    let config = futures::executor::block_on(root.reserve())
-        .and_then(|permit| permit.provision())
-        .unwrap();
+    let config = futures::executor::block_on(async {
+        root.reserve()
+            .await?
+            .provision(AttemptIdentity::new())
+            .await
+    })
+    .unwrap();
     (temp, config)
+}
+
+fn provision_test_domain(root: &ExecutionDomainRoot) -> ExecutionDomain {
+    futures::executor::block_on(async {
+        root.reserve()
+            .await?
+            .provision(AttemptIdentity::new())
+            .await
+    })
+    .unwrap()
 }
 
 const DOCKER_CONTEXT_CHILD_CASE: &str = "CHIMERA_DOCKER_CONTEXT_CHILD_CASE";
@@ -363,6 +377,26 @@ fn step_environment_cannot_override_docker_config() {
 }
 
 #[test]
+fn step_environment_cannot_override_runner_command_files() {
+    let (_temp, workspace) = test_workspace();
+    let (_resources, config) = test_docker_config();
+    let state = test_job_state();
+    let base = host_base_env(&config);
+
+    for key in [
+        "GITHUB_ENV",
+        "GITHUB_PATH",
+        "GITHUB_OUTPUT",
+        "GITHUB_STATE",
+        "GITHUB_STEP_SUMMARY",
+        "GITHUB_EVENT_PATH",
+    ] {
+        let step = step_with_environment(key, "/tmp/attacker");
+        assert!(build_step_env(&step, &state, &workspace, &base, Some(&config)).is_err());
+    }
+}
+
+#[test]
 fn job_environment_cannot_override_docker_config() {
     let (_temp, workspace) = test_workspace();
     let (_resources, config) = test_docker_config();
@@ -382,21 +416,17 @@ fn job_environment_cannot_override_docker_config() {
     ));
 }
 
-#[test]
-fn github_env_cannot_override_docker_config() {
+#[tokio::test]
+async fn github_env_cannot_override_docker_config() {
     let (_temp, workspace) = test_workspace();
     let (_resources, config) = test_docker_config();
+    config.bind_workspace(&workspace).await.unwrap();
+    let state_id = config.prepare_step(b"{}").await.unwrap();
     std::fs::write(workspace.env_file(), "DOCKER_CONFIG=/shared/.docker\n").unwrap();
-    let base = host_base_env(&config);
-
-    let error = build_step_env(
-        &test_step(),
-        &test_job_state(),
-        &workspace,
-        &base,
-        Some(&config),
-    )
-    .unwrap_err();
+    let mut state = test_job_state();
+    let error = finish_step_transaction(&config, state_id, &mut state)
+        .await
+        .unwrap_err();
 
     assert!(matches!(
         error.downcast_ref::<ExecutionDomainError>(),
@@ -404,6 +434,37 @@ fn github_env_cannot_override_docker_config() {
             source: "GITHUB_ENV"
         })
     ));
+}
+
+#[tokio::test]
+async fn failed_spawn_still_closes_the_step_transaction() {
+    let (_temp, workspace) = test_workspace();
+    let (_resources, config) = test_docker_config();
+    let mut state = test_job_state();
+    let env = host_base_env(&config);
+    let (log_tx, _log_rx) = tokio::sync::mpsc::channel(8);
+    let log_sender = LogSender::new_for_test(
+        log_tx,
+        crate::job::secret_masker::shared_masker_for_test(&[]),
+    );
+
+    let result = run_process(
+        OsStr::new("/definitely-missing-chimera-command"),
+        &[],
+        &env,
+        workspace.workspace_dir(),
+        &workspace,
+        &config,
+        &mut state,
+        &log_sender,
+        Duration::from_secs(1),
+        &CancellationToken::new(),
+    )
+    .await;
+    assert!(result.is_err());
+
+    let next = config.prepare_step(b"{}").await.unwrap();
+    config.read_step(next).await.unwrap();
 }
 
 #[test]
@@ -1019,9 +1080,13 @@ fn host_command_rejects_default_docker_credential_helpers_on_effective_path() {
             NonZeroUsize::new(1).unwrap(),
         )
         .unwrap();
-        let config = futures::executor::block_on(root.reserve())
-            .and_then(|permit| permit.provision())
-            .unwrap();
+        let config = futures::executor::block_on(async {
+            root.reserve()
+                .await?
+                .provision(AttemptIdentity::new())
+                .await
+        })
+        .unwrap();
         let bin = temp.path().join("bin");
         std::fs::create_dir(&bin).unwrap();
         write_executable(&bin.join(helper));
@@ -1043,9 +1108,7 @@ fn host_command_allows_non_executable_default_credential_helper() {
         NonZeroUsize::new(1).unwrap(),
     )
     .unwrap();
-    let config = futures::executor::block_on(root.reserve())
-        .and_then(|permit| permit.provision())
-        .unwrap();
+    let config = provision_test_domain(&root);
     let bin = temp.path().join("bin");
     std::fs::create_dir(&bin).unwrap();
     let helper = bin.join("docker-credential-pass");
@@ -1093,9 +1156,7 @@ fn host_command_path_precedence_child() {
         NonZeroUsize::new(1).unwrap(),
     )
     .unwrap();
-    let config = futures::executor::block_on(root.reserve())
-        .and_then(|permit| permit.provision())
-        .unwrap();
+    let config = provision_test_domain(&root);
     let mut explicit = host_base_env(&config);
     explicit.insert("PATH".into(), safe_dir.to_string_lossy().into_owned());
 
@@ -1114,9 +1175,7 @@ fn host_command_rejects_missing_runner_owned_docker_config() {
         NonZeroUsize::new(1).unwrap(),
     )
     .unwrap();
-    let config = futures::executor::block_on(root.reserve())
-        .and_then(|permit| permit.provision())
-        .unwrap();
+    let config = provision_test_domain(&root);
 
     let error =
         host_command("/usr/bin/true", &[], &HashMap::new(), temp.path(), &config).unwrap_err();
@@ -1136,9 +1195,7 @@ fn host_command_explicitly_overrides_inherited_docker_config() {
         NonZeroUsize::new(1).unwrap(),
     )
     .unwrap();
-    let config = futures::executor::block_on(root.reserve())
-        .and_then(|permit| permit.provision())
-        .unwrap();
+    let config = provision_test_domain(&root);
     let env = host_base_env(&config);
 
     let command = host_command("/usr/bin/true", &[], &env, temp.path(), &config).unwrap();
@@ -1165,9 +1222,7 @@ fn host_command_rejects_credential_helper_from_private_tmp_path() {
         NonZeroUsize::new(1).unwrap(),
     )
     .unwrap();
-    let config = futures::executor::block_on(root.reserve())
-        .and_then(|permit| permit.provision())
-        .unwrap();
+    let config = provision_test_domain(&root);
     let directory_name = format!("chimera-helper-{}", uuid::Uuid::new_v4().simple());
     let private_bin = config.private_tmp().join(&directory_name);
     std::fs::create_dir(&private_bin).unwrap();
@@ -1198,9 +1253,7 @@ fn host_command_rejects_credential_helper_from_relative_private_tmp_path() {
         NonZeroUsize::new(1).unwrap(),
     )
     .unwrap();
-    let config = futures::executor::block_on(root.reserve())
-        .and_then(|permit| permit.provision())
-        .unwrap();
+    let config = provision_test_domain(&root);
     let directory_name = format!("chimera-helper-{}", uuid::Uuid::new_v4().simple());
     let private_bin = config.private_tmp().join(&directory_name);
     std::fs::create_dir(&private_bin).unwrap();
@@ -1232,9 +1285,7 @@ fn host_command_rejects_credential_helper_through_symlink_into_private_tmp() {
         NonZeroUsize::new(1).unwrap(),
     )
     .unwrap();
-    let config = futures::executor::block_on(root.reserve())
-        .and_then(|permit| permit.provision())
-        .unwrap();
+    let config = provision_test_domain(&root);
     let directory_name = format!("chimera-helper-{}", uuid::Uuid::new_v4().simple());
     let private_bin = config.private_tmp().join(&directory_name);
     std::fs::create_dir(&private_bin).unwrap();
@@ -1267,9 +1318,7 @@ fn host_command_rejects_credential_helper_through_symlink_within_private_tmp() {
         NonZeroUsize::new(1).unwrap(),
     )
     .unwrap();
-    let config = futures::executor::block_on(root.reserve())
-        .and_then(|permit| permit.provision())
-        .unwrap();
+    let config = provision_test_domain(&root);
     let real_name = format!("chimera-helper-real-{}", uuid::Uuid::new_v4().simple());
     let link_name = format!("chimera-helper-link-{}", uuid::Uuid::new_v4().simple());
     let private_bin = config.private_tmp().join(&real_name);
@@ -1306,9 +1355,7 @@ fn host_command_skips_inaccessible_path_entry() {
         NonZeroUsize::new(1).unwrap(),
     )
     .unwrap();
-    let config = futures::executor::block_on(root.reserve())
-        .and_then(|permit| permit.provision())
-        .unwrap();
+    let config = provision_test_domain(&root);
     let inaccessible = temp.path().join("inaccessible");
     std::fs::create_dir(&inaccessible).unwrap();
     std::fs::set_permissions(&inaccessible, std::fs::Permissions::from_mode(0o000)).unwrap();
@@ -1337,9 +1384,7 @@ fn host_command_resets_symlink_budget_after_working_directory_lookup() {
         NonZeroUsize::new(1).unwrap(),
     )
     .unwrap();
-    let config = futures::executor::block_on(root.reserve())
-        .and_then(|permit| permit.provision())
-        .unwrap();
+    let config = provision_test_domain(&root);
     let final_directory = temp.path().join("resolved-working-directory");
     let real_bin = final_directory.join("real-bin");
     std::fs::create_dir_all(&real_bin).unwrap();
@@ -1437,7 +1482,13 @@ async fn concurrent_webhook_flows_get_private_absolute_tmp() {
     );
     let mut runs = Vec::new();
     for index in 0..JOBS {
-        let config = root.reserve().await.unwrap().provision().unwrap();
+        let config = root
+            .reserve()
+            .await
+            .unwrap()
+            .provision(AttemptIdentity::new())
+            .await
+            .unwrap();
         let workspace_root = temp.path().join(format!("workspace-{index}"));
         let workspace = Workspace::create(
             &workspace_root.join("work"),
@@ -1553,7 +1604,7 @@ async fn concurrent_webhook_flows_get_private_absolute_tmp() {
             config.private_tmp().display()
         );
         let attempt_dir = config.attempt_dir().to_path_buf();
-        config.destroy().unwrap();
+        config.destroy().await.unwrap();
         assert!(!attempt_dir.exists(), "job {index} cleanup");
     }
 
@@ -1580,8 +1631,8 @@ async fn concurrent_webhook_flows_get_private_absolute_tmp() {
 }
 
 #[cfg(target_os = "linux")]
-#[test]
-fn host_command_fails_closed_when_private_tmp_is_missing() {
+#[tokio::test]
+async fn host_command_fails_closed_when_private_tmp_is_missing() {
     let test_root = std::env::var_os("CARGO_TARGET_DIR")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| std::path::PathBuf::from("target"));
@@ -1592,9 +1643,7 @@ fn host_command_fails_closed_when_private_tmp_is_missing() {
         NonZeroUsize::new(1).unwrap(),
     )
     .unwrap();
-    let config = futures::executor::block_on(root.reserve())
-        .and_then(|permit| permit.provision())
-        .unwrap();
+    let config = provision_test_domain(&root);
     let sentinel = temp.path().join("command-ran");
     let script = format!("touch '{}'", sentinel.display());
     let env = host_base_env(&config);
@@ -1612,14 +1661,19 @@ fn host_command_fails_closed_when_private_tmp_is_missing() {
 
     assert_eq!(error.raw_os_error(), Some(libc::ENOENT));
     assert!(!sentinel.exists());
-    config.destroy().unwrap();
+    config.destroy().await.unwrap();
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn host_spawn_error_explains_denied_private_namespace_setup() {
-    let source = std::io::Error::from_raw_os_error(libc::EPERM);
-
-    let context = host_spawn_error_context("/opt/chimera/externals/node", &source, true);
+    let context = ExecutionDomainError::Backend {
+        attempt: None,
+        stage: crate::job::execution_domain::Stage::Command,
+        category: crate::job::execution_domain::FailureCategory::Io,
+        errno: Some(libc::EPERM),
+    }
+    .to_string();
 
     assert!(
         context.contains("private user/mount namespace setup"),
@@ -1644,7 +1698,13 @@ async fn private_tmp_mount_precedes_working_directory_lookup() {
         NonZeroUsize::new(1).unwrap(),
     )
     .unwrap();
-    let config = root.reserve().await.unwrap().provision().unwrap();
+    let config = root
+        .reserve()
+        .await
+        .unwrap()
+        .provision(AttemptIdentity::new())
+        .await
+        .unwrap();
     let env = host_base_env(&config);
     let directory_name = format!("chimera-cwd-{}", uuid::Uuid::new_v4().simple());
     let private_working_directory = std::path::PathBuf::from("/tmp").join(&directory_name);
@@ -1691,7 +1751,7 @@ async fn private_tmp_mount_precedes_working_directory_lookup() {
         .unwrap(),
         "private"
     );
-    config.destroy().unwrap();
+    config.destroy().await.unwrap();
 }
 
 #[cfg(target_os = "linux")]
@@ -1707,7 +1767,13 @@ async fn working_directory_tmp_does_not_write_to_host_tmp() {
         NonZeroUsize::new(1).unwrap(),
     )
     .unwrap();
-    let config = root.reserve().await.unwrap().provision().unwrap();
+    let config = root
+        .reserve()
+        .await
+        .unwrap()
+        .provision(AttemptIdentity::new())
+        .await
+        .unwrap();
     let env = host_base_env(&config);
     let file_name = format!("chimera-cwd-{}", uuid::Uuid::new_v4().simple());
     let host_path = std::path::Path::new("/tmp").join(&file_name);
@@ -1733,7 +1799,7 @@ async fn working_directory_tmp_does_not_write_to_host_tmp() {
     assert!(status.success());
     assert!(!host_file_existed, "relative write escaped to host /tmp");
     assert_eq!(std::fs::read_to_string(private_path).unwrap(), "private");
-    config.destroy().unwrap();
+    config.destroy().await.unwrap();
 }
 
 #[test]
@@ -1768,7 +1834,13 @@ async fn host_command_inheritance_child() {
         NonZeroUsize::new(1).unwrap(),
     )
     .unwrap();
-    let config = root.reserve().await.unwrap().provision().unwrap();
+    let config = root
+        .reserve()
+        .await
+        .unwrap()
+        .provision(AttemptIdentity::new())
+        .await
+        .unwrap();
     let job_config = config.docker_config_dir().to_path_buf();
     let env = HashMap::from([(
         DOCKER_CONFIG_ENV.to_string(),

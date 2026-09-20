@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Context, Result, bail};
 use chimera::docker::endpoint::DockerEndpoint;
 use chimera::job::client::JobConclusion;
-use chimera::job::execution_domain::ExecutionDomainRoot;
+use chimera::job::execution_domain::{AttemptIdentity, ExecutionDomainRoot};
 use chimera::job::schema::JobManifest;
 use common::docker_registry::*;
 use common::pinned_action::*;
@@ -976,7 +976,13 @@ async fn docker_cli_atomic_rewrite_stays_private() {
         NonZeroUsize::new(1).unwrap(),
     )
     .unwrap();
-    let config = root.reserve().await.unwrap().provision().unwrap();
+    let config = root
+        .reserve()
+        .await
+        .unwrap()
+        .provision(AttemptIdentity::new())
+        .await
+        .unwrap();
     let attempt = config.attempt_dir().to_path_buf();
 
     docker_output(
@@ -1028,7 +1034,7 @@ async fn docker_cli_atomic_rewrite_stays_private() {
     .unwrap();
     assert!(attempt.exists());
 
-    config.destroy().unwrap();
+    config.destroy().await.unwrap();
     assert!(!attempt.exists());
 }
 
