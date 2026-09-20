@@ -15,9 +15,52 @@ use super::{ExecutionDomainError, FailureCategory, Stage};
 
 const MAX_HASH_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_HASH_TIME: Duration = Duration::from_secs(30);
+const MAX_TRAVERSAL_DEPTH: usize = 128;
+const MAX_TRAVERSAL_ENTRIES: usize = 1_000_000;
+const MAX_RELATIVE_PATH_BYTES: usize = 256 * 1024 * 1024;
+const MAX_MATCHES: usize = 100_000;
 const DIRECTORY_FLAGS: i32 =
     libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW;
 const READ_FLAGS: i32 = libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK;
+
+#[derive(Clone, Copy, Debug)]
+struct ReadLimits {
+    max_hash_bytes: u64,
+    max_time: Duration,
+    max_depth: usize,
+    max_entries: usize,
+    max_path_bytes: usize,
+    max_matches: usize,
+}
+
+impl Default for ReadLimits {
+    fn default() -> Self {
+        Self {
+            max_hash_bytes: MAX_HASH_BYTES,
+            max_time: MAX_HASH_TIME,
+            max_depth: MAX_TRAVERSAL_DEPTH,
+            max_entries: MAX_TRAVERSAL_ENTRIES,
+            max_path_bytes: MAX_RELATIVE_PATH_BYTES,
+            max_matches: MAX_MATCHES,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct TraversalBudget {
+    entries: usize,
+    path_bytes: usize,
+    matches: usize,
+}
+
+struct Traversal<'a> {
+    root_device: u64,
+    patterns: &'a [glob::Pattern],
+    matched: &'a mut BTreeSet<PathBuf>,
+    budget: &'a mut TraversalBudget,
+    started: Instant,
+    limits: ReadLimits,
+}
 
 #[derive(Debug)]
 struct RootBinding {
@@ -63,7 +106,7 @@ impl Drop for ReadLease {
 
 impl DomainWorkspaceReader {
     #[cfg(test)]
-    pub(super) fn new(root: PathBuf) -> Result<Self, ExecutionDomainError> {
+    pub(crate) fn new(root: PathBuf) -> Result<Self, ExecutionDomainError> {
         let reader = Self::unbound();
         reader.bind(root)?;
         Ok(reader)
@@ -84,6 +127,14 @@ impl DomainWorkspaceReader {
     }
 
     pub fn hash_files(&self, patterns: &[String]) -> Result<String, ExecutionDomainError> {
+        self.hash_files_with_limits(patterns, ReadLimits::default())
+    }
+
+    fn hash_files_with_limits(
+        &self,
+        patterns: &[String],
+        limits: ReadLimits,
+    ) -> Result<String, ExecutionDomainError> {
         let (_lease, root) = self.acquire()?;
         verify_directory(&root.fd, root.device, root.inode)?;
         let started = Instant::now();
@@ -95,34 +146,45 @@ impl DomainWorkspaceReader {
             })
             .collect::<Result<Vec<_>, _>>()?;
         let mut matched = BTreeSet::new();
-        enumerate(
-            root.fd.as_raw_fd(),
-            root.device,
-            Path::new(""),
-            &compiled,
-            &mut matched,
+        let mut budget = TraversalBudget::default();
+        let mut traversal = Traversal {
+            root_device: root.device,
+            patterns: &compiled,
+            matched: &mut matched,
+            budget: &mut budget,
             started,
-        )?;
+            limits,
+        };
+        traversal.enumerate(root.fd.as_raw_fd(), Path::new(""), 0)?;
 
         let mut total = 0u64;
         let mut hasher = Sha256::new();
         for relative in matched {
-            check_deadline(started)?;
-            let mut file = File::from(open_relative_regular(&root, &relative)?);
+            check_deadline(started, limits.max_time)?;
+            let mut file = File::from(open_relative_regular(
+                &root,
+                &relative,
+                started,
+                limits.max_time,
+            )?);
             let before = file.metadata().map_err(io_failure)?;
             validate_regular_metadata(&before, root.device)?;
-            total = total
-                .checked_add(before.len())
-                .filter(|total| *total <= MAX_HASH_BYTES)
-                .ok_or_else(|| failure(FailureCategory::InvalidInput))?;
+            if before.len() > limits.max_hash_bytes.saturating_sub(total) {
+                return Err(failure(FailureCategory::InvalidInput));
+            }
             let mut buffer = [0u8; 64 * 1024];
             loop {
+                check_deadline(started, limits.max_time)?;
                 let count = file.read(&mut buffer).map_err(io_failure)?;
+                check_deadline(started, limits.max_time)?;
                 if count == 0 {
                     break;
                 }
+                total = total
+                    .checked_add(count as u64)
+                    .filter(|total| *total <= limits.max_hash_bytes)
+                    .ok_or_else(|| failure(FailureCategory::InvalidInput))?;
                 hasher.update(&buffer[..count]);
-                check_deadline(started)?;
             }
             let after = file.metadata().map_err(io_failure)?;
             validate_regular_metadata(&after, root.device)?;
@@ -244,56 +306,102 @@ fn validate_pattern(pattern: &str) -> Result<(), ExecutionDomainError> {
     Ok(())
 }
 
-fn enumerate(
-    directory: RawFd,
-    root_device: u64,
-    relative_dir: &Path,
-    patterns: &[glob::Pattern],
-    matched: &mut BTreeSet<PathBuf>,
-    started: Instant,
-) -> Result<(), ExecutionDomainError> {
-    check_deadline(started)?;
-    for name in directory_entries(directory)? {
-        let before = metadata_at(directory, &name)?;
-        if before.st_dev as u64 != root_device {
-            return Err(failure(FailureCategory::IdentityMismatch));
-        }
-        let relative = relative_dir.join(OsString::from_vec(name.to_bytes().to_vec()));
-        match file_type(&before) {
-            libc::S_IFDIR => {
-                let child = open_component(directory, &name, DIRECTORY_FLAGS)?;
-                let after = metadata(child.as_raw_fd())?;
-                if !same_identity(&before, &after) || after.st_dev as u64 != root_device {
-                    return Err(failure(FailureCategory::IdentityMismatch));
-                }
-                enumerate(
-                    child.as_raw_fd(),
-                    root_device,
-                    &relative,
-                    patterns,
-                    matched,
-                    started,
-                )?;
+impl Traversal<'_> {
+    fn enumerate(
+        &mut self,
+        directory: RawFd,
+        relative_dir: &Path,
+        depth: usize,
+    ) -> Result<(), ExecutionDomainError> {
+        check_deadline(self.started, self.limits.max_time)?;
+        for_each_directory_entry(directory, self.started, self.limits.max_time, |name| {
+            consume_budget(self.budget, self.limits, relative_dir, name)?;
+            check_deadline(self.started, self.limits.max_time)?;
+            let before = metadata_at(directory, name)?;
+            check_deadline(self.started, self.limits.max_time)?;
+            if before.st_dev as u64 != self.root_device {
+                return Err(failure(FailureCategory::IdentityMismatch));
             }
-            libc::S_IFREG => {
-                if patterns
-                    .iter()
-                    .any(|pattern| pattern.matches_path(&relative))
-                {
-                    matched.insert(relative);
+            let relative = relative_dir.join(OsString::from_vec(name.to_bytes().to_vec()));
+            match file_type(&before) {
+                libc::S_IFDIR => {
+                    let child_depth = depth
+                        .checked_add(1)
+                        .filter(|depth| *depth <= self.limits.max_depth)
+                        .ok_or_else(|| failure(FailureCategory::InvalidInput))?;
+                    let child = open_component_bounded(
+                        directory,
+                        name,
+                        DIRECTORY_FLAGS,
+                        self.started,
+                        self.limits.max_time,
+                    )?;
+                    let after = metadata(child.as_raw_fd())?;
+                    if !same_identity(&before, &after) || after.st_dev as u64 != self.root_device {
+                        return Err(failure(FailureCategory::IdentityMismatch));
+                    }
+                    self.enumerate(child.as_raw_fd(), &relative, child_depth)?;
                 }
+                libc::S_IFREG => {
+                    if self
+                        .patterns
+                        .iter()
+                        .any(|pattern| pattern.matches_path(&relative))
+                        && !self.matched.contains(&relative)
+                    {
+                        self.budget.matches = self
+                            .budget
+                            .matches
+                            .checked_add(1)
+                            .filter(|matches| *matches <= self.limits.max_matches)
+                            .ok_or_else(|| failure(FailureCategory::InvalidInput))?;
+                        self.matched.insert(relative);
+                    }
+                }
+                _ => return Err(failure(FailureCategory::IdentityMismatch)),
             }
-            _ => return Err(failure(FailureCategory::IdentityMismatch)),
-        }
+            Ok(())
+        })
     }
+}
+
+fn consume_budget(
+    budget: &mut TraversalBudget,
+    limits: ReadLimits,
+    relative_dir: &Path,
+    name: &CStr,
+) -> Result<(), ExecutionDomainError> {
+    budget.entries = budget
+        .entries
+        .checked_add(1)
+        .filter(|entries| *entries <= limits.max_entries)
+        .ok_or_else(|| failure(FailureCategory::InvalidInput))?;
+
+    let separator = usize::from(!relative_dir.as_os_str().is_empty());
+    let relative_bytes = relative_dir
+        .as_os_str()
+        .as_bytes()
+        .len()
+        .checked_add(separator)
+        .and_then(|bytes| bytes.checked_add(name.to_bytes().len()))
+        .ok_or_else(|| failure(FailureCategory::InvalidInput))?;
+    budget.path_bytes = budget
+        .path_bytes
+        .checked_add(relative_bytes)
+        .filter(|bytes| *bytes <= limits.max_path_bytes)
+        .ok_or_else(|| failure(FailureCategory::InvalidInput))?;
     Ok(())
 }
 
 fn open_relative_regular(
     root: &RootBinding,
     relative: &Path,
+    started: Instant,
+    max_time: Duration,
 ) -> Result<OwnedFd, ExecutionDomainError> {
+    check_deadline(started, max_time)?;
     let mut directory = duplicate(root.fd.as_raw_fd())?;
+    check_deadline(started, max_time)?;
     let mut components = relative.components().peekable();
     while let Some(component) = components.next() {
         let Component::Normal(name) = component else {
@@ -302,10 +410,12 @@ fn open_relative_regular(
         let name =
             CString::new(name.as_bytes()).map_err(|_| failure(FailureCategory::InvalidInput))?;
         let last = components.peek().is_none();
-        let next = open_component(
+        let next = open_component_bounded(
             directory.as_raw_fd(),
             &name,
             if last { READ_FLAGS } else { DIRECTORY_FLAGS },
+            started,
+            max_time,
         )?;
         let metadata = metadata(next.as_raw_fd())?;
         if metadata.st_dev as u64 != root.device
@@ -332,19 +442,24 @@ fn validate_regular_metadata(
     Ok(())
 }
 
-fn check_deadline(started: Instant) -> Result<(), ExecutionDomainError> {
-    if started.elapsed() > MAX_HASH_TIME {
+fn check_deadline(started: Instant, max_time: Duration) -> Result<(), ExecutionDomainError> {
+    if started.elapsed() > max_time {
         Err(failure(FailureCategory::Timeout))
     } else {
         Ok(())
     }
 }
 
-fn directory_entries(fd: RawFd) -> Result<Vec<CString>, ExecutionDomainError> {
+fn for_each_directory_entry(
+    fd: RawFd,
+    started: Instant,
+    max_time: Duration,
+    mut visit: impl FnMut(&CStr) -> Result<(), ExecutionDomainError>,
+) -> Result<(), ExecutionDomainError> {
     // `dup(2)` shares the directory-stream offset with the pinned descriptor.
     // Reopen `.` instead so repeated and concurrent hashFiles() evaluations
     // always enumerate from an independent open file description.
-    let reopened = open_component(fd, c".", DIRECTORY_FLAGS)?;
+    let reopened = open_component_bounded(fd, c".", DIRECTORY_FLAGS, started, max_time)?;
     let raw = reopened.into_raw_fd();
     let directory = unsafe { libc::fdopendir(raw) };
     if directory.is_null() {
@@ -359,10 +474,11 @@ fn directory_entries(fd: RawFd) -> Result<Vec<CString>, ExecutionDomainError> {
         }
     }
     let directory = Directory(directory);
-    let mut names = Vec::new();
     loop {
+        check_deadline(started, max_time)?;
         clear_errno();
         let entry = unsafe { libc::readdir(directory.0) };
+        check_deadline(started, max_time)?;
         if entry.is_null() {
             let error = std::io::Error::last_os_error();
             if error.raw_os_error().unwrap_or(0) != 0 {
@@ -377,9 +493,9 @@ fn directory_entries(fd: RawFd) -> Result<Vec<CString>, ExecutionDomainError> {
         if name.is_empty() || name.to_bytes().contains(&b'/') {
             return Err(failure(FailureCategory::IdentityMismatch));
         }
-        names.push(name.to_owned());
+        visit(name)?;
     }
-    Ok(names)
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -446,6 +562,19 @@ fn open_component(fd: RawFd, name: &CStr, flags: i32) -> Result<OwnedFd, Executi
 #[cfg(not(target_os = "linux"))]
 fn open_component(fd: RawFd, name: &CStr, flags: i32) -> Result<OwnedFd, ExecutionDomainError> {
     owned_fd(unsafe { libc::openat(fd, name.as_ptr(), flags) })
+}
+
+fn open_component_bounded(
+    fd: RawFd,
+    name: &CStr,
+    flags: i32,
+    started: Instant,
+    max_time: Duration,
+) -> Result<OwnedFd, ExecutionDomainError> {
+    check_deadline(started, max_time)?;
+    let opened = open_component(fd, name, flags)?;
+    check_deadline(started, max_time)?;
+    Ok(opened)
 }
 
 fn duplicate(fd: RawFd) -> Result<OwnedFd, ExecutionDomainError> {

@@ -2129,44 +2129,23 @@ fn original_runner_labels_condition_survives_failure_and_cancellation() {
     ));
 }
 
-#[tokio::test]
-async fn hashfiles_prefers_domain_reader_over_host_workspace_fallback() {
-    use std::num::NonZeroUsize;
-
+#[test]
+fn hashfiles_prefers_domain_reader_over_host_workspace_fallback() {
     use sha2::{Digest, Sha256};
 
-    use crate::job::execution_domain::{AttemptIdentity, ExecutionDomainRoot};
-    use crate::job::workspace::Workspace;
+    use crate::job::execution_domain::DomainWorkspaceReader;
 
     let temp = tempfile::tempdir().unwrap();
-    let workspace = Workspace::create(
-        &temp.path().join("work"),
-        &temp.path().join("tmp"),
-        &temp.path().join("tools"),
-        "runner",
-        "owner/repo",
-    )
-    .unwrap();
-    std::fs::write(workspace.workspace_dir().join("domain.txt"), b"domain").unwrap();
+    let workspace = temp.path().join("work");
+    std::fs::create_dir(&workspace).unwrap();
+    std::fs::write(workspace.join("domain.txt"), b"domain").unwrap();
     let fallback = temp.path().join("fallback");
     std::fs::create_dir(&fallback).unwrap();
     std::fs::write(fallback.join("host.txt"), b"host").unwrap();
 
-    let root =
-        ExecutionDomainRoot::prepare(&temp.path().join("domains"), NonZeroUsize::new(1).unwrap())
-            .unwrap();
-    let domain = root
-        .reserve()
-        .await
-        .unwrap()
-        .provision(AttemptIdentity::new())
-        .await
-        .unwrap();
-    domain.bind_workspace(&workspace).await.unwrap();
-
     let mut ctx = empty_ctx();
     ctx.workspace_path = Some(fallback.to_string_lossy().into_owned());
-    ctx.workspace_reader = Some(domain.workspace_reader());
+    ctx.workspace_reader = Some(DomainWorkspaceReader::new(workspace).unwrap());
     let digest = parse_and_eval("hashFiles('*.txt')", &ctx)
         .unwrap()
         .to_display();
@@ -2174,5 +2153,4 @@ async fn hashfiles_prefers_domain_reader_over_host_workspace_fallback() {
     let mut expected = Sha256::new();
     expected.update(b"domain");
     assert_eq!(digest, format!("{:x}", expected.finalize()));
-    domain.destroy().await.unwrap();
 }

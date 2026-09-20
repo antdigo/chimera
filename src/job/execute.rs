@@ -1029,7 +1029,7 @@ pub(crate) async fn run_all_steps_with_masker(
         secrets,
         manifest.context_data.clone(),
     );
-    job_state.workspace_reader = Some(execution.docker_config().workspace_reader());
+    job_state.workspace_reader = execution.docker_config().workspace_reader();
 
     // Populate the `job` context for expression evaluation
     if let serde_json::Value::Object(ref mut map) = job_state.context_data {

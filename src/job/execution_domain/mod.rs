@@ -953,8 +953,8 @@ impl ExecutionDomain {
     pub fn environment(&self) -> &DomainEnvironment {
         &self.environment
     }
-    pub fn workspace_reader(&self) -> DomainWorkspaceReader {
-        self.workspace_reader.clone()
+    pub fn workspace_reader(&self) -> Option<DomainWorkspaceReader> {
+        (self.paths == DomainPaths::sandboxed()).then(|| self.workspace_reader.clone())
     }
     pub fn docker_config_dir(&self) -> &Path {
         self.docker_paths.config_dir()

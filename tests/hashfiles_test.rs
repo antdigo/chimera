@@ -1,5 +1,8 @@
 mod common;
 
+use std::os::unix::fs::symlink;
+use std::os::unix::net::UnixListener;
+
 use chimera::job::client::JobConclusion;
 use common::*;
 
@@ -63,6 +66,27 @@ async fn no_match_returns_empty() {
         &env.mock_server.uri(),
     );
     let (conclusion, _) = env.run(&manifest).await.unwrap();
+    assert_eq!(conclusion, JobConclusion::Succeeded);
+}
+
+#[tokio::test]
+async fn trusted_hashfiles_ignores_unrelated_symlink_and_special_file() {
+    let env = TestEnv::setup().await;
+    let workspace = env.workspace.workspace_dir();
+    std::fs::write(workspace.join("target.txt"), "trusted contents").unwrap();
+    symlink("target.txt", workspace.join("unrelated-link")).unwrap();
+    let _socket = UnixListener::bind(workspace.join("unrelated.sock")).unwrap();
+
+    let manifest = manifest_with_steps(
+        vec![script_step(
+            "s1",
+            r#"test -n "${{ hashFiles('target.txt') }}" || exit 1"#,
+        )],
+        &env.mock_server.uri(),
+    );
+
+    let (conclusion, _) = env.run(&manifest).await.unwrap();
+
     assert_eq!(conclusion, JobConclusion::Succeeded);
 }
 
