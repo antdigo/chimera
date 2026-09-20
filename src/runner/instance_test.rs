@@ -1174,6 +1174,76 @@ async fn start_retries_transient_broker_session_failure() {
 }
 
 #[tokio::test]
+async fn start_deletes_stale_session_after_conflict_then_reaches_idle() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/oauth2/token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "access_token": "test-token",
+            "expires_in": 7200
+        })))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/session"))
+        .respond_with(ResponseTemplate::new(409))
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/session"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "sessionId": "session-uuid-123"
+        })))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/message"))
+        .respond_with(ResponseTemplate::new(202).set_delay(Duration::from_millis(50)))
+        .mount(&mock_server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/session"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&mock_server)
+        .await;
+
+    let state = Arc::new(DaemonState::new(&["test-runner".to_string()]));
+    let (_temp, runner) = make_startup_runner(
+        Some(Arc::clone(&state)),
+        format!("{}/oauth2/token", mock_server.uri()),
+        mock_server.uri(),
+    );
+
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let start = tokio::spawn(runner.start(shutdown_rx));
+
+    wait_for_phase(&state, "test-runner", RunnerPhase::Idle)
+        .await
+        .expect("runner should delete the stale session and reach Idle");
+
+    shutdown_tx.send(true).unwrap();
+    tokio::time::timeout(Duration::from_secs(10), start)
+        .await
+        .expect("runner should exit after shutdown")
+        .unwrap()
+        .expect("runner should shut down cleanly after reaching Idle");
+
+    let session_requests = mock_server
+        .received_requests()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|request| request.url.path() == "/session")
+        .map(|request| request.method.as_str().to_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(session_requests, ["POST", "DELETE", "POST", "DELETE"]);
+}
+
+#[tokio::test]
 async fn start_permanent_token_failure_returns_error_without_retry() {
     let mock_server = MockServer::start().await;
 

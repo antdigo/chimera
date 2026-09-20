@@ -13,6 +13,8 @@ use super::auth::TokenManager;
 // ---------------------------------------------------------------------------
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const SESSION_CONFLICT_RETRY_DELAYS: [Duration; 2] =
+    [Duration::from_secs(1), Duration::from_secs(2)];
 
 // Values the official runner sends on every broker poll and acknowledge
 // (VarUtil.OS / VarUtil.OSArchitecture). They ride along on the same requests
@@ -265,69 +267,90 @@ impl BrokerClient {
             use_fips_encryption: false,
         };
 
-        debug!(agent_id, agent_name, "creating broker session");
-
         let url = format!("{}/session", server_url.trim_end_matches('/'));
-        let resp = client
-            .post(&url)
-            .bearer_auth(&token)
-            .json(&body)
-            .timeout(REQUEST_TIMEOUT)
-            .send()
-            .await
-            .map_err(|e| {
-                // A request-builder failure means the broker URL itself is
-                // unusable (bad registration data) — not something to retry.
-                if e.is_builder() {
-                    anyhow::anyhow!("invalid broker URL {server_url}: {e}")
-                } else {
-                    BrokerError::Connection(e.to_string()).into()
-                }
-            })
-            .context("sending create session request")?;
+        let mut conflict_retry_delays = SESSION_CONFLICT_RETRY_DELAYS.into_iter();
 
-        let status = resp.status();
-        if !status.is_success() {
-            let response_body_bytes = resp
+        loop {
+            debug!(agent_id, agent_name, "creating broker session");
+
+            let resp = client
+                .post(&url)
+                .bearer_auth(&token)
+                .json(&body)
+                .timeout(REQUEST_TIMEOUT)
+                .send()
+                .await
+                .map_err(|e| {
+                    // A request-builder failure means the broker URL itself is
+                    // unusable (bad registration data) — not something to retry.
+                    if e.is_builder() {
+                        anyhow::anyhow!("invalid broker URL {server_url}: {e}")
+                    } else {
+                        BrokerError::Connection(e.to_string()).into()
+                    }
+                })
+                .context("sending create session request")?;
+
+            let status = resp.status();
+            if !status.is_success() {
+                let response_body_bytes = resp
+                    .bytes()
+                    .await
+                    .map(|body| body.len())
+                    .unwrap_or_default();
+
+                if status.as_u16() == 409
+                    && let Some(delay) = conflict_retry_delays.next()
+                {
+                    debug!(
+                        agent_id,
+                        agent_name,
+                        delay_secs = delay.as_secs(),
+                        "deleting stale broker session after create conflict"
+                    );
+                    Self::delete_session(&client, &url, &token)
+                        .await
+                        .context("deleting stale broker session after create conflict")?;
+                    tokio::time::sleep(delay).await;
+                    continue;
+                }
+
+                return match status.as_u16() {
+                    401 => Err(BrokerError::Unauthorized.into()),
+                    s if (500..600).contains(&s) || s == 429 => Err(BrokerError::ServerError {
+                        status: s,
+                        response_body_bytes,
+                    }
+                    .into()),
+                    _ => bail!(
+                        "create session failed ({status}), response_body_bytes={response_body_bytes}"
+                    ),
+                };
+            }
+
+            // Read the body before parsing so transport failures while reading
+            // (stalled body, connection reset) stay retryable instead of being
+            // misfiled as a permanent malformed-response error.
+            let body = resp
                 .bytes()
                 .await
-                .map(|body| body.len())
-                .unwrap_or_default();
-            return match status.as_u16() {
-                401 => Err(BrokerError::Unauthorized.into()),
-                s if (500..600).contains(&s) || s == 429 => Err(BrokerError::ServerError {
-                    status: s,
-                    response_body_bytes,
-                }
-                .into()),
-                _ => bail!(
-                    "create session failed ({status}), response_body_bytes={response_body_bytes}"
-                ),
-            };
+                .map_err(|e| BrokerError::Connection(e.to_string()))
+                .context("reading create session response")?;
+
+            let session: CreateSessionResponse = serde_json::from_slice(&body)
+                .map_err(|e| BrokerError::BadResponse(e.to_string()))
+                .context("parsing create session response")?;
+
+            debug!(session_id = %session.session_id, "broker session created");
+
+            return Ok(Self {
+                client,
+                server_url: server_url.to_string(),
+                session_id: session.session_id,
+                token_manager,
+                poll_timeout: POLL_TIMEOUT,
+            });
         }
-
-        // Read the body before parsing so transport failures while reading
-        // (stalled body, connection reset) stay retryable instead of being
-        // misfiled as a permanent malformed-response error.
-        let body = resp
-            .bytes()
-            .await
-            .map_err(|e| BrokerError::Connection(e.to_string()))
-            .context("reading create session response")?;
-
-        let session: CreateSessionResponse = serde_json::from_slice(&body)
-            .map_err(|e| BrokerError::BadResponse(e.to_string()))
-            .context("parsing create session response")?;
-
-        debug!(session_id = %session.session_id, "broker session created");
-
-        Ok(Self {
-            client,
-            server_url: server_url.to_string(),
-            session_id: session.session_id,
-            token_manager,
-            poll_timeout: POLL_TIMEOUT,
-        })
     }
 
     pub fn session_id(&self) -> &str {
@@ -486,13 +509,26 @@ impl BrokerClient {
 
         debug!(session_id = %self.session_id, "deleting broker session");
 
-        let resp = self
-            .client
-            .delete(&url)
-            .bearer_auth(&token)
+        Self::delete_session(&self.client, &url, &token).await?;
+
+        debug!("broker session deleted");
+        Ok(())
+    }
+
+    async fn delete_session(client: &reqwest::Client, url: &str, token: &str) -> Result<()> {
+        let resp = client
+            .delete(url)
+            .bearer_auth(token)
             .timeout(REQUEST_TIMEOUT)
             .send()
             .await
+            .map_err(|error| {
+                if error.is_builder() {
+                    anyhow::anyhow!("invalid broker session URL {url}: {error}")
+                } else {
+                    BrokerError::Connection(error.to_string()).into()
+                }
+            })
             .context("sending delete session request")?;
 
         let status = resp.status();
@@ -502,10 +538,21 @@ impl BrokerClient {
                 .await
                 .map(|body| body.len())
                 .unwrap_or_default();
-            bail!("delete session failed ({status}), response_body_bytes={response_body_bytes}");
+            return match status.as_u16() {
+                401 => Err(BrokerError::Unauthorized.into()),
+                value if (500..600).contains(&value) || value == 429 => {
+                    Err(BrokerError::ServerError {
+                        status: value,
+                        response_body_bytes,
+                    }
+                    .into())
+                }
+                _ => bail!(
+                    "delete session failed ({status}), response_body_bytes={response_body_bytes}"
+                ),
+            };
         }
 
-        debug!("broker session deleted");
         Ok(())
     }
 }

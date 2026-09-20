@@ -852,6 +852,20 @@ unsafe fn write_proc_file(path: &CStr, value: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
+fn host_spawn_error_context(
+    program: &str,
+    source: &std::io::Error,
+    uses_private_namespace: bool,
+) -> String {
+    if uses_private_namespace && source.raw_os_error() == Some(libc::EPERM) {
+        return format!(
+            "spawning {program}: private user/mount namespace setup failed with EPERM; on Ubuntu 24.04 this is commonly the unprivileged-userns AppArmor restriction, while containers may also deny it through seccomp/AppArmor (see README.md#private-tmp-for-linux-host-jobs)"
+        );
+    }
+
+    format!("spawning {program}")
+}
+
 /// Shared process runner used by host steps, node actions, and composite steps.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_process(
@@ -868,7 +882,10 @@ pub async fn run_process(
     let mut child = host_command_for_process(program, args, env, working_dir, docker_config)
         .await?
         .spawn()
-        .with_context(|| format!("spawning {program}"))?;
+        .map_err(|source| {
+            let context = host_spawn_error_context(program, &source, cfg!(target_os = "linux"));
+            anyhow::Error::new(source).context(context)
+        })?;
 
     let stdout = child.stdout.take().context("no stdout")?;
     let stderr = child.stderr.take().context("no stderr")?;
