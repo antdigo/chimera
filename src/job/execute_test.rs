@@ -1472,7 +1472,7 @@ fn host_command_fails_closed_when_private_tmp_is_missing() {
         NonZeroUsize::new(1).unwrap(),
     )
     .unwrap();
-    let mut config = futures::executor::block_on(root.reserve())
+    let config = futures::executor::block_on(root.reserve())
         .and_then(|permit| permit.provision())
         .unwrap();
     let sentinel = temp.path().join("command-ran");
@@ -1524,7 +1524,7 @@ async fn private_tmp_mount_precedes_working_directory_lookup() {
         NonZeroUsize::new(1).unwrap(),
     )
     .unwrap();
-    let mut config = root.reserve().await.unwrap().provision().unwrap();
+    let config = root.reserve().await.unwrap().provision().unwrap();
     let env = host_base_env(&config);
     let directory_name = format!("chimera-cwd-{}", uuid::Uuid::new_v4().simple());
     let private_working_directory = std::path::PathBuf::from("/tmp").join(&directory_name);
@@ -1587,7 +1587,7 @@ async fn working_directory_tmp_does_not_write_to_host_tmp() {
         NonZeroUsize::new(1).unwrap(),
     )
     .unwrap();
-    let mut config = root.reserve().await.unwrap().provision().unwrap();
+    let config = root.reserve().await.unwrap().provision().unwrap();
     let env = host_base_env(&config);
     let file_name = format!("chimera-cwd-{}", uuid::Uuid::new_v4().simple());
     let host_path = std::path::Path::new("/tmp").join(&file_name);
