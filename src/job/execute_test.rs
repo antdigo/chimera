@@ -219,6 +219,7 @@ async fn run_docker_context_child(
 ) {
     let mut command = tokio::process::Command::new(std::env::current_exe().unwrap());
     command
+        .kill_on_drop(true)
         .args(["--exact", test_name, "--nocapture"])
         .env(DOCKER_CONTEXT_CHILD_CASE, case)
         .env("DOCKER_HOST", docker_host);

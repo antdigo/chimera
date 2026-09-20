@@ -561,6 +561,7 @@ async fn run_docker_action_endpoint_child(test_name: &str, endpoint: &DockerEndp
     let output = tokio::time::timeout(
         Duration::from_secs(5),
         tokio::process::Command::new(std::env::current_exe().unwrap())
+            .kill_on_drop(true)
             .args(["--exact", test_name, "--nocapture"])
             .env(DOCKER_ACTION_ENDPOINT_CHILD_CASE, "run")
             .env("DOCKER_HOST", endpoint.socket_address())
