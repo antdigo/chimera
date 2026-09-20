@@ -1,16 +1,16 @@
 use std::collections::HashMap;
 
 use super::*;
-use crate::job::docker_config::{DOCKER_CONFIG_ENV, JobResourceRoot};
 use crate::job::execute::{JobExecutionContext, JobState, StepConclusion};
+use crate::job::execution_domain::{DOCKER_CONFIG_ENV, ExecutionDomainRoot};
 use crate::job::logs::StepLogger;
 use crate::job::schema::{Step, StepReference};
 use crate::job::workspace::Workspace;
 use tokio_util::sync::CancellationToken;
 
-fn test_docker_config(tmp: &tempfile::TempDir) -> crate::job::docker_config::JobDockerConfig {
-    let root = JobResourceRoot::prepare(&tmp.path().join("job-resources")).unwrap();
-    root.create_docker_config().unwrap()
+fn test_docker_config(tmp: &tempfile::TempDir) -> crate::job::execution_domain::ExecutionDomain {
+    let root = ExecutionDomainRoot::prepare(&tmp.path().join("job-resources")).unwrap();
+    root.create_domain().unwrap()
 }
 
 fn make_test_workspace(tmp: &tempfile::TempDir) -> Workspace {
@@ -89,13 +89,13 @@ async fn node_action_executes_script() {
     );
     let masks = crate::job::secret_masker::shared_masker_for_test(&[]);
     let logger = StepLogger::results_for_test(masks);
-    let docker_config = test_docker_config(&tmp);
+    let domain = test_docker_config(&tmp);
     let base_env = HashMap::from([(
         DOCKER_CONFIG_ENV.to_string(),
-        docker_config.directory().to_string_lossy().into_owned(),
+        domain.docker_config_dir().to_string_lossy().into_owned(),
     )]);
     let node_runtimes = crate::node::NodeRuntimes::single("node".into());
-    let execution = JobExecutionContext::new(&docker_config, None, &node_runtimes);
+    let execution = JobExecutionContext::new(&domain, None, &node_runtimes);
 
     let result = run_node_action(
         &action_dir,
@@ -133,13 +133,13 @@ async fn node_action_diagnostics_omit_action_paths_and_script_names() {
     let masker = crate::job::secret_masker::shared_masker_for_test(&[canary]);
     let mut state = JobState::new(masker.clone(), HashMap::new(), serde_json::json!({}));
     let logger = StepLogger::results_for_test(masker);
-    let docker_config = test_docker_config(&tmp);
+    let domain = test_docker_config(&tmp);
     let base_env = HashMap::from([(
         DOCKER_CONFIG_ENV.to_string(),
-        docker_config.directory().to_string_lossy().into_owned(),
+        domain.docker_config_dir().to_string_lossy().into_owned(),
     )]);
     let node_runtimes = crate::node::NodeRuntimes::single("/bin/sh".into());
-    let execution = JobExecutionContext::new(&docker_config, None, &node_runtimes);
+    let execution = JobExecutionContext::new(&domain, None, &node_runtimes);
     let captured = crate::testing::TracingWriter::default();
     let subscriber = tracing_subscriber::fmt()
         .with_max_level(tracing::Level::DEBUG)
@@ -205,13 +205,13 @@ if (process.env.INPUT_TOKEN !== 'my-secret') {
     );
     let masks = crate::job::secret_masker::shared_masker_for_test(&[]);
     let logger = StepLogger::results_for_test(masks);
-    let docker_config = test_docker_config(&tmp);
+    let domain = test_docker_config(&tmp);
     let base_env = HashMap::from([(
         DOCKER_CONFIG_ENV.to_string(),
-        docker_config.directory().to_string_lossy().into_owned(),
+        domain.docker_config_dir().to_string_lossy().into_owned(),
     )]);
     let node_runtimes = crate::node::NodeRuntimes::single("node".into());
-    let execution = JobExecutionContext::new(&docker_config, None, &node_runtimes);
+    let execution = JobExecutionContext::new(&domain, None, &node_runtimes);
 
     let result = run_node_action(
         &action_dir,
@@ -269,13 +269,13 @@ if (process.env.INPUT_FLAVOR !== 'vanilla') {
     );
     let masks = crate::job::secret_masker::shared_masker_for_test(&[]);
     let logger = StepLogger::results_for_test(masks);
-    let docker_config = test_docker_config(&tmp);
+    let domain = test_docker_config(&tmp);
     let base_env = HashMap::from([(
         DOCKER_CONFIG_ENV.to_string(),
-        docker_config.directory().to_string_lossy().into_owned(),
+        domain.docker_config_dir().to_string_lossy().into_owned(),
     )]);
     let node_runtimes = crate::node::NodeRuntimes::single("node".into());
-    let execution = JobExecutionContext::new(&docker_config, None, &node_runtimes);
+    let execution = JobExecutionContext::new(&domain, None, &node_runtimes);
 
     let result = run_node_action(
         &action_dir,
@@ -318,13 +318,13 @@ async fn nonzero_exit_fails() {
     );
     let masks = crate::job::secret_masker::shared_masker_for_test(&[]);
     let logger = StepLogger::results_for_test(masks);
-    let docker_config = test_docker_config(&tmp);
+    let domain = test_docker_config(&tmp);
     let base_env = HashMap::from([(
         DOCKER_CONFIG_ENV.to_string(),
-        docker_config.directory().to_string_lossy().into_owned(),
+        domain.docker_config_dir().to_string_lossy().into_owned(),
     )]);
     let node_runtimes = crate::node::NodeRuntimes::single("node".into());
-    let execution = JobExecutionContext::new(&docker_config, None, &node_runtimes);
+    let execution = JobExecutionContext::new(&domain, None, &node_runtimes);
 
     let result = run_node_action(
         &action_dir,
@@ -370,13 +370,13 @@ process.exit(1);
     let masks = crate::job::secret_masker::shared_masker_for_test(&[secret]);
     let mut state = JobState::new(masks.clone(), HashMap::new(), serde_json::json!({}));
     let logger = StepLogger::results_for_test(masks);
-    let docker_config = test_docker_config(&tmp);
+    let domain = test_docker_config(&tmp);
     let base_env = HashMap::from([(
         DOCKER_CONFIG_ENV.to_string(),
-        docker_config.directory().to_string_lossy().into_owned(),
+        domain.docker_config_dir().to_string_lossy().into_owned(),
     )]);
     let node_runtimes = crate::node::NodeRuntimes::single("node".into());
-    let execution = JobExecutionContext::new(&docker_config, None, &node_runtimes);
+    let execution = JobExecutionContext::new(&domain, None, &node_runtimes);
 
     let result = run_node_action(
         &action_dir,

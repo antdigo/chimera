@@ -13,8 +13,8 @@ use tracing::{Instrument, error, info, warn};
 use crate::cache::manager::CacheManager;
 use crate::cache::server as cache_server;
 use crate::config::{ChimeraConfig, ChimeraPaths, load_config, load_runner_credentials};
-use crate::job::docker_config::{
-    JobDockerConfigError, JobResourceCleanupFatalError, JobResourceRoot,
+use crate::job::execution_domain::{
+    ExecutionDomainCleanupFatalError, ExecutionDomainError, ExecutionDomainRoot,
 };
 use crate::runner::Runner;
 use crate::storage::RootLock;
@@ -204,7 +204,7 @@ pub fn is_process_alive(pid: u32) -> bool {
     std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
-fn prepare_daemon_root(paths: &ChimeraPaths) -> Result<(PidLock, JobResourceRoot)> {
+fn prepare_daemon_root(paths: &ChimeraPaths) -> Result<(PidLock, ExecutionDomainRoot)> {
     #[cfg(target_os = "linux")]
     {
         let lexical_root = lexical_absolute_path(&paths.root)?;
@@ -214,14 +214,14 @@ fn prepare_daemon_root(paths: &ChimeraPaths) -> Result<(PidLock, JobResourceRoot
             std::fs::canonicalize("/tmp").context("canonicalizing host /tmp")?;
         if lexical_root.starts_with("/tmp") || canonical_root.starts_with(&canonical_host_tmp) {
             return Err(
-                JobDockerConfigError::ChimeraRootUnderHostTmp { path: lexical_root }.into(),
+                ExecutionDomainError::ChimeraRootUnderHostTmp { path: lexical_root }.into(),
             );
         }
     }
     reject_stale_legacy_job_data(paths)?;
     let pid_lock = PidLock::acquire(&paths.pid_file()).context("acquiring PID lock")?;
-    let job_resources = JobResourceRoot::prepare(&paths.job_resources_dir())?;
-    Ok((pid_lock, job_resources))
+    let execution_domains = ExecutionDomainRoot::prepare(&paths.job_resources_dir())?;
+    Ok((pid_lock, execution_domains))
 }
 
 fn reject_stale_legacy_job_data(paths: &ChimeraPaths) -> Result<()> {
@@ -247,7 +247,7 @@ fn reject_stale_legacy_job_data(paths: &ChimeraPaths) -> Result<()> {
         };
 
         if stale {
-            return Err(JobDockerConfigError::StaleLegacyJobData { path }.into());
+            return Err(ExecutionDomainError::StaleLegacyJobData { path }.into());
         }
     }
     Ok(())
@@ -415,11 +415,11 @@ fn is_fatal_job_resource_error(error: &anyhow::Error) -> bool {
     // anyhow's downcast_ref walks the error chain, so wrappers added along
     // the way do not hide the fatal marker.
     let poisoned = matches!(
-        error.downcast_ref::<JobDockerConfigError>(),
-        Some(JobDockerConfigError::PoisonedRoot { .. })
+        error.downcast_ref::<ExecutionDomainError>(),
+        Some(ExecutionDomainError::PoisonedRoot { .. })
     );
     let cleanup_fatal = error
-        .downcast_ref::<JobResourceCleanupFatalError>()
+        .downcast_ref::<ExecutionDomainCleanupFatalError>()
         .is_some();
     poisoned || cleanup_fatal
 }
@@ -456,7 +456,7 @@ impl Daemon {
     }
 
     pub async fn run(self, mut shutdown_rx: watch::Receiver<bool>) -> Result<()> {
-        let (_pid_lock, job_resources) = prepare_daemon_root(&self.paths)?;
+        let (_pid_lock, execution_domains) = prepare_daemon_root(&self.paths)?;
 
         // Start cache server if configured
         let cache_config = self.config.cache.clone();
@@ -502,7 +502,7 @@ impl Daemon {
                 creds,
                 self.paths.clone(),
                 Arc::clone(&state),
-                job_resources.clone(),
+                execution_domains.clone(),
                 cache_port,
                 Arc::clone(&cache_authority),
                 Arc::clone(&docker_action_builder),

@@ -426,8 +426,9 @@ fn startup_preparation_rejects_stale_job_resources_without_deleting_them() {
     let paths = ChimeraPaths::new(temp.path().to_path_buf());
     std::fs::create_dir_all(&paths.root).unwrap();
     let root =
-        crate::job::docker_config::JobResourceRoot::prepare(&paths.job_resources_dir()).unwrap();
-    let stale = root.create_docker_config().unwrap();
+        crate::job::execution_domain::ExecutionDomainRoot::prepare(&paths.job_resources_dir())
+            .unwrap();
+    let stale = root.create_domain().unwrap();
     let stale_dir = stale.attempt_dir().to_path_buf();
 
     let error = prepare_daemon_root(&paths).unwrap_err();
@@ -526,7 +527,7 @@ fn daemon_load_canonicalizes_root_with_intermediate_tmp_symlink() {
 
 #[test]
 fn poisoned_job_resource_error_requires_daemon_shutdown() {
-    let poisoned = anyhow::Error::new(JobDockerConfigError::PoisonedRoot {
+    let poisoned = anyhow::Error::new(ExecutionDomainError::PoisonedRoot {
         path: "/synthetic/job-resources".into(),
     });
     let unrelated = anyhow::anyhow!("unrelated runner failure");
@@ -537,8 +538,8 @@ fn poisoned_job_resource_error_requires_daemon_shutdown() {
 
 #[test]
 fn cleanup_fatal_error_requires_daemon_shutdown() {
-    let fatal = anyhow::Error::new(JobResourceCleanupFatalError {
-        source: JobDockerConfigError::Cleanup {
+    let fatal = anyhow::Error::new(ExecutionDomainCleanupFatalError {
+        source: ExecutionDomainError::Cleanup {
             path: "/synthetic/job-resources/attempt".into(),
             source: std::io::Error::other("synthetic cleanup failure"),
         },
@@ -549,7 +550,7 @@ fn cleanup_fatal_error_requires_daemon_shutdown() {
 
 #[test]
 fn fatal_job_resource_errors_are_detected_through_wrapping_context() {
-    let wrapped = anyhow::Error::new(JobDockerConfigError::PoisonedRoot {
+    let wrapped = anyhow::Error::new(ExecutionDomainError::PoisonedRoot {
         path: "/synthetic/job-resources".into(),
     })
     .context("runner exited");

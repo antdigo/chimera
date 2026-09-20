@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use super::*;
 use crate::job::action::metadata::{ActionInput, ActionRuns, ActionRuntime};
-use crate::job::docker_config::{DOCKER_CONFIG_ENV, JobResourceRoot};
+use crate::job::execution_domain::{DOCKER_CONFIG_ENV, ExecutionDomainRoot};
 use crate::job::logs::LogSender;
 use crate::job::schema::{StepReference, StepReferenceKind};
 use crate::job::workspace::Workspace;
@@ -534,9 +534,9 @@ fn prebuilt_image_trace_omits_arg_values_and_reference() {
 
 // ── run_docker_metadata_action ──────────────────────────────────
 
-fn test_docker_config(tmp: &tempfile::TempDir) -> crate::job::docker_config::JobDockerConfig {
-    let root = JobResourceRoot::prepare(&tmp.path().join("job-resources")).unwrap();
-    root.create_docker_config().unwrap()
+fn test_docker_config(tmp: &tempfile::TempDir) -> crate::job::execution_domain::ExecutionDomain {
+    let root = ExecutionDomainRoot::prepare(&tmp.path().join("job-resources")).unwrap();
+    root.create_domain().unwrap()
 }
 
 #[tokio::test]
@@ -565,15 +565,14 @@ async fn build_timeout_log_send_never_blocks_on_a_full_log_channel() {
     let docker_build_scope = DockerBuildScope::new("test-runner", "test/timeout-notice");
     let base_env = HashMap::new();
     let resources = tempfile::tempdir().unwrap();
-    let docker_config = test_docker_config(&resources);
+    let domain = test_docker_config(&resources);
     let node_runtimes = crate::node::NodeRuntimes::single("node".into());
     // An HTTP-transport client never dials until a request is made, so the
     // expired-deadline short-circuit is under test, not daemon reachability.
     let docker = Docker::connect_with_http("127.0.0.1:9", 120, bollard::API_DEFAULT_VERSION)
         .expect("lazy HTTP docker client must construct without a daemon");
     let docker_resources = JobDockerResources::new(docker);
-    let execution =
-        JobExecutionContext::new(&docker_config, Some(&docker_resources), &node_runtimes);
+    let execution = JobExecutionContext::new(&domain, Some(&docker_resources), &node_runtimes);
     let deadline = Instant::now() - Duration::from_secs(1);
     let cancel_token = CancellationToken::new();
 

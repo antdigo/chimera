@@ -666,14 +666,10 @@ async fn cancel_token_cancels_job() {
         &env.mock_server.uri(),
     );
 
-    let mut docker_config = env.job_resources.create_docker_config().unwrap();
-    let base_env = chimera::runner::env::build_base_env(
-        &manifest,
-        &env.workspace,
-        "test-runner",
-        &docker_config,
-    )
-    .unwrap();
+    let domain = env.execution_domains.create_domain().unwrap();
+    let base_env =
+        chimera::runner::env::build_base_env(&manifest, &env.workspace, "test-runner", &domain)
+            .unwrap();
     let action_cache = chimera::job::action::ActionCache::new(
         env.workspace.runner_temp().join("actions"),
         reqwest::Client::new(),
@@ -682,8 +678,7 @@ async fn cancel_token_cancels_job() {
     let cancel_token = tokio_util::sync::CancellationToken::new();
     cancel_token.cancel();
     let node_runtimes = chimera::node::NodeRuntimes::single("node".into());
-    let execution =
-        chimera::job::execute::JobExecutionContext::new(&docker_config, None, &node_runtimes);
+    let execution = chimera::job::execute::JobExecutionContext::new(&domain, None, &node_runtimes);
 
     let result = chimera::job::execute::run_all_steps(
         &manifest,
@@ -700,7 +695,7 @@ async fn cancel_token_cancels_job() {
         None,
     )
     .await;
-    docker_config.cleanup().unwrap();
+    domain.destroy().unwrap();
 
     let (conclusion, _) = result.unwrap();
     assert_eq!(conclusion, JobConclusion::Cancelled);

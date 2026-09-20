@@ -14,7 +14,7 @@ use crate::cache::auth::{CacheAuthError, CacheAuthority, CacheScope};
 use crate::config::ChimeraPaths;
 use crate::github::auth::TokenManager;
 use crate::github::broker::{BrokerClient, MessageType};
-use crate::job::docker_config::JobDockerConfigError;
+use crate::job::execution_domain::ExecutionDomainError;
 
 use super::*;
 
@@ -176,8 +176,9 @@ async fn setup() -> (MockServer, Arc<TokenManager>, watch::Sender<bool>) {
 fn make_runner() -> (TempDir, Runner) {
     let temp = TempDir::new().unwrap();
     let paths = ChimeraPaths::new(temp.path().to_path_buf());
-    let job_resources =
-        crate::job::docker_config::JobResourceRoot::prepare(&paths.job_resources_dir()).unwrap();
+    let execution_domains =
+        crate::job::execution_domain::ExecutionDomainRoot::prepare(&paths.job_resources_dir())
+            .unwrap();
 
     let runner = Runner {
         name: "test-runner".into(),
@@ -210,7 +211,7 @@ fn make_runner() -> (TempDir, Runner) {
         },
         paths,
         state: None,
-        job_resources,
+        execution_domains,
         cache_port: 9999,
         cache_authority: Arc::new(CacheAuthority::new()),
         docker_action_builder: Arc::new(crate::docker::build::DockerActionBuilder::new()),
@@ -222,7 +223,7 @@ fn make_runner() -> (TempDir, Runner) {
 #[test]
 fn runner_creates_workspace_inside_the_current_attempt() {
     let (_temp, runner) = make_runner();
-    let resources = runner.job_resources.create_docker_config().unwrap();
+    let resources = runner.execution_domains.create_domain().unwrap();
 
     let workspace = runner
         .create_job_workspace(&resources, "owner/repo")
@@ -261,14 +262,14 @@ async fn cancelled_job_removes_attempt_workspace_and_temp_canaries() {
 
     let (_temp, runner) = make_runner();
     cache_node_runtimes(&runner);
-    let mut docker_config = runner.job_resources.create_docker_config().unwrap();
-    let workspace_canary = docker_config
+    let domain = runner.execution_domains.create_domain().unwrap();
+    let workspace_canary = domain
         .work_dir()
         .join("test-runner/test-repo/test-repo/workspace-canary");
-    let temp_canary = docker_config
+    let temp_canary = domain
         .private_tmp()
         .join("test-runner/checkout-v6-credential-canary");
-    let cancel_ready = docker_config.private_tmp().join("test-runner/cancel-ready");
+    let cancel_ready = domain.private_tmp().join("test-runner/cancel-ready");
     let mut manifest_value = finish_manifest_value(&server.uri());
     manifest_value["steps"] = serde_json::json!([{
         "id": "write-canaries",
@@ -302,7 +303,7 @@ async fn cancelled_job_removes_attempt_workspace_and_temp_canaries() {
             cancel,
             "owner/test-repo",
             &cache_scope,
-            &docker_config,
+            &domain,
             &secret_masker,
         ),
         async {
@@ -322,9 +323,9 @@ async fn cancelled_job_removes_attempt_workspace_and_temp_canaries() {
     assert!(!workspace_canary.exists());
     assert!(!temp_canary.exists());
 
-    let first_attempt = docker_config.attempt_dir().to_path_buf();
-    docker_config.cleanup().unwrap();
-    let mut next_attempt = runner.job_resources.create_docker_config().unwrap();
+    let first_attempt = domain.attempt_dir().to_path_buf();
+    domain.destroy().unwrap();
+    let next_attempt = runner.execution_domains.create_domain().unwrap();
     assert_ne!(next_attempt.attempt_dir(), first_attempt);
     assert!(!workspace_canary.exists());
     assert!(!temp_canary.exists());
@@ -338,7 +339,7 @@ async fn cancelled_job_removes_attempt_workspace_and_temp_canaries() {
             .count(),
         0
     );
-    next_attempt.cleanup().unwrap();
+    next_attempt.destroy().unwrap();
 }
 
 #[test]
@@ -405,7 +406,7 @@ async fn registration_failure_cleans_docker_config_without_revoking_existing_cap
 
     assert!(format!("{error:#}").contains("active capability"));
     assert!(
-        std::fs::read_dir(runner.job_resources.path())
+        std::fs::read_dir(runner.execution_domains.path())
             .unwrap()
             .next()
             .is_none(),
@@ -634,19 +635,20 @@ async fn poll_loop_stops_when_job_resource_root_is_poisoned() {
     );
 
     let (_temp, runner) = make_runner();
-    let root = runner.job_resources.clone();
+    let root = runner.execution_domains.clone();
     let mut rx = shutdown_tx.subscribe();
     let poll = tokio::spawn(async move { runner.poll_loop(&broker, &mut rx).await });
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    let mut config = root.create_docker_config().unwrap();
+    let config = root.create_domain().unwrap();
+    let attempt_dir = config.attempt_dir().to_path_buf();
     let outside = root.path().parent().unwrap().join("outside");
     std::fs::write(&outside, "outside").unwrap();
     let symlink_path = config.attempt_dir().join("unexpected-link");
     std::os::unix::fs::symlink(&outside, &symlink_path).unwrap();
-    config.cleanup().unwrap_err();
+    config.destroy().unwrap_err();
     std::fs::remove_file(symlink_path).unwrap();
-    config.cleanup().unwrap();
+    std::fs::remove_dir_all(attempt_dir).unwrap();
 
     let error = tokio::time::timeout(Duration::from_secs(1), poll)
         .await
@@ -661,7 +663,8 @@ async fn poll_loop_stops_when_job_resource_root_is_poisoned() {
 async fn poisoned_runner_refuses_job_before_acknowledgement() {
     let (mock_server, token_manager, _shutdown_tx) = setup().await;
     let (_temp, runner) = make_runner();
-    let mut resources = runner.job_resources.create_docker_config().unwrap();
+    let resources = runner.execution_domains.create_domain().unwrap();
+    let attempt_dir = resources.attempt_dir().to_path_buf();
     let workspace_canary = resources.work_dir().join("workspace-canary");
     let credential_canary = resources
         .private_tmp()
@@ -669,7 +672,7 @@ async fn poisoned_runner_refuses_job_before_acknowledgement() {
     std::fs::write(&workspace_canary, "workspace-secret").unwrap();
     std::fs::write(&credential_canary, "credential-secret").unwrap();
     let outside = runner
-        .job_resources
+        .execution_domains
         .path()
         .parent()
         .unwrap()
@@ -678,7 +681,7 @@ async fn poisoned_runner_refuses_job_before_acknowledgement() {
     let symlink_path = resources.attempt_dir().join("unexpected-link");
     std::os::unix::fs::symlink(&outside, &symlink_path).unwrap();
 
-    resources.cleanup().unwrap_err();
+    resources.destroy().unwrap_err();
 
     assert_eq!(
         std::fs::read_to_string(&workspace_canary).unwrap(),
@@ -719,7 +722,7 @@ async fn poisoned_runner_refuses_job_before_acknowledgement() {
     );
 
     std::fs::remove_file(symlink_path).unwrap();
-    resources.cleanup().unwrap();
+    std::fs::remove_dir_all(attempt_dir).unwrap();
 }
 
 #[tokio::test]
@@ -985,8 +988,9 @@ fn make_startup_runner(
 ) -> (TempDir, Runner) {
     let temp = TempDir::new().unwrap();
     let paths = ChimeraPaths::new(temp.path().to_path_buf());
-    let job_resources =
-        crate::job::docker_config::JobResourceRoot::prepare(&paths.job_resources_dir()).unwrap();
+    let execution_domains =
+        crate::job::execution_domain::ExecutionDomainRoot::prepare(&paths.job_resources_dir())
+            .unwrap();
 
     let rsa_params =
         crate::config::private_key_to_rsa_params(&crate::testing::test_private_key()).unwrap();
@@ -1013,7 +1017,7 @@ fn make_startup_runner(
         },
         paths,
         state,
-        job_resources,
+        execution_domains,
         cache_port: 9999,
         cache_authority: Arc::new(CacheAuthority::new()),
         docker_action_builder: Arc::new(crate::docker::build::DockerActionBuilder::new()),
@@ -1645,14 +1649,14 @@ fn cleanup_failure_only_downgrades_success() {
 
 #[test]
 fn job_execution_error_is_terminal_covers_both_fatal_markers() {
-    let cleanup_fatal = anyhow::Error::new(JobResourceCleanupFatalError {
-        source: JobDockerConfigError::Cleanup {
+    let cleanup_fatal = anyhow::Error::new(ExecutionDomainCleanupFatalError {
+        source: ExecutionDomainError::Cleanup {
             path: "/synthetic/job-resources/attempt".into(),
             source: std::io::Error::other("synthetic cleanup failure"),
         },
     })
     .context("runner job path");
-    let poisoned = anyhow::Error::new(JobDockerConfigError::PoisonedRoot {
+    let poisoned = anyhow::Error::new(ExecutionDomainError::PoisonedRoot {
         path: "/synthetic/job-resources".into(),
     });
     let ordinary = anyhow::anyhow!("job execution failed for an ordinary reason");
@@ -1716,7 +1720,7 @@ async fn successful_job_reports_failed_when_docker_config_cleanup_fails() {
         conclusion: JobConclusion::Succeeded,
         outputs: HashMap::new(),
     });
-    let cleanup = Err(JobDockerConfigError::UnsafeEntry {
+    let cleanup = Err(ExecutionDomainError::UnsafeEntry {
         path: "/synthetic/job-resource/entry".into(),
     });
     let mut capability = JobCacheCapability::new(Arc::clone(&authority), id);
@@ -1776,7 +1780,7 @@ async fn execution_and_cleanup_errors_are_both_returned_without_early_completion
         .await
         .unwrap();
     let execution = Err(anyhow::anyhow!("job-execution-category"));
-    let cleanup = Err(JobDockerConfigError::UnsafeEntry {
+    let cleanup = Err(ExecutionDomainError::UnsafeEntry {
         path: "/synthetic/job-resource/entry".into(),
     });
     let mut capability = JobCacheCapability::new(Arc::clone(&authority), id);

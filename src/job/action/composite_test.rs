@@ -3,16 +3,16 @@ use std::collections::HashMap;
 use super::*;
 use crate::job::action::download::{ActionCache, TrustedActionDirectory};
 use crate::job::action::metadata::{ActionInput, ActionMetadata, ActionRuns};
-use crate::job::docker_config::{DOCKER_CONFIG_ENV, JobResourceRoot};
 use crate::job::execute::{JobExecutionContext, JobState, StepConclusion};
+use crate::job::execution_domain::{DOCKER_CONFIG_ENV, ExecutionDomainRoot};
 use crate::job::logs::StepLogger;
 use crate::job::schema::{Step, StepReference};
 use crate::job::workspace::Workspace;
 use tokio_util::sync::CancellationToken;
 
-fn test_docker_config(tmp: &tempfile::TempDir) -> crate::job::docker_config::JobDockerConfig {
-    let root = JobResourceRoot::prepare(&tmp.path().join("job-resources")).unwrap();
-    root.create_docker_config().unwrap()
+fn test_docker_config(tmp: &tempfile::TempDir) -> crate::job::execution_domain::ExecutionDomain {
+    let root = ExecutionDomainRoot::prepare(&tmp.path().join("job-resources")).unwrap();
+    root.create_domain().unwrap()
 }
 
 fn make_test_workspace(tmp: &tempfile::TempDir) -> Workspace {
@@ -113,13 +113,13 @@ async fn nested_script_steps_execute() {
     let docker_build_scope =
         crate::docker::build::DockerBuildScope::new("test-runner", "https://github.com/owner/repo");
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(360 * 60);
-    let docker_config = test_docker_config(&tmp);
+    let domain = test_docker_config(&tmp);
     let base_env = HashMap::from([(
         DOCKER_CONFIG_ENV.to_string(),
-        docker_config.directory().to_string_lossy().into_owned(),
+        domain.docker_config_dir().to_string_lossy().into_owned(),
     )]);
     let node_runtimes = crate::node::NodeRuntimes::single("node".into());
-    let execution = JobExecutionContext::new(&docker_config, None, &node_runtimes);
+    let execution = JobExecutionContext::new(&domain, None, &node_runtimes);
 
     let result = run_composite_action(
         &action_dir,
@@ -168,13 +168,13 @@ async fn skipped_composite_condition_is_not_written_to_daemon_trace() {
     let docker_build_scope =
         crate::docker::build::DockerBuildScope::new("test-runner", "https://github.com/owner/repo");
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(360 * 60);
-    let docker_config = test_docker_config(&tmp);
+    let domain = test_docker_config(&tmp);
     let base_env = HashMap::from([(
         DOCKER_CONFIG_ENV.to_string(),
-        docker_config.directory().to_string_lossy().into_owned(),
+        domain.docker_config_dir().to_string_lossy().into_owned(),
     )]);
     let node_runtimes = crate::node::NodeRuntimes::single("node".into());
-    let execution = JobExecutionContext::new(&docker_config, None, &node_runtimes);
+    let execution = JobExecutionContext::new(&domain, None, &node_runtimes);
     let captured = crate::testing::TracingWriter::default();
     let subscriber = tracing_subscriber::fmt()
         .with_max_level(tracing::Level::DEBUG)
@@ -243,13 +243,13 @@ async fn failure_propagates() {
     let docker_build_scope =
         crate::docker::build::DockerBuildScope::new("test-runner", "https://github.com/owner/repo");
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(360 * 60);
-    let docker_config = test_docker_config(&tmp);
+    let domain = test_docker_config(&tmp);
     let base_env = HashMap::from([(
         DOCKER_CONFIG_ENV.to_string(),
-        docker_config.directory().to_string_lossy().into_owned(),
+        domain.docker_config_dir().to_string_lossy().into_owned(),
     )]);
     let node_runtimes = crate::node::NodeRuntimes::single("node".into());
-    let execution = JobExecutionContext::new(&docker_config, None, &node_runtimes);
+    let execution = JobExecutionContext::new(&domain, None, &node_runtimes);
 
     let result = run_composite_action(
         &action_dir,
@@ -309,13 +309,13 @@ async fn inputs_available_as_env() {
     let docker_build_scope =
         crate::docker::build::DockerBuildScope::new("test-runner", "https://github.com/owner/repo");
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(360 * 60);
-    let docker_config = test_docker_config(&tmp);
+    let domain = test_docker_config(&tmp);
     let base_env = HashMap::from([(
         DOCKER_CONFIG_ENV.to_string(),
-        docker_config.directory().to_string_lossy().into_owned(),
+        domain.docker_config_dir().to_string_lossy().into_owned(),
     )]);
     let node_runtimes = crate::node::NodeRuntimes::single("node".into());
-    let execution = JobExecutionContext::new(&docker_config, None, &node_runtimes);
+    let execution = JobExecutionContext::new(&domain, None, &node_runtimes);
 
     let result = run_composite_action(
         &action_dir,
@@ -372,13 +372,13 @@ async fn nested_host_script_rejects_mismatched_docker_config_before_spawn() {
     let docker_build_scope =
         crate::docker::build::DockerBuildScope::new("test-runner", "https://github.com/owner/repo");
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(360 * 60);
-    let docker_config = test_docker_config(&tmp);
+    let domain = test_docker_config(&tmp);
     let base_env = HashMap::from([(
         DOCKER_CONFIG_ENV.to_string(),
-        docker_config.directory().to_string_lossy().into_owned(),
+        domain.docker_config_dir().to_string_lossy().into_owned(),
     )]);
     let node_runtimes = crate::node::NodeRuntimes::single("node".into());
-    let execution = JobExecutionContext::new(&docker_config, None, &node_runtimes);
+    let execution = JobExecutionContext::new(&domain, None, &node_runtimes);
 
     let error = run_composite_action(
         &action_dir,
@@ -434,14 +434,14 @@ async fn nested_host_script_allows_matching_docker_config() {
     let docker_build_scope =
         crate::docker::build::DockerBuildScope::new("test-runner", "https://github.com/owner/repo");
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(360 * 60);
-    let docker_config = test_docker_config(&tmp);
-    let docker_config_path = docker_config.directory().to_string_lossy().into_owned();
+    let domain = test_docker_config(&tmp);
+    let docker_config_path = domain.docker_config_dir().to_string_lossy().into_owned();
     let base_env = HashMap::from([
         (DOCKER_CONFIG_ENV.to_string(), docker_config_path.clone()),
         ("EXPECTED_CONFIG".into(), docker_config_path),
     ]);
     let node_runtimes = crate::node::NodeRuntimes::single("node".into());
-    let execution = JobExecutionContext::new(&docker_config, None, &node_runtimes);
+    let execution = JobExecutionContext::new(&domain, None, &node_runtimes);
 
     let result = run_composite_action(
         &action_dir,
@@ -496,11 +496,11 @@ async fn nested_local_node_rejects_mismatched_docker_config_before_spawn() {
     let docker_build_scope =
         crate::docker::build::DockerBuildScope::new("test-runner", "https://github.com/owner/repo");
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(360 * 60);
-    let docker_config = test_docker_config(&tmp);
+    let domain = test_docker_config(&tmp);
     let base_env = HashMap::from([
         (
             DOCKER_CONFIG_ENV.to_string(),
-            docker_config.directory().to_string_lossy().into_owned(),
+            domain.docker_config_dir().to_string_lossy().into_owned(),
         ),
         (
             "GITHUB_WORKSPACE".into(),
@@ -508,7 +508,7 @@ async fn nested_local_node_rejects_mismatched_docker_config_before_spawn() {
         ),
     ]);
     let node_runtimes = crate::node::NodeRuntimes::single("/bin/sh".into());
-    let execution = JobExecutionContext::new(&docker_config, None, &node_runtimes);
+    let execution = JobExecutionContext::new(&domain, None, &node_runtimes);
 
     let error = run_composite_action(
         &action_dir,
@@ -570,8 +570,8 @@ test "$DOCKER_CONFIG" = "$EXPECTED_CONFIG"
     let docker_build_scope =
         crate::docker::build::DockerBuildScope::new("test-runner", "https://github.com/owner/repo");
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(360 * 60);
-    let docker_config = test_docker_config(&tmp);
-    let docker_config_path = docker_config.directory().to_string_lossy().into_owned();
+    let domain = test_docker_config(&tmp);
+    let docker_config_path = domain.docker_config_dir().to_string_lossy().into_owned();
     let base_env = HashMap::from([
         (DOCKER_CONFIG_ENV.to_string(), docker_config_path.clone()),
         ("EXPECTED_CONFIG".into(), docker_config_path),
@@ -581,7 +581,7 @@ test "$DOCKER_CONFIG" = "$EXPECTED_CONFIG"
         ),
     ]);
     let node_runtimes = crate::node::NodeRuntimes::single("/bin/sh".into());
-    let execution = JobExecutionContext::new(&docker_config, None, &node_runtimes);
+    let execution = JobExecutionContext::new(&domain, None, &node_runtimes);
 
     let result = run_composite_action(
         &action_dir,
@@ -637,13 +637,13 @@ async fn recursion_depth_limit() {
     let docker_build_scope =
         crate::docker::build::DockerBuildScope::new("test-runner", "https://github.com/owner/repo");
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(360 * 60);
-    let docker_config = test_docker_config(&tmp);
+    let domain = test_docker_config(&tmp);
     let base_env = HashMap::from([(
         DOCKER_CONFIG_ENV.to_string(),
-        docker_config.directory().to_string_lossy().into_owned(),
+        domain.docker_config_dir().to_string_lossy().into_owned(),
     )]);
     let node_runtimes = crate::node::NodeRuntimes::single("node".into());
-    let execution = JobExecutionContext::new(&docker_config, None, &node_runtimes);
+    let execution = JobExecutionContext::new(&domain, None, &node_runtimes);
 
     let result = run_composite_action(
         &action_dir,

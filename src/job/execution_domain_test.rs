@@ -7,6 +7,20 @@ use uuid::Uuid;
 
 use super::*;
 
+#[test]
+fn execution_domain_owns_all_attempt_paths() {
+    let (_temp, root) = prepared_root();
+    let domain = root.create_domain().unwrap();
+
+    assert_eq!(
+        domain.docker_config_dir().parent(),
+        Some(domain.attempt_dir())
+    );
+    assert_eq!(domain.private_tmp().parent(), Some(domain.attempt_dir()));
+    assert_eq!(domain.work_dir().parent(), Some(domain.attempt_dir()));
+    assert_ne!(domain.attempt_id(), uuid::Uuid::nil());
+}
+
 fn mode(path: &std::path::Path) -> u32 {
     std::fs::symlink_metadata(path)
         .unwrap()
@@ -15,10 +29,10 @@ fn mode(path: &std::path::Path) -> u32 {
         & 0o777
 }
 
-fn prepared_root() -> (TempDir, JobResourceRoot) {
+fn prepared_root() -> (TempDir, ExecutionDomainRoot) {
     let temp = TempDir::new().unwrap();
     let path = temp.path().join("job-resources");
-    let root = JobResourceRoot::prepare(&path).unwrap();
+    let root = ExecutionDomainRoot::prepare(&path).unwrap();
     (temp, root)
 }
 
@@ -48,12 +62,12 @@ impl Drop for ChildGuard {
 fn creates_private_empty_config() {
     let (_temp, root) = prepared_root();
 
-    let config = root.create_docker_config().unwrap();
+    let config = root.create_domain().unwrap();
     let private_tmp = config.attempt_dir().join("tmp");
 
     assert_eq!(mode(root.path()), 0o700);
     assert_eq!(mode(config.attempt_dir()), 0o700);
-    assert_eq!(mode(config.directory()), 0o700);
+    assert_eq!(mode(config.docker_config_dir()), 0o700);
     assert_eq!(mode(&private_tmp), 0o700);
     assert_eq!(std::fs::read_dir(&private_tmp).unwrap().count(), 0);
     assert_eq!(mode(config.config_file()), 0o600);
@@ -68,13 +82,13 @@ fn concurrent_configs_have_distinct_generated_ids() {
     let second_root = root.clone();
 
     let (first, second) = std::thread::scope(|scope| {
-        let first = scope.spawn(move || first_root.create_docker_config().unwrap());
-        let second = scope.spawn(move || second_root.create_docker_config().unwrap());
+        let first = scope.spawn(move || first_root.create_domain().unwrap());
+        let second = scope.spawn(move || second_root.create_domain().unwrap());
         (first.join().unwrap(), second.join().unwrap())
     });
 
     assert_ne!(first.attempt_id(), second.attempt_id());
-    assert_ne!(first.directory(), second.directory());
+    assert_ne!(first.docker_config_dir(), second.docker_config_dir());
     assert_ne!(first.work_dir(), second.work_dir());
     assert_ne!(first.private_tmp(), second.private_tmp());
 }
@@ -82,8 +96,8 @@ fn concurrent_configs_have_distinct_generated_ids() {
 #[test]
 fn new_attempt_is_empty_after_previous_cleanup() {
     let (_temp, root) = prepared_root();
-    let mut first = root.create_docker_config().unwrap();
-    let first_path = first.directory().to_path_buf();
+    let first = root.create_domain().unwrap();
+    let first_path = first.docker_config_dir().to_path_buf();
     std::fs::write(
         first.config_file(),
         r#"{"auths":{"registry.test":{"auth":"synthetic"}}}"#,
@@ -91,11 +105,11 @@ fn new_attempt_is_empty_after_previous_cleanup() {
     .unwrap();
     std::fs::write(first.work_dir().join("workspace-canary"), "secret").unwrap();
     std::fs::write(first.private_tmp().join("credential-canary"), "credential").unwrap();
-    first.cleanup().unwrap();
+    first.destroy().unwrap();
 
-    let second = root.create_docker_config().unwrap();
+    let second = root.create_domain().unwrap();
 
-    assert_ne!(first_path, second.directory());
+    assert_ne!(first_path, second.docker_config_dir());
     assert_eq!(std::fs::read(second.config_file()).unwrap(), b"{}");
     assert_eq!(std::fs::read_dir(second.work_dir()).unwrap().count(), 0);
     assert_eq!(std::fs::read_dir(second.private_tmp()).unwrap().count(), 0);
@@ -104,7 +118,7 @@ fn new_attempt_is_empty_after_previous_cleanup() {
 #[test]
 fn inserts_and_validates_reserved_host_environment() {
     let (_temp, root) = prepared_root();
-    let config = root.create_docker_config().unwrap();
+    let config = root.create_domain().unwrap();
     let mut env = HashMap::new();
 
     config
@@ -119,7 +133,7 @@ fn inserts_and_validates_reserved_host_environment() {
         .unwrap_err();
     assert!(matches!(
         error,
-        JobDockerConfigError::ReservedEnvironmentOverride {
+        ExecutionDomainError::ReservedEnvironmentOverride {
             source: "step environment"
         }
     ));
@@ -127,15 +141,14 @@ fn inserts_and_validates_reserved_host_environment() {
 }
 
 #[test]
-fn cleanup_is_idempotent_and_keeps_neighbor() {
+fn destroy_removes_owned_attempt_and_keeps_neighbor() {
     let (_temp, root) = prepared_root();
-    let mut owned = root.create_docker_config().unwrap();
-    let neighbor = root.create_docker_config().unwrap();
+    let owned = root.create_domain().unwrap();
+    let neighbor = root.create_domain().unwrap();
     let owned_dir = owned.attempt_dir().to_path_buf();
     let neighbor_dir = neighbor.attempt_dir().to_path_buf();
 
-    owned.cleanup().unwrap();
-    owned.cleanup().unwrap();
+    owned.destroy().unwrap();
 
     assert!(!owned_dir.exists());
     assert!(neighbor_dir.exists());
@@ -144,8 +157,8 @@ fn cleanup_is_idempotent_and_keeps_neighbor() {
 #[test]
 fn cleanup_allows_symlinks_and_sockets_inside_private_tmp() {
     let temp = TempDir::new_in("/tmp").unwrap();
-    let root = JobResourceRoot::prepare(&temp.path().join("job-resources")).unwrap();
-    let mut config = root.create_docker_config().unwrap();
+    let root = ExecutionDomainRoot::prepare(&temp.path().join("job-resources")).unwrap();
+    let config = root.create_domain().unwrap();
     let target = temp.path().join("outside-target");
     std::fs::write(&target, "preserve me").unwrap();
     std::os::unix::fs::symlink(&target, config.private_tmp().join("link")).unwrap();
@@ -153,7 +166,7 @@ fn cleanup_allows_symlinks_and_sockets_inside_private_tmp() {
         std::os::unix::net::UnixListener::bind(config.private_tmp().join("service.sock")).unwrap();
     let attempt = config.attempt_dir().to_path_buf();
 
-    config.cleanup().unwrap();
+    config.destroy().unwrap();
 
     assert!(!attempt.exists());
     assert_eq!(std::fs::read_to_string(target).unwrap(), "preserve me");
@@ -163,8 +176,8 @@ fn cleanup_allows_symlinks_and_sockets_inside_private_tmp() {
 #[test]
 fn cleanup_handles_non_writable_directories_inside_private_tmp() {
     let temp = TempDir::new_in("/tmp").unwrap();
-    let root = JobResourceRoot::prepare(&temp.path().join("job-resources")).unwrap();
-    let mut config = root.create_docker_config().unwrap();
+    let root = ExecutionDomainRoot::prepare(&temp.path().join("job-resources")).unwrap();
+    let config = root.create_domain().unwrap();
     let attempt = config.attempt_dir().to_path_buf();
     let private_tmp = config.private_tmp().to_path_buf();
     let locked = private_tmp.join("locked");
@@ -175,7 +188,7 @@ fn cleanup_handles_non_writable_directories_inside_private_tmp() {
     std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o500)).unwrap();
     std::fs::set_permissions(&private_tmp, std::fs::Permissions::from_mode(0o500)).unwrap();
 
-    let result = config.cleanup();
+    let result = config.destroy();
     if result.is_err() {
         if nested.exists() {
             std::fs::set_permissions(&nested, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -200,8 +213,8 @@ fn cleanup_removes_work_and_temp_when_workspace_leaf_is_missing() {
     use crate::job::workspace::Workspace;
 
     let temp = TempDir::new_in("/tmp").unwrap();
-    let root = JobResourceRoot::prepare(&temp.path().join("job-resources")).unwrap();
-    let mut config = root.create_docker_config().unwrap();
+    let root = ExecutionDomainRoot::prepare(&temp.path().join("job-resources")).unwrap();
+    let config = root.create_domain().unwrap();
     let tool_cache = temp.path().join("tool-cache");
     let workspace = Workspace::create(
         config.work_dir(),
@@ -218,7 +231,7 @@ fn cleanup_removes_work_and_temp_when_workspace_leaf_is_missing() {
     std::fs::write(&temp_canary, "credential").unwrap();
     std::fs::remove_dir_all(workspace.workspace_dir()).unwrap();
 
-    config.cleanup().unwrap();
+    config.destroy().unwrap();
 
     assert!(!attempt.exists());
     assert!(!command_canary.exists());
@@ -228,14 +241,14 @@ fn cleanup_removes_work_and_temp_when_workspace_leaf_is_missing() {
 #[test]
 fn cleanup_allows_workspace_symlinks_without_touching_their_targets() {
     let temp = TempDir::new_in("/tmp").unwrap();
-    let root = JobResourceRoot::prepare(&temp.path().join("job-resources")).unwrap();
-    let mut config = root.create_docker_config().unwrap();
+    let root = ExecutionDomainRoot::prepare(&temp.path().join("job-resources")).unwrap();
+    let config = root.create_domain().unwrap();
     let target = temp.path().join("outside-workspace-target");
     std::fs::write(&target, "preserve me").unwrap();
     std::os::unix::fs::symlink(&target, config.work_dir().join("repository-link")).unwrap();
     let attempt = config.attempt_dir().to_path_buf();
 
-    config.cleanup().unwrap();
+    config.destroy().unwrap();
 
     assert!(!attempt.exists());
     assert_eq!(std::fs::read_to_string(target).unwrap(), "preserve me");
@@ -254,7 +267,7 @@ fn creation_refuses_replacement_root_before_mutation() {
 
     let error = root.create_with_id(attempt_id).unwrap_err();
 
-    assert!(matches!(error, JobDockerConfigError::UnsafeEntry { .. }));
+    assert!(matches!(error, ExecutionDomainError::UnsafeEntry { .. }));
     assert!(!original_root.join(&attempt_name).exists());
     assert!(!moved_root.join(&attempt_name).exists());
 }
@@ -265,7 +278,7 @@ fn creation_refuses_ancestor_symlink_before_mutation() {
     let original_parent = temp.path().join("resource-parent");
     std::fs::create_dir(&original_parent).unwrap();
     let root_path = original_parent.join("job-resources");
-    let root = JobResourceRoot::prepare(&root_path).unwrap();
+    let root = ExecutionDomainRoot::prepare(&root_path).unwrap();
     let moved_parent = temp.path().join("moved-resource-parent");
     std::fs::rename(&original_parent, &moved_parent).unwrap();
     std::os::unix::fs::symlink(&moved_parent, &original_parent).unwrap();
@@ -275,7 +288,7 @@ fn creation_refuses_ancestor_symlink_before_mutation() {
 
     let error = root.create_with_id(attempt_id).unwrap_err();
 
-    assert!(matches!(error, JobDockerConfigError::UnsafeEntry { .. }));
+    assert!(matches!(error, ExecutionDomainError::UnsafeEntry { .. }));
     assert!(!root_path.join(&attempt_name).exists());
     assert!(!moved_root.join(&attempt_name).exists());
 }
@@ -284,15 +297,15 @@ fn creation_refuses_ancestor_symlink_before_mutation() {
 fn cleanup_refuses_moved_root_replaced_by_symlink() {
     let (temp, root) = prepared_root();
     let original_root = root.path().to_path_buf();
-    let mut config = root.create_docker_config().unwrap();
+    let config = root.create_domain().unwrap();
     let attempt_name = config.attempt_dir().file_name().unwrap().to_owned();
     let moved_root = temp.path().join("moved-job-resources");
     std::fs::rename(&original_root, &moved_root).unwrap();
     std::os::unix::fs::symlink(&moved_root, &original_root).unwrap();
 
-    let error = config.cleanup().unwrap_err();
+    let error = config.destroy().unwrap_err();
 
-    assert!(matches!(error, JobDockerConfigError::UnsafeEntry { .. }));
+    assert!(matches!(error, ExecutionDomainError::UnsafeEntry { .. }));
     assert!(
         std::fs::symlink_metadata(&original_root)
             .unwrap()
@@ -305,7 +318,7 @@ fn cleanup_refuses_moved_root_replaced_by_symlink() {
 #[test]
 fn cleanup_refuses_replacement_attempt_at_same_path() {
     let (temp, root) = prepared_root();
-    let mut config = root.create_docker_config().unwrap();
+    let config = root.create_domain().unwrap();
     let attempt_path = config.attempt_dir().to_path_buf();
     let moved_attempt = temp.path().join("moved-attempt");
     std::fs::rename(&attempt_path, &moved_attempt).unwrap();
@@ -314,9 +327,9 @@ fn cleanup_refuses_replacement_attempt_at_same_path() {
     let replacement_marker = attempt_path.join("replacement-marker");
     std::fs::write(&replacement_marker, "replacement").unwrap();
 
-    let error = config.cleanup().unwrap_err();
+    let error = config.destroy().unwrap_err();
 
-    assert!(matches!(error, JobDockerConfigError::UnsafeEntry { .. }));
+    assert!(matches!(error, ExecutionDomainError::UnsafeEntry { .. }));
     assert!(moved_attempt.join("docker/config.json").exists());
     assert_eq!(
         std::fs::read_to_string(replacement_marker).unwrap(),
@@ -327,20 +340,21 @@ fn cleanup_refuses_replacement_attempt_at_same_path() {
 #[test]
 fn cleanup_refuses_config_symlink_without_touching_target() {
     let (_temp, root) = prepared_root();
-    let mut config = root.create_docker_config().unwrap();
+    let config = root.create_domain().unwrap();
+    let attempt_dir = config.attempt_dir().to_path_buf();
     let outside = root.path().parent().unwrap().join("outside-config.json");
     std::fs::write(&outside, "synthetic-outside").unwrap();
     std::fs::remove_file(config.config_file()).unwrap();
     std::os::unix::fs::symlink(&outside, config.config_file()).unwrap();
 
-    let error = config.cleanup().unwrap_err();
+    let error = config.destroy().unwrap_err();
 
-    assert!(matches!(error, JobDockerConfigError::UnsafeEntry { .. }));
+    assert!(matches!(error, ExecutionDomainError::UnsafeEntry { .. }));
     assert_eq!(
         std::fs::read_to_string(&outside).unwrap(),
         "synthetic-outside"
     );
-    assert!(config.attempt_dir().exists());
+    assert!(attempt_dir.exists());
 }
 
 #[test]
@@ -353,7 +367,7 @@ fn generated_id_collision_is_rejected() {
 
     assert!(matches!(
         error,
-        JobDockerConfigError::AttemptCollision { attempt_id } if attempt_id == id
+        ExecutionDomainError::AttemptCollision { attempt_id } if attempt_id == id
     ));
     assert!(first.config_file().exists());
 }
@@ -370,7 +384,7 @@ fn daemon_docker_config_is_not_copied_or_modified() {
     let status = std::process::Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
-            "job::docker_config::docker_config_test::daemon_docker_config_child",
+            "job::execution_domain::execution_domain_test::daemon_docker_config_child",
             "--nocapture",
         ])
         .env(DOCKER_CONFIG_ENV, &daemon_dir)
@@ -394,17 +408,17 @@ fn daemon_docker_config_child() {
         parent.join("daemon-docker")
     );
 
-    let root = JobResourceRoot::prepare(&parent.join("job-resources")).unwrap();
-    let config = root.create_docker_config().unwrap();
+    let root = ExecutionDomainRoot::prepare(&parent.join("job-resources")).unwrap();
+    let config = root.create_domain().unwrap();
 
     assert_eq!(std::fs::read(config.config_file()).unwrap(), b"{}");
-    assert_ne!(config.directory(), parent.join("daemon-docker"));
+    assert_ne!(config.docker_config_dir(), parent.join("daemon-docker"));
 }
 
 #[test]
 fn stale_root_with_live_child_is_not_removed() {
     let (temp, root) = prepared_root();
-    let mut config = root.create_docker_config().unwrap();
+    let config = root.create_domain().unwrap();
     let stale_dir = config.attempt_dir().to_path_buf();
     let work_canary = config.work_dir().join("workspace-canary");
     let temp_canary = config.private_tmp().join("checkout-credential-canary");
@@ -413,16 +427,16 @@ fn stale_root_with_live_child_is_not_removed() {
     let mut child = ChildGuard {
         child: std::process::Command::new("sh")
             .args(["-c", "while :; do sleep 1; done"])
-            .current_dir(config.directory())
+            .current_dir(config.docker_config_dir())
             .spawn()
             .unwrap(),
     };
 
-    let result = JobResourceRoot::prepare(root.path());
+    let result = ExecutionDomainRoot::prepare(root.path());
 
     assert!(matches!(
         result,
-        Err(JobDockerConfigError::StaleJobResources { .. })
+        Err(ExecutionDomainError::StaleJobResources { .. })
     ));
     assert!(stale_dir.exists());
     assert_eq!(
@@ -432,15 +446,15 @@ fn stale_root_with_live_child_is_not_removed() {
     assert_eq!(std::fs::read_to_string(&temp_canary).unwrap(), "credential");
 
     child.stop();
-    config.cleanup().unwrap();
+    config.destroy().unwrap();
     assert!(!stale_dir.exists());
-    JobResourceRoot::prepare(&temp.path().join("job-resources")).unwrap();
+    ExecutionDomainRoot::prepare(&temp.path().join("job-resources")).unwrap();
 }
 
 #[test]
 fn umask_zero_still_creates_private_paths() {
     let temp = TempDir::new().unwrap();
-    let child_test = "job::docker_config::docker_config_test::umask_zero_child";
+    let child_test = "job::execution_domain::execution_domain_test::umask_zero_child";
     let status = std::process::Command::new(std::env::current_exe().unwrap())
         .args(["--exact", child_test, "--nocapture"])
         .env("CHIMERA_UMASK_ZERO_CHILD", temp.path())
@@ -469,9 +483,9 @@ fn umask_zero_child() {
         libc::umask(0);
     }
     let root =
-        JobResourceRoot::prepare(&std::path::PathBuf::from(root_parent).join("job-resources"))
+        ExecutionDomainRoot::prepare(&std::path::PathBuf::from(root_parent).join("job-resources"))
             .unwrap();
-    root.create_docker_config().unwrap();
+    root.create_domain().unwrap();
 }
 
 #[test]
@@ -479,12 +493,12 @@ fn read_only_root_fails_without_fallback() {
     let (_temp, root) = prepared_root();
     std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
 
-    let result = root.create_docker_config();
+    let result = root.create_domain();
 
     std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     assert!(matches!(
         result,
-        Err(JobDockerConfigError::UnsafeRoot { .. })
+        Err(ExecutionDomainError::UnsafeRoot { .. })
     ));
     assert!(std::fs::read_dir(root.path()).unwrap().next().is_none());
 }
@@ -498,7 +512,7 @@ fn utf8_path_rejects_non_utf8_bytes() {
 
     assert!(matches!(
         error,
-        JobDockerConfigError::UnsafeRoot {
+        ExecutionDomainError::UnsafeRoot {
             reason: "path is not valid UTF-8",
             ..
         }
@@ -512,12 +526,12 @@ fn prepare_rejects_non_utf8_path_before_creating_it() {
         .path()
         .join(std::ffi::OsString::from_vec(b"job-resources-\xff".to_vec()));
 
-    let error = JobResourceRoot::prepare(&invalid).unwrap_err();
+    let error = ExecutionDomainRoot::prepare(&invalid).unwrap_err();
 
     assert!(
         matches!(
             &error,
-            JobDockerConfigError::UnsafeRoot {
+            ExecutionDomainError::UnsafeRoot {
                 reason: "path is not valid UTF-8",
                 ..
             }
@@ -534,12 +548,12 @@ fn prepare_rejects_non_utf8_canonical_root() {
     let invalid_name = std::ffi::OsString::from_vec(b"job-resources-\xff".to_vec());
     let path = temp.path().join(invalid_name);
 
-    let error = JobResourceRoot::prepare(&path).unwrap_err();
+    let error = ExecutionDomainRoot::prepare(&path).unwrap_err();
 
     assert!(
         matches!(
             &error,
-            JobDockerConfigError::UnsafeRoot {
+            ExecutionDomainError::UnsafeRoot {
                 reason: "path is not valid UTF-8",
                 ..
             }
@@ -557,40 +571,42 @@ fn prepare_rejects_symlink_root() {
     let link = temp.path().join("job-resources");
     std::os::unix::fs::symlink(&target, &link).unwrap();
 
-    let result = JobResourceRoot::prepare(&link);
+    let result = ExecutionDomainRoot::prepare(&link);
 
     assert!(matches!(
         result,
-        Err(JobDockerConfigError::UnsafeRoot { .. })
+        Err(ExecutionDomainError::UnsafeRoot { .. })
     ));
 }
 
 #[test]
 fn cleanup_refuses_special_file() {
     let temp = TempDir::new_in("/tmp").unwrap();
-    let root = JobResourceRoot::prepare(&temp.path().join("job-resources")).unwrap();
-    let mut config = root.create_docker_config().unwrap();
+    let root = ExecutionDomainRoot::prepare(&temp.path().join("job-resources")).unwrap();
+    let config = root.create_domain().unwrap();
+    let attempt_dir = config.attempt_dir().to_path_buf();
     let socket_path = config.attempt_dir().join("unexpected.sock");
     let socket = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
 
-    let result = config.cleanup();
+    let result = config.destroy();
 
     assert!(matches!(
         result,
-        Err(JobDockerConfigError::UnsafeEntry { .. })
+        Err(ExecutionDomainError::UnsafeEntry { .. })
     ));
-    assert!(config.attempt_dir().exists());
+    assert!(attempt_dir.exists());
     drop(socket);
     std::fs::remove_file(socket_path).unwrap();
-    config.cleanup().unwrap();
+    std::fs::remove_dir_all(attempt_dir).unwrap();
 }
 
 #[test]
 fn cleanup_failure_poisoned_root_blocks_sibling_creation() {
     let temp = TempDir::new_in("/tmp").unwrap();
-    let root = JobResourceRoot::prepare(&temp.path().join("job-resources")).unwrap();
+    let root = ExecutionDomainRoot::prepare(&temp.path().join("job-resources")).unwrap();
     let sibling_root = root.clone();
-    let mut config = root.create_docker_config().unwrap();
+    let config = root.create_domain().unwrap();
+    let attempt_dir = config.attempt_dir().to_path_buf();
     let work_canary = config.work_dir().join("workspace-canary");
     let temp_canary = config.private_tmp().join("checkout-credential-canary");
     std::fs::write(&work_canary, "APP_ENV=secret").unwrap();
@@ -598,8 +614,8 @@ fn cleanup_failure_poisoned_root_blocks_sibling_creation() {
     let socket_path = config.attempt_dir().join("unexpected.sock");
     let socket = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
 
-    config.cleanup().unwrap_err();
-    let creation_error = sibling_root.create_docker_config().unwrap_err();
+    config.destroy().unwrap_err();
+    let creation_error = sibling_root.create_domain().unwrap_err();
 
     assert!(
         creation_error
@@ -613,33 +629,33 @@ fn cleanup_failure_poisoned_root_blocks_sibling_creation() {
     assert_eq!(std::fs::read_to_string(&temp_canary).unwrap(), "credential");
     drop(socket);
     std::fs::remove_file(socket_path).unwrap();
-    config.cleanup().unwrap();
+    std::fs::remove_dir_all(attempt_dir).unwrap();
 }
 
 #[test]
 fn injected_permission_cleanup_failure_preserves_canaries_and_blocks_reuse() {
     let temp = TempDir::new_in("/tmp").unwrap();
-    let root = JobResourceRoot::prepare(&temp.path().join("job-resources")).unwrap();
+    let root = ExecutionDomainRoot::prepare(&temp.path().join("job-resources")).unwrap();
     let sibling_root = root.clone();
-    let mut config = root.create_docker_config().unwrap();
+    let mut config = root.create_domain().unwrap();
     let work_canary = config.work_dir().join("workspace-canary");
     let temp_canary = config.private_tmp().join("checkout-v6-credential-canary");
     std::fs::write(&work_canary, "workspace-secret").unwrap();
     std::fs::write(&temp_canary, "credential-secret").unwrap();
 
     let cleanup_error = config
-        .cleanup_with_remover(|_| {
+        .destroy_with_remover(|_| {
             Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
                 "synthetic permission failure",
             ))
         })
         .unwrap_err();
-    let creation_error = sibling_root.create_docker_config().unwrap_err();
+    let creation_error = sibling_root.create_domain().unwrap_err();
 
     assert!(matches!(
         cleanup_error,
-        JobDockerConfigError::Cleanup { ref source, .. }
+        ExecutionDomainError::Cleanup { ref source, .. }
             if source.kind() == std::io::ErrorKind::PermissionDenied
     ));
     assert!(
@@ -656,5 +672,5 @@ fn injected_permission_cleanup_failure_preserves_canaries_and_blocks_reuse() {
         "credential-secret"
     );
 
-    config.cleanup().unwrap();
+    config.destroy().unwrap();
 }
