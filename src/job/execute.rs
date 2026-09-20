@@ -168,8 +168,22 @@ pub(crate) struct BufferedWorkflowState {
     state: Vec<(String, String)>,
 }
 
+pub(crate) struct WorkflowStateDrainPermit(());
+
+impl WorkflowStateDrainPermit {
+    fn new() -> Self {
+        Self(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_test() -> Self {
+        Self::new()
+    }
+}
+
 impl BufferedWorkflowState {
     pub(crate) fn new(
+        _permit: &WorkflowStateDrainPermit,
         env: Vec<(String, String)>,
         path: Vec<String>,
         output: Vec<(String, String)>,
@@ -865,7 +879,8 @@ pub(crate) async fn complete_step_transaction<T>(
     // Terminal state validation has deterministic priority over a command error:
     // a corrupted bridge must never be hidden by a simultaneous spawn/transport failure.
     let snapshot = domain.read_step(state_id).await?;
-    let commands = processor.take_workflow_state().await;
+    let permit = WorkflowStateDrainPermit::new();
+    let commands = processor.take_workflow_state(&permit).await;
     apply_step_snapshot(snapshot, commands, domain, job_state)?;
     command_result
 }

@@ -74,17 +74,15 @@ pub async fn run_docker_image_action(
         docker_resources: execution.docker_resources(),
     })
     .await;
-    let result = complete_step_transaction(
+    complete_docker_action_transaction(
         execution.docker_config(),
         state_id,
         &processor,
         job_state,
+        step,
         result,
     )
-    .await?;
-
-    rekey_action_state(job_state, step);
-    Ok(result)
+    .await
 }
 
 /// Case 2: Repo action with `runs.using: docker` — has action.yml with Docker fields.
@@ -194,17 +192,29 @@ pub(crate) async fn run_docker_metadata_action(
         docker_resources: execution.docker_resources(),
     })
     .await;
-    let result = complete_step_transaction(
+    complete_docker_action_transaction(
         execution.docker_config(),
         state_id,
         &processor,
         job_state,
+        step,
         result,
     )
-    .await?;
+    .await
+}
 
+async fn complete_docker_action_transaction<T>(
+    domain: &crate::job::execution_domain::ExecutionDomain,
+    state_id: crate::job::execution_domain::StepFilesId,
+    processor: &OutputProcessor,
+    job_state: &mut JobState,
+    step: &Step,
+    command_result: Result<T>,
+) -> Result<T> {
+    let result =
+        complete_step_transaction(domain, state_id, processor, job_state, command_result).await;
     rekey_action_state(job_state, step);
-    Ok(result)
+    result
 }
 
 // ── Env assembly ────────────────────────────────────────────────

@@ -564,6 +564,50 @@ async fn command_files_win_collisions_with_buffered_stdout_commands() {
 }
 
 #[tokio::test]
+async fn valid_step_transaction_applies_each_workflow_command_once() {
+    let (_temp, workspace) = test_workspace();
+    let (_resources, domain) = test_docker_config();
+    let mut state = test_job_state();
+    let mut env = host_base_env(&domain);
+    env.insert("PATH".into(), "/usr/bin:/bin".into());
+    let (log_tx, _log_rx) = tokio::sync::mpsc::channel(8);
+    let log_sender = LogSender::new_for_test(
+        log_tx,
+        crate::job::secret_masker::shared_masker_for_test(&[]),
+    );
+    let first = make_step(
+        "first",
+        "printf '%s\\n' '::add-path::/stdout/once'; \
+         printf '/file/once\\n' > \"$GITHUB_PATH\"",
+    );
+
+    run_host_step(
+        &first,
+        &mut state,
+        &workspace,
+        &env,
+        &log_sender,
+        &CancellationToken::new(),
+        &domain,
+    )
+    .await
+    .unwrap();
+    run_host_step(
+        &make_step("second", "true"),
+        &mut state,
+        &workspace,
+        &env,
+        &log_sender,
+        &CancellationToken::new(),
+        &domain,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(state.path_prepends, ["/stdout/once", "/file/once"]);
+}
+
+#[tokio::test]
 async fn snapshot_failure_has_priority_over_command_failure_without_partial_mutation() {
     let (_temp, workspace) = test_workspace();
     let (_resources, domain) = test_docker_config();

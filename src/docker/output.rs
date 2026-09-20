@@ -4,7 +4,7 @@ use bollard::container::LogOutput;
 use bollard::errors::Error as DockerError;
 
 use crate::job::commands::{WorkflowCommand, parse_command};
-use crate::job::execute::BufferedWorkflowState;
+use crate::job::execute::{BufferedWorkflowState, WorkflowStateDrainPermit};
 use crate::job::logs::LogSender;
 use crate::job::secret_masker::SharedSecretMasker;
 
@@ -191,13 +191,23 @@ impl OutputProcessor {
         }
     }
 
-    pub(crate) async fn take_workflow_state(&self) -> BufferedWorkflowState {
+    pub(crate) async fn take_workflow_state(
+        &self,
+        permit: &WorkflowStateDrainPermit,
+    ) -> BufferedWorkflowState {
         BufferedWorkflowState::new(
+            permit,
             self.env_buf.lock().await.drain(..).collect(),
             self.path_buf.lock().await.drain(..).collect(),
             self.output_buf.lock().await.drain(..).collect(),
             self.state_buf.lock().await.drain(..).collect(),
         )
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn take_workflow_state_for_test(&self) -> BufferedWorkflowState {
+        let permit = WorkflowStateDrainPermit::new_for_test();
+        self.take_workflow_state(&permit).await
     }
 }
 

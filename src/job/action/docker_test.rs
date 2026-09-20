@@ -558,6 +558,49 @@ fn test_docker_config(tmp: &tempfile::TempDir) -> crate::job::execution_domain::
     .unwrap()
 }
 
+#[tokio::test]
+async fn docker_action_rekeys_saved_state_before_returning_command_error() {
+    let (temp, workspace) = action_workspace();
+    let domain = test_docker_config(&temp);
+    domain.bind_workspace(&workspace).await.unwrap();
+    let state_id = domain.prepare_step(b"{}").await.unwrap();
+    let masks = crate::job::secret_masker::shared_masker_for_test(&[]);
+    let (log_tx, _log_rx) = tokio::sync::mpsc::channel(8);
+    let processor = OutputProcessor::new(
+        LogSender::new_for_test(log_tx, Arc::clone(&masks)),
+        masks,
+        false,
+    );
+    processor
+        .process_line("::save-state name=cleanup::ready")
+        .await;
+    let mut state = action_job_state();
+    let step = docker_action_step(None);
+    let command_result: Result<StepResult> = Err(anyhow::anyhow!("command canary"));
+
+    let error = complete_docker_action_transaction(
+        &domain,
+        state_id,
+        &processor,
+        &mut state,
+        &step,
+        command_result,
+    )
+    .await
+    .unwrap_err();
+
+    assert!(format!("{error:#}").contains("command canary"));
+    assert!(!state.action_states.contains_key(""));
+    assert_eq!(
+        state
+            .action_states
+            .get("step")
+            .and_then(|values| values.get("cleanup"))
+            .map(String::as_str),
+        Some("ready")
+    );
+}
+
 const DOCKER_ACTION_ENDPOINT_CHILD_CASE: &str = "CHIMERA_DOCKER_ACTION_ENDPOINT_CHILD_CASE";
 
 async fn run_docker_action_endpoint_child(test_name: &str, endpoint: &DockerEndpoint) {

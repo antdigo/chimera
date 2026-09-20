@@ -116,7 +116,7 @@ async fn set_env_collected() {
     let (proc, _rx) = make_processor(false);
     proc.process_line("::set-env name=FOO::bar").await;
 
-    let state = proc.take_workflow_state().await;
+    let state = proc.take_workflow_state_for_test().await;
     assert_eq!(state.env(), &[("FOO".into(), "bar".into())]);
 }
 
@@ -125,7 +125,7 @@ async fn set_output_collected() {
     let (proc, _rx) = make_processor(false);
     proc.process_line("::set-output name=result::42").await;
 
-    let state = proc.take_workflow_state().await;
+    let state = proc.take_workflow_state_for_test().await;
     assert_eq!(state.output(), &[("result".into(), "42".into())]);
 }
 
@@ -134,7 +134,7 @@ async fn add_path_collected() {
     let (proc, _rx) = make_processor(false);
     proc.process_line("::add-path::/usr/local/bin").await;
 
-    let state = proc.take_workflow_state().await;
+    let state = proc.take_workflow_state_for_test().await;
     assert_eq!(state.path(), &["/usr/local/bin"]);
 }
 
@@ -163,7 +163,7 @@ async fn save_state_collected() {
     let (proc, _rx) = make_processor(false);
     proc.process_line("::save-state name=key::val").await;
 
-    let state = proc.take_workflow_state().await;
+    let state = proc.take_workflow_state_for_test().await;
     assert_eq!(state.state(), &[("key".into(), "val".into())]);
 }
 
@@ -216,10 +216,10 @@ async fn apply_drains_buffers() {
     proc.process_line("::set-env name=A::1").await;
     proc.process_line("::set-output name=B::2").await;
 
-    let state = proc.take_workflow_state().await;
+    let state = proc.take_workflow_state_for_test().await;
     assert_eq!(state.env(), &[("A".into(), "1".into())]);
     assert_eq!(state.output(), &[("B".into(), "2".into())]);
 
     // The next drain should find all command buffers empty.
-    assert!(proc.take_workflow_state().await.is_empty());
+    assert!(proc.take_workflow_state_for_test().await.is_empty());
 }
