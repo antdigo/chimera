@@ -190,6 +190,71 @@ impl EntryIndex {
         None
     }
 
+    pub fn find(
+        &self,
+        keys: &[String],
+        version: &str,
+        scope_repo: &str,
+        scope_ref: &str,
+        default_ref: &str,
+    ) -> Option<&CacheEntry> {
+        self.find_for_ref(keys, version, scope_repo, scope_ref)
+            .or_else(|| {
+                (scope_ref != default_ref)
+                    .then(|| self.find_for_ref(keys, version, scope_repo, default_ref))
+                    .flatten()
+            })
+    }
+
+    fn find_for_ref(
+        &self,
+        keys: &[String],
+        version: &str,
+        repo: &str,
+        git_ref: &str,
+    ) -> Option<&CacheEntry> {
+        for search_key in keys {
+            let exact_key = (
+                repo.to_string(),
+                git_ref.to_string(),
+                search_key.clone(),
+                version.to_string(),
+            );
+            if let Some(entry) = self.exact.get(&exact_key) {
+                return Some(entry);
+            }
+
+            if let Some(version_keys) = self
+                .by_repo_version
+                .get(&(repo.to_string(), version.to_string()))
+            {
+                for candidate in version_keys.range(..=search_key.clone()).rev() {
+                    if search_key.starts_with(candidate.as_str()) {
+                        let candidate_key = (
+                            repo.to_string(),
+                            git_ref.to_string(),
+                            candidate.clone(),
+                            version.to_string(),
+                        );
+                        if let Some(entry) = self.exact.get(&candidate_key) {
+                            return Some(entry);
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    pub fn get(&self, repo: &str, git_ref: &str, key: &str, version: &str) -> Option<&CacheEntry> {
+        self.exact.get(&(
+            repo.to_string(),
+            git_ref.to_string(),
+            key.to_string(),
+            version.to_string(),
+        ))
+    }
+
     /// Get all entries sorted by last_accessed_at (oldest first) for LRU eviction.
     pub fn lru_candidates(&self) -> Vec<&CacheEntry> {
         let mut entries: Vec<&CacheEntry> = self.exact.values().collect();

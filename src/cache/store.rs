@@ -16,6 +16,8 @@ pub struct BlobStore {
     data_dir: PathBuf,
     tmp_dir: PathBuf,
     ref_counts: RwLock<HashMap<String, u32>>,
+    #[cfg(test)]
+    pub(crate) before_store_io: super::test_support::BlockingPausePoint,
 }
 
 impl BlobStore {
@@ -24,6 +26,8 @@ impl BlobStore {
             data_dir,
             tmp_dir,
             ref_counts: RwLock::new(HashMap::new()),
+            #[cfg(test)]
+            before_store_io: Default::default(),
         }
     }
 
@@ -33,8 +37,14 @@ impl BlobStore {
     pub async fn store_from_file(&self, source: &Path) -> Result<String> {
         let source = source.to_path_buf();
         let data_dir = self.data_dir.clone();
+        #[cfg(test)]
+        let pause = self.before_store_io.take();
 
         tokio::task::spawn_blocking(move || {
+            #[cfg(test)]
+            if let Some(pause) = pause {
+                pause.wait();
+            }
             // Stream the file through blake3 in 64KB chunks to avoid OOM on large blobs
             let file = std::fs::File::open(&source)
                 .with_context(|| format!("opening file {}", source.display()))?;

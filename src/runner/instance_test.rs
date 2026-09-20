@@ -10,6 +10,7 @@ use tracing_subscriber::fmt::MakeWriter;
 use wiremock::matchers::{method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+use crate::cache::auth::{CacheAuthError, CacheAuthority, CacheScope};
 use crate::config::ChimeraPaths;
 use crate::github::auth::TokenManager;
 use crate::github::broker::{BrokerClient, MessageType};
@@ -211,10 +212,166 @@ fn make_runner() -> (TempDir, Runner) {
         state: None,
         job_resources,
         cache_port: 9999,
+        cache_authority: Arc::new(CacheAuthority::new()),
         docker_action_builder: Arc::new(crate::docker::build::DockerActionBuilder::new()),
     };
 
     (temp, runner)
+}
+
+#[test]
+fn cache_scope_is_derived_once_from_manifest_context() {
+    let manifest: JobManifest =
+        serde_json::from_str(include_str!("../../tests/fixtures/job_manifest.json")).unwrap();
+
+    assert_eq!(
+        cache_scope_for_job(&manifest, "owner/test-repo"),
+        CacheScope {
+            repo: "owner/test-repo".into(),
+            git_ref: "refs/heads/main".into(),
+            default_ref: "refs/heads/main".into(),
+        },
+    );
+}
+
+#[tokio::test]
+async fn register_job_cache_capability_uses_manifest_runtime_token_and_job_id() {
+    let authority = CacheAuthority::new();
+    let manifest: JobManifest =
+        serde_json::from_str(include_str!("../../tests/fixtures/job_manifest.json")).unwrap();
+    let scope = cache_scope_for_job(&manifest, "owner/test-repo");
+
+    let id = register_job_cache_capability(&authority, &manifest, scope.clone(), Utc::now())
+        .await
+        .unwrap();
+
+    let authorized = authority.authorize("job-token-xyz", &scope).await.unwrap();
+    assert_eq!(authorized.capability_id(), id.capability_id());
+    assert_eq!(authorized.job_id(), "job-001");
+}
+
+#[tokio::test]
+async fn registration_failure_cleans_docker_config_without_revoking_existing_capability() {
+    let server = MockServer::start().await;
+    let (_temp, runner) = make_runner();
+    let client = finish_client(&server).await;
+    let manifest = finish_manifest(&server.uri());
+    let scope = cache_scope_for_job(&manifest, "owner/test-repo");
+    let existing_id = register_job_cache_capability(
+        &runner.cache_authority,
+        &manifest,
+        scope.clone(),
+        Utc::now(),
+    )
+    .await
+    .unwrap();
+    let secret_masker = Arc::new(tokio::sync::RwLock::new(
+        SecretMasker::from_manifest(&manifest).unwrap(),
+    ));
+
+    let error = runner
+        .run_job(
+            &manifest,
+            &client,
+            &reqwest::Client::new(),
+            CancellationToken::new(),
+            "owner/test-repo",
+            &secret_masker,
+        )
+        .await
+        .unwrap_err();
+
+    assert!(format!("{error:#}").contains("active capability"));
+    assert!(
+        std::fs::read_dir(runner.job_resources.path())
+            .unwrap()
+            .next()
+            .is_none(),
+        "registration failure must not leave a per-job Docker config behind"
+    );
+    let existing = runner
+        .cache_authority
+        .authorize("synthetic", &scope)
+        .await
+        .unwrap();
+    assert_eq!(existing.capability_id(), existing_id.capability_id());
+}
+
+#[tokio::test]
+async fn panicking_job_execution_revokes_capability_and_download_grant_before_unwind() {
+    use futures::FutureExt;
+    use std::panic::AssertUnwindSafe;
+
+    let authority = Arc::new(CacheAuthority::new());
+    let manifest: JobManifest =
+        serde_json::from_str(include_str!("../../tests/fixtures/job_manifest.json")).unwrap();
+    let scope = cache_scope_for_job(&manifest, "owner/test-repo");
+    let id = register_job_cache_capability(&authority, &manifest, scope.clone(), Utc::now())
+        .await
+        .unwrap();
+    let authorized = authority.authorize("job-token-xyz", &scope).await.unwrap();
+    let grant = authority
+        .issue_download(&authorized, "a".repeat(64))
+        .await
+        .unwrap();
+    let mut capability = JobCacheCapability::new(Arc::clone(&authority), id);
+
+    let unwind = AssertUnwindSafe(run_with_cache_capability(&mut capability, async {
+        panic!("synthetic job execution panic");
+    }))
+    .catch_unwind()
+    .await;
+
+    assert!(unwind.is_err(), "execution panic must still propagate");
+    assert_eq!(
+        authority
+            .authorize("job-token-xyz", &scope)
+            .await
+            .unwrap_err(),
+        CacheAuthError::Unauthorized,
+    );
+    assert_eq!(
+        authority.resolve_download(grant).await.unwrap_err(),
+        CacheAuthError::DownloadNotFound,
+    );
+}
+
+#[tokio::test]
+async fn aborting_job_execution_revokes_capability_and_download_grant_on_drop() {
+    let authority = Arc::new(CacheAuthority::new());
+    let manifest: JobManifest =
+        serde_json::from_str(include_str!("../../tests/fixtures/job_manifest.json")).unwrap();
+    let scope = cache_scope_for_job(&manifest, "owner/test-repo");
+    let id = register_job_cache_capability(&authority, &manifest, scope.clone(), Utc::now())
+        .await
+        .unwrap();
+    let authorized = authority.authorize("job-token-xyz", &scope).await.unwrap();
+    let grant = authority
+        .issue_download(&authorized, "a".repeat(64))
+        .await
+        .unwrap();
+    let task_authority = Arc::clone(&authority);
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(async move {
+        let mut capability = JobCacheCapability::new(task_authority, id);
+        started_tx.send(()).unwrap();
+        run_with_cache_capability(&mut capability, std::future::pending::<()>()).await;
+    });
+    started_rx.await.unwrap();
+
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    assert_eq!(
+        authority
+            .authorize("job-token-xyz", &scope)
+            .await
+            .unwrap_err(),
+        CacheAuthError::Unauthorized,
+    );
+    assert_eq!(
+        authority.resolve_download(grant).await.unwrap_err(),
+        CacheAuthError::DownloadNotFound,
+    );
 }
 
 #[tokio::test]
@@ -671,6 +828,7 @@ fn make_startup_runner(
         state,
         job_resources,
         cache_port: 9999,
+        cache_authority: Arc::new(CacheAuthority::new()),
         docker_action_builder: Arc::new(crate::docker::build::DockerActionBuilder::new()),
     };
 
@@ -1248,6 +1406,31 @@ fn job_execution_error_is_terminal_covers_both_fatal_markers() {
 }
 
 #[tokio::test]
+async fn cache_capability_is_revoked_before_failure_is_reported() {
+    let authority = Arc::new(CacheAuthority::new());
+    let server = MockServer::start().await;
+    let manifest = finish_manifest(&server.uri());
+    let scope = cache_scope_for_job(&manifest, "owner/test-repo");
+    let id = register_job_cache_capability(&authority, &manifest, scope.clone(), Utc::now())
+        .await
+        .unwrap();
+    let execution = Err(anyhow::anyhow!("setup failed"));
+    let cleanup = Ok(());
+    let client = finish_client(&server).await;
+    let mut capability = JobCacheCapability::new(Arc::clone(&authority), id);
+
+    let result =
+        finish_job_after_cache_revoke(&mut capability, &client, &manifest, execution, cleanup)
+            .await;
+
+    assert!(result.is_err());
+    assert_eq!(
+        authority.authorize("synthetic", &scope).await.unwrap_err(),
+        CacheAuthError::Unauthorized,
+    );
+}
+
+#[tokio::test]
 async fn successful_job_reports_failed_when_docker_config_cleanup_fails() {
     use wiremock::matchers::body_json;
 
@@ -1265,8 +1448,13 @@ async fn successful_job_reports_failed_when_docker_config_cleanup_fails() {
         .expect(1)
         .mount(&server)
         .await;
+    let authority = Arc::new(CacheAuthority::new());
     let client = finish_client(&server).await;
     let manifest = finish_manifest(&server.uri());
+    let scope = cache_scope_for_job(&manifest, "owner/test-repo");
+    let id = register_job_cache_capability(&authority, &manifest, scope.clone(), Utc::now())
+        .await
+        .unwrap();
     let execution = Ok(JobExecutionOutcome {
         conclusion: JobConclusion::Succeeded,
         outputs: HashMap::new(),
@@ -1274,12 +1462,18 @@ async fn successful_job_reports_failed_when_docker_config_cleanup_fails() {
     let cleanup = Err(JobDockerConfigError::UnsafeEntry {
         path: "/synthetic/job-resource/entry".into(),
     });
+    let mut capability = JobCacheCapability::new(Arc::clone(&authority), id);
 
-    let error = finish_job(&client, &manifest, execution, cleanup)
-        .await
-        .unwrap_err();
+    let error =
+        finish_job_after_cache_revoke(&mut capability, &client, &manifest, execution, cleanup)
+            .await
+            .unwrap_err();
 
     assert!(error.to_string().contains("job-resource-cleanup-fatal"));
+    assert_eq!(
+        authority.authorize("synthetic", &scope).await.unwrap_err(),
+        CacheAuthError::Unauthorized,
+    );
 }
 
 #[tokio::test]
@@ -1317,16 +1511,23 @@ async fn finish_job_serializes_only_the_execution_outcome_outputs() {
 #[tokio::test]
 async fn execution_and_cleanup_errors_are_both_returned_without_early_completion() {
     let server = MockServer::start().await;
+    let authority = Arc::new(CacheAuthority::new());
     let client = finish_client(&server).await;
     let manifest = finish_manifest(&server.uri());
+    let scope = cache_scope_for_job(&manifest, "owner/test-repo");
+    let id = register_job_cache_capability(&authority, &manifest, scope.clone(), Utc::now())
+        .await
+        .unwrap();
     let execution = Err(anyhow::anyhow!("job-execution-category"));
     let cleanup = Err(JobDockerConfigError::UnsafeEntry {
         path: "/synthetic/job-resource/entry".into(),
     });
+    let mut capability = JobCacheCapability::new(Arc::clone(&authority), id);
 
-    let error = finish_job(&client, &manifest, execution, cleanup)
-        .await
-        .unwrap_err();
+    let error =
+        finish_job_after_cache_revoke(&mut capability, &client, &manifest, execution, cleanup)
+            .await
+            .unwrap_err();
 
     let chain = format!("{error:#}");
     assert!(chain.contains("job-execution-category"));
@@ -1336,6 +1537,51 @@ async fn execution_and_cleanup_errors_are_both_returned_without_early_completion
         requests
             .iter()
             .all(|request| request.url.path() != "/completejob")
+    );
+    assert_eq!(
+        authority.authorize("synthetic", &scope).await.unwrap_err(),
+        CacheAuthError::Unauthorized,
+    );
+}
+
+#[tokio::test]
+async fn cancelled_job_revokes_cache_capability_before_completion() {
+    use wiremock::matchers::body_json;
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/completejob"))
+        .and(body_json(serde_json::json!({
+            "planId": "plan",
+            "jobId": "job",
+            "conclusion": "failed",
+            "outputs": {},
+            "stepResults": []
+        })))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let authority = Arc::new(CacheAuthority::new());
+    let client = finish_client(&server).await;
+    let manifest = finish_manifest(&server.uri());
+    let scope = cache_scope_for_job(&manifest, "owner/test-repo");
+    let id = register_job_cache_capability(&authority, &manifest, scope.clone(), Utc::now())
+        .await
+        .unwrap();
+    let execution = Ok(JobExecutionOutcome {
+        conclusion: JobConclusion::Cancelled,
+        outputs: HashMap::new(),
+    });
+    let mut capability = JobCacheCapability::new(Arc::clone(&authority), id);
+
+    finish_job_after_cache_revoke(&mut capability, &client, &manifest, execution, Ok(()))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        authority.authorize("synthetic", &scope).await.unwrap_err(),
+        CacheAuthError::Unauthorized,
     );
 }
 

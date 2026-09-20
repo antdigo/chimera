@@ -256,6 +256,59 @@ async fn job_api_error_responses_never_include_response_body() {
 }
 
 #[tokio::test]
+async fn acquire_job_diagnostics_do_not_expose_runtime_token() {
+    assert_acquire_diagnostics_safe(false).await;
+}
+
+#[tokio::test]
+async fn acquire_job_error_diagnostics_do_not_expose_runtime_token() {
+    assert_acquire_diagnostics_safe(true).await;
+}
+
+async fn assert_acquire_diagnostics_safe(malformed: bool) {
+    use tracing::instrument::WithSubscriber;
+
+    let (mock_server, tm) = setup().await;
+    let sentinel = "SENTINEL_RUNTIME_TOKEN_MUST_STAY_SECRET";
+    let mut manifest: serde_json::Value = serde_json::from_str(
+        &include_str!("../../tests/fixtures/job_manifest.json").replace("job-token-xyz", sentinel),
+    )
+    .unwrap();
+    assert!(manifest.to_string().contains(sentinel));
+    if malformed {
+        manifest["variables"]["system.github.token"]["isSecret"] = serde_json::json!(sentinel);
+    }
+    Mock::given(method("POST"))
+        .and(path("/acquirejob"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(manifest))
+        .mount(&mock_server)
+        .await;
+    let client = make_client(&mock_server, tm, false);
+    let logs = crate::testing::CapturedLogs::default();
+
+    let result = async {
+        let result = client.acquire_job("req-123").await;
+        if let Err(error) = &result {
+            tracing::error!(error = %format!("{error:#}"), "job acquisition failed");
+        }
+        result
+    }
+    .with_subscriber(logs.subscriber())
+    .await;
+
+    assert_eq!(result.is_err(), malformed);
+    let output = logs.text();
+    assert!(
+        output.contains("received job manifest"),
+        "capture must record real diagnostics"
+    );
+    assert!(
+        !output.contains(sentinel),
+        "manifest diagnostics exposed the runtime token"
+    );
+}
+
+#[tokio::test]
 async fn renew_job_correct_body() {
     let (mock_server, tm) = setup().await;
 

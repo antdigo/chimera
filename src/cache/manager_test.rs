@@ -4,6 +4,7 @@ use std::sync::atomic::Ordering;
 use tempfile::TempDir;
 
 use super::*;
+use crate::cache::auth::{CacheAuthority, CacheScope, CapabilityEpoch, JobCapabilityClaims};
 
 const REPO: &str = "owner/repo";
 const MAIN_REF: &str = "refs/heads/main";
@@ -31,8 +32,11 @@ async fn upload_scoped_blob(
     git_ref: &str,
     data: &[u8],
 ) {
+    let owner = CapabilityEpoch::for_test("manager-test-owner");
     let id = manager
         .reserve_upload(
+            owner.clone(),
+            "manager-test-job".into(),
             key.to_string(),
             version.to_string(),
             repo.to_string(),
@@ -40,8 +44,26 @@ async fn upload_scoped_blob(
         )
         .await
         .unwrap();
-    manager.write_chunk(id, 0, data).await.unwrap();
-    manager.commit_upload(id, data.len() as u64).await.unwrap();
+    manager.write_chunk(&owner, id, 0, data).await.unwrap();
+    manager
+        .commit_upload(&owner, id, data.len() as u64)
+        .await
+        .unwrap();
+}
+
+async fn over_quota_lru_manager(tmp: &TempDir) -> Arc<CacheManager> {
+    let manager = Arc::new(make_manager(tmp, 10).await);
+    upload_blob(&manager, "oldest", "v1", b"aaaaaaaaaa").await;
+    upload_blob(&manager, "next", "v1", b"bbbbbbbbbb").await;
+
+    let mut entries = manager.entries.write().await;
+    for (key, age) in [("oldest", 10), ("next", 5)] {
+        let mut entry = entries.remove(REPO, MAIN_REF, key, "v1").unwrap();
+        entry.last_accessed_at = Utc::now() - chrono::Duration::minutes(age);
+        entries.insert(entry);
+    }
+    drop(entries);
+    manager
 }
 
 #[tokio::test]
@@ -132,6 +154,93 @@ async fn lru_eviction() {
 }
 
 #[tokio::test]
+async fn eviction_rechecks_lru_after_a_waiting_candidate_is_refreshed() {
+    let tmp = TempDir::new().unwrap();
+    let manager = over_quota_lru_manager(&tmp).await;
+    let eviction_wait = manager.arm_before_eviction_entry_wait();
+    let eviction_manager = manager.clone();
+    let eviction = tokio::spawn(async move { eviction_manager.evict().await });
+    eviction_wait.reached.notified().await;
+
+    let refreshed = manager
+        .lookup(&["oldest".into()], "v1", REPO, MAIN_REF, MAIN_REF)
+        .await
+        .unwrap();
+    let blob_path = manager.blob_path(&refreshed.blob_hash).unwrap();
+    let authority = CacheAuthority::new();
+    authority
+        .register_job(
+            "eviction-grant-owner",
+            JobCapabilityClaims {
+                scope: CacheScope {
+                    repo: REPO.into(),
+                    git_ref: MAIN_REF.into(),
+                    default_ref: MAIN_REF.into(),
+                },
+                job_id: "eviction-grant-job".into(),
+            },
+            Utc::now(),
+        )
+        .await
+        .unwrap();
+    let authorized = authority
+        .authenticate("eviction-grant-owner")
+        .await
+        .unwrap();
+    let grant = authority
+        .issue_download(&authorized, refreshed.blob_hash.clone())
+        .await
+        .unwrap();
+
+    eviction_wait.resume.notify_one();
+    eviction.await.unwrap();
+
+    let entries = manager.entries.read().await;
+    assert!(entries.get(REPO, MAIN_REF, "oldest", "v1").is_some());
+    assert!(entries.get(REPO, MAIN_REF, "next", "v1").is_none());
+    drop(entries);
+    assert!(blob_path.exists(), "refreshed entry blob was removed");
+    assert_eq!(
+        authority.resolve_download(grant).await.unwrap(),
+        refreshed.blob_hash,
+    );
+}
+
+#[tokio::test]
+async fn eviction_stops_when_another_worker_restores_the_quota() {
+    let tmp = TempDir::new().unwrap();
+    let manager = over_quota_lru_manager(&tmp).await;
+    let eviction_wait = manager.arm_before_eviction_entry_wait();
+    let first_manager = manager.clone();
+    let first = tokio::spawn(async move { first_manager.evict().await });
+    eviction_wait.reached.notified().await;
+
+    let refreshed = manager
+        .lookup(&["oldest".into()], "v1", REPO, MAIN_REF, MAIN_REF)
+        .await
+        .unwrap();
+    let refreshed_blob_path = manager.blob_path(&refreshed.blob_hash).unwrap();
+    manager.evict().await;
+    {
+        let entries = manager.entries.read().await;
+        assert_eq!(entries.total_size_bytes(), 10);
+        assert!(entries.get(REPO, MAIN_REF, "next", "v1").is_none());
+    }
+
+    eviction_wait.resume.notify_one();
+    first.await.unwrap();
+
+    let entries = manager.entries.read().await;
+    assert_eq!(entries.total_size_bytes(), 10);
+    assert!(entries.get(REPO, MAIN_REF, "oldest", "v1").is_some());
+    drop(entries);
+    assert!(
+        refreshed_blob_path.exists(),
+        "first worker over-evicted after quota was restored",
+    );
+}
+
+#[tokio::test]
 async fn persist_and_reload() {
     let tmp = TempDir::new().unwrap();
     let entries_dir = tmp.path().join("entries");
@@ -165,6 +274,59 @@ async fn persist_and_reload() {
     let blob_path = manager.blob_path(&entry.blob_hash).unwrap();
     let content = std::fs::read(blob_path).unwrap();
     assert_eq!(content, b"persist data");
+}
+
+#[tokio::test]
+async fn overwrite_persists_replacement_and_releases_old_blob() {
+    let tmp = TempDir::new().unwrap();
+    let entries_dir = tmp.path().join("entries");
+    let data_dir = tmp.path().join("data");
+    let tmp_dir = tmp.path().join("tmp");
+    let manager = CacheManager::new(
+        entries_dir.clone(),
+        data_dir.clone(),
+        tmp_dir.clone(),
+        1024 * 1024,
+    )
+    .await
+    .unwrap();
+
+    upload_blob(&manager, "replace", "v1", b"old").await;
+    let old = manager
+        .lookup(&["replace".into()], "v1", REPO, MAIN_REF, MAIN_REF)
+        .await
+        .unwrap();
+    let old_blob = manager.blob_path(&old.blob_hash).unwrap();
+    upload_blob(&manager, "replace", "v1", b"replacement").await;
+    let replacement = manager
+        .entries
+        .read()
+        .await
+        .get(REPO, MAIN_REF, "replace", "v1")
+        .unwrap()
+        .clone();
+    assert_eq!(
+        tokio::fs::read(manager.blob_path(&replacement.blob_hash).unwrap())
+            .await
+            .unwrap(),
+        b"replacement",
+    );
+    assert!(!old_blob.exists(), "old unreferenced blob was retained");
+    drop(manager);
+
+    let reloaded = CacheManager::new(entries_dir, data_dir, tmp_dir, 1024 * 1024)
+        .await
+        .unwrap();
+    let replacement = reloaded
+        .lookup(&["replace".into()], "v1", REPO, MAIN_REF, MAIN_REF)
+        .await
+        .expect("replacement metadata must survive reload");
+    assert_eq!(
+        tokio::fs::read(reloaded.blob_path(&replacement.blob_hash).unwrap())
+            .await
+            .unwrap(),
+        b"replacement",
+    );
 }
 
 #[tokio::test]

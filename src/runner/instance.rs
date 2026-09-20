@@ -1,14 +1,18 @@
 use std::collections::HashMap;
+use std::future::Future;
 use std::io;
+use std::panic::{AssertUnwindSafe, resume_unwind};
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use chrono::Utc;
+use futures::FutureExt;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
+use crate::cache::auth::{CacheAuthority, CacheScope, CapabilityHandle, JobCapabilityClaims};
 use crate::config::{ChimeraPaths, RunnerCredentials, rsa_params_to_private_key};
 use crate::daemon::{DaemonState, JobInfo, RunnerPhase};
 use crate::docker::build::DockerActionBuilder;
@@ -108,6 +112,99 @@ fn startup_error_is_transient(error: &anyhow::Error) -> bool {
     )
 }
 
+fn cache_scope_for_job(manifest: &JobManifest, repo: &str) -> CacheScope {
+    let git_ref = manifest
+        .context_data
+        .get("github")
+        .and_then(|github| github.get("ref"))
+        .and_then(|value| value.as_str())
+        .unwrap_or("refs/heads/main");
+    let default_branch = manifest
+        .context_data
+        .get("github")
+        .and_then(|github| github.get("event"))
+        .and_then(|event| event.get("repository"))
+        .and_then(|repository| repository.get("default_branch"))
+        .and_then(|value| value.as_str())
+        .unwrap_or("main");
+    let default_ref = if default_branch.starts_with("refs/") {
+        default_branch.to_string()
+    } else {
+        format!("refs/heads/{default_branch}")
+    };
+
+    CacheScope {
+        repo: repo.to_string(),
+        git_ref: git_ref.to_string(),
+        default_ref,
+    }
+}
+
+async fn register_job_cache_capability(
+    authority: &CacheAuthority,
+    manifest: &JobManifest,
+    scope: CacheScope,
+    issued_at: chrono::DateTime<Utc>,
+) -> Result<CapabilityHandle> {
+    authority
+        .register_job(
+            manifest
+                .access_token()
+                .context("reading cache runtime token")?,
+            JobCapabilityClaims {
+                scope,
+                job_id: manifest.plan.job_id.clone(),
+            },
+            issued_at,
+        )
+        .await
+        .context("registering cache capability")
+}
+
+struct JobCacheCapability {
+    authority: Arc<CacheAuthority>,
+    capability: CapabilityHandle,
+    active: bool,
+}
+
+impl JobCacheCapability {
+    fn new(authority: Arc<CacheAuthority>, capability: CapabilityHandle) -> Self {
+        Self {
+            authority,
+            capability,
+            active: true,
+        }
+    }
+
+    async fn revoke(&mut self) {
+        if self.active {
+            self.authority.revoke(&self.capability).await;
+            self.active = false;
+        }
+    }
+}
+
+impl Drop for JobCacheCapability {
+    fn drop(&mut self) {
+        if self.active {
+            self.authority.revoke_immediately(&self.capability);
+        }
+    }
+}
+
+async fn run_with_cache_capability<F, T>(capability: &mut JobCacheCapability, execution: F) -> T
+where
+    F: Future<Output = T>,
+{
+    match AssertUnwindSafe(execution).catch_unwind().await {
+        Ok(output) => output,
+        Err(panic) => {
+            capability.revoke().await;
+            resume_unwind(panic)
+        }
+    }
+}
+
 async fn finish_job(
     job_client: &Arc<JobClient>,
     manifest: &JobManifest,
@@ -148,6 +245,17 @@ async fn finish_job(
     }
 }
 
+async fn finish_job_after_cache_revoke(
+    capability: &mut JobCacheCapability,
+    job_client: &Arc<JobClient>,
+    manifest: &JobManifest,
+    execution_result: Result<JobExecutionOutcome>,
+    cleanup_result: std::result::Result<(), JobDockerConfigError>,
+) -> Result<()> {
+    capability.revoke().await;
+    finish_job(job_client, manifest, execution_result, cleanup_result).await
+}
+
 pub struct Runner {
     pub(super) name: String,
     pub(super) credentials: RunnerCredentials,
@@ -155,10 +263,15 @@ pub struct Runner {
     pub(super) state: Option<Arc<DaemonState>>,
     pub(super) job_resources: JobResourceRoot,
     pub(super) cache_port: u16,
+    pub(super) cache_authority: Arc<CacheAuthority>,
     pub(super) docker_action_builder: Arc<DockerActionBuilder>,
 }
 
 impl Runner {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the daemon's sole runner construction boundary keeps each shared dependency explicit"
+    )]
     pub fn with_state(
         name: String,
         credentials: RunnerCredentials,
@@ -166,6 +279,7 @@ impl Runner {
         state: Arc<DaemonState>,
         job_resources: JobResourceRoot,
         cache_port: u16,
+        cache_authority: Arc<CacheAuthority>,
         docker_action_builder: Arc<DockerActionBuilder>,
     ) -> Self {
         Self {
@@ -175,6 +289,7 @@ impl Runner {
             state: Some(state),
             job_resources,
             cache_port,
+            cache_authority,
             docker_action_builder,
         }
     }
@@ -502,6 +617,7 @@ impl Runner {
         repo: &str,
         secret_masker: &SharedSecretMasker,
     ) -> Result<()> {
+        let cache_scope = cache_scope_for_job(manifest, repo);
         let job_resources = self.job_resources.clone();
         let mut docker_config =
             tokio::task::spawn_blocking(move || job_resources.create_docker_config())
@@ -511,50 +627,114 @@ impl Runner {
         let attempt_id = docker_config.attempt_id();
         info!(%attempt_id, "created job Docker config");
 
-        let execution_result = self
-            .run_job_body(
-                manifest,
-                job_client,
-                client,
-                cancel_token,
-                repo,
-                &docker_config,
-                secret_masker,
-            )
+        let capability_id = match register_job_cache_capability(
+            &self.cache_authority,
+            manifest,
+            cache_scope.clone(),
+            Utc::now(),
+        )
+        .await
+        {
+            Ok(capability_id) => capability_id,
+            Err(registration_error) => {
+                let cleanup_path = docker_config.attempt_dir().to_path_buf();
+                let cleanup_result = tokio::task::spawn_blocking(move || docker_config.cleanup())
+                    .await
+                    .unwrap_or_else(|source| {
+                        Err(JobDockerConfigError::Cleanup {
+                            path: cleanup_path,
+                            source: io::Error::other(format!(
+                                "per-job resource cleanup task failed: {source}"
+                            )),
+                        })
+                    });
+                match &cleanup_result {
+                    Ok(()) => info!(%attempt_id, "cleaned job Docker config"),
+                    Err(cleanup_error) => {
+                        let masked_error = mask_error_chain(
+                            &anyhow::Error::msg(cleanup_error.to_string()),
+                            secret_masker,
+                        )
+                        .await;
+                        error!(
+                            category = "job-resource-cleanup",
+                            %attempt_id,
+                            error = %masked_error,
+                            "job Docker config cleanup failed"
+                        );
+                    }
+                }
+                return match cleanup_result {
+                    Ok(()) => Err(registration_error),
+                    Err(cleanup_error) => {
+                        Err(registration_error.context(cleanup_error.to_string()))
+                    }
+                };
+            }
+        };
+        let mut cache_capability =
+            JobCacheCapability::new(Arc::clone(&self.cache_authority), capability_id);
+
+        let (execution_result, cleanup_result) =
+            run_with_cache_capability(&mut cache_capability, async {
+                let execution_result = self
+                    .run_job_body(
+                        manifest,
+                        job_client,
+                        client,
+                        cancel_token,
+                        repo,
+                        &cache_scope,
+                        &docker_config,
+                        secret_masker,
+                    )
+                    .await;
+
+                let cleanup_path = docker_config.attempt_dir().to_path_buf();
+                let cleanup_result = tokio::task::spawn_blocking(move || docker_config.cleanup())
+                    .await
+                    .unwrap_or_else(|source| {
+                        Err(JobDockerConfigError::Cleanup {
+                            path: cleanup_path,
+                            source: io::Error::other(format!(
+                                "per-job resource cleanup task failed: {source}"
+                            )),
+                        })
+                    });
+                match &cleanup_result {
+                    Ok(()) => info!(%attempt_id, "cleaned job Docker config"),
+                    Err(cleanup_error) => {
+                        let masked_error = mask_error_chain(
+                            &anyhow::Error::msg(cleanup_error.to_string()),
+                            secret_masker,
+                        )
+                        .await;
+                        error!(
+                            category = "job-resource-cleanup",
+                            %attempt_id,
+                            error = %masked_error,
+                            "job Docker config cleanup failed"
+                        );
+                    }
+                }
+                (execution_result, cleanup_result)
+            })
             .await;
 
-        let cleanup_path = docker_config.attempt_dir().to_path_buf();
-        let cleanup_result = tokio::task::spawn_blocking(move || docker_config.cleanup())
-            .await
-            .unwrap_or_else(|source| {
-                Err(JobDockerConfigError::Cleanup {
-                    path: cleanup_path,
-                    source: io::Error::other(format!(
-                        "per-job resource cleanup task failed: {source}"
-                    )),
-                })
-            });
-        match &cleanup_result {
-            Ok(()) => info!(%attempt_id, "cleaned job Docker config"),
-            Err(cleanup_error) => {
-                let masked_error = mask_error_chain(
-                    &anyhow::Error::msg(cleanup_error.to_string()),
-                    secret_masker,
-                )
-                .await;
-                error!(
-                    category = "job-resource-cleanup",
-                    %attempt_id,
-                    error = %masked_error,
-                    "job Docker config cleanup failed"
-                );
-            }
-        }
-
-        finish_job(job_client, manifest, execution_result, cleanup_result).await
+        finish_job_after_cache_revoke(
+            &mut cache_capability,
+            job_client,
+            manifest,
+            execution_result,
+            cleanup_result,
+        )
+        .await
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the job lifecycle boundary keeps execution, cache scope, cleanup ownership, and secret masking explicit"
+    )]
     async fn run_job_body(
         &self,
         manifest: &JobManifest,
@@ -562,6 +742,7 @@ impl Runner {
         client: &reqwest::Client,
         cancel_token: CancellationToken,
         repo: &str,
+        cache_scope: &CacheScope,
         docker_config: &JobDockerConfig,
         secret_masker: &SharedSecretMasker,
     ) -> Result<JobExecutionOutcome> {
@@ -626,7 +807,7 @@ impl Runner {
                 job_client,
                 client,
                 cancel_token,
-                repo,
+                cache_scope,
                 &workspace,
                 &node_runtimes,
                 &mut docker_resources,
@@ -655,7 +836,7 @@ impl Runner {
         job_client: &Arc<JobClient>,
         client: &reqwest::Client,
         cancel_token: CancellationToken,
-        repo: &str,
+        cache_scope: &CacheScope,
         workspace: &Workspace,
         node_runtimes: &crate::node::NodeRuntimes,
         docker_resources: &mut Option<JobDockerResources>,
@@ -688,25 +869,9 @@ impl Runner {
         }
 
         // Inject ACTIONS_CACHE_URL for actions/cache support, with scope prefix
-        let git_ref = manifest
-            .context_data
-            .get("github")
-            .and_then(|g| g.get("ref"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("refs/heads/main");
-        let default_branch = manifest
-            .context_data
-            .get("github")
-            .and_then(|g| g.get("event"))
-            .and_then(|e| e.get("repository"))
-            .and_then(|r| r.get("default_branch"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("main");
-        let default_ref = format!("refs/heads/{default_branch}");
-
-        let scope_repo = crate::cache::server::encode_scope(repo);
-        let scope_ref = crate::cache::server::encode_scope(git_ref);
-        let scope_default = crate::cache::server::encode_scope(&default_ref);
+        let scope_repo = crate::cache::server::encode_scope(&cache_scope.repo);
+        let scope_ref = crate::cache::server::encode_scope(&cache_scope.git_ref);
+        let scope_default = crate::cache::server::encode_scope(&cache_scope.default_ref);
 
         if manifest.has_container() {
             // On macOS, Docker Desktop runs in a Linux VM so the bridge gateway IP
