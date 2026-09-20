@@ -733,3 +733,181 @@ fn failed_quarantine_retains_original_cleanup_error_and_poisons_root() {
         Err(ExecutionDomainError::PoisonedRoot { .. })
     ));
 }
+
+#[test]
+fn creation_syncs_resource_root_after_ready_publication() {
+    use std::os::unix::fs::MetadataExt;
+    let (_temp, root) = prepared_root();
+    let id = Uuid::from_u128(21);
+    let attempt = root.path().join(id.simple().to_string());
+    let called = std::cell::Cell::new(false);
+    let domain = root
+        .create_with_id_and_sync(id, |directory| {
+            assert_eq!(
+                directory.metadata()?.ino(),
+                std::fs::metadata(root.path())?.ino()
+            );
+            assert_eq!(
+                DomainLifecycle::load(&attempt).unwrap().state(),
+                DomainState::Ready
+            );
+            assert!(attempt.join("docker/config.json").is_file());
+            assert!(attempt.join("tmp").is_dir());
+            assert!(attempt.join("work").is_dir());
+            directory.sync_all()?;
+            called.set(true);
+            Ok(())
+        })
+        .unwrap();
+    assert!(called.get());
+    domain.destroy().unwrap();
+}
+
+#[test]
+fn failed_creation_root_sync_preserves_attempt_and_poisons_root() {
+    let (_temp, root) = prepared_root();
+    let id = Uuid::from_u128(22);
+    let attempt = root.path().join(id.simple().to_string());
+    let error = root
+        .create_with_id_and_sync(id, |_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "sync failure",
+            ))
+        })
+        .unwrap_err();
+    assert!(matches!(error, ExecutionDomainError::Io { source, .. }
+        if source.kind() == std::io::ErrorKind::PermissionDenied));
+    assert_eq!(
+        DomainLifecycle::load(&attempt).unwrap().state(),
+        DomainState::Ready
+    );
+    assert!(matches!(
+        root.create_domain(),
+        Err(ExecutionDomainError::PoisonedRoot { .. })
+    ));
+}
+
+#[test]
+fn removal_syncs_resource_root_before_completing_destroyed() {
+    use std::os::unix::fs::MetadataExt;
+    let (_temp, root) = prepared_root();
+    let mut domain = root.create_domain().unwrap();
+    let attempt = domain.attempt_dir().to_path_buf();
+    let called = std::cell::Cell::new(false);
+    domain
+        .destroy_with_remover_and_sync(
+            |path| {
+                assert_eq!(
+                    DomainLifecycle::load(path).unwrap().state(),
+                    DomainState::Destroying
+                );
+                std::fs::remove_dir_all(path)
+            },
+            |directory| {
+                assert!(!attempt.exists());
+                assert_eq!(
+                    directory.metadata()?.ino(),
+                    std::fs::metadata(root.path())?.ino()
+                );
+                directory.sync_all()?;
+                called.set(true);
+                Ok(())
+            },
+        )
+        .unwrap();
+    assert!(called.get());
+    assert_eq!(domain.lifecycle.state(), DomainState::Destroyed);
+}
+
+#[test]
+fn failed_removal_root_sync_keeps_destroying_and_poisons_root() {
+    let (_temp, root) = prepared_root();
+    let mut domain = root.create_domain().unwrap();
+    let error = domain
+        .destroy_with_remover_and_sync(
+            |path| std::fs::remove_dir_all(path),
+            |_| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "sync failure",
+                ))
+            },
+        )
+        .unwrap_err();
+    assert!(
+        matches!(error, ExecutionDomainError::QuarantineFailed { cleanup, .. }
+        if matches!(&*cleanup, ExecutionDomainError::Io { source, .. }
+            if source.kind() == std::io::ErrorKind::PermissionDenied))
+    );
+    assert!(!domain.attempt_dir().exists());
+    assert!(!domain.destroyed);
+    assert_eq!(domain.lifecycle.state(), DomainState::Destroying);
+    assert!(matches!(
+        root.create_domain(),
+        Err(ExecutionDomainError::PoisonedRoot { .. })
+    ));
+}
+
+#[test]
+fn root_sync_refuses_replacement_without_touching_canary() {
+    let (temp, root) = prepared_root();
+    let mut domain = root.create_domain().unwrap();
+    let moved = temp.path().join("moved-root");
+    let canary = root.path().join("canary");
+    let error = domain
+        .destroy_with_remover_and_sync(
+            |path| {
+                std::fs::remove_dir_all(path)?;
+                std::fs::rename(root.path(), &moved)?;
+                std::fs::create_dir(root.path())?;
+                std::fs::write(&canary, "preserve-root-canary")
+            },
+            |_| panic!("must not sync a replaced root"),
+        )
+        .unwrap_err();
+    assert!(
+        matches!(error, ExecutionDomainError::QuarantineFailed { cleanup, .. }
+        if matches!(&*cleanup, ExecutionDomainError::UnsafeEntry { .. }))
+    );
+    assert_eq!(
+        std::fs::read_to_string(canary).unwrap(),
+        "preserve-root-canary"
+    );
+    assert_eq!(domain.lifecycle.state(), DomainState::Destroying);
+    assert!(matches!(
+        root.create_domain(),
+        Err(ExecutionDomainError::PoisonedRoot { .. })
+    ));
+}
+
+#[test]
+fn creation_rechecks_root_identity_after_sync() {
+    let (temp, root) = prepared_root();
+    let moved = temp.path().join("moved-root");
+    let canary = root.path().join("canary");
+    let id = Uuid::from_u128(23);
+    let error = root
+        .create_with_id_and_sync(id, |directory| {
+            directory.sync_all()?;
+            std::fs::rename(root.path(), &moved)?;
+            std::fs::create_dir(root.path())?;
+            std::fs::write(&canary, "preserve-root-canary")
+        })
+        .unwrap_err();
+    assert!(matches!(error, ExecutionDomainError::UnsafeEntry { .. }));
+    assert_eq!(
+        std::fs::read_to_string(canary).unwrap(),
+        "preserve-root-canary"
+    );
+    assert_eq!(
+        DomainLifecycle::load(&moved.join(id.simple().to_string()))
+            .unwrap()
+            .state(),
+        DomainState::Ready
+    );
+    assert!(matches!(
+        root.create_domain(),
+        Err(ExecutionDomainError::PoisonedRoot { .. })
+    ));
+}

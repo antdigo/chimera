@@ -1,6 +1,6 @@
-use std::fs::{self, DirBuilder};
+use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io;
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 
 use super::ExecutionDomainError;
@@ -51,6 +51,34 @@ pub(super) fn validate_bound_directory(
         });
     }
     Ok(())
+}
+
+pub(super) fn sync_bound_directory<F>(
+    path: &Path,
+    expected_identity: DirectoryIdentity,
+    sync_directory: F,
+) -> Result<(), ExecutionDomainError>
+where
+    F: FnOnce(&File) -> io::Result<()>,
+{
+    let validate_path = || {
+        let metadata = fs::symlink_metadata(path)
+            .map_err(|source| io_error("reading resource root for sync", path, source))?;
+        validate_bound_directory(path, expected_identity, &metadata)
+    };
+    validate_path()?;
+    let directory = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .map_err(|source| io_error("opening resource root for sync", path, source))?;
+    let metadata = directory
+        .metadata()
+        .map_err(|source| io_error("reading opened resource root identity", path, source))?;
+    validate_bound_directory(path, expected_identity, &metadata)?;
+    validate_path()?;
+    sync_directory(&directory).map_err(|source| io_error("syncing resource root", path, source))?;
+    validate_path()
 }
 
 pub(super) fn create_private_dir(

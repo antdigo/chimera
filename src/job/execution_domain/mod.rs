@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -20,9 +20,9 @@ mod journal_test;
 pub use error::{ExecutionDomainCleanupFatalError, ExecutionDomainError};
 
 use filesystem::{
-    DirectoryIdentity, create_private_dir, directory_identity, io_error, utf8_path,
-    validate_attempt_removal_tree, validate_bound_directory, validate_bound_private_directory,
-    validate_private_directory,
+    DirectoryIdentity, create_private_dir, directory_identity, io_error, sync_bound_directory,
+    utf8_path, validate_attempt_removal_tree, validate_bound_directory,
+    validate_bound_private_directory, validate_private_directory,
 };
 
 pub const DOCKER_CONFIG_ENV: &str = "DOCKER_CONFIG";
@@ -147,6 +147,17 @@ impl ExecutionDomainRoot {
     }
 
     fn create_with_id(&self, attempt_id: Uuid) -> Result<ExecutionDomain, ExecutionDomainError> {
+        self.create_with_id_and_sync(attempt_id, File::sync_all)
+    }
+
+    fn create_with_id_and_sync<F>(
+        &self,
+        attempt_id: Uuid,
+        sync_root: F,
+    ) -> Result<ExecutionDomain, ExecutionDomainError>
+    where
+        F: FnOnce(&File) -> io::Result<()>,
+    {
         let _operation = self.state.lock(&self.canonical_path)?;
         self.ensure_healthy()?;
         validate_bound_private_directory(&self.canonical_path, self.identity)?;
@@ -224,6 +235,12 @@ impl ExecutionDomainRoot {
                 };
             }
         };
+
+        // The Ready journal and attempt directory are synced before their parent entry.
+        // If that barrier fails, retain the complete attempt for recovery rather
+        // than removing through a root whose binding may have changed.
+        sync_bound_directory(&self.canonical_path, self.identity, sync_root)
+            .inspect_err(|_| self.state.poison())?;
 
         Ok(ExecutionDomain {
             root: self.canonical_path.clone(),
@@ -312,13 +329,25 @@ impl ExecutionDomain {
     where
         F: FnOnce(&Path) -> io::Result<()>,
     {
+        self.destroy_with_remover_and_sync(remove_attempt, File::sync_all)
+    }
+
+    fn destroy_with_remover_and_sync<F, S>(
+        &mut self,
+        remove_attempt: F,
+        sync_root: S,
+    ) -> Result<(), ExecutionDomainError>
+    where
+        F: FnOnce(&Path) -> io::Result<()>,
+        S: FnOnce(&File) -> io::Result<()>,
+    {
         if self.destroyed {
             return Ok(());
         }
 
         let state = Arc::clone(&self.state);
         let _operation = state.lock(&self.root)?;
-        let result = self.destroy_locked(remove_attempt);
+        let result = self.destroy_locked(remove_attempt, sync_root);
         if result.is_err() {
             state.poison();
         }
@@ -336,9 +365,14 @@ impl ExecutionDomain {
         }
     }
 
-    fn destroy_locked<F>(&mut self, remove_attempt: F) -> Result<(), ExecutionDomainError>
+    fn destroy_locked<F, S>(
+        &mut self,
+        remove_attempt: F,
+        sync_root: S,
+    ) -> Result<(), ExecutionDomainError>
     where
         F: FnOnce(&Path) -> io::Result<()>,
+        S: FnOnce(&File) -> io::Result<()>,
     {
         let root_metadata =
             fs::symlink_metadata(&self.root).map_err(|source| ExecutionDomainError::Cleanup {
@@ -379,6 +413,7 @@ impl ExecutionDomain {
             path: self.attempt_dir.clone(),
             source,
         })?;
+        sync_bound_directory(&self.root, self.root_identity, sync_root)?;
         self.lifecycle.complete_destroyed()?;
         self.destroyed = true;
         Ok(())
