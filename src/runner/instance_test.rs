@@ -7,7 +7,7 @@ use std::time::Duration;
 use tempfile::TempDir;
 use tokio::sync::watch;
 use tracing_subscriber::fmt::MakeWriter;
-use wiremock::matchers::{method, path, query_param};
+use wiremock::matchers::{method, path, path_regex, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use crate::cache::auth::{CacheAuthError, CacheAuthority, CacheScope};
@@ -217,6 +217,128 @@ fn make_runner() -> (TempDir, Runner) {
     };
 
     (temp, runner)
+}
+
+#[test]
+fn runner_creates_workspace_inside_the_current_attempt() {
+    let (_temp, runner) = make_runner();
+    let resources = runner.job_resources.create_docker_config().unwrap();
+
+    let workspace = runner
+        .create_job_workspace(&resources, "owner/repo")
+        .unwrap();
+
+    assert!(workspace.workspace_dir().starts_with(resources.work_dir()));
+    assert!(workspace.runner_temp().starts_with(resources.private_tmp()));
+    assert!(
+        !workspace
+            .workspace_dir()
+            .starts_with(runner.paths.work_dir())
+    );
+    assert!(!workspace.runner_temp().starts_with(runner.paths.tmp_dir()));
+}
+
+#[tokio::test]
+async fn cancelled_job_removes_attempt_workspace_and_temp_canaries() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path_regex(r"/_apis/pipelines/workflows/.*/logs$"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"id": 1})))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path_regex(r"/_apis/pipelines/workflows/.*/logs/\d+"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+    Mock::given(method("PATCH"))
+        .and(path_regex(
+            r"/_apis/distributedtask/hubs/build/plans/.*/timelines/.*",
+        ))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+
+    let (_temp, runner) = make_runner();
+    cache_node_runtimes(&runner);
+    let mut docker_config = runner.job_resources.create_docker_config().unwrap();
+    let workspace_canary = docker_config
+        .work_dir()
+        .join("test-runner/test-repo/test-repo/workspace-canary");
+    let temp_canary = docker_config
+        .private_tmp()
+        .join("test-runner/checkout-v6-credential-canary");
+    let cancel_ready = docker_config.private_tmp().join("test-runner/cancel-ready");
+    let mut manifest_value = finish_manifest_value(&server.uri());
+    manifest_value["steps"] = serde_json::json!([{
+        "id": "write-canaries",
+        "displayName": "Write private canaries",
+        "reference": { "name": "script", "type": "script" },
+        "inputs": {
+            "script": "printf workspace-secret > \"$GITHUB_WORKSPACE/workspace-canary\"; printf credential-secret > \"$RUNNER_TEMP/checkout-v6-credential-canary\"; touch \"$RUNNER_TEMP/cancel-ready\"; while :; do sleep 1; done"
+        },
+        "condition": null,
+        "timeoutInMinutes": null,
+        "continueOnError": false,
+        "order": 1,
+        "environment": null,
+        "contextName": "write-canaries"
+    }]);
+    let manifest: JobManifest = serde_json::from_value(manifest_value).unwrap();
+    let client = finish_client(&server).await;
+    let http_client = reqwest::Client::new();
+    let cache_scope = cache_scope_for_job(&manifest, "owner/test-repo");
+    let cancel = CancellationToken::new();
+    let cancel_after_ready = cancel.clone();
+    let secret_masker = Arc::new(tokio::sync::RwLock::new(
+        SecretMasker::from_manifest(&manifest).unwrap(),
+    ));
+
+    let (execution, ready) = tokio::join!(
+        runner.run_job_body(
+            &manifest,
+            &client,
+            &http_client,
+            cancel,
+            "owner/test-repo",
+            &cache_scope,
+            &docker_config,
+            &secret_masker,
+        ),
+        async {
+            let ready = tokio::time::timeout(Duration::from_secs(5), async {
+                while !cancel_ready.exists() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await;
+            cancel_after_ready.cancel();
+            ready
+        }
+    );
+
+    ready.expect("job did not create canaries inside its attempt before cancellation");
+    assert_eq!(execution.unwrap().conclusion, JobConclusion::Cancelled);
+    assert!(!workspace_canary.exists());
+    assert!(!temp_canary.exists());
+
+    let first_attempt = docker_config.attempt_dir().to_path_buf();
+    docker_config.cleanup().unwrap();
+    let mut next_attempt = runner.job_resources.create_docker_config().unwrap();
+    assert_ne!(next_attempt.attempt_dir(), first_attempt);
+    assert!(!workspace_canary.exists());
+    assert!(!temp_canary.exists());
+    assert_eq!(
+        std::fs::read_dir(next_attempt.work_dir()).unwrap().count(),
+        0
+    );
+    assert_eq!(
+        std::fs::read_dir(next_attempt.private_tmp())
+            .unwrap()
+            .count(),
+        0
+    );
+    next_attempt.cleanup().unwrap();
 }
 
 #[test]
@@ -533,6 +655,71 @@ async fn poll_loop_stops_when_job_resource_root_is_poisoned() {
         .unwrap_err();
 
     assert!(error.to_string().contains("poisoned-job-resource-root"));
+}
+
+#[tokio::test]
+async fn poisoned_runner_refuses_job_before_acknowledgement() {
+    let (mock_server, token_manager, _shutdown_tx) = setup().await;
+    let (_temp, runner) = make_runner();
+    let mut resources = runner.job_resources.create_docker_config().unwrap();
+    let workspace_canary = resources.work_dir().join("workspace-canary");
+    let credential_canary = resources
+        .private_tmp()
+        .join("checkout-v6-credential-canary");
+    std::fs::write(&workspace_canary, "workspace-secret").unwrap();
+    std::fs::write(&credential_canary, "credential-secret").unwrap();
+    let outside = runner
+        .job_resources
+        .path()
+        .parent()
+        .unwrap()
+        .join("outside");
+    std::fs::write(&outside, "outside").unwrap();
+    let symlink_path = resources.attempt_dir().join("unexpected-link");
+    std::os::unix::fs::symlink(&outside, &symlink_path).unwrap();
+
+    resources.cleanup().unwrap_err();
+
+    assert_eq!(
+        std::fs::read_to_string(&workspace_canary).unwrap(),
+        "workspace-secret"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&credential_canary).unwrap(),
+        "credential-secret"
+    );
+    let message: BrokerMessage = serde_json::from_value(serde_json::json!({
+        "messageId": 99,
+        "messageType": "RunnerJobRequest",
+        "body": format!(
+            "{{\"runner_request_id\":\"request-abc\",\"run_service_url\":\"{}\"}}",
+            mock_server.uri()
+        )
+    }))
+    .unwrap();
+    let broker = BrokerClient::new(
+        reqwest::Client::new(),
+        mock_server.uri(),
+        "session-123".into(),
+        token_manager.clone(),
+    );
+
+    let error = runner
+        .handle_job_message(&message, &broker, &reqwest::Client::new(), token_manager)
+        .await
+        .unwrap_err();
+
+    assert!(error.to_string().contains("poisoned-job-resource-root"));
+    let requests = mock_server.received_requests().await.unwrap();
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.url.path() != "/acknowledge"),
+        "poisoned runner must not acknowledge a new job"
+    );
+
+    std::fs::remove_file(symlink_path).unwrap();
+    resources.cleanup().unwrap();
 }
 
 #[tokio::test]

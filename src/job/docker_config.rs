@@ -15,6 +15,9 @@ pub enum JobDockerConfigError {
     StaleJobResources {
         path: PathBuf,
     },
+    StaleLegacyJobData {
+        path: PathBuf,
+    },
     UnsafeRoot {
         path: PathBuf,
         reason: &'static str,
@@ -59,6 +62,11 @@ impl std::fmt::Display for JobDockerConfigError {
             Self::StaleJobResources { path } => write!(
                 formatter,
                 "stale-job-resources: resource root is not empty: {}",
+                path.display()
+            ),
+            Self::StaleLegacyJobData { path } => write!(
+                formatter,
+                "stale-legacy-job-data: refusing jobs until the legacy path is recovered: {}",
                 path.display()
             ),
             Self::UnsafeRoot { path, reason } => write!(
@@ -216,6 +224,8 @@ pub struct JobDockerConfig {
     config_file: PathBuf,
     private_tmp: PathBuf,
     private_tmp_identity: DirectoryIdentity,
+    work_dir: PathBuf,
+    work_dir_identity: DirectoryIdentity,
     cleaned: bool,
 }
 
@@ -281,6 +291,7 @@ impl JobResourceRoot {
         let attempt_dir = self.canonical_path.join(attempt_id.simple().to_string());
         let config_dir = attempt_dir.join("docker");
         let private_tmp = attempt_dir.join("tmp");
+        let work_dir = attempt_dir.join("work");
         let config_dir_env = utf8_path(&config_dir)?.to_owned();
         let config_file = config_dir.join("config.json");
         match create_private_dir(&attempt_dir, "creating job attempt directory") {
@@ -300,6 +311,9 @@ impl JobResourceRoot {
             create_private_dir(&private_tmp, "creating private job temp directory")?;
             let private_tmp_identity =
                 directory_identity(&private_tmp, "reading private job temp identity")?;
+            create_private_dir(&work_dir, "creating private job work directory")?;
+            let work_dir_identity =
+                directory_identity(&work_dir, "reading private job work identity")?;
             let mut file = OpenOptions::new()
                 .write(true)
                 .create_new(true)
@@ -313,10 +327,10 @@ impl JobResourceRoot {
             fs::set_permissions(&config_file, fs::Permissions::from_mode(0o600)).map_err(
                 |source| io_error("setting Docker config permissions", &config_file, source),
             )?;
-            Ok((attempt_identity, private_tmp_identity))
+            Ok((attempt_identity, private_tmp_identity, work_dir_identity))
         })();
 
-        let (attempt_identity, private_tmp_identity) = match creation {
+        let (attempt_identity, private_tmp_identity, work_dir_identity) = match creation {
             Ok(identities) => identities,
             Err(create) => {
                 return match fs::remove_dir_all(&attempt_dir) {
@@ -345,6 +359,8 @@ impl JobResourceRoot {
             config_file,
             private_tmp,
             private_tmp_identity,
+            work_dir,
+            work_dir_identity,
             cleaned: false,
         })
     }
@@ -361,6 +377,10 @@ impl JobDockerConfig {
 
     pub fn private_tmp(&self) -> &Path {
         &self.private_tmp
+    }
+
+    pub fn work_dir(&self) -> &Path {
+        &self.work_dir
     }
 
     pub fn attempt_dir(&self) -> &Path {
@@ -395,20 +415,30 @@ impl JobDockerConfig {
     }
 
     pub fn cleanup(&mut self) -> Result<(), JobDockerConfigError> {
+        self.cleanup_with_remover(|path| fs::remove_dir_all(path))
+    }
+
+    fn cleanup_with_remover<F>(&mut self, remove_attempt: F) -> Result<(), JobDockerConfigError>
+    where
+        F: FnOnce(&Path) -> io::Result<()>,
+    {
         if self.cleaned {
             return Ok(());
         }
 
         let state = Arc::clone(&self.state);
         let _operation = state.lock(&self.root)?;
-        let result = self.cleanup_locked();
+        let result = self.cleanup_locked(remove_attempt);
         if result.is_err() {
             state.poison();
         }
         result
     }
 
-    fn cleanup_locked(&mut self) -> Result<(), JobDockerConfigError> {
+    fn cleanup_locked<F>(&mut self, remove_attempt: F) -> Result<(), JobDockerConfigError>
+    where
+        F: FnOnce(&Path) -> io::Result<()>,
+    {
         let root_metadata =
             fs::symlink_metadata(&self.root).map_err(|source| JobDockerConfigError::Cleanup {
                 path: self.root.clone(),
@@ -441,8 +471,10 @@ impl JobDockerConfig {
             &self.attempt_dir,
             &self.private_tmp,
             self.private_tmp_identity,
+            &self.work_dir,
+            self.work_dir_identity,
         )?;
-        fs::remove_dir_all(&self.attempt_dir).map_err(|source| JobDockerConfigError::Cleanup {
+        remove_attempt(&self.attempt_dir).map_err(|source| JobDockerConfigError::Cleanup {
             path: self.attempt_dir.clone(),
             source,
         })?;
@@ -567,6 +599,8 @@ fn validate_attempt_removal_tree(
     attempt_dir: &Path,
     private_tmp: &Path,
     private_tmp_identity: DirectoryIdentity,
+    work_dir: &Path,
+    work_dir_identity: DirectoryIdentity,
 ) -> Result<(), JobDockerConfigError> {
     let entries = fs::read_dir(attempt_dir)
         .map_err(|source| io_error("reading cleanup directory", attempt_dir, source))?;
@@ -575,7 +609,9 @@ fn validate_attempt_removal_tree(
             entry.map_err(|source| io_error("reading cleanup entry", attempt_dir, source))?;
         let path = entry.path();
         if path == private_tmp {
-            prepare_private_tmp_for_removal(&path, private_tmp_identity)?;
+            prepare_owned_directory_for_removal(&path, private_tmp_identity)?;
+        } else if path == work_dir {
+            prepare_owned_directory_for_removal(&path, work_dir_identity)?;
         } else {
             validate_removal_tree(&path)?;
         }
@@ -583,14 +619,14 @@ fn validate_attempt_removal_tree(
     Ok(())
 }
 
-fn prepare_private_tmp_for_removal(
-    private_tmp: &Path,
+fn prepare_owned_directory_for_removal(
+    path: &Path,
     expected_identity: DirectoryIdentity,
 ) -> Result<(), JobDockerConfigError> {
-    let metadata = fs::symlink_metadata(private_tmp)
-        .map_err(|source| io_error("reading private temp cleanup metadata", private_tmp, source))?;
-    validate_bound_directory(private_tmp, expected_identity, &metadata)?;
-    prepare_owned_directory_tree_for_removal(private_tmp, &metadata)
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|source| io_error("reading private cleanup metadata", path, source))?;
+    validate_bound_directory(path, expected_identity, &metadata)?;
+    prepare_owned_directory_tree_for_removal(path, &metadata)
 }
 
 fn prepare_owned_directory_tree_for_removal(

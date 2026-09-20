@@ -37,6 +37,38 @@ fn cleanup_removes_dirs() {
 }
 
 #[test]
+fn cleanup_removes_command_files_when_workspace_leaf_is_missing() {
+    let (_tmp, ws) = make_workspace();
+    let command_canary = ws.env_file().to_path_buf();
+    std::fs::write(&command_canary, "APP_ENV=secret").unwrap();
+    std::fs::remove_dir_all(ws.workspace_dir()).unwrap();
+
+    ws.cleanup().unwrap();
+
+    assert!(!command_canary.exists());
+    assert!(!ws.runner_temp().exists());
+}
+
+#[test]
+fn cleanup_reports_temp_failure_after_removing_work_area() {
+    let (_tmp, ws) = make_workspace();
+    let runner_work = ws
+        .workspace_dir()
+        .parent()
+        .and_then(std::path::Path::parent)
+        .unwrap()
+        .to_path_buf();
+    std::fs::remove_dir_all(ws.runner_temp()).unwrap();
+    std::fs::write(ws.runner_temp(), "cannot remove with remove_dir_all").unwrap();
+
+    let error = ws.cleanup().unwrap_err();
+
+    assert!(error.to_string().contains("runner temp"));
+    assert!(!runner_work.exists());
+    assert!(ws.runner_temp().exists());
+}
+
+#[test]
 fn failed_creation_removes_partial_runner_dirs_without_touching_tool_cache() {
     let root = tempfile::tempdir().unwrap();
     let work_dir = root.path().join("work");

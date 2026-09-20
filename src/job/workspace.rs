@@ -189,47 +189,46 @@ impl Workspace {
     }
 
     pub fn cleanup(&self) -> Result<()> {
-        if self.workspace_dir.exists() {
-            // Remove the runner's work directory (parent of parent of workspace)
-            let runner_work = self
-                .workspace_dir
-                .parent()
-                .and_then(|p| p.parent())
-                .context("workspace has no grandparent")?;
-            std::fs::remove_dir_all(runner_work)
-                .with_context(|| format!("removing workspace {}", runner_work.display()))?;
-        }
-
-        if self.runner_temp.exists()
-            && let Err(e) = std::fs::remove_dir_all(&self.runner_temp)
-        {
-            warn!(
-                path = %self.runner_temp.display(),
-                error = %e,
-                "failed to clean up runner temp directory"
-            );
-        }
-
-        Ok(())
+        // Remove the runner's work directory (parent of parent of workspace).
+        // The workspace leaf may already be gone while sibling command files remain.
+        let runner_work = self
+            .workspace_dir
+            .parent()
+            .and_then(|p| p.parent())
+            .context("workspace has no grandparent")?;
+        cleanup_workspace_resources([
+            (runner_work, "workspace"),
+            (&self.runner_temp, "runner temp"),
+        ])
     }
 }
 
 fn cleanup_partial_workspace(runner_work: &Path, runner_temp: &Path) -> Result<()> {
-    let mut cleanup_error = None;
+    cleanup_workspace_resources([
+        (runner_work, "partial workspace"),
+        (runner_temp, "partial runner temp"),
+    ])
+}
 
-    for path in [runner_work, runner_temp] {
-        if !path.exists() {
-            continue;
-        }
-        if let Err(error) = std::fs::remove_dir_all(path) {
-            let error = anyhow::Error::new(error).context(format!(
-                "removing partial workspace resource {}",
-                path.display()
-            ));
-            warn!(error = %error, "failed to remove partial workspace resource");
-            if cleanup_error.is_none() {
-                cleanup_error = Some(error);
-            }
+fn cleanup_workspace_resources<const N: usize>(
+    resources: [(&Path, &'static str); N],
+) -> Result<()> {
+    let mut cleanup_error: Option<anyhow::Error> = None;
+
+    for (path, resource) in resources {
+        let removal = match std::fs::symlink_metadata(path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => Err(error),
+            Ok(_) => std::fs::remove_dir_all(path),
+        };
+        if let Err(error) = removal {
+            let error = anyhow::Error::new(error)
+                .context(format!("removing {resource} {}", path.display()));
+            warn!(error = %error, "failed to remove workspace resource");
+            cleanup_error = Some(match cleanup_error {
+                Some(previous) => previous.context(error.to_string()),
+                None => error,
+            });
         }
     }
 
