@@ -100,6 +100,7 @@ fn config_load_save_roundtrip() {
         execution: ExecutionConfig {
             profile: ExecutionProfile::Sandboxed,
             max_active_domains: std::num::NonZeroUsize::new(40).unwrap(),
+            resources: None,
         },
         runners: vec!["runner-0".into(), "runner-1".into()],
         ..Default::default()

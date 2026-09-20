@@ -10,7 +10,7 @@ use chrono::Utc;
 use tempfile::TempDir;
 
 use super::*;
-use crate::config::{ExecutionConfig, ExecutionProfile};
+use crate::config::{ExecutionConfig, ExecutionProfile, ExecutionResources, ResourceLimits};
 use crate::storage::{RootLock, RootLockError};
 
 #[test]
@@ -19,6 +19,7 @@ fn sandboxed_profile_is_rejected_before_runtime_start() {
         execution: ExecutionConfig {
             profile: ExecutionProfile::Sandboxed,
             max_active_domains: NonZeroUsize::new(20).unwrap(),
+            resources: None,
         },
         ..Default::default()
     };
@@ -42,6 +43,7 @@ async fn sandboxed_run_rejects_before_daemon_owned_side_effects() {
             execution: ExecutionConfig {
                 profile: ExecutionProfile::Sandboxed,
                 max_active_domains: NonZeroUsize::new(20).unwrap(),
+                resources: None,
             },
             ..Default::default()
         },
@@ -69,6 +71,38 @@ async fn sandboxed_run_rejects_before_daemon_owned_side_effects() {
     assert!(!paths.pid_file().exists());
     assert!(!paths.job_resources_dir().exists());
     assert!(!paths.cache_entries_dir().exists());
+}
+
+#[test]
+fn sandboxed_gate_precedes_resource_validation() {
+    let invalid = ResourceLimits {
+        memory_high: "2 MiB".into(),
+        memory_max: "1 MiB".into(),
+        memory_swap_max: "0".into(),
+        cpu_quota: "0%".into(),
+        cpu_weight: 0,
+        pids_max: "0".into(),
+        io_weight: 0,
+        io_max: Vec::new(),
+    };
+    let config = ChimeraConfig {
+        execution: ExecutionConfig {
+            profile: ExecutionProfile::Sandboxed,
+            max_active_domains: NonZeroUsize::new(20).unwrap(),
+            resources: Some(ExecutionResources {
+                global: invalid.clone(),
+                attempt: invalid,
+            }),
+        },
+        ..Default::default()
+    };
+
+    let error = validate_execution_profile(&config).unwrap_err();
+
+    assert_eq!(
+        error.to_string(),
+        "sandboxed execution profile is not available in this build"
+    );
 }
 
 #[test]
