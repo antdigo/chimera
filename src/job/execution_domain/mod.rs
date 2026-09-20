@@ -17,8 +17,28 @@ mod docker_paths;
 mod error;
 mod filesystem;
 mod journal;
-#[cfg(all(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", test))]
 mod linux;
+#[cfg(any(target_os = "linux", test))]
+mod protocol;
+#[cfg(test)]
+#[path = "protocol_test.rs"]
+mod protocol_test;
+
+/// Dispatch reserved bootstrap modes before constructing any async runtime.
+pub fn internal_entry() -> Option<i32> {
+    #[cfg(target_os = "linux")]
+    {
+        linux::launcher::internal_entry()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        std::env::args_os()
+            .nth(1)
+            .filter(|arg| arg == "--internal-domain-launch" || arg == "--internal-domain-bootstrap")
+            .map(|_| 78)
+    }
+}
 
 #[cfg(test)]
 #[path = "contracts_test.rs"]

@@ -440,6 +440,35 @@ fn cgroup_order_sets_limits_before_admitting_processes() {
 }
 
 #[test]
+fn launcher_checks_bound_rootfs_before_spawning() {
+    use super::launcher::{LaunchSpec, NetworkLaunch, launch};
+    let fixture = Fixture::new();
+    let root = fixture.ready();
+    let identity = AttemptIdentity::new();
+    let attempt = root.create_attempt(identity, &limits()).unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let staging = temp.path().join("rootfs");
+    fs::create_dir(&staging).unwrap();
+    let bound_rootfs = super::dirfd::BoundDir::open_root(&staging).unwrap();
+    let spec = LaunchSpec {
+        attempt: identity,
+        rootfs: super::rootfs::RootfsPlan {
+            inputs: vec![],
+            staging_root: staging.clone(),
+        },
+        bound_rootfs,
+        executable: fs::canonicalize("/bin/false").unwrap(),
+        rootlesskit: fs::canonicalize("/bin/true").unwrap(),
+        state_directory: temp.path().to_owned(),
+        hostname: "test".into(),
+        network: NetworkLaunch::Disconnected,
+    };
+    fs::rename(&staging, temp.path().join("old")).unwrap();
+    fs::create_dir(&staging).unwrap();
+    assert!(launch(&attempt, &spec).is_err());
+}
+
+#[test]
 fn missing_controller_is_a_preflight_error() {
     assert!(validate_controllers("cpu memory pids").is_err());
     assert!(validate_controllers("cpuset cpu io memory pids").is_ok());
