@@ -60,12 +60,37 @@ fn immutable_cache_refuses_writable_files_and_replaced_identity() {
     let input = MountInput::readonly(&cache, "/opt/hostedtoolcache").unwrap();
     assert!(super::rootfs::verify_immutable(&input).is_err());
     std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o555)).unwrap();
-    super::rootfs::verify_immutable(&input).unwrap();
+    assert!(super::rootfs::verify_immutable(&input).is_err());
     std::fs::set_permissions(&cache, std::fs::Permissions::from_mode(0o755)).unwrap();
     std::fs::rename(&cache, temp.path().join("old")).unwrap();
     std::fs::create_dir(&cache).unwrap();
     std::fs::set_permissions(&cache, std::fs::Permissions::from_mode(0o555)).unwrap();
     assert!(super::rootfs::verify_immutable(&input).is_err());
+}
+
+#[test]
+fn readonly_mode_does_not_hide_a_service_owned_writable_hardlink_alias() {
+    use std::os::unix::fs::PermissionsExt;
+    let temp = tempfile::tempdir().unwrap();
+    let input_path = temp.path().join("tool");
+    let alias = temp.path().join("writable-alias");
+    std::fs::write(&input_path, b"canary").unwrap();
+    std::fs::hard_link(&input_path, &alias).unwrap();
+    std::fs::set_permissions(&input_path, std::fs::Permissions::from_mode(0o444)).unwrap();
+    let input = MountInput::readonly(&input_path, "/opt/chimera-tools/tool").unwrap();
+    assert!(super::rootfs::verify_immutable(&input).is_err());
+    std::fs::set_permissions(&alias, std::fs::Permissions::from_mode(0o644)).unwrap();
+    std::fs::write(&alias, b"changed").unwrap();
+    assert_eq!(std::fs::read(&input_path).unwrap(), b"changed");
+}
+
+#[test]
+fn operator_owned_inputs_are_accepted_and_walk_budget_is_enforced() {
+    let input =
+        MountInput::readonly("/usr/share/zoneinfo/Etc", "/opt/chimera-tools/zoneinfo").unwrap();
+    super::rootfs::verify_immutable(&input).unwrap();
+    assert!(super::rootfs::linux::verify_immutable_with_budget(&input, 1, 128).is_err());
+    assert!(super::rootfs::linux::verify_immutable_with_budget(&input, 100_000, 1).is_err());
 }
 
 #[test]
@@ -86,10 +111,8 @@ fn debian_builder_rejects_mutable_cache_without_modifying_it() {
 fn debian_builder_accepts_readonly_caches_and_preserves_modes() {
     use super::rootfs::linux::ImmutableInputs;
     use std::os::unix::fs::PermissionsExt;
-    let temp = tempfile::tempdir().unwrap();
-    let cache = temp.path().join("cache");
-    std::fs::create_dir(&cache).unwrap();
-    std::fs::set_permissions(&cache, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let cache = std::path::PathBuf::from("/usr/share/zoneinfo/Etc");
+    let before = std::fs::metadata(&cache).unwrap().permissions().mode();
     let inputs = ImmutableInputs {
         tool_cache: cache.clone(),
         actions_cache: cache.clone(),
@@ -99,7 +122,7 @@ fn debian_builder_accepts_readonly_caches_and_preserves_modes() {
     assert!(plan.inputs.iter().all(|i| i.readonly));
     assert_eq!(
         std::fs::metadata(&cache).unwrap().permissions().mode() & 0o777,
-        0o555
+        before & 0o777
     );
 }
 
@@ -192,6 +215,7 @@ fn full_layout_refuses_peer_control_roots_and_wrong_cgroup() {
             readonly,
             expected_device: 1,
             expected_inode: 1,
+            immutable_fingerprint: None,
         });
     }
     let plan = super::rootfs::RootfsPlan {

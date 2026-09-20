@@ -11,6 +11,9 @@ use super::{MountInput, RootfsPlan};
 use crate::job::execution_domain::DomainPath;
 use crate::job::execution_domain::{ExecutionDomainError, FailureCategory, Stage};
 
+#[path = "rootfs_immutable.rs"]
+mod immutable;
+
 const SYSTEM_INPUTS: &[&str] = &[
     "/usr/bin",
     "/usr/sbin",
@@ -71,6 +74,7 @@ impl MountInput {
             readonly,
             expected_device: metadata.dev(),
             expected_inode: metadata.ino(),
+            immutable_fingerprint: None,
         })
     }
 }
@@ -105,8 +109,8 @@ impl RootfsPlan {
             )?);
         }
         validate_inputs(&mounts)?;
-        for input in &mounts {
-            verify_immutable(input)?;
+        for input in &mut mounts {
+            input.immutable_fingerprint = Some(immutable::fingerprint(input, false)?);
         }
         Ok(Self {
             inputs: mounts,
@@ -138,8 +142,10 @@ impl RootfsPlan {
         for input in &self.inputs {
             let metadata = checked_metadata(input)?;
             if input.readonly {
-                if !namespace {
-                    verify_immutable(input)?;
+                if !namespace
+                    && input.immutable_fingerprint != Some(immutable::fingerprint(input, false)?)
+                {
+                    return Err(failure(FailureCategory::IdentityMismatch));
                 }
             } else if input.target.as_str() == "/sys/fs/cgroup" {
                 let fd = open_path(&input.source)?;
@@ -303,42 +309,20 @@ pub(in crate::job::execution_domain::linux) fn generated_etc(
     ]))
 }
 
+#[cfg(test)]
 pub(in crate::job::execution_domain::linux) fn verify_immutable(
     input: &MountInput,
 ) -> Result<(), ExecutionDomainError> {
-    let root = checked_metadata(input)?;
-    let mut pending = vec![input.source.clone()];
-    while let Some(path) = pending.pop() {
-        let metadata = fs::symlink_metadata(&path).map_err(io_failure)?;
-        if metadata.file_type().is_symlink() {
-            // System symlinks are interpreted after pivot, so links into omitted
-            // host /etc remain absent. In particular Debian's lib/ssl/private
-            // must not cause that host directory to become an exported input.
-            if SYSTEM_INPUTS.contains(&input.target.as_str()) {
-                continue;
-            }
-            let resolved = path.canonicalize().map_err(io_failure)?;
-            if !resolved.starts_with(&input.source) {
-                return Err(invalid());
-            }
-            continue;
-        }
-        if !metadata.is_dir() && !metadata.is_file()
-            || metadata.dev() != root.dev()
-            || (metadata.uid() != 0 && metadata.uid() != unsafe { libc::geteuid() })
-            || metadata.mode() & 0o022 != 0
-            || metadata.uid() == unsafe { libc::geteuid() } && metadata.mode() & 0o200 != 0
-        {
-            return Err(invalid());
-        }
-        if metadata.is_dir() {
-            for child in fs::read_dir(path).map_err(io_failure)? {
-                pending.push(child.map_err(io_failure)?.path());
-            }
-        }
-    }
-    checked_metadata(input)?;
-    Ok(())
+    immutable::fingerprint(input, false).map(|_| ())
+}
+
+#[cfg(test)]
+pub(in crate::job::execution_domain::linux) fn verify_immutable_with_budget(
+    input: &MountInput,
+    entries: usize,
+    depth: usize,
+) -> Result<(), ExecutionDomainError> {
+    immutable::fingerprint_with_budget(input, false, entries, depth).map(|_| ())
 }
 
 fn canonical(path: &Path) -> Result<(), ExecutionDomainError> {
@@ -409,11 +393,13 @@ pub(in crate::job::execution_domain::linux) struct RootfsProof {
 }
 
 struct MountLine {
+    id: u64,
     root: PathBuf,
     target: PathBuf,
     filesystem: String,
     options: BTreeSet<String>,
     propagation: bool,
+    super_readonly: bool,
 }
 
 pub(in crate::job::execution_domain::linux) struct ExpectedMount {
@@ -458,10 +444,12 @@ fn parse_mountinfo(text: &str) -> Result<Vec<MountLine>, ExecutionDomainError> {
                 return Err(invalid());
             }
             Ok(MountLine {
+                id: left[0].parse().map_err(|_| invalid())?,
                 root: unescape_mount(left[3])?,
                 target: unescape_mount(left[4])?,
                 filesystem: right[0].into(),
                 options: left[5].split(',').map(str::to_owned).collect(),
+                super_readonly: right[2].split(',').any(|option| option == "ro"),
                 propagation: left[6..].iter().any(|s| {
                     s.starts_with("shared:")
                         || s.starts_with("master:")
@@ -585,6 +573,9 @@ pub(in crate::job::execution_domain::linux) fn assemble_and_pivot(
             fs::metadata(format!("/proc/self/fd/{}", fd.as_raw_fd())).map_err(io_failure)?;
         if metadata.dev() != input.expected_device || metadata.ino() != input.expected_inode {
             return Err(failure(FailureCategory::IdentityMismatch));
+        }
+        if input.readonly {
+            immutable::verify_snapshot(input, &fd, true)?;
         }
         expected.extend(expected_bind(
             &input.source,

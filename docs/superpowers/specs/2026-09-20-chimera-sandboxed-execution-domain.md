@@ -184,6 +184,16 @@ Read-only inputs:
 - проверенный immutable tool cache и actions cache;
 - CA certificates и необходимые timezone/locale assets.
 
+Immutable здесь означает невозможность изменения backing inode пользователем
+service, включая namespace root и доступ через hardlink alias. Одних `chmod
+0444/0555` и readonly bind mount недостаточно: namespace root может снять bind-RO
+и изменить inode, принадлежащий mapped UID. На writable filesystem shared tools
+и caches устанавливает оператор с unmapped ownership (в реализации B6 — root),
+без group/other write. Альтернатива — readonly backing superblock; readonly bind
+такой гарантии не даёт. Service работает без root, проверяет дерево перед запуском
+и не меняет ownership/permissions либо копирует caches автоматически. Обновление
+этих immutable inputs оператор выполняет вне активных attempts.
+
 Generated/private state:
 
 - минимальный `/etc` без host users, credentials и service configuration;

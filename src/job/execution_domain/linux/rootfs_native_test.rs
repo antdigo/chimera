@@ -1,6 +1,149 @@
 use super::*;
 
 #[test]
+fn immutable_snapshot_rejects_a_changed_launch_record() {
+    let mut input =
+        MountInput::readonly("/usr/share/zoneinfo/Etc", "/opt/chimera-tools/zoneinfo").unwrap();
+    input.immutable_fingerprint = Some(immutable::fingerprint(&input, false).unwrap());
+    let fd = open_path(&input.source).unwrap();
+    immutable::verify_snapshot(&input, &fd, false).unwrap();
+    input.immutable_fingerprint.as_mut().unwrap()[0] ^= 1;
+    assert!(immutable::verify_snapshot(&input, &fd, false).is_err());
+}
+
+#[test]
+#[ignore = "root-owned fixture inside disposable container, then UID1000 user namespace"]
+fn operator_owned_cache_resists_rw_remount_and_hardlink_alias() {
+    let source = Path::new("/chimera-operator-fixture/operator");
+    let alias = Path::new("/chimera-operator-fixture/operator-alias");
+    if std::env::var_os("CHIMERA_B6_NATIVE_CHILD").is_none() {
+        let mut input = MountInput::readonly(source, "/opt/chimera-tools/tool").unwrap();
+        input.immutable_fingerprint = Some(immutable::fingerprint(&input, false).unwrap());
+        let status = std::process::Command::new("unshare")
+            .args(["--user", "--map-root-user", "--mount", "--pid", "--fork", "--uts"])
+            .arg(std::env::current_exe().unwrap())
+            .args(["--exact", "job::execution_domain::linux::rootfs::linux::native_test::operator_owned_cache_resists_rw_remount_and_hardlink_alias", "--ignored", "--nocapture", "--test-threads=1"])
+            .env("CHIMERA_B6_NATIVE_CHILD", "1")
+            .env("CHIMERA_B6_INPUT", serde_json::to_string(&input).unwrap())
+            .status().unwrap();
+        assert!(status.success());
+        return;
+    }
+    checked_mount_private_recursive().unwrap();
+    let input: MountInput =
+        serde_json::from_str(&std::env::var("CHIMERA_B6_INPUT").unwrap()).unwrap();
+    immutable::verify_snapshot(&input, &open_path(source).unwrap(), true).unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    mount(
+        Some(source),
+        temp.path(),
+        None,
+        libc::MS_BIND | libc::MS_REC,
+        None,
+    )
+    .unwrap();
+    mount_attributes(temp.path(), true, true, false, true).unwrap();
+    let tool = temp.path().join("tool");
+    assert_eq!(
+        fs::write(&tool, b"changed").unwrap_err().raw_os_error(),
+        Some(libc::EROFS)
+    );
+    // This succeeds: readonly bind flags are not the immutability boundary.
+    mount(
+        None,
+        temp.path(),
+        None,
+        libc::MS_REMOUNT | libc::MS_BIND,
+        None,
+    )
+    .unwrap();
+    for path in [&tool, &alias.to_path_buf()] {
+        assert_eq!(
+            fs::set_permissions(path, fs::Permissions::from_mode(0o644))
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EPERM)
+        );
+        assert_eq!(
+            fs::write(path, b"changed").unwrap_err().raw_os_error(),
+            Some(libc::EACCES)
+        );
+    }
+    assert_eq!(fs::read(source.join("tool")).unwrap(), b"operator-canary");
+    assert_eq!(fs::read(alias).unwrap(), b"operator-canary");
+    std::mem::forget(temp);
+}
+
+#[test]
+#[ignore = "readonly superblock fixture created in disposable container"]
+fn readonly_superblock_accepts_service_owned_content_without_writable_alias() {
+    let source = Path::new("/chimera-operator-fixture/readonly");
+    let input = MountInput::readonly(source, "/opt/chimera-tools/tool").unwrap();
+    immutable::fingerprint(&input, false).unwrap();
+    assert_eq!(
+        fs::write(source.join("tool"), b"changed")
+            .unwrap_err()
+            .raw_os_error(),
+        Some(libc::EROFS)
+    );
+    assert_eq!(
+        fs::set_permissions(source.join("tool"), fs::Permissions::from_mode(0o644))
+            .unwrap_err()
+            .raw_os_error(),
+        Some(libc::EROFS)
+    );
+    assert_eq!(fs::read(source.join("tool")).unwrap(), b"readonly-canary");
+}
+
+#[test]
+#[ignore = "disposable Linux user/mount namespace required"]
+fn readonly_bind_flags_do_not_admit_service_owned_cache() {
+    if !in_disposable_namespace(
+        "job::execution_domain::linux::rootfs::linux::native_test::readonly_bind_flags_do_not_admit_service_owned_cache",
+    ) {
+        return;
+    }
+    checked_mount_private_recursive().unwrap();
+    let source = tempfile::tempdir().unwrap();
+    let target = tempfile::tempdir().unwrap();
+    fs::write(source.path().join("tool"), b"canary").unwrap();
+    fs::set_permissions(
+        source.path().join("tool"),
+        fs::Permissions::from_mode(0o444),
+    )
+    .unwrap();
+    fs::set_permissions(source.path(), fs::Permissions::from_mode(0o555)).unwrap();
+    mount(
+        Some(source.path()),
+        target.path(),
+        None,
+        libc::MS_BIND,
+        None,
+    )
+    .unwrap();
+    mount_attributes(target.path(), true, true, false, true).unwrap();
+    let input = MountInput::readonly(target.path(), "/opt/chimera-tools/tool").unwrap();
+    assert!(immutable::fingerprint(&input, true).is_err());
+    mount(
+        None,
+        target.path(),
+        None,
+        libc::MS_REMOUNT | libc::MS_BIND | libc::MS_NOSUID | libc::MS_NODEV,
+        None,
+    )
+    .unwrap();
+    fs::set_permissions(
+        target.path().join("tool"),
+        fs::Permissions::from_mode(0o644),
+    )
+    .unwrap();
+    fs::write(target.path().join("tool"), b"changed").unwrap();
+    assert_eq!(fs::read(source.path().join("tool")).unwrap(), b"changed");
+    std::mem::forget(source);
+    std::mem::forget(target);
+}
+
+#[test]
 fn unavailable_mount_setattr_fails_closed() {
     const MARKER: &str = "CHIMERA_B6_NO_MOUNT_SETATTR";
     if std::env::var_os(MARKER).is_none() {

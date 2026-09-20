@@ -21,6 +21,7 @@ pub(in crate::job::execution_domain) struct MountInput {
     pub readonly: bool,
     pub expected_device: u64,
     pub expected_inode: u64,
+    pub immutable_fingerprint: Option<[u8; 32]>,
 }
 
 #[cfg(target_os = "linux")]
