@@ -12,6 +12,10 @@ mod launcher_test;
 pub(super) mod rootfs;
 
 #[cfg(all(target_os = "linux", test))]
+#[path = "rootfs_test.rs"]
+mod rootfs_test;
+
+#[cfg(all(target_os = "linux", test))]
 #[path = "cgroup_test.rs"]
 mod cgroup_test;
 

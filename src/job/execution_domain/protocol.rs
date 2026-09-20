@@ -285,6 +285,12 @@ pub(super) struct ControlConnection {
 }
 
 impl ControlConnection {
+    #[cfg(target_os = "linux")]
+    pub(super) fn control_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        use std::os::fd::AsFd;
+        self.stream.as_fd()
+    }
+
     pub(super) fn new(
         stream: UnixStream,
         attempt: AttemptIdentity,

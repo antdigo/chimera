@@ -62,9 +62,9 @@ pub(super) fn serve(
     {
         return Err(failure(FailureCategory::InvalidInput));
     }
-    // Bootstrap only acknowledges transport and received records. No code can
-    // issue KernelReady until Task 6 has produced a RootfsProof.
-    let _bootstrap = spec;
+    // A transport acknowledgement is deliberately distinct from kernel readiness.
+    let mut bootstrap = Some(spec);
+    let mut rootfs_proof = None;
     connection.send(Message::Response(Response::Bootstrapped), deadline)?;
     loop {
         reap_orphans()?;
@@ -73,6 +73,38 @@ pub(super) fn serve(
         }
         let request = connection.receive(Instant::now() + super::launcher::STARTUP_TIMEOUT)?;
         let (response, finished) = match request {
+            Message::Request(Request::Hello) => {
+                if let Some(spec) = bootstrap.take() {
+                    match super::rootfs::assemble_and_pivot(
+                        &spec.rootfs,
+                        connection.control_fd(),
+                        &spec.hostname,
+                    ) {
+                        Ok(proof) => rootfs_proof = Some(proof),
+                        Err(_) => {
+                            connection.send(
+                                Message::Response(Response::Rejected {
+                                    category: FailureCategory::NotReady,
+                                }),
+                                Instant::now() + super::launcher::STARTUP_TIMEOUT,
+                            )?;
+                            // No retry after a partial assembly. Shutdown is still
+                            // usable until the supervisor reclaims this domain.
+                            continue;
+                        }
+                    }
+                }
+                (
+                    if rootfs_proof.is_some() {
+                        Response::KernelReady
+                    } else {
+                        Response::Rejected {
+                            category: FailureCategory::NotReady,
+                        }
+                    },
+                    false,
+                )
+            }
             Message::Request(Request::Shutdown { .. }) => (Response::ShuttingDown, true),
             Message::Request(Request::Bootstrap { .. }) | Message::Response(_) => (
                 Response::Rejected {

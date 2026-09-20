@@ -293,6 +293,7 @@ pub(super) fn launch<F: super::cgroup::CgroupFilesystem>(
     if named.dev() != device || named.ino() != expected.stx_ino {
         return Err(failure(FailureCategory::IdentityMismatch));
     }
+    spec.rootfs.validate()?;
     spawn_launcher(cgroup.launch_membership_fd(), spec)
 }
 
