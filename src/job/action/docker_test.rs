@@ -1,6 +1,6 @@
-use std::num::NonZeroUsize;
 use std::collections::HashMap;
 use std::io::{self, Write};
+use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -541,7 +541,9 @@ fn test_docker_config(tmp: &tempfile::TempDir) -> crate::job::execution_domain::
         NonZeroUsize::new(1).unwrap(),
     )
     .unwrap();
-    futures::executor::block_on(root.reserve()).and_then(|permit| permit.provision()).unwrap()
+    futures::executor::block_on(root.reserve())
+        .and_then(|permit| permit.provision())
+        .unwrap()
 }
 
 #[tokio::test]

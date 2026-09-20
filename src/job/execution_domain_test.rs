@@ -433,11 +433,9 @@ fn daemon_docker_config_child() {
         parent.join("daemon-docker")
     );
 
-    let root = ExecutionDomainRoot::prepare(
-        &parent.join("job-resources"),
-        NonZeroUsize::new(1).unwrap(),
-    )
-    .unwrap();
+    let root =
+        ExecutionDomainRoot::prepare(&parent.join("job-resources"), NonZeroUsize::new(1).unwrap())
+            .unwrap();
     let config = admitted_domain(&root).unwrap();
 
     assert_eq!(std::fs::read(config.config_file()).unwrap(), b"{}");

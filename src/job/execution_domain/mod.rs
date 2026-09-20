@@ -157,7 +157,10 @@ impl ExecutionDomainRoot {
         self.state.poison();
     }
 
-    fn create_domain_with_id(&self, attempt_id: Uuid) -> Result<ExecutionDomain, ExecutionDomainError> {
+    fn create_domain_with_id(
+        &self,
+        attempt_id: Uuid,
+    ) -> Result<ExecutionDomain, ExecutionDomainError> {
         self.create_with_id_and_sync(attempt_id, File::sync_all)
     }
 

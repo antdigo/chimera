@@ -922,12 +922,11 @@ async fn concurrent_logout_does_not_remove_other_job_credentials() {
     assert_eq!(seeded, format!("{}/probe:seed", registry.address()));
     let sync = tempfile::tempdir().unwrap();
     let daemon_root = tempfile::tempdir().unwrap();
-    let execution_domains =
-        ExecutionDomainRoot::prepare(
-            &daemon_root.path().join("job-resources"),
-            NonZeroUsize::new(2).unwrap(),
-        )
-        .unwrap();
+    let execution_domains = ExecutionDomainRoot::prepare(
+        &daemon_root.path().join("job-resources"),
+        NonZeroUsize::new(2).unwrap(),
+    )
+    .unwrap();
     let first = TestEnv::setup_with_job_resources(execution_domains.clone()).await;
     let second = TestEnv::setup_with_job_resources(execution_domains).await;
 

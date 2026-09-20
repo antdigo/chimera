@@ -242,12 +242,11 @@ fn assert_reserved_override_diagnostic(spy: &StepLogSpy) {
 #[tokio::test]
 async fn concurrent_jobs_use_distinct_configs() {
     let daemon_root = tempfile::tempdir().unwrap();
-    let execution_domains =
-        ExecutionDomainRoot::prepare(
-            &daemon_root.path().join("job-resources"),
-            NonZeroUsize::new(2).unwrap(),
-        )
-        .unwrap();
+    let execution_domains = ExecutionDomainRoot::prepare(
+        &daemon_root.path().join("job-resources"),
+        NonZeroUsize::new(2).unwrap(),
+    )
+    .unwrap();
     let resource_root = execution_domains.path().to_path_buf();
     let release = daemon_root.path().join("release");
     let first = TestEnv::setup_with_job_resources(execution_domains.clone()).await;
@@ -401,13 +400,17 @@ async fn pre_main_post_share_config_until_post_finishes() {
 #[tokio::test]
 async fn cleanup_runs_for_all_job_outcomes() {
     let daemon_root = tempfile::tempdir().unwrap();
-    let execution_domains =
-        ExecutionDomainRoot::prepare(
-            &daemon_root.path().join("job-resources"),
-            NonZeroUsize::new(2).unwrap(),
-        )
+    let execution_domains = ExecutionDomainRoot::prepare(
+        &daemon_root.path().join("job-resources"),
+        NonZeroUsize::new(2).unwrap(),
+    )
+    .unwrap();
+    let neighbor = execution_domains
+        .reserve()
+        .await
+        .unwrap()
+        .provision()
         .unwrap();
-    let neighbor = execution_domains.reserve().await.unwrap().provision().unwrap();
     let neighbor_dir = neighbor.attempt_dir().to_path_buf();
 
     for case in ["success", "failure", "cancelled", "pre-error"] {

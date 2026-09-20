@@ -1,8 +1,8 @@
-use std::num::NonZeroUsize;
 use super::*;
 use crate::job::execution_domain::{DOCKER_CONFIG_ENV, ExecutionDomain, ExecutionDomainRoot};
 use crate::job::schema::{JobManifest, JobVariable};
 use serde_json::json;
+use std::num::NonZeroUsize;
 
 fn minimal_manifest() -> JobManifest {
     serde_json::from_value(json!({

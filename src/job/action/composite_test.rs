@@ -1,5 +1,5 @@
-use std::num::NonZeroUsize;
 use std::collections::HashMap;
+use std::num::NonZeroUsize;
 
 use super::*;
 use crate::job::action::download::{ActionCache, TrustedActionDirectory};
@@ -17,7 +17,9 @@ fn test_docker_config(tmp: &tempfile::TempDir) -> crate::job::execution_domain::
         NonZeroUsize::new(1).unwrap(),
     )
     .unwrap();
-    futures::executor::block_on(root.reserve()).and_then(|permit| permit.provision()).unwrap()
+    futures::executor::block_on(root.reserve())
+        .and_then(|permit| permit.provision())
+        .unwrap()
 }
 
 fn make_test_workspace(tmp: &tempfile::TempDir) -> Workspace {

@@ -666,7 +666,13 @@ async fn cancel_token_cancels_job() {
         &env.mock_server.uri(),
     );
 
-    let domain = env.execution_domains.reserve().await.unwrap().provision().unwrap();
+    let domain = env
+        .execution_domains
+        .reserve()
+        .await
+        .unwrap()
+        .provision()
+        .unwrap();
     let base_env =
         chimera::runner::env::build_base_env(&manifest, &env.workspace, "test-runner", &domain)
             .unwrap();

@@ -47,12 +47,11 @@ pub struct TestEnv {
 impl TestEnv {
     pub async fn setup() -> Self {
         let tmp = tempfile::tempdir().unwrap();
-        let execution_domains =
-            ExecutionDomainRoot::prepare(
-                &tmp.path().join("job-resources"),
-                NonZeroUsize::new(1).unwrap(),
-            )
-            .unwrap();
+        let execution_domains = ExecutionDomainRoot::prepare(
+            &tmp.path().join("job-resources"),
+            NonZeroUsize::new(1).unwrap(),
+        )
+        .unwrap();
         Self::setup_with_tmp(tmp, execution_domains).await
     }
 
