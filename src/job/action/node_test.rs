@@ -318,6 +318,66 @@ async fn node_post_replaced_state_discards_mutations_and_terminates_transaction(
 }
 
 #[tokio::test]
+async fn reverse_order_node_posts_apply_each_command_once_in_fresh_transactions() {
+    let tmp = tempfile::tempdir().unwrap();
+    let workspace = make_test_workspace(&tmp);
+    let domain = test_docker_config(&tmp);
+    let base_env = HashMap::from([(
+        DOCKER_CONFIG_ENV.to_string(),
+        domain.docker_config_dir().to_string_lossy().into_owned(),
+    )]);
+    let node_runtimes = crate::node::NodeRuntimes::single("/bin/sh".into());
+    let execution = JobExecutionContext::new(&domain, None, &node_runtimes);
+    let masks = crate::job::secret_masker::shared_masker_for_test(&[]);
+    let logger = StepLogger::results_for_test(masks.clone());
+    let mut state = JobState::new(masks, HashMap::new(), serde_json::json!({}));
+
+    for label in ["second", "first"] {
+        let action_dir = tmp.path().join(label);
+        std::fs::create_dir_all(&action_dir).unwrap();
+        std::fs::write(
+            action_dir.join("post.sh"),
+            format!(
+                "printf '%s\\n' '::add-path::/stdout/{label}'; printf '/file/{label}\\n' > \"$GITHUB_PATH\"\n"
+            ),
+        )
+        .unwrap();
+        let mut metadata = make_node_metadata("main.sh");
+        metadata.runs.post = Some("post.sh".into());
+        let mut step = make_action_step(label);
+        step.context_name = Some(format!("{label}_post"));
+
+        let result = run_node_action(
+            &action_dir,
+            &metadata,
+            "post",
+            &step,
+            &mut state,
+            &workspace,
+            &base_env,
+            logger.sender(),
+            &CancellationToken::new(),
+            &execution,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.conclusion, StepConclusion::Succeeded);
+    }
+
+    assert_eq!(
+        state.path_prepends,
+        [
+            "/stdout/second",
+            "/file/second",
+            "/stdout/first",
+            "/file/first"
+        ]
+    );
+    let next = domain.prepare_step(b"{}").await.unwrap();
+    domain.read_step(next).await.unwrap();
+}
+
+#[tokio::test]
 async fn input_env_vars_set() {
     let tmp = tempfile::tempdir().unwrap();
     let ws = make_test_workspace(&tmp);

@@ -9,7 +9,7 @@ use tracing::debug;
 use super::metadata::ActionMetadata;
 use crate::docker::output::OutputProcessor;
 use crate::job::execute::{
-    JobExecutionContext, JobState, StepResult, build_step_env, complete_step_transaction,
+    JobExecutionContext, JobState, StepResult, build_step_env, complete_docker_exec_transaction,
     prepare_step_transaction, run_process,
 };
 use crate::job::expression::ExprContext;
@@ -126,7 +126,7 @@ pub async fn run_node_action(
             cancel_token,
         )
         .await;
-        let result = complete_step_transaction(
+        let result = complete_docker_exec_transaction(
             execution.docker_config(),
             state_id,
             &processor,

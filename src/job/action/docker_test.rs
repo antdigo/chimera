@@ -601,6 +601,63 @@ async fn docker_action_rekeys_saved_state_before_returning_command_error() {
     );
 }
 
+#[tokio::test]
+async fn docker_action_transactions_apply_each_workflow_command_once() {
+    let (temp, workspace) = action_workspace();
+    let domain = test_docker_config(&temp);
+    domain.bind_workspace(&workspace).await.unwrap();
+    let masks = crate::job::secret_masker::shared_masker_for_test(&[]);
+    let mut state = action_job_state();
+    let step = docker_action_step(None);
+
+    let first_id = domain.prepare_step(b"{}").await.unwrap();
+    let first_processor = OutputProcessor::new(
+        LogSender::new_for_test(tokio::sync::mpsc::channel(8).0, Arc::clone(&masks)),
+        Arc::clone(&masks),
+        false,
+    );
+    first_processor
+        .process_line("::add-path::/stdout/docker-action")
+        .await;
+    std::fs::write(workspace.path_file(), "/file/docker-action\n").unwrap();
+    complete_docker_action_transaction(
+        &domain,
+        first_id,
+        &first_processor,
+        &mut state,
+        &step,
+        Ok(StepResult {
+            conclusion: StepConclusion::Succeeded,
+        }),
+    )
+    .await
+    .unwrap();
+
+    let second_id = domain.prepare_step(b"{}").await.unwrap();
+    let second_processor = OutputProcessor::new(
+        LogSender::new_for_test(tokio::sync::mpsc::channel(8).0, Arc::clone(&masks)),
+        masks,
+        false,
+    );
+    complete_docker_action_transaction(
+        &domain,
+        second_id,
+        &second_processor,
+        &mut state,
+        &step,
+        Ok(StepResult {
+            conclusion: StepConclusion::Succeeded,
+        }),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        state.path_prepends,
+        ["/stdout/docker-action", "/file/docker-action"]
+    );
+}
+
 const DOCKER_ACTION_ENDPOINT_CHILD_CASE: &str = "CHIMERA_DOCKER_ACTION_ENDPOINT_CHILD_CASE";
 
 async fn run_docker_action_endpoint_child(test_name: &str, endpoint: &DockerEndpoint) {

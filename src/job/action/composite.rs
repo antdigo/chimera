@@ -13,7 +13,8 @@ use crate::docker::build::{DockerActionBuilder, DockerBuildScope, RegistryAuth};
 use crate::docker::output::OutputProcessor;
 use crate::job::execute::{
     JobExecutionContext, JobState, StepConclusion, StepResult, build_step_env,
-    complete_step_transaction, is_reserved_command_file_env, prepare_step_transaction, run_process,
+    complete_docker_exec_transaction, is_reserved_command_file_env, prepare_step_transaction,
+    run_process,
 };
 use crate::job::execution_domain::DOCKER_CONFIG_ENV;
 use crate::job::expression::ExprContext;
@@ -281,7 +282,7 @@ async fn run_nested_script(
             cancel_token,
         )
         .await;
-        return complete_step_transaction(
+        return complete_docker_exec_transaction(
             execution.docker_config(),
             state_id,
             &processor,

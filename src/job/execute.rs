@@ -594,7 +594,8 @@ pub async fn run_container_step(
         cancel_token,
     )
     .await;
-    let result = complete_step_transaction(domain, state_id, &processor, job_state, result).await;
+    let result =
+        complete_docker_exec_transaction(domain, state_id, &processor, job_state, result).await;
 
     // Re-key saved state from the empty-key bucket into the correct action-keyed bucket
     if let Some(unnamed_state) = job_state.action_states.remove("") {
@@ -883,6 +884,23 @@ pub(crate) async fn complete_step_transaction<T>(
     let commands = processor.take_workflow_state(&permit).await;
     apply_step_snapshot(snapshot, commands, domain, job_state)?;
     command_result
+}
+
+pub(crate) async fn complete_docker_exec_transaction<T>(
+    domain: &ExecutionDomain,
+    state_id: crate::job::execution_domain::StepFilesId,
+    processor: &OutputProcessor,
+    job_state: &mut JobState,
+    command_result: Result<T>,
+) -> Result<T> {
+    if command_result
+        .as_ref()
+        .err()
+        .is_some_and(crate::docker::exec::state_may_still_change)
+    {
+        return command_result;
+    }
+    complete_step_transaction(domain, state_id, processor, job_state, command_result).await
 }
 
 async fn consume_command_events(

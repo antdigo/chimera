@@ -237,6 +237,65 @@ async fn composite_replaced_state_discards_substep_mutations_and_terminates_tran
 }
 
 #[tokio::test]
+async fn composite_substeps_apply_each_workflow_command_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    let workspace = make_test_workspace(&tmp);
+    let action_dir = tmp.path().join("action");
+    std::fs::create_dir_all(&action_dir).unwrap();
+    let action_dir =
+        TrustedActionDirectory::resolve(&action_dir, std::path::Path::new(".")).unwrap();
+    let metadata = make_composite_metadata(
+        r#"
+- run: |
+    printf '%s\n' '::add-path::/stdout/composite'
+    printf '/file/composite\n' > "$GITHUB_PATH"
+  shell: bash
+"#,
+    );
+    let masks = crate::job::secret_masker::shared_masker_for_test(&[]);
+    let mut state = JobState::new(masks.clone(), HashMap::new(), serde_json::json!({}));
+    let logger = StepLogger::results_for_test(masks);
+    let cache = ActionCache::new(tmp.path().join("cache"), reqwest::Client::new());
+    let docker_action_builder = crate::docker::build::DockerActionBuilder::new();
+    let docker_build_scope =
+        crate::docker::build::DockerBuildScope::new("test-runner", "https://github.com/owner/repo");
+    let domain = test_docker_config(&tmp);
+    let base_env = HashMap::from([(
+        DOCKER_CONFIG_ENV.to_string(),
+        domain.docker_config_dir().to_string_lossy().into_owned(),
+    )]);
+    let node_runtimes = crate::node::NodeRuntimes::single("node".into());
+    let execution = JobExecutionContext::new(&domain, None, &node_runtimes);
+
+    let result = run_composite_action(
+        &action_dir,
+        &metadata,
+        &make_step(),
+        &mut state,
+        &workspace,
+        &base_env,
+        logger.sender(),
+        &cache,
+        &docker_action_builder,
+        &docker_build_scope,
+        None,
+        "fake-token",
+        0,
+        tokio::time::Instant::now() + std::time::Duration::from_secs(30),
+        &CancellationToken::new(),
+        &execution,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(result.conclusion, StepConclusion::Succeeded);
+    assert_eq!(
+        state.path_prepends,
+        ["/stdout/composite", "/file/composite"]
+    );
+}
+
+#[tokio::test]
 async fn skipped_composite_condition_is_not_written_to_daemon_trace() {
     let tmp = tempfile::tempdir().unwrap();
     let workspace = make_test_workspace(&tmp);

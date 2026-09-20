@@ -657,6 +657,41 @@ async fn snapshot_failure_has_priority_over_command_failure_without_partial_muta
     ));
 }
 
+#[tokio::test]
+async fn unterminated_docker_exec_failure_does_not_consume_or_apply_state() {
+    let (_temp, workspace) = test_workspace();
+    let (_resources, domain) = test_docker_config();
+    domain.bind_workspace(&workspace).await.unwrap();
+    let state_id = domain.prepare_step(b"{}").await.unwrap();
+    std::fs::write(workspace.path_file(), "/file/leak\n").unwrap();
+    let masks = crate::job::secret_masker::shared_masker_for_test(&[]);
+    let processor = OutputProcessor::new(
+        LogSender::new_for_test(tokio::sync::mpsc::channel(8).0, masks.clone()),
+        masks,
+        false,
+    );
+    processor.process_line("::add-path::/stdout/leak").await;
+    let mut state = test_job_state();
+    let command_result: Result<StepResult> =
+        Err(crate::docker::exec::DockerExecTerminalizationError::StillRunning.into());
+
+    let error =
+        complete_docker_exec_transaction(&domain, state_id, &processor, &mut state, command_result)
+            .await
+            .unwrap_err();
+
+    assert!(
+        error
+            .downcast_ref::<crate::docker::exec::DockerExecTerminalizationError>()
+            .is_some()
+    );
+    assert!(state.path_prepends.is_empty());
+    assert!(matches!(
+        domain.prepare_step(b"{}").await.unwrap_err(),
+        ExecutionDomainError::Backend { .. }
+    ));
+}
+
 #[test]
 fn matching_override_is_allowed() {
     let (_temp, workspace) = test_workspace();
