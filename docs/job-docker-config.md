@@ -59,6 +59,29 @@ racing filesystem or `PATH` changes after validation.
 6. Remove that exact generated attempt directory, confirm `job-resources` is empty,
    then start Chimera again. A cleanup error is handled by the same procedure.
 
+## `stale-legacy-job-data` recovery
+
+This diagnostic means an upgrade found data in the former shared `<root>/work` or
+`<root>/tmp` job path. Chimera preserves the path and refuses all new assignments;
+it does not assume that stale credentials or command files are safe to delete.
+
+1. Stop the Chimera service and perform the cgroup/process checks from steps 1–3
+   above. If any job descendant or related Docker operation may still own the data,
+   do not delete it and do not restart Chimera.
+2. Resolve the canonical Chimera root without traversing either legacy path. Verify
+   that the reported path is exactly `<canonical-root>/work` or
+   `<canonical-root>/tmp`, not a prefix, suffix, or nested entry.
+3. Use `stat`, without reading file contents, to verify that the canonical root and
+   reported legacy path are real non-symlink directories owned by the daemon UID.
+   If either path is unavailable, non-canonical, symlinked, owned by another UID, or
+   otherwise uncertain, stop and escalate instead of deleting anything.
+4. Obtain explicit authorization to remove only the verified legacy directory. Do
+   not use globs, delete the Chimera root, inspect credential contents, or touch
+   neighboring `job-resources`, tool-cache, action-cache, or user Docker paths.
+5. Remove the exact verified `<canonical-root>/work` or `<canonical-root>/tmp`
+   directory, repeat the same checks if the other legacy path is reported, and
+   confirm both legacy paths are absent or empty before restarting Chimera.
+
 On Debian/systemd installations using rootless Docker, the service environment must
 pass through `DOCKER_HOST`, `XDG_RUNTIME_DIR`, and `PATH` for the daemon UID. See
 the [rootless systemd drop-in in the README](../README.md#rootless-docker-alternative).

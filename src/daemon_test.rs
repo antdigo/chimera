@@ -436,6 +436,28 @@ fn startup_preparation_rejects_stale_job_resources_without_deleting_them() {
     assert!(stale_dir.exists());
 }
 
+#[test]
+fn startup_preparation_rejects_legacy_work_and_temp_canaries() {
+    let test_root = std::env::var_os("CARGO_TARGET_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("target"));
+    std::fs::create_dir_all(&test_root).unwrap();
+
+    for legacy_name in ["work", "tmp"] {
+        let temp = TempDir::new_in(&test_root).unwrap();
+        let paths = ChimeraPaths::new(temp.path().to_path_buf());
+        let canary = paths.root.join(legacy_name).join("runner-0/canary");
+        std::fs::create_dir_all(canary.parent().unwrap()).unwrap();
+        std::fs::write(&canary, "secret from previous job").unwrap();
+
+        let error = prepare_daemon_root(&paths).unwrap_err();
+
+        assert!(error.to_string().contains("stale-legacy-job-data"));
+        assert!(canary.exists());
+        assert!(!paths.job_resources_dir().exists());
+    }
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn startup_rejects_chimera_root_under_host_tmp() {

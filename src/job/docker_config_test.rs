@@ -75,6 +75,8 @@ fn concurrent_configs_have_distinct_generated_ids() {
 
     assert_ne!(first.attempt_id(), second.attempt_id());
     assert_ne!(first.directory(), second.directory());
+    assert_ne!(first.work_dir(), second.work_dir());
+    assert_ne!(first.private_tmp(), second.private_tmp());
 }
 
 #[test]
@@ -87,12 +89,16 @@ fn new_attempt_is_empty_after_previous_cleanup() {
         r#"{"auths":{"registry.test":{"auth":"synthetic"}}}"#,
     )
     .unwrap();
+    std::fs::write(first.work_dir().join("workspace-canary"), "secret").unwrap();
+    std::fs::write(first.private_tmp().join("credential-canary"), "credential").unwrap();
     first.cleanup().unwrap();
 
     let second = root.create_docker_config().unwrap();
 
     assert_ne!(first_path, second.directory());
     assert_eq!(std::fs::read(second.config_file()).unwrap(), b"{}");
+    assert_eq!(std::fs::read_dir(second.work_dir()).unwrap().count(), 0);
+    assert_eq!(std::fs::read_dir(second.private_tmp()).unwrap().count(), 0);
 }
 
 #[test]
@@ -187,6 +193,52 @@ fn cleanup_handles_non_writable_directories_inside_private_tmp() {
 
     result.unwrap();
     assert!(!attempt.exists());
+}
+
+#[test]
+fn cleanup_removes_work_and_temp_when_workspace_leaf_is_missing() {
+    use crate::job::workspace::Workspace;
+
+    let temp = TempDir::new_in("/tmp").unwrap();
+    let root = JobResourceRoot::prepare(&temp.path().join("job-resources")).unwrap();
+    let mut config = root.create_docker_config().unwrap();
+    let tool_cache = temp.path().join("tool-cache");
+    let workspace = Workspace::create(
+        config.work_dir(),
+        config.private_tmp(),
+        &tool_cache,
+        "runner-0",
+        "owner/repo",
+    )
+    .unwrap();
+    let attempt = config.attempt_dir().to_path_buf();
+    let command_canary = workspace.env_file().to_path_buf();
+    let temp_canary = workspace.runner_temp().join("checkout-credential-canary");
+    std::fs::write(&command_canary, "APP_ENV=secret").unwrap();
+    std::fs::write(&temp_canary, "credential").unwrap();
+    std::fs::remove_dir_all(workspace.workspace_dir()).unwrap();
+
+    config.cleanup().unwrap();
+
+    assert!(!attempt.exists());
+    assert!(!command_canary.exists());
+    assert!(!temp_canary.exists());
+}
+
+#[test]
+fn cleanup_allows_workspace_symlinks_without_touching_their_targets() {
+    let temp = TempDir::new_in("/tmp").unwrap();
+    let root = JobResourceRoot::prepare(&temp.path().join("job-resources")).unwrap();
+    let mut config = root.create_docker_config().unwrap();
+    let target = temp.path().join("outside-workspace-target");
+    std::fs::write(&target, "preserve me").unwrap();
+    std::os::unix::fs::symlink(&target, config.work_dir().join("repository-link")).unwrap();
+    let attempt = config.attempt_dir().to_path_buf();
+
+    config.cleanup().unwrap();
+
+    assert!(!attempt.exists());
+    assert_eq!(std::fs::read_to_string(target).unwrap(), "preserve me");
 }
 
 #[test]
@@ -354,6 +406,10 @@ fn stale_root_with_live_child_is_not_removed() {
     let (temp, root) = prepared_root();
     let mut config = root.create_docker_config().unwrap();
     let stale_dir = config.attempt_dir().to_path_buf();
+    let work_canary = config.work_dir().join("workspace-canary");
+    let temp_canary = config.private_tmp().join("checkout-credential-canary");
+    std::fs::write(&work_canary, "APP_ENV=secret").unwrap();
+    std::fs::write(&temp_canary, "credential").unwrap();
     let mut child = ChildGuard {
         child: std::process::Command::new("sh")
             .args(["-c", "while :; do sleep 1; done"])
@@ -369,6 +425,11 @@ fn stale_root_with_live_child_is_not_removed() {
         Err(JobDockerConfigError::StaleJobResources { .. })
     ));
     assert!(stale_dir.exists());
+    assert_eq!(
+        std::fs::read_to_string(&work_canary).unwrap(),
+        "APP_ENV=secret"
+    );
+    assert_eq!(std::fs::read_to_string(&temp_canary).unwrap(), "credential");
 
     child.stop();
     config.cleanup().unwrap();
@@ -530,6 +591,10 @@ fn cleanup_failure_poisoned_root_blocks_sibling_creation() {
     let root = JobResourceRoot::prepare(&temp.path().join("job-resources")).unwrap();
     let sibling_root = root.clone();
     let mut config = root.create_docker_config().unwrap();
+    let work_canary = config.work_dir().join("workspace-canary");
+    let temp_canary = config.private_tmp().join("checkout-credential-canary");
+    std::fs::write(&work_canary, "APP_ENV=secret").unwrap();
+    std::fs::write(&temp_canary, "credential").unwrap();
     let socket_path = config.attempt_dir().join("unexpected.sock");
     let socket = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
 
@@ -541,7 +606,55 @@ fn cleanup_failure_poisoned_root_blocks_sibling_creation() {
             .to_string()
             .contains("poisoned-job-resource-root")
     );
+    assert_eq!(
+        std::fs::read_to_string(&work_canary).unwrap(),
+        "APP_ENV=secret"
+    );
+    assert_eq!(std::fs::read_to_string(&temp_canary).unwrap(), "credential");
     drop(socket);
     std::fs::remove_file(socket_path).unwrap();
+    config.cleanup().unwrap();
+}
+
+#[test]
+fn injected_permission_cleanup_failure_preserves_canaries_and_blocks_reuse() {
+    let temp = TempDir::new_in("/tmp").unwrap();
+    let root = JobResourceRoot::prepare(&temp.path().join("job-resources")).unwrap();
+    let sibling_root = root.clone();
+    let mut config = root.create_docker_config().unwrap();
+    let work_canary = config.work_dir().join("workspace-canary");
+    let temp_canary = config.private_tmp().join("checkout-v6-credential-canary");
+    std::fs::write(&work_canary, "workspace-secret").unwrap();
+    std::fs::write(&temp_canary, "credential-secret").unwrap();
+
+    let cleanup_error = config
+        .cleanup_with_remover(|_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "synthetic permission failure",
+            ))
+        })
+        .unwrap_err();
+    let creation_error = sibling_root.create_docker_config().unwrap_err();
+
+    assert!(matches!(
+        cleanup_error,
+        JobDockerConfigError::Cleanup { ref source, .. }
+            if source.kind() == std::io::ErrorKind::PermissionDenied
+    ));
+    assert!(
+        creation_error
+            .to_string()
+            .contains("poisoned-job-resource-root")
+    );
+    assert_eq!(
+        std::fs::read_to_string(&work_canary).unwrap(),
+        "workspace-secret"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&temp_canary).unwrap(),
+        "credential-secret"
+    );
+
     config.cleanup().unwrap();
 }

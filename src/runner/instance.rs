@@ -489,6 +489,7 @@ impl Runner {
         };
 
         debug!(%runner_request_id, "parsed job request");
+        self.job_resources.ensure_healthy()?;
 
         if let Err(e) = broker.ack_job(&runner_request_id).await {
             error!(error = %e, "failed to ack job");
@@ -746,14 +747,7 @@ impl Runner {
         docker_config: &JobDockerConfig,
         secret_masker: &SharedSecretMasker,
     ) -> Result<JobExecutionOutcome> {
-        let workspace = Workspace::create(
-            &self.paths.work_dir(),
-            &self.paths.tmp_dir(),
-            &self.paths.tool_cache_dir(),
-            &self.name,
-            repo,
-        )
-        .context("creating workspace")?;
+        let workspace = self.create_job_workspace(docker_config, repo)?;
         let mut docker_resources = None;
 
         let execution_result = async {
@@ -827,6 +821,21 @@ impl Runner {
         }
 
         execution_result
+    }
+
+    fn create_job_workspace(
+        &self,
+        docker_config: &JobDockerConfig,
+        repo: &str,
+    ) -> Result<Workspace> {
+        Workspace::create(
+            docker_config.work_dir(),
+            docker_config.private_tmp(),
+            &self.paths.tool_cache_dir(),
+            &self.name,
+            repo,
+        )
+        .context("creating workspace")
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -987,7 +996,7 @@ impl Runner {
             }
 
             let poll_result = tokio::select! {
-                result = broker.poll_message(AgentStatus::Online) => result,
+                biased;
                 _ = shutdown_rx.changed() => {
                     info!("shutdown signal received, cancelling poll");
                     return Ok(None);
@@ -996,10 +1005,12 @@ impl Runner {
                     self.job_resources.ensure_healthy()?;
                     continue;
                 }
+                result = broker.poll_message(AgentStatus::Online) => result,
             };
 
             match poll_result {
                 Ok(Some(msg)) => {
+                    self.job_resources.ensure_healthy()?;
                     // Any successful poll proves the token still works.
                     token_just_refreshed = false;
 

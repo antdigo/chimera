@@ -218,9 +218,39 @@ fn prepare_daemon_root(paths: &ChimeraPaths) -> Result<(PidLock, JobResourceRoot
             );
         }
     }
+    reject_stale_legacy_job_data(paths)?;
     let pid_lock = PidLock::acquire(&paths.pid_file()).context("acquiring PID lock")?;
     let job_resources = JobResourceRoot::prepare(&paths.job_resources_dir())?;
     Ok((pid_lock, job_resources))
+}
+
+fn reject_stale_legacy_job_data(paths: &ChimeraPaths) -> Result<()> {
+    for path in [paths.work_dir(), paths.tmp_dir()] {
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("reading legacy job path {}", path.display()));
+            }
+        };
+
+        let stale = if metadata.is_dir() && !metadata.file_type().is_symlink() {
+            std::fs::read_dir(&path)
+                .with_context(|| format!("reading legacy job path {}", path.display()))?
+                .next()
+                .transpose()
+                .with_context(|| format!("reading legacy job entry in {}", path.display()))?
+                .is_some()
+        } else {
+            true
+        };
+
+        if stale {
+            return Err(JobDockerConfigError::StaleLegacyJobData { path }.into());
+        }
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
