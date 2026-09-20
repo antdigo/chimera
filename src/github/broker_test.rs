@@ -179,6 +179,88 @@ async fn connect_maps_401_to_unauthorized() {
 }
 
 #[tokio::test]
+async fn connect_bounds_stale_session_recovery_attempts() {
+    let (mock_server, tm) = setup().await;
+
+    Mock::given(method("POST"))
+        .and(path("/session"))
+        .respond_with(ResponseTemplate::new(409))
+        .mount(&mock_server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/session"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&mock_server)
+        .await;
+
+    let result = BrokerClient::connect(
+        reqwest::Client::new(),
+        &mock_server.uri(),
+        tm,
+        42,
+        "chimera-0",
+    )
+    .await;
+    let error = match result {
+        Ok(_) => panic!("persistent session conflicts should exhaust bounded recovery"),
+        Err(error) => error,
+    };
+
+    assert!(
+        error.to_string().contains("409 Conflict"),
+        "terminal error should retain the broker status: {error}"
+    );
+    let session_requests = mock_server
+        .received_requests()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|request| request.url.path() == "/session")
+        .map(|request| request.method.as_str().to_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        session_requests,
+        ["POST", "DELETE", "POST", "DELETE", "POST"]
+    );
+}
+
+#[tokio::test]
+async fn connect_preserves_transient_delete_failure_classification() {
+    let (mock_server, tm) = setup().await;
+
+    Mock::given(method("POST"))
+        .and(path("/session"))
+        .respond_with(ResponseTemplate::new(409))
+        .mount(&mock_server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/session"))
+        .respond_with(ResponseTemplate::new(503).set_body_string("try later"))
+        .mount(&mock_server)
+        .await;
+
+    let result = BrokerClient::connect(
+        reqwest::Client::new(),
+        &mock_server.uri(),
+        tm,
+        42,
+        "chimera-0",
+    )
+    .await;
+    let error = match result {
+        Ok(_) => panic!("stale-session delete failure should abort this connect attempt"),
+        Err(error) => error,
+    };
+
+    assert!(
+        error
+            .downcast_ref::<BrokerError>()
+            .is_some_and(|error| matches!(error, BrokerError::ServerError { status: 503, .. })),
+        "503 from stale-session delete should remain retryable: {error:?}"
+    );
+}
+
+#[tokio::test]
 async fn disconnect_success() {
     let (mock_server, tm) = setup().await;
 

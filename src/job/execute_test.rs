@@ -1412,6 +1412,22 @@ fn host_command_fails_closed_when_private_tmp_is_missing() {
     config.cleanup().unwrap();
 }
 
+#[test]
+fn host_spawn_error_explains_denied_private_namespace_setup() {
+    let source = std::io::Error::from_raw_os_error(libc::EPERM);
+
+    let context = host_spawn_error_context("/opt/chimera/externals/node", &source, true);
+
+    assert!(
+        context.contains("private user/mount namespace setup"),
+        "error should identify the failing setup boundary: {context}"
+    );
+    assert!(
+        context.contains("AppArmor"),
+        "error should name the common Ubuntu restriction: {context}"
+    );
+}
+
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn private_tmp_mount_precedes_working_directory_lookup() {

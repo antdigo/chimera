@@ -130,10 +130,31 @@ The Chimera root and host-job workspaces must live outside `/tmp`, because the p
 mount intentionally hides the host's `/tmp` from workflow commands. On Linux, Chimera
 canonicalizes its root before deriving host-job workspace paths and refuses startup when
 that root is inside the host temp tree.
-The kernel must allow the daemon user to create unprivileged user namespaces. Ubuntu
-installations with AppArmor's unprivileged-user-namespace restriction enabled must grant
-Chimera an appropriate profile or disable that restriction for the dedicated worker. A
-container running Chimera also needs a seccomp/AppArmor policy that permits user and
+The kernel must allow the daemon user to create unprivileged user namespaces. Stock
+Ubuntu 24.04 enables AppArmor's unprivileged-user-namespace restriction; check it with:
+
+```bash
+sysctl kernel.apparmor_restrict_unprivileged_userns
+```
+
+When the value is `1`, install the repository's targeted profile for the default binary
+path instead of disabling the restriction globally:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/antdigo/chimera/main/packaging/apparmor/chimera \
+  | sudo tee /etc/apparmor.d/chimera > /dev/null
+sudo apparmor_parser -r /etc/apparmor.d/chimera
+sudo systemctl restart chimera
+```
+
+The profile attaches to `/usr/local/bin/chimera`, the path used by `install.sh`. If the
+service's `ExecStart` uses another path, replace the attachment path in the profile before
+loading it. Keep `kernel.apparmor_restrict_unprivileged_userns=1`; unlike the global
+sysctl workaround, the profile grants `userns` to Chimera's AppArmor profile label and
+the subprocesses that inherit it. A failed host spawn reports the private user/mount
+namespace boundary when its setup returns `EPERM`.
+
+A container running Chimera also needs a seccomp/AppArmor policy that permits user and
 mount namespace setup; the CI test container uses `seccomp=unconfined` and
 `apparmor=unconfined`.
 
