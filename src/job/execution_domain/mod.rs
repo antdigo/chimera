@@ -9,7 +9,10 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 use uuid::Uuid;
 
+use crate::docker::endpoint::DockerEndpoint;
+
 mod admission;
+mod docker_paths;
 mod error;
 mod filesystem;
 mod journal;
@@ -23,6 +26,7 @@ mod journal_test;
 mod admission_test;
 
 pub use admission::DomainPermit;
+pub use docker_paths::DockerPaths;
 pub use error::{ExecutionDomainCleanupFatalError, ExecutionDomainError};
 
 use filesystem::{
@@ -87,7 +91,8 @@ pub struct ExecutionDomain {
     attempt_id: Uuid,
     attempt_dir: PathBuf,
     attempt_identity: DirectoryIdentity,
-    docker_config_dir: PathBuf,
+    docker_endpoint: DockerEndpoint,
+    docker_paths: DockerPaths,
     docker_config_dir_env: String,
     docker_config_file: PathBuf,
     private_tmp: PathBuf,
@@ -175,11 +180,13 @@ impl ExecutionDomainRoot {
         let _operation = self.state.lock(&self.canonical_path)?;
         self.ensure_healthy()?;
         validate_bound_private_directory(&self.canonical_path, self.identity)?;
+        let docker_endpoint = DockerEndpoint::trusted_host();
         let attempt_dir = self.canonical_path.join(attempt_id.simple().to_string());
-        let docker_config_dir = attempt_dir.join("docker");
+        let docker_paths = DockerPaths::for_attempt(&attempt_dir);
+        let docker_config_dir = docker_paths.config_dir();
         let private_tmp = attempt_dir.join("tmp");
         let work_dir = attempt_dir.join("work");
-        let docker_config_dir_env = utf8_path(&docker_config_dir)?.to_owned();
+        let docker_config_dir_env = utf8_path(docker_config_dir)?.to_owned();
         let docker_config_file = docker_config_dir.join("config.json");
         match create_private_dir(&attempt_dir, "creating job attempt directory") {
             Ok(()) => {}
@@ -195,7 +202,7 @@ impl ExecutionDomainRoot {
             let attempt_identity =
                 directory_identity(&attempt_dir, "reading job attempt directory identity")?;
             let mut lifecycle = DomainLifecycle::create(&attempt_dir, attempt_id)?;
-            create_private_dir(&docker_config_dir, "creating Docker config directory")?;
+            create_private_dir(docker_config_dir, "creating Docker config directory")?;
             create_private_dir(&private_tmp, "creating private job temp directory")?;
             let private_tmp_identity =
                 directory_identity(&private_tmp, "reading private job temp identity")?;
@@ -263,7 +270,8 @@ impl ExecutionDomainRoot {
             attempt_id,
             attempt_dir,
             attempt_identity,
-            docker_config_dir,
+            docker_endpoint,
+            docker_paths,
             docker_config_dir_env,
             docker_config_file,
             private_tmp,
@@ -287,7 +295,15 @@ impl ExecutionDomain {
     }
 
     pub fn docker_config_dir(&self) -> &Path {
-        &self.docker_config_dir
+        self.docker_paths.config_dir()
+    }
+
+    pub fn docker_endpoint(&self) -> &DockerEndpoint {
+        &self.docker_endpoint
+    }
+
+    pub fn docker_paths(&self) -> &DockerPaths {
+        &self.docker_paths
     }
 
     pub fn config_file(&self) -> &Path {
