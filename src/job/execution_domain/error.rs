@@ -178,9 +178,9 @@ impl std::error::Error for ExecutionDomainError {
     }
 }
 
-/// A job completed and its completion was published, but the per-job Docker
-/// config cleanup failed. Terminal for the runner: the resource root is no
-/// longer trustworthy, so the daemon must stop instead of taking new jobs.
+/// Execution-domain cleanup failed and job completion was attempted.
+/// Terminal for the runner: the resource root is no longer trustworthy,
+/// so the daemon must stop instead of taking new jobs.
 #[derive(Debug)]
 pub struct ExecutionDomainCleanupFatalError {
     pub source: ExecutionDomainError,
@@ -190,7 +190,7 @@ impl std::fmt::Display for ExecutionDomainCleanupFatalError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             formatter,
-            "job-resource-cleanup-fatal: completion published after cleanup failed: {}",
+            "job-resource-cleanup-fatal: completion attempted after cleanup failed: {}",
             self.source
         )
     }

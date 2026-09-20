@@ -77,8 +77,8 @@ fn is_poisoned_job_resource_error(error: &anyhow::Error) -> bool {
 }
 
 /// A job error the runner must not recover from by polling again: the job
-/// resource root is known-untrustworthy (poisoned) or a completion was already
-/// published after a failed cleanup. Classified by construction, not by the
+/// resource root is known-untrustworthy (poisoned) or completion was attempted
+/// after a failed cleanup. Classified by construction, not by the
 /// separate poisoning side effect.
 fn job_execution_error_is_terminal(error: &anyhow::Error) -> bool {
     is_poisoned_job_resource_error(error) || is_job_resource_cleanup_fatal(error)
@@ -228,7 +228,7 @@ async fn finish_job(
     }
 
     let outputs = outputs_to_variable_values(&outcome.outputs);
-    job_client
+    let completion_result = job_client
         .complete_job(
             &manifest.plan.plan_id,
             &manifest.plan.job_id,
@@ -238,13 +238,17 @@ async fn finish_job(
         )
         .await
         .context("completing job")
-        .map_err(|source| anyhow::Error::new(CompletionPublicationError { source }))?;
+        .map_err(|source| anyhow::Error::new(CompletionPublicationError { source }));
 
     match cleanup_error {
-        Some(source) => Err(anyhow::Error::new(ExecutionDomainCleanupFatalError {
-            source,
-        })),
-        None => Ok(()),
+        Some(source) => {
+            let fatal = ExecutionDomainCleanupFatalError { source };
+            Err(match completion_result {
+                Ok(()) => anyhow::Error::new(fatal),
+                Err(publication_error) => publication_error.context(fatal),
+            })
+        }
+        None => completion_result,
     }
 }
 
@@ -433,8 +437,7 @@ impl Runner {
                 break;
             }
             let permit = tokio::select! {
-                changed = shutdown_rx.changed() => {
-                    changed.context("watching shutdown before domain reservation")?;
+                _ = shutdown_rx.changed() => {
                     self.report_phase(RunnerPhase::Stopping).await;
                     break;
                 }

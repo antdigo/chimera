@@ -1156,7 +1156,8 @@ async fn wait_for_phase(
 
 #[tokio::test]
 async fn start_reserves_before_online_polling_and_shutdown_interrupts_admission() {
-    for release_capacity in [false, true] {
+    for (release_capacity, close_shutdown_channel) in [(false, false), (false, true), (true, false)]
+    {
         let (server, _token_manager, _shutdown) = setup().await;
         Mock::given(method("POST"))
             .and(path("/session"))
@@ -1226,12 +1227,20 @@ async fn start_reserves_before_online_polling_and_shutdown_interrupts_admission(
             );
         } else {
             // Keep admission saturated until the runner has exited.
-            shutdown_tx.send(true).unwrap();
+            if close_shutdown_channel {
+                drop(shutdown_tx);
+            } else {
+                shutdown_tx.send(true).unwrap();
+            }
             tokio::time::timeout(Duration::from_secs(2), start)
                 .await
                 .unwrap()
                 .unwrap()
                 .unwrap();
+            assert_eq!(
+                state.snapshot().await.runners["test-runner"].phase,
+                RunnerPhase::Stopping,
+            );
             drop(occupied);
             continue;
         }
@@ -2005,6 +2014,52 @@ async fn successful_job_reports_failed_when_docker_config_cleanup_fails() {
         authority.authorize("synthetic", &scope).await.unwrap_err(),
         CacheAuthError::Unauthorized,
     );
+}
+
+#[tokio::test]
+async fn cleanup_and_completion_failure_preserve_both_causes_and_fatal_classification() {
+    use wiremock::matchers::body_partial_json;
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/completejob"))
+        .and(body_partial_json(
+            serde_json::json!({ "conclusion": "failed" }),
+        ))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let client = finish_client(&server).await;
+    let manifest = finish_manifest(&server.uri());
+    let error = finish_job(
+        &client,
+        &manifest,
+        Ok(JobExecutionOutcome {
+            conclusion: JobConclusion::Succeeded,
+            outputs: HashMap::new(),
+        }),
+        Err(ExecutionDomainError::Cleanup {
+            path: "/synthetic/job-resource/attempt".into(),
+            source: io::Error::other("synthetic destroy failure"),
+        }),
+    )
+    .await
+    .unwrap_err();
+
+    assert!(job_execution_error_is_terminal(&error));
+    let fatal = error
+        .downcast_ref::<ExecutionDomainCleanupFatalError>()
+        .unwrap();
+    let ExecutionDomainError::Cleanup { source, .. } = &fatal.source else {
+        panic!("cleanup cause was not preserved: {fatal:?}");
+    };
+    assert_eq!(source.to_string(), "synthetic destroy failure");
+    assert!(error.downcast_ref::<CompletionPublicationError>().is_some());
+    let causes = format!("{error:#}");
+    assert!(causes.contains("job-resource-cleanup-fatal"), "{causes}");
+    assert!(causes.contains("completing job"), "{causes}");
+    assert!(causes.contains("500"), "{causes}");
 }
 
 #[tokio::test]
