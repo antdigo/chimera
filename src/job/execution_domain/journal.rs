@@ -57,6 +57,7 @@ impl DomainLifecycle {
         Ok(lifecycle)
     }
 
+    #[cfg(test)]
     pub(super) fn load(attempt_dir: &Path) -> Result<Self, ExecutionDomainError> {
         let mut lifecycle = Self::bind(attempt_dir, Uuid::nil(), DomainState::Provisioning)?;
         lifecycle.refuse_next()?;

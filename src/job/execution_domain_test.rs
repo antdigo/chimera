@@ -488,16 +488,26 @@ fn assert_stale_journal_is_untouched(
     root_path: &std::path::Path,
     attempt: &std::path::Path,
     journal: &std::path::Path,
+    journal_contents: &std::path::Path,
     expected_journal_bytes: &[u8],
 ) {
-    let expected_attempt_identity = {
-        let metadata = std::fs::symlink_metadata(attempt).unwrap();
-        (metadata.dev(), metadata.ino())
+    let identity = |path: &std::path::Path| {
+        let metadata = std::fs::symlink_metadata(path).unwrap();
+        (
+            metadata.dev(),
+            metadata.ino(),
+            metadata.permissions().mode(),
+        )
     };
-    let expected_journal_identity = {
-        let metadata = std::fs::symlink_metadata(journal).unwrap();
-        (metadata.dev(), metadata.ino())
-    };
+    let expected_attempt_identity = identity(attempt);
+    let expected_journal_identity = identity(journal);
+    let expected_contents_identity = identity(journal_contents);
+
+    assert_eq!(
+        std::fs::read(journal).unwrap_err().kind(),
+        std::io::ErrorKind::PermissionDenied,
+        "the fixture must fail if startup opens the stale journal"
+    );
 
     let error = ExecutionDomainRoot::prepare(root_path, NonZeroUsize::new(1).unwrap()).unwrap_err();
 
@@ -508,20 +518,21 @@ fn assert_stale_journal_is_untouched(
         }
         other => panic!("unexpected stale-root error: {other}"),
     }
-    let diagnostic = error.to_string();
-    assert!(diagnostic.contains(&root_path.display().to_string()));
-    assert!(diagnostic.contains('1'));
-    assert!(!diagnostic.contains("journal-secret"));
-    assert_eq!(std::fs::read(journal).unwrap(), expected_journal_bytes);
-    let attempt_metadata = std::fs::symlink_metadata(attempt).unwrap();
     assert_eq!(
-        (attempt_metadata.dev(), attempt_metadata.ino()),
-        expected_attempt_identity
+        error.to_string(),
+        format!(
+            "stale-job-resources: resource root has 1 stale entries: {}",
+            root_path.display()
+        )
     );
-    let journal_metadata = std::fs::symlink_metadata(journal).unwrap();
+    assert_eq!(identity(attempt), expected_attempt_identity);
+    assert_eq!(identity(journal), expected_journal_identity);
+    assert_eq!(identity(journal_contents), expected_contents_identity);
+
+    std::fs::set_permissions(journal_contents, std::fs::Permissions::from_mode(0o600)).unwrap();
     assert_eq!(
-        (journal_metadata.dev(), journal_metadata.ino()),
-        expected_journal_identity
+        std::fs::read(journal_contents).unwrap(),
+        expected_journal_bytes
     );
 }
 
@@ -535,8 +546,9 @@ fn stale_journal_is_not_read_or_removed_during_root_prepare() {
         br#"{"version":1,"attempt_id":"00000000-0000-0000-0000-000000000001","state":"ready"}"#;
     std::fs::create_dir(&attempt).unwrap();
     std::fs::write(&journal, body).unwrap();
+    std::fs::set_permissions(&journal, std::fs::Permissions::from_mode(0o000)).unwrap();
 
-    assert_stale_journal_is_untouched(&root_path, &attempt, &journal, body);
+    assert_stale_journal_is_untouched(&root_path, &attempt, &journal, &journal, body);
     drop((root, temp));
 }
 
@@ -549,8 +561,9 @@ fn stale_journal_truncation_is_not_removed_during_root_prepare() {
     let body = b"{\"version\":1,\"note\":\"journal-secret\"";
     std::fs::create_dir(&attempt).unwrap();
     std::fs::write(&journal, body).unwrap();
+    std::fs::set_permissions(&journal, std::fs::Permissions::from_mode(0o000)).unwrap();
 
-    assert_stale_journal_is_untouched(&root_path, &attempt, &journal, body);
+    assert_stale_journal_is_untouched(&root_path, &attempt, &journal, &journal, body);
     drop((root, temp));
 }
 
@@ -565,12 +578,15 @@ fn stale_journal_symlink_is_not_followed_or_removed_during_root_prepare() {
     std::fs::create_dir(&attempt).unwrap();
     std::fs::write(&target, body).unwrap();
     std::os::unix::fs::symlink(&target, &journal).unwrap();
+    std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o000)).unwrap();
 
-    assert_stale_journal_is_untouched(&root_path, &attempt, &journal, body);
-    assert!(std::fs::symlink_metadata(&journal)
-        .unwrap()
-        .file_type()
-        .is_symlink());
+    assert_stale_journal_is_untouched(&root_path, &attempt, &journal, &target, body);
+    assert!(
+        std::fs::symlink_metadata(&journal)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
     assert_eq!(std::fs::read(&target).unwrap(), body);
     drop((root, temp));
 }
