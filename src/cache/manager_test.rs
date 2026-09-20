@@ -4,7 +4,7 @@ use std::sync::atomic::Ordering;
 use tempfile::TempDir;
 
 use super::*;
-use crate::cache::auth::CapabilityEpoch;
+use crate::cache::auth::{CacheAuthority, CacheScope, CapabilityEpoch, JobCapabilityClaims};
 
 const REPO: &str = "owner/repo";
 const MAIN_REF: &str = "refs/heads/main";
@@ -49,6 +49,21 @@ async fn upload_scoped_blob(
         .commit_upload(&owner, id, data.len() as u64)
         .await
         .unwrap();
+}
+
+async fn over_quota_lru_manager(tmp: &TempDir) -> Arc<CacheManager> {
+    let manager = Arc::new(make_manager(tmp, 10).await);
+    upload_blob(&manager, "oldest", "v1", b"aaaaaaaaaa").await;
+    upload_blob(&manager, "next", "v1", b"bbbbbbbbbb").await;
+
+    let mut entries = manager.entries.write().await;
+    for (key, age) in [("oldest", 10), ("next", 5)] {
+        let mut entry = entries.remove(REPO, MAIN_REF, key, "v1").unwrap();
+        entry.last_accessed_at = Utc::now() - chrono::Duration::minutes(age);
+        entries.insert(entry);
+    }
+    drop(entries);
+    manager
 }
 
 #[tokio::test]
@@ -136,6 +151,93 @@ async fn lru_eviction() {
         .lookup(&["new".to_string()], "v1", REPO, MAIN_REF, MAIN_REF)
         .await;
     assert!(new.is_some());
+}
+
+#[tokio::test]
+async fn eviction_rechecks_lru_after_a_waiting_candidate_is_refreshed() {
+    let tmp = TempDir::new().unwrap();
+    let manager = over_quota_lru_manager(&tmp).await;
+    let eviction_wait = manager.arm_before_eviction_entry_wait();
+    let eviction_manager = manager.clone();
+    let eviction = tokio::spawn(async move { eviction_manager.evict().await });
+    eviction_wait.reached.notified().await;
+
+    let refreshed = manager
+        .lookup(&["oldest".into()], "v1", REPO, MAIN_REF, MAIN_REF)
+        .await
+        .unwrap();
+    let blob_path = manager.blob_path(&refreshed.blob_hash).unwrap();
+    let authority = CacheAuthority::new();
+    authority
+        .register_job(
+            "eviction-grant-owner",
+            JobCapabilityClaims {
+                scope: CacheScope {
+                    repo: REPO.into(),
+                    git_ref: MAIN_REF.into(),
+                    default_ref: MAIN_REF.into(),
+                },
+                job_id: "eviction-grant-job".into(),
+            },
+            Utc::now(),
+        )
+        .await
+        .unwrap();
+    let authorized = authority
+        .authenticate("eviction-grant-owner")
+        .await
+        .unwrap();
+    let grant = authority
+        .issue_download(&authorized, refreshed.blob_hash.clone())
+        .await
+        .unwrap();
+
+    eviction_wait.resume.notify_one();
+    eviction.await.unwrap();
+
+    let entries = manager.entries.read().await;
+    assert!(entries.get(REPO, MAIN_REF, "oldest", "v1").is_some());
+    assert!(entries.get(REPO, MAIN_REF, "next", "v1").is_none());
+    drop(entries);
+    assert!(blob_path.exists(), "refreshed entry blob was removed");
+    assert_eq!(
+        authority.resolve_download(grant).await.unwrap(),
+        refreshed.blob_hash,
+    );
+}
+
+#[tokio::test]
+async fn eviction_stops_when_another_worker_restores_the_quota() {
+    let tmp = TempDir::new().unwrap();
+    let manager = over_quota_lru_manager(&tmp).await;
+    let eviction_wait = manager.arm_before_eviction_entry_wait();
+    let first_manager = manager.clone();
+    let first = tokio::spawn(async move { first_manager.evict().await });
+    eviction_wait.reached.notified().await;
+
+    let refreshed = manager
+        .lookup(&["oldest".into()], "v1", REPO, MAIN_REF, MAIN_REF)
+        .await
+        .unwrap();
+    let refreshed_blob_path = manager.blob_path(&refreshed.blob_hash).unwrap();
+    manager.evict().await;
+    {
+        let entries = manager.entries.read().await;
+        assert_eq!(entries.total_size_bytes(), 10);
+        assert!(entries.get(REPO, MAIN_REF, "next", "v1").is_none());
+    }
+
+    eviction_wait.resume.notify_one();
+    first.await.unwrap();
+
+    let entries = manager.entries.read().await;
+    assert_eq!(entries.total_size_bytes(), 10);
+    assert!(entries.get(REPO, MAIN_REF, "oldest", "v1").is_some());
+    drop(entries);
+    assert!(
+        refreshed_blob_path.exists(),
+        "first worker over-evicted after quota was restored",
+    );
 }
 
 #[tokio::test]

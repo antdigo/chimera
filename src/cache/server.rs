@@ -421,14 +421,15 @@ async fn handle_upload_chunk(
     let authority = state.authority.clone();
     let owner = authorized.epoch().clone();
     let operation = spawn_storage_operation("upload-chunk", async move {
-        let locked = manager.lock_upload(&owner, id).await.map_err(|error| {
-            debug!(error = %error, id, "upload chunk failed");
-            StatusCode::NOT_FOUND
-        })?;
+        let locked = manager.lock_upload(&owner, id).await;
         authority
             .revalidate(&permit)
             .await
             .map_err(|_| StatusCode::UNAUTHORIZED)?;
+        let locked = locked.map_err(|error| {
+            debug!(error = %error, id, "upload chunk failed");
+            StatusCode::NOT_FOUND
+        })?;
         manager
             .write_chunk_locked(locked, start, &body)
             .await
@@ -471,14 +472,15 @@ async fn handle_commit(
     let authority = state.authority.clone();
     let owner = authorized.epoch().clone();
     let operation = spawn_storage_operation("commit", async move {
-        let locked = manager.lock_upload(&owner, id).await.map_err(|error| {
-            debug!(error = %error, id, "commit failed");
-            StatusCode::NOT_FOUND
-        })?;
+        let locked = manager.lock_upload(&owner, id).await;
         authority
             .revalidate(&permit)
             .await
             .map_err(|_| StatusCode::UNAUTHORIZED)?;
+        let locked = locked.map_err(|error| {
+            debug!(error = %error, id, "commit failed");
+            StatusCode::NOT_FOUND
+        })?;
         manager
             .commit_upload_locked(locked, body.size)
             .await

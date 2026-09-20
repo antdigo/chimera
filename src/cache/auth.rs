@@ -378,7 +378,7 @@ impl CacheAuthority {
             .jobs
             .get(job.capability_id())
             .ok_or(CacheAuthError::Unauthorized)?;
-        if parent.epoch != job.epoch || self.is_revoked(job.epoch()) {
+        if parent.epoch != job.epoch || parent.expires_at <= now || self.is_revoked(job.epoch()) {
             return Err(CacheAuthError::Unauthorized);
         }
         let expires_at = parent.expires_at.to_owned();
@@ -417,6 +417,11 @@ impl CacheAuthority {
         }
 
         Ok(blob_hash)
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn download_count(&self) -> usize {
+        self.state.read().await.downloads.len()
     }
 
     pub(crate) async fn authorize_download_start(

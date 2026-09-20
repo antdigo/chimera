@@ -45,9 +45,15 @@ pub struct CacheManager {
     #[cfg(test)]
     before_entry_publish: super::test_support::PausePoint,
     #[cfg(test)]
+    before_upload_commit: super::test_support::PausePoint,
+    #[cfg(test)]
+    before_lookup_index_wait: super::test_support::PausePoint,
+    #[cfg(test)]
     before_lookup_index: super::test_support::PausePoint,
     #[cfg(test)]
     before_lookup_persist: super::test_support::PausePoint,
+    #[cfg(test)]
+    before_eviction_entry_wait: super::test_support::PausePoint,
 }
 
 impl CacheManager {
@@ -115,9 +121,15 @@ impl CacheManager {
             #[cfg(test)]
             before_entry_publish: Default::default(),
             #[cfg(test)]
+            before_upload_commit: Default::default(),
+            #[cfg(test)]
+            before_lookup_index_wait: Default::default(),
+            #[cfg(test)]
             before_lookup_index: Default::default(),
             #[cfg(test)]
             before_lookup_persist: Default::default(),
+            #[cfg(test)]
+            before_eviction_entry_wait: Default::default(),
         };
 
         // Run initial eviction in case max_gb was lowered
@@ -137,6 +149,7 @@ impl CacheManager {
 
     /// Look up a cache entry with scope isolation.
     /// Falls back to default_ref if no match on scope_ref (feature branch reads from default branch).
+    #[cfg(test)]
     pub async fn lookup(
         &self,
         keys: &[String],
@@ -147,7 +160,8 @@ impl CacheManager {
     ) -> Option<CacheEntry> {
         self.lookup_inner(keys, version, scope_repo, scope_ref, default_ref, None)
             .await
-            .expect("lookup without admission cannot fail authorization")
+            .ok()
+            .flatten()
     }
 
     #[expect(
@@ -185,6 +199,8 @@ impl CacheManager {
         admission: Option<(&CacheAuthority, &CacheOperationPermit)>,
     ) -> Result<Option<CacheEntry>, CacheAuthError> {
         loop {
+            #[cfg(test)]
+            self.before_lookup_index_wait.wait().await;
             let expected_file = self
                 .entries
                 .read()
@@ -312,6 +328,8 @@ impl CacheManager {
         locked: LockedUpload,
         expected_size: u64,
     ) -> Result<()> {
+        #[cfg(test)]
+        self.before_upload_commit.wait().await;
         let (key, version, scope_repo, scope_ref, tmp_path, size) =
             self.uploads.commit_locked(locked, expected_size).await?;
 
@@ -385,6 +403,18 @@ impl CacheManager {
     }
 
     #[cfg(test)]
+    pub(crate) fn arm_before_upload_commit(&self) -> std::sync::Arc<super::test_support::Pause> {
+        self.before_upload_commit.arm()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn arm_before_lookup_index_wait(
+        &self,
+    ) -> std::sync::Arc<super::test_support::Pause> {
+        self.before_lookup_index_wait.arm()
+    }
+
+    #[cfg(test)]
     pub(crate) fn arm_before_lookup_index(&self) -> std::sync::Arc<super::test_support::Pause> {
         self.before_lookup_index.arm()
     }
@@ -392,6 +422,13 @@ impl CacheManager {
     #[cfg(test)]
     pub(crate) fn arm_before_lookup_persist(&self) -> std::sync::Arc<super::test_support::Pause> {
         self.before_lookup_persist.arm()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn arm_before_eviction_entry_wait(
+        &self,
+    ) -> std::sync::Arc<super::test_support::Pause> {
+        self.before_eviction_entry_wait.arm()
     }
 
     #[cfg(test)]
@@ -432,31 +469,41 @@ impl CacheManager {
                 return;
             };
 
+            #[cfg(test)]
+            self.before_eviction_entry_wait.wait().await;
             let entry_io = self.entry_io_lock(&victim.filename());
             let _entry_io_guard = entry_io.lock().await;
             let removed = {
                 let mut entries = self.entries.write().await;
-                let unchanged = entries
-                    .get(
+                if entries.total_size_bytes() <= self.max_bytes {
+                    return;
+                }
+                let revalidated_now = Utc::now();
+                let still_correct_victim = entries
+                    .lru_candidates()
+                    .into_iter()
+                    .find(|entry| {
+                        revalidated_now.signed_duration_since(entry.last_accessed_at)
+                            > protection_window
+                    })
+                    .is_some_and(|current| {
+                        current.scope_repo == victim.scope_repo
+                            && current.scope_ref == victim.scope_ref
+                            && current.key == victim.key
+                            && current.version == victim.version
+                            && current.blob_hash == victim.blob_hash
+                            && current.created_at == victim.created_at
+                    });
+                if still_correct_victim {
+                    entries.remove(
                         &victim.scope_repo,
                         &victim.scope_ref,
                         &victim.key,
                         &victim.version,
                     )
-                    .is_some_and(|current| {
-                        current.blob_hash == victim.blob_hash
-                            && current.created_at == victim.created_at
-                    });
-                unchanged.then(|| {
-                    entries
-                        .remove(
-                            &victim.scope_repo,
-                            &victim.scope_ref,
-                            &victim.key,
-                            &victim.version,
-                        )
-                        .expect("validated eviction entry must still exist")
-                })
+                } else {
+                    None
+                }
             };
             let Some(removed) = removed else {
                 continue;

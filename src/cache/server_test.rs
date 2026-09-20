@@ -37,6 +37,44 @@ impl Invalidation {
     }
 }
 
+#[derive(Clone, Copy)]
+enum QueuedUploadOperation {
+    Patch,
+    Commit,
+}
+
+impl QueuedUploadOperation {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Patch => "PATCH",
+            Self::Commit => "commit",
+        }
+    }
+
+    fn request(self, prefix: &str, cache_id: u64) -> Request<Body> {
+        match self {
+            Self::Patch => bearer(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(format!("{prefix}/_apis/artifactcache/caches/{cache_id}"))
+                    .header("content-range", "bytes 0-0/*"),
+                TOKEN_A,
+            )
+            .body(Body::from("y"))
+            .unwrap(),
+            Self::Commit => bearer(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("{prefix}/_apis/artifactcache/caches/{cache_id}"))
+                    .header("content-type", "application/json"),
+                TOKEN_A,
+            )
+            .body(Body::from(r#"{"size":1}"#))
+            .unwrap(),
+        }
+    }
+}
+
 fn test_claims() -> JobCapabilityClaims {
     JobCapabilityClaims {
         scope: CacheScope {
@@ -415,18 +453,23 @@ async fn queued_lookup_rechecks_revocation_and_expiry_before_mutating_index() {
         });
         index_pause.reached.notified().await;
 
+        let index_wait = manager.arm_before_lookup_index_wait();
         let request_app = app.clone();
         let request_prefix = prefix.clone();
         let response = tokio::spawn(async move {
             lookup_status(&request_app, &request_prefix, TOKEN_A, "queued-hit", "v1").await
         });
-        tokio::task::yield_now().await;
-        assert!(!response.is_finished(), "lookup did not queue on the index");
+        index_wait.reached.notified().await;
 
         let status = match invalidation {
             Invalidation::Revoke => {
                 let mut revoke = Box::pin(authority.revoke(&capability));
                 let revoke_pending = futures::poll!(&mut revoke).is_pending();
+                assert!(
+                    revoke_pending,
+                    "lookup barrier was reached without retaining its operation permit",
+                );
+                index_wait.resume.notify_one();
                 index_pause.resume.notify_one();
                 blocker.await.unwrap();
                 if revoke_pending {
@@ -441,6 +484,7 @@ async fn queued_lookup_rechecks_revocation_and_expiry_before_mutating_index() {
                     let mut now = clock.lock().unwrap();
                     *now = *now + JOB_CAPABILITY_LIFETIME + chrono::Duration::seconds(1);
                 }
+                index_wait.resume.notify_one();
                 index_pause.resume.notify_one();
                 blocker.await.unwrap();
                 response.await.unwrap()
@@ -456,6 +500,39 @@ async fn queued_lookup_rechecks_revocation_and_expiry_before_mutating_index() {
         );
         assert_eq!(std::fs::read(entry_path).unwrap(), persisted_before);
     }
+}
+
+#[tokio::test]
+async fn lookup_expiring_during_persistence_does_not_issue_a_download_grant() {
+    let tmp = TempDir::new().unwrap();
+    let (app, manager, authority, clock, _) = make_clocked_test_app(&tmp).await;
+    let prefix = scope_prefix(SCOPE_REPO, SCOPE_REF, DEFAULT_REF);
+    authorized_roundtrip(&app, &prefix, TOKEN_A, "expiring-hit", b"secret").await;
+
+    let persistence = manager.arm_before_lookup_persist();
+    let request = bearer(
+        Request::builder().uri(format!(
+            "{prefix}/_apis/artifactcache/cache?keys=expiring-hit&version=v1"
+        )),
+        TOKEN_A,
+    )
+    .header("host", "localhost:9999")
+    .body(Body::empty())
+    .unwrap();
+    let response = tokio::spawn(async move { app.oneshot(request).await });
+    persistence.reached.notified().await;
+
+    {
+        let mut now = clock.lock().unwrap();
+        *now = *now + JOB_CAPABILITY_LIFETIME + chrono::Duration::seconds(1);
+    }
+    persistence.resume.notify_one();
+
+    assert_eq!(
+        response.await.unwrap().unwrap().status(),
+        StatusCode::UNAUTHORIZED,
+    );
+    assert_eq!(authority.download_count().await, 0);
 }
 
 #[tokio::test]
@@ -616,6 +693,75 @@ async fn queued_patch_rechecks_authority_after_waiting_for_its_session() {
         "revoke returned while an admitted write was in flight"
     );
     assert_eq!(second_status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn queued_uploads_check_authority_before_disclosing_a_consumed_session() {
+    for invalidation in [Invalidation::Revoke, Invalidation::Expire] {
+        for operation in [QueuedUploadOperation::Patch, QueuedUploadOperation::Commit] {
+            let tmp = TempDir::new().unwrap();
+            let (app, manager, authority, clock, capability) = make_clocked_test_app(&tmp).await;
+            let prefix = scope_prefix(SCOPE_REPO, SCOPE_REF, DEFAULT_REF);
+            let cache_id = reserve(&app, &prefix, TOKEN_A, "consumed", "v1").await;
+            assert_eq!(
+                upload(&app, &prefix, TOKEN_A, cache_id, b"x").await,
+                StatusCode::NO_CONTENT,
+            );
+
+            let before_commit = manager.arm_before_upload_commit();
+            let consumer_request = bearer(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("{prefix}/_apis/artifactcache/caches/{cache_id}"))
+                    .header("content-type", "application/json"),
+                TOKEN_A,
+            )
+            .body(Body::from(r#"{"size":1}"#))
+            .unwrap();
+            let consumer_app = app.clone();
+            let consumer =
+                tokio::spawn(async move { consumer_app.oneshot(consumer_request).await });
+            before_commit.reached.notified().await;
+
+            let session_wait = manager.arm_before_upload_session_wait();
+            let queued_request = operation.request(&prefix, cache_id);
+            let queued_app = app.clone();
+            let queued = tokio::spawn(async move { queued_app.oneshot(queued_request).await });
+            session_wait.reached.notified().await;
+
+            let mut revoke = None;
+            match invalidation {
+                Invalidation::Revoke => {
+                    revoke = Some(Box::pin(authority.revoke(&capability)));
+                    assert!(
+                        futures::poll!(revoke.as_mut().unwrap().as_mut()).is_pending(),
+                        "revoke returned while admitted operations were paused",
+                    );
+                }
+                Invalidation::Expire => {
+                    let mut now = clock.lock().unwrap();
+                    *now = *now + JOB_CAPABILITY_LIFETIME + chrono::Duration::seconds(1);
+                }
+            }
+
+            session_wait.resume.notify_one();
+            before_commit.resume.notify_one();
+            assert_eq!(
+                consumer.await.unwrap().unwrap().status(),
+                StatusCode::NO_CONTENT,
+            );
+            assert_eq!(
+                queued.await.unwrap().unwrap().status(),
+                StatusCode::UNAUTHORIZED,
+                "{} after {}",
+                operation.label(),
+                invalidation.label(),
+            );
+            if let Some(revoke) = revoke {
+                revoke.await;
+            }
+        }
+    }
 }
 
 #[tokio::test]
