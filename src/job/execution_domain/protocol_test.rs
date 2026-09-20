@@ -216,7 +216,7 @@ fn queue_is_bounded_and_cancel_overtakes_full_output_queue() {
 
 fn snapshot() -> super::StepStateSnapshot {
     super::StepStateSnapshot {
-        env: "я".repeat(20000),
+        env: "€".repeat(20000),
         path: String::new(),
         output: "x".repeat(1024 * 1024),
         state: "CANARY".into(),
@@ -229,6 +229,11 @@ fn snapshot_chunks_round_trip_across_utf8_boundaries_and_validate_totals() {
     let id = super::StepFilesId::new();
     let chunks = snapshot_chunks(9, &id, &snapshot()).unwrap();
     assert!(chunks.len() > 32);
+    let Response::SnapshotChunk { bytes, .. } = &chunks[0] else {
+        panic!("expected first snapshot chunk");
+    };
+    assert_eq!(bytes.len(), 32 * 1024);
+    assert!(std::str::from_utf8(bytes).is_err());
     let mut assembly = SnapshotAssembler::new(9, id.clone());
     let mut result = None;
     for chunk in chunks.clone() {
