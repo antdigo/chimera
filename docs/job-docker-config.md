@@ -12,6 +12,11 @@ process can change its own environment or invoke `docker --config`. It also does
 not isolate Docker daemon access or descendants that escape Chimera's current
 process-tree cancellation.
 
+Internally, `ExecutionDomainRoot` owns admission and the shared resource root,
+while each admitted `ExecutionDomain` owns one attempt and its Docker
+configuration. These names replace the former internal owners only; the Docker
+configuration behavior documented here is unchanged in `trusted-host`.
+
 Docker actions and job containers do not receive or mount this host path. Named
 contexts, credential helpers, CLI plugins, and credentials from `$HOME/.docker`
 are not imported.

@@ -16,9 +16,12 @@ review gates слишком крупными.
 
 ## Plan A — Execution-domain foundation
 
+Status: implemented and verified at commit `b65da30`.
+
 Результат:
 
-- `JobResourceRoot`/`JobDockerConfig` углублены в единый `ExecutionDomain`;
+- `ExecutionDomainRoot` и `ExecutionDomain` владеют общим root и ресурсами
+  отдельного attempt соответственно;
 - добавлены config types, lifecycle journal, admission permit и deterministic
   attempt identity;
 - текущий `trusted-host` lifecycle использует новый interface без изменения

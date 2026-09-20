@@ -90,7 +90,17 @@ runners = ["runner-0", "runner-1"]
 [daemon]
 log_format = "text"           # "text" or "json" (json works well with journald)
 shutdown_timeout_secs = 300
+
+[execution]
+profile = "trusted-host"
+max_active_domains = 1
 ```
+
+`trusted-host` is the ordinary self-hosted-runner trust model. The
+`max_active_domains` field is reserved for sandboxed execution and does not reduce
+`trusted-host` runner concurrency. `sandboxed` is intentionally rejected by this
+release until its namespace, private-Docker, network, storage, and native release
+gates are all present; Chimera never falls back from `sandboxed` to `trusted-host`.
 
 ### Per-job Docker configuration
 
