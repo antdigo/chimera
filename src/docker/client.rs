@@ -6,16 +6,12 @@ use futures::StreamExt;
 use tracing::{debug, info};
 
 use super::container::ContainerCredentials;
+use super::endpoint::DockerEndpoint;
 
-/// Connect to the Docker daemon via the given socket path (or default).
-pub fn connect(socket: Option<&str>) -> Result<Docker> {
-    let docker = match socket {
-        Some(path) => Docker::connect_with_socket(path, 120, bollard::API_DEFAULT_VERSION)
-            .with_context(|| format!("connecting to Docker socket at {path}"))?,
-        None => Docker::connect_with_local_defaults()
-            .context("connecting to Docker with local defaults")?,
-    };
-    Ok(docker)
+/// Connect to the selected Docker Unix endpoint.
+pub fn connect(endpoint: &DockerEndpoint) -> Result<Docker> {
+    Docker::connect_with_unix(endpoint.socket_address(), 120, bollard::API_DEFAULT_VERSION)
+        .context("connecting to selected Docker Unix endpoint")
 }
 
 /// Verify the Docker daemon is reachable.
@@ -81,6 +77,13 @@ fn parse_image_ref(image: &str) -> (&str, &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn selected_missing_endpoint_fails_without_default_fallback() {
+        let temp = tempfile::tempdir().unwrap();
+        let endpoint = DockerEndpoint::unix_socket(&temp.path().join("absent.sock")).unwrap();
+        assert!(connect(&endpoint).is_err());
+    }
 
     #[test]
     fn parse_simple_image() {

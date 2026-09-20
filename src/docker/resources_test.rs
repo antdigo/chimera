@@ -205,7 +205,9 @@ fn job_container_bind_mounts_make_only_actions_read_only() {
 #[tokio::test]
 #[ignore]
 async fn setup_and_cleanup_job_container() {
-    let docker = crate::docker::client::connect(None).unwrap();
+    let docker =
+        crate::docker::client::connect(&crate::docker::endpoint::DockerEndpoint::trusted_host())
+            .unwrap();
     crate::docker::client::ping(&docker).await.unwrap();
 
     let job_id = uuid::Uuid::new_v4().to_string();
@@ -275,7 +277,9 @@ async fn setup_and_cleanup_job_container() {
 #[tokio::test]
 #[ignore]
 async fn setup_and_cleanup_with_service() {
-    let docker = crate::docker::client::connect(None).unwrap();
+    let docker =
+        crate::docker::client::connect(&crate::docker::endpoint::DockerEndpoint::trusted_host())
+            .unwrap();
     crate::docker::client::ping(&docker).await.unwrap();
 
     // Use nginx as the service — it stays running and gets an IP

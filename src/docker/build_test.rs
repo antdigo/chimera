@@ -44,7 +44,9 @@ fn format_complete_build_progress(info: BuildInfo, internal_tag: &str) -> Vec<St
 #[tokio::test]
 #[ignore]
 async fn engine_build_returns_verified_local_image_id() {
-    let docker = crate::docker::client::connect(None).unwrap();
+    let docker =
+        crate::docker::client::connect(&crate::docker::endpoint::DockerEndpoint::trusted_host())
+            .unwrap();
     crate::docker::client::ping(&docker).await.unwrap();
     let tmp = tempfile::tempdir().unwrap();
     std::fs::write(
@@ -90,7 +92,9 @@ async fn engine_build_returns_verified_local_image_id() {
 #[tokio::test]
 #[ignore]
 async fn engine_build_failure_does_not_publish_cache_entry() {
-    let docker = crate::docker::client::connect(None).unwrap();
+    let docker =
+        crate::docker::client::connect(&crate::docker::endpoint::DockerEndpoint::trusted_host())
+            .unwrap();
     let tmp = tempfile::tempdir().unwrap();
     std::fs::write(
         tmp.path().join("Dockerfile"),
@@ -126,7 +130,9 @@ async fn engine_build_failure_does_not_publish_cache_entry() {
 #[tokio::test]
 #[ignore]
 async fn cancelling_build_stops_engine_work_and_never_publishes_image() {
-    let docker = crate::docker::client::connect(None).unwrap();
+    let docker =
+        crate::docker::client::connect(&crate::docker::endpoint::DockerEndpoint::trusted_host())
+            .unwrap();
     let engine_version = docker.version().await.unwrap();
     eprintln!("D-06 Docker Engine: {engine_version:?}");
     crate::docker::client::ensure_image(&docker, "alpine:3.19", None)
@@ -226,7 +232,9 @@ async fn cancelling_build_stops_engine_work_and_never_publishes_image() {
 #[tokio::test]
 #[ignore]
 async fn timed_out_build_returns_bounded_and_never_publishes_image() {
-    let docker = crate::docker::client::connect(None).unwrap();
+    let docker =
+        crate::docker::client::connect(&crate::docker::endpoint::DockerEndpoint::trusted_host())
+            .unwrap();
     crate::docker::client::ensure_image(&docker, "alpine:3.19", None)
         .await
         .unwrap();
@@ -334,7 +342,9 @@ fn intermediate_container_id_from_builder_stream(line: &str) -> Option<&str> {
 #[tokio::test]
 #[ignore]
 async fn reuse_skips_context_preparation_after_dockerfile_removal() {
-    let docker = crate::docker::client::connect(None).unwrap();
+    let docker =
+        crate::docker::client::connect(&crate::docker::endpoint::DockerEndpoint::trusted_host())
+            .unwrap();
     crate::docker::client::ensure_image(&docker, "alpine:3.19", None)
         .await
         .unwrap();
@@ -620,7 +630,9 @@ async fn test_build_with_reuse(
 #[tokio::test]
 #[ignore]
 async fn missing_cached_image_is_rebuilt() {
-    let docker = crate::docker::client::connect(None).unwrap();
+    let docker =
+        crate::docker::client::connect(&crate::docker::endpoint::DockerEndpoint::trusted_host())
+            .unwrap();
     let tmp = tempfile::tempdir().unwrap();
     std::fs::write(
         tmp.path().join("Dockerfile"),
@@ -665,7 +677,9 @@ async fn missing_cached_image_is_rebuilt() {
 #[tokio::test]
 #[ignore]
 async fn concurrent_same_context_builds_once() {
-    let docker = crate::docker::client::connect(None).unwrap();
+    let docker =
+        crate::docker::client::connect(&crate::docker::endpoint::DockerEndpoint::trusted_host())
+            .unwrap();
     crate::docker::client::ensure_image(&docker, "alpine:3.19", None)
         .await
         .unwrap();
@@ -702,7 +716,9 @@ async fn concurrent_same_context_builds_once() {
 #[tokio::test]
 #[ignore]
 async fn same_daemon_reuse_skips_present_image_and_rebuilds_missing_image() {
-    let docker = crate::docker::client::connect(None).unwrap();
+    let docker =
+        crate::docker::client::connect(&crate::docker::endpoint::DockerEndpoint::trusted_host())
+            .unwrap();
     crate::docker::client::ensure_image(&docker, "alpine:3.19", None)
         .await
         .unwrap();

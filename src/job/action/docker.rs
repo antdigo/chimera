@@ -55,7 +55,9 @@ pub async fn run_docker_image_action(
     let docker = match execution.docker_resources() {
         Some(resources) => resources.docker(),
         None => {
-            owned_docker = crate::docker::client::connect(None)?;
+            owned_docker = crate::docker::client::connect(
+                &crate::docker::endpoint::DockerEndpoint::trusted_host(),
+            )?;
             &owned_docker
         }
     };
@@ -111,7 +113,9 @@ pub(crate) async fn run_docker_metadata_action(
     let docker = match execution.docker_resources() {
         Some(resources) => resources.docker(),
         None => {
-            owned_docker = crate::docker::client::connect(None)?;
+            owned_docker = crate::docker::client::connect(
+                &crate::docker::endpoint::DockerEndpoint::trusted_host(),
+            )?;
             &owned_docker
         }
     };

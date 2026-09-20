@@ -11,7 +11,9 @@ use crate::job::logs::LogSender;
 #[tokio::test]
 #[ignore]
 async fn exec_echo_in_container() {
-    let docker = crate::docker::client::connect(None).unwrap();
+    let docker =
+        crate::docker::client::connect(&crate::docker::endpoint::DockerEndpoint::trusted_host())
+            .unwrap();
     crate::docker::client::ping(&docker).await.unwrap();
     crate::docker::client::ensure_image(&docker, "alpine:latest", None)
         .await
@@ -79,7 +81,9 @@ async fn exec_echo_in_container() {
 #[tokio::test]
 #[ignore]
 async fn exec_failing_command() {
-    let docker = crate::docker::client::connect(None).unwrap();
+    let docker =
+        crate::docker::client::connect(&crate::docker::endpoint::DockerEndpoint::trusted_host())
+            .unwrap();
     crate::docker::client::ping(&docker).await.unwrap();
     crate::docker::client::ensure_image(&docker, "alpine:latest", None)
         .await

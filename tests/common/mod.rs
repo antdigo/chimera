@@ -316,7 +316,8 @@ pub async fn setup_docker(
     job_container: Option<&JobContainerSpec>,
     services: &[ServiceContainerSpec],
 ) -> JobDockerResources {
-    let docker = docker_client::connect(None).unwrap();
+    let docker =
+        docker_client::connect(&chimera::docker::endpoint::DockerEndpoint::trusted_host()).unwrap();
     docker_client::ping(&docker).await.unwrap();
 
     let job_id = uuid::Uuid::new_v4().to_string();

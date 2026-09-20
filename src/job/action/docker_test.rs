@@ -180,7 +180,9 @@ async fn assert_engine_container_absent(docker: &Docker, container_name: &str) {
 #[tokio::test]
 #[ignore]
 async fn cancellation_immediately_before_create_does_not_create_container() {
-    let docker = crate::docker::client::connect(None).unwrap();
+    let docker =
+        crate::docker::client::connect(&crate::docker::endpoint::DockerEndpoint::trusted_host())
+            .unwrap();
     crate::docker::client::ensure_image(&docker, "alpine:3.19", None)
         .await
         .unwrap();
@@ -212,7 +214,9 @@ async fn cancellation_immediately_before_create_does_not_create_container() {
 #[tokio::test]
 #[ignore]
 async fn cancellation_at_engine_create_event_removes_container() {
-    let docker = crate::docker::client::connect(None).unwrap();
+    let docker =
+        crate::docker::client::connect(&crate::docker::endpoint::DockerEndpoint::trusted_host())
+            .unwrap();
     crate::docker::client::ensure_image(&docker, "alpine:3.19", None)
         .await
         .unwrap();
@@ -269,7 +273,9 @@ async fn cancellation_at_engine_create_event_removes_container() {
 #[tokio::test]
 #[ignore]
 async fn cancellation_after_build_publication_does_not_launch_container() {
-    let docker = crate::docker::client::connect(None).unwrap();
+    let docker =
+        crate::docker::client::connect(&crate::docker::endpoint::DockerEndpoint::trusted_host())
+            .unwrap();
     crate::docker::client::ensure_image(&docker, "alpine:3.19", None)
         .await
         .unwrap();
@@ -921,7 +927,9 @@ fn docker_action_binds_never_mount_the_action_directory() {
 async fn engine_action_contents_come_from_pinned_context_after_root_replacement() {
     use crate::job::action::{ActionCache, ActionSource};
 
-    let docker = crate::docker::client::connect(None).unwrap();
+    let docker =
+        crate::docker::client::connect(&crate::docker::endpoint::DockerEndpoint::trusted_host())
+            .unwrap();
     crate::docker::client::ping(&docker).await.unwrap();
     crate::docker::client::ensure_image(&docker, "alpine:3.19", None)
         .await
@@ -1027,7 +1035,9 @@ async fn engine_action_contents_come_from_pinned_context_after_symlink_root_repl
 
     use crate::job::action::{ActionCache, ActionSource};
 
-    let docker = crate::docker::client::connect(None).unwrap();
+    let docker =
+        crate::docker::client::connect(&crate::docker::endpoint::DockerEndpoint::trusted_host())
+            .unwrap();
     crate::docker::client::ping(&docker).await.unwrap();
     crate::docker::client::ensure_image(&docker, "alpine:3.19", None)
         .await
