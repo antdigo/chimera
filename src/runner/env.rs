@@ -23,7 +23,7 @@ pub fn build_base_env(
 
     let mut env = build_common_env(manifest, workspace, runner_name);
     domain.insert_into_host_env(&mut env, "job environment")?;
-    Ok(env)
+    Ok(domain.command_environment(&env)?)
 }
 
 /// Build environment variables for container-mode execution.

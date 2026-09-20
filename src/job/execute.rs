@@ -35,7 +35,7 @@ use crate::docker::output::OutputProcessor;
 use crate::docker::resources::JobDockerResources;
 use crate::job::execution_domain::ExecutionDomainError;
 use crate::job::execution_domain::{
-    CommandEvent, CommandOutcome, CommandSpec, CommandTarget, DOCKER_CONFIG_ENV, ExecutionDomain,
+    CommandEvent, CommandOutcome, CommandSpec, DOCKER_CONFIG_ENV, ExecutionDomain,
 };
 use crate::node::NodeRuntimes;
 use crate::utils::{
@@ -729,13 +729,10 @@ pub async fn run_process(
         job_state.debug_enabled,
     );
     let (output, mut events) = mpsc::channel(32);
+    let env = domain.command_environment(env)?;
     let spec = CommandSpec {
-        target: CommandTarget::Trusted {
-            program: program.to_os_string(),
-            args: args.iter().map(|arg| (*arg).to_os_string()).collect(),
-            cwd: working_dir.to_path_buf(),
-        },
-        env: env.clone(),
+        target: domain.command_target(program, args, working_dir, &env)?,
+        env,
         timeout,
         state: Some(state_id.clone()),
     };

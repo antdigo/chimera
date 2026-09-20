@@ -1,5 +1,5 @@
 use std::panic::AssertUnwindSafe;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use futures::FutureExt;
 use tokio::sync::{OwnedSemaphorePermit, mpsc, oneshot};
@@ -55,27 +55,61 @@ enum Backend {
     // The Linux variant remains private until C1 can publish its private
     // Docker endpoint. Its protocol implementation is compiled only on Linux.
     #[cfg(target_os = "linux")]
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "private until C1 installs the sandbox Docker endpoint"
-        )
-    )]
     Linux(LinuxBackend),
 }
 
 #[cfg(target_os = "linux")]
-#[allow(dead_code)]
 struct LinuxBackend {
     kernel: super::linux::launcher::KernelDomain,
+    cleanup: Option<super::linux::StrictCleanupAuthority>,
+    path_mappings: Vec<(std::path::PathBuf, super::DomainPath)>,
     next_command_id: u64,
+}
+
+enum BackendBuilder {
+    Trusted,
+    #[cfg(target_os = "linux")]
+    Sandboxed(super::linux::StrictBackendBuilder),
 }
 
 struct ManagerPermitGuard {
     root_state: Arc<ExecutionDomainState>,
     permit: Option<OwnedSemaphorePermit>,
     clean_exit: bool,
+}
+
+#[derive(Clone)]
+pub(super) struct ManagerCancellation {
+    token: CancellationToken,
+    reason: Arc<Mutex<Option<CancelReason>>>,
+}
+
+impl ManagerCancellation {
+    pub(super) fn new() -> Self {
+        Self {
+            token: CancellationToken::new(),
+            reason: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    fn cancel(&self, reason: CancelReason) {
+        if let Ok(mut stored) = self.reason.lock() {
+            stored.get_or_insert(reason);
+        }
+        self.token.cancel();
+    }
+
+    pub(super) async fn cancelled(&self) {
+        self.token.cancelled().await;
+    }
+
+    pub(super) fn reason(&self) -> CancelReason {
+        self.reason
+            .lock()
+            .ok()
+            .and_then(|reason| reason.clone())
+            .unwrap_or(CancelReason::Shutdown)
+    }
 }
 
 impl ManagerPermitGuard {
@@ -108,6 +142,29 @@ impl DomainManager {
         permit: OwnedSemaphorePermit,
         attempt: AttemptIdentity,
     ) -> Result<ExecutionDomain, ExecutionDomainError> {
+        Self::spawn_selected(root, permit, attempt, BackendBuilder::Trusted).await
+    }
+
+    #[cfg(target_os = "linux")]
+    #[expect(
+        dead_code,
+        reason = "private strict selector is called by C1 only after endpoint installation"
+    )]
+    pub(in crate::job::execution_domain) async fn spawn_sandboxed(
+        root: ExecutionDomainRoot,
+        permit: OwnedSemaphorePermit,
+        attempt: AttemptIdentity,
+        builder: super::linux::StrictBackendBuilder,
+    ) -> Result<ExecutionDomain, ExecutionDomainError> {
+        Self::spawn_selected(root, permit, attempt, BackendBuilder::Sandboxed(builder)).await
+    }
+
+    async fn spawn_selected(
+        root: ExecutionDomainRoot,
+        permit: OwnedSemaphorePermit,
+        attempt: AttemptIdentity,
+        builder: BackendBuilder,
+    ) -> Result<ExecutionDomain, ExecutionDomainError> {
         let (request, mut receiver) = mpsc::channel(32);
         let (ready_tx, ready_rx) = oneshot::channel();
         let response_root = root.canonical_path.clone();
@@ -129,12 +186,28 @@ impl DomainManager {
 
             let managed = AssertUnwindSafe(async {
                 let provision_root = root.clone();
-                let provision = tokio::task::spawn_blocking(move || {
-                    provision_root.create_domain_with_id(attempt.uuid())
+                #[cfg(target_os = "linux")]
+                let provision_state = Arc::clone(&state);
+                let provision = tokio::task::spawn_blocking(move || match builder {
+                    BackendBuilder::Trusted => provision_root
+                        .create_domain_with_id(attempt.uuid())
+                        .map(|backend| Backend::Trusted(Box::new(backend))),
+                    #[cfg(target_os = "linux")]
+                    BackendBuilder::Sandboxed(builder) => builder
+                        .build()
+                        .inspect_err(|_| provision_state.poison())
+                        .map(|parts| {
+                            Backend::Linux(LinuxBackend {
+                                kernel: parts.kernel,
+                                cleanup: Some(parts.cleanup),
+                                path_mappings: parts.path_mappings,
+                                next_command_id: 1,
+                            })
+                        }),
                 })
                 .await;
                 let backend = match provision {
-                    Ok(Ok(backend)) => Backend::Trusted(Box::new(backend)),
+                    Ok(Ok(backend)) => backend,
                     Ok(Err(error)) => {
                         if !*state.poisoned.borrow() {
                             guard.release_without_resources();
@@ -273,6 +346,8 @@ fn build_handle(
     request: mpsc::Sender<ManagerRequest>,
     reader: DomainWorkspaceReader,
 ) -> Result<ExecutionDomain, ExecutionDomainError> {
+    let (paths, environment) = backend.domain_layout()?;
+    let command_mapping = backend.command_mapping();
     let backend = match backend {
         Backend::Trusted(backend) => backend,
         #[cfg(target_os = "linux")]
@@ -293,13 +368,9 @@ fn build_handle(
         private_tmp: backend.private_tmp.clone(),
         work_dir: backend.work_dir.clone(),
         attempt_dir: backend.attempt_dir.clone(),
-        paths: DomainPaths::trusted(
-            &backend.work_dir,
-            &backend.private_tmp,
-            &backend.attempt_dir,
-            backend.docker_paths.config_dir(),
-        )?,
-        environment: DomainEnvironment::trusted(backend.docker_config_dir_env.clone()),
+        paths,
+        environment,
+        command_mapping,
         workspace_reader: reader,
         explicit_destroy: false,
     })
@@ -332,8 +403,57 @@ async fn manager_loop(
                 cancelled,
                 reply,
             } => {
-                let result = backend.run(spec, output, cancelled).await;
+                let manager_cancelled = ManagerCancellation::new();
+                let mut destroy_reply = None;
+                let mut channel_closed = false;
+                let result = {
+                    let run = backend.run(spec, output, cancelled, manager_cancelled.clone());
+                    tokio::pin!(run);
+                    loop {
+                        tokio::select! {
+                            result = &mut run => break result,
+                            request = receiver.recv(), if !channel_closed => match request {
+                                Some(ManagerRequest::Cancel { reason, reply }) => {
+                                    manager_cancelled.cancel(reason);
+                                    let _ = reply.send(Ok(()));
+                                }
+                                Some(ManagerRequest::Destroy { reply }) => {
+                                    if destroy_reply.is_none() {
+                                        manager_cancelled.cancel(CancelReason::Shutdown);
+                                        destroy_reply = Some(reply);
+                                    } else {
+                                        let _ = reply.send(Err(backend_failure(
+                                            super::FailureCategory::Unavailable,
+                                        )));
+                                    }
+                                }
+                                #[cfg(test)]
+                                Some(ManagerRequest::Panic) => {
+                                    panic!("injected execution-domain manager panic")
+                                }
+                                Some(other) => reject_while_running(other),
+                                None => {
+                                    manager_cancelled.cancel(CancelReason::Shutdown);
+                                    channel_closed = true;
+                                }
+                            }
+                        }
+                    }
+                };
                 let _ = reply.send(result);
+                if let Some(reply) = destroy_reply {
+                    reader.revoke_and_wait();
+                    let result = backend.destroy();
+                    if result.is_ok() {
+                        guard.confirmed_destroyed();
+                    }
+                    let report = result.map(|()| DestroyReport {
+                        attempt,
+                        forced_kill: true,
+                    });
+                    let _ = reply.send(report);
+                    return;
+                }
             }
             ManagerRequest::PrepareStep { event, reply } => {
                 let _ = reply.send(backend.prepare_step(&event));
@@ -370,7 +490,81 @@ async fn manager_loop(
     let _ = backend.destroy();
 }
 
+fn reject_while_running(request: ManagerRequest) {
+    let error = || backend_failure(super::FailureCategory::Unavailable);
+    match request {
+        ManagerRequest::BindWorkspace { reply, .. }
+        | ManagerRequest::MarkRunning { reply }
+        | ManagerRequest::MarkCleaning { reply } => {
+            let _ = reply.send(Err(error()));
+        }
+        ManagerRequest::Run { reply, .. } => {
+            let _ = reply.send(Err(error()));
+        }
+        ManagerRequest::PrepareStep { reply, .. } => {
+            let _ = reply.send(Err(error()));
+        }
+        ManagerRequest::ReadStep { reply, .. } => {
+            let _ = reply.send(Err(error()));
+        }
+        ManagerRequest::Cancel { reply, .. } => {
+            let _ = reply.send(Err(error()));
+        }
+        ManagerRequest::Destroy { reply } => {
+            let _ = reply.send(Err(error()));
+        }
+        #[cfg(test)]
+        ManagerRequest::Panic => unreachable!("panic requests are handled before rejection"),
+    }
+}
+
 impl Backend {
+    fn command_mapping(&self) -> super::DomainCommandMapping {
+        match self {
+            Self::Trusted(_) => super::DomainCommandMapping::Trusted,
+            #[cfg(target_os = "linux")]
+            Self::Linux(backend) => {
+                super::DomainCommandMapping::Sandboxed(backend.path_mappings.clone())
+            }
+        }
+    }
+
+    fn domain_layout(&self) -> Result<(DomainPaths, DomainEnvironment), ExecutionDomainError> {
+        match self {
+            Self::Trusted(backend) => Ok((
+                DomainPaths::trusted(
+                    &backend.work_dir,
+                    &backend.private_tmp,
+                    &backend.attempt_dir,
+                    backend.docker_paths.config_dir(),
+                )?,
+                DomainEnvironment::trusted(backend.docker_config_dir_env.clone()),
+            )),
+            #[cfg(target_os = "linux")]
+            Self::Linux(backend) => {
+                let paths = DomainPaths::sandboxed();
+                for required in [
+                    &paths.work,
+                    &paths.tmp,
+                    &paths.home,
+                    &paths.run,
+                    &paths.docker_config,
+                    &paths.docker_data,
+                    &paths.docker_exec,
+                ] {
+                    if !backend
+                        .path_mappings
+                        .iter()
+                        .any(|(_, target)| target == required)
+                    {
+                        return Err(backend_failure(super::FailureCategory::IdentityMismatch));
+                    }
+                }
+                Ok((paths, DomainEnvironment::sandboxed()))
+            }
+        }
+    }
+
     fn bind_workspace(&mut self, paths: WorkspaceStatePaths) -> Result<(), ExecutionDomainError> {
         match self {
             Self::Trusted(backend) => backend.bind_workspace(paths),
@@ -400,11 +594,20 @@ impl Backend {
         spec: CommandSpec,
         output: mpsc::Sender<CommandEvent>,
         cancelled: CancellationToken,
+        manager_cancelled: ManagerCancellation,
     ) -> Result<CommandOutcome, ExecutionDomainError> {
         match self {
-            Self::Trusted(backend) => backend.run(spec, output, cancelled).await,
+            Self::Trusted(backend) => {
+                backend
+                    .run(spec, output, cancelled, manager_cancelled)
+                    .await
+            }
             #[cfg(target_os = "linux")]
-            Self::Linux(backend) => backend.run(spec, output, cancelled).await,
+            Self::Linux(backend) => {
+                backend
+                    .run(spec, output, cancelled, manager_cancelled)
+                    .await
+            }
         }
     }
 
@@ -444,7 +647,6 @@ impl Backend {
     }
 }
 
-#[cfg(target_os = "linux")]
 fn backend_failure(category: super::FailureCategory) -> ExecutionDomainError {
     ExecutionDomainError::Backend {
         attempt: None,
@@ -472,6 +674,7 @@ impl LinuxBackend {
         spec: CommandSpec,
         output: mpsc::Sender<CommandEvent>,
         cancelled: CancellationToken,
+        manager_cancelled: ManagerCancellation,
     ) -> Result<CommandOutcome, ExecutionDomainError> {
         use super::protocol::{Message, Request, Response};
 
@@ -499,6 +702,16 @@ impl LinuxBackend {
                 )?;
                 cancel_sent = true;
             }
+            if manager_cancelled.token.is_cancelled() && !cancel_sent {
+                self.kernel.control.send(
+                    Message::Request(Request::CancelCommand {
+                        command_id,
+                        reason: manager_cancelled.reason(),
+                    }),
+                    deadline,
+                )?;
+                cancel_sent = true;
+            }
             if output.is_closed() && !cancel_sent {
                 self.kernel.control.send(
                     Message::Request(Request::CancelCommand {
@@ -515,6 +728,7 @@ impl LinuxBackend {
                 }
                 tokio::select! {
                     _ = cancelled.cancelled(), if !cancel_sent => {}
+                    _ = manager_cancelled.cancelled(), if !cancel_sent => {}
                     _ = output.closed(), if !cancel_sent => {}
                     _ = tokio::time::sleep(std::time::Duration::from_millis(5)) => {}
                 }
@@ -558,6 +772,16 @@ impl LinuxBackend {
                                     Message::Request(Request::CancelCommand {
                                         command_id,
                                         reason: CancelReason::User,
+                                    }),
+                                    deadline,
+                                )?;
+                                cancel_sent = true;
+                            }
+                            _ = manager_cancelled.cancelled() => {
+                                self.kernel.control.send(
+                                    Message::Request(Request::CancelCommand {
+                                        command_id,
+                                        reason: manager_cancelled.reason(),
                                     }),
                                     deadline,
                                 )?;
@@ -645,6 +869,13 @@ impl LinuxBackend {
                     category: super::FailureCategory::Io,
                     errno: error.raw_os_error(),
                 })?;
+        }
+        if let Some(cleanup) = &self.cleanup {
+            cleanup.verify()?;
+            // Task 10 must kill/prove-empty/unmount/remove before this cleanup
+            // authority can be released. Never report a private strict backend
+            // as destroyed while that proof is unavailable.
+            return Err(backend_failure(super::FailureCategory::NotReady));
         }
         Ok(())
     }

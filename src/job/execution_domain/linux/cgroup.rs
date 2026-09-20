@@ -1,3 +1,11 @@
+#![cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "private B3/B4 construction and Task 10 teardown are not daemon-activated yet"
+    )
+)]
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{CStr, CString};
 use std::fs::File;
@@ -88,7 +96,9 @@ pub(super) fn validate_controllers(value: &str) -> Result<(), ExecutionDomainErr
 
 // This boundary represents the external cgroup filesystem, not a second driver.
 // Tests supply real temporary files to inject kernel read/write failures safely.
-pub(super) trait CgroupFilesystem: Send + Sync + 'static {
+pub(in crate::job::execution_domain) trait CgroupFilesystem:
+    Send + Sync + 'static
+{
     fn verify_filesystem(&self, fd: RawFd) -> io::Result<()> {
         let mut stat = std::mem::MaybeUninit::<libc::statfs>::zeroed();
         check(unsafe { libc::fstatfs(fd, stat.as_mut_ptr()) })?;
@@ -122,7 +132,7 @@ pub(super) trait CgroupFilesystem: Send + Sync + 'static {
     }
 }
 
-pub(super) struct KernelCgroupFs;
+pub(in crate::job::execution_domain) struct KernelCgroupFs;
 impl CgroupFilesystem for KernelCgroupFs {}
 
 pub(super) struct CgroupRoot<F = KernelCgroupFs> {
@@ -130,7 +140,7 @@ pub(super) struct CgroupRoot<F = KernelCgroupFs> {
     global: Option<ValidatedLimits>,
 }
 
-pub(super) struct AttemptCgroup<F = KernelCgroupFs> {
+pub(in crate::job::execution_domain) struct AttemptCgroup<F = KernelCgroupFs> {
     directory: Arc<CgroupDir<F>>,
     domain: Arc<CgroupDir<F>>,
     membership: OwnedFd,

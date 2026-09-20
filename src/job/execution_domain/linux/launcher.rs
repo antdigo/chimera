@@ -11,7 +11,7 @@ const MEMBERSHIP_FD: i32 = 3;
 pub(super) const STARTUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 #[derive(Clone, Copy)]
-pub(super) enum NetworkLaunch {
+pub(in crate::job::execution_domain) enum NetworkLaunch {
     Disconnected,
     #[cfg(test)]
     Slirp,
@@ -257,9 +257,8 @@ fn io_failure(error: io::Error) -> ExecutionDomainError {
     }
 }
 
-// B3/B4 resources stay staged until manager ownership is implemented in Task 9.
-#[cfg(test)]
-pub(super) struct LaunchSpec {
+// Constructed only by the private strict backend builder.
+pub(in crate::job::execution_domain) struct LaunchSpec {
     pub attempt: AttemptIdentity,
     pub rootfs: super::rootfs::RootfsPlan,
     pub bound_rootfs: super::dirfd::BoundDir,
@@ -273,25 +272,10 @@ pub(super) struct LaunchSpec {
 pub(in crate::job::execution_domain) struct KernelDomain {
     pub control: super::super::protocol::ControlConnection,
     pub launcher: std::process::Child,
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "retained cleanup authority is consumed by Task 10"
-        )
-    )]
     pub pidfd: OwnedFd,
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "startup deadline is consumed by the private activation path"
-        )
-    )]
     pub deadline: std::time::Instant,
 }
 
-#[cfg(test)]
 pub(super) fn launch<F: super::cgroup::CgroupFilesystem>(
     cgroup: &super::cgroup::AttemptCgroup<F>,
     spec: &LaunchSpec,
@@ -310,7 +294,6 @@ pub(super) fn launch<F: super::cgroup::CgroupFilesystem>(
     spawn_launcher(cgroup.launch_membership_fd(), spec)
 }
 
-#[cfg(test)]
 impl KernelDomain {
     pub(super) fn bootstrap(
         &mut self,
@@ -339,7 +322,6 @@ impl KernelDomain {
     }
 }
 
-#[cfg(test)]
 fn spawn_launcher(
     membership: BorrowedFd<'_>,
     spec: &LaunchSpec,

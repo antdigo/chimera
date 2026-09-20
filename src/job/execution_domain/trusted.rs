@@ -31,6 +31,25 @@ use super::{
 const IMPLICIT_DOCKER_CREDENTIAL_HELPERS: [&str; 2] =
     ["docker-credential-pass", "docker-credential-secretservice"];
 const STATE_FILE_LIMIT: usize = 1024 * 1024;
+const OUTPUT_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+struct ProcessGroupGuard(Option<i32>);
+
+impl ProcessGroupGuard {
+    fn new(process_group: Option<i32>) -> Self {
+        Self(process_group)
+    }
+
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for ProcessGroupGuard {
+    fn drop(&mut self) {
+        terminate_process_group(self.0);
+    }
+}
 
 #[derive(Debug)]
 struct BoundStateFile {
@@ -255,6 +274,7 @@ impl TrustedBackend {
         spec: CommandSpec,
         output: mpsc::Sender<CommandEvent>,
         cancelled: CancellationToken,
+        manager_cancelled: super::manager::ManagerCancellation,
     ) -> Result<CommandOutcome, ExecutionDomainError> {
         let CommandTarget::Trusted { program, args, cwd } = spec.target else {
             return Err(failure(FailureCategory::InvalidInput));
@@ -288,9 +308,13 @@ impl TrustedBackend {
             &self.docker_config_dir_env,
             &self.private_tmp,
         )?;
+        command.process_group(0);
+        command.kill_on_drop(true);
         let mut child = command
             .spawn()
             .map_err(|error| io_failure(Stage::Command, error))?;
+        let process_group = child.id().map(|id| id as i32);
+        let mut process_group_guard = ProcessGroupGuard::new(process_group);
         let stdout = child
             .stdout
             .take()
@@ -306,17 +330,27 @@ impl TrustedBackend {
         let (outcome, drain_output) = tokio::select! {
             result = child.wait() => (status_outcome(result.map_err(|error| io_failure(Stage::Command, error))?), true),
             _ = cancelled.cancelled() => {
+                terminate_process_group(process_group);
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                (CommandOutcome::Cancelled, false)
+            }
+            _ = manager_cancelled.cancelled() => {
+                let _reason = manager_cancelled.reason();
+                terminate_process_group(process_group);
                 let _ = child.kill().await;
                 let _ = child.wait().await;
                 (CommandOutcome::Cancelled, false)
             }
             _ = receiver_closed.cancelled() => {
                 let _reason = CancelReason::HandleDropped;
+                terminate_process_group(process_group);
                 let _ = child.kill().await;
                 let _ = child.wait().await;
                 (CommandOutcome::Cancelled, false)
             }
             _ = tokio::time::sleep(spec.timeout) => {
+                terminate_process_group(process_group);
                 let _ = child.kill().await;
                 let _ = child.wait().await;
                 (CommandOutcome::TimedOut, false)
@@ -328,13 +362,38 @@ impl TrustedBackend {
             // domain-level stall that prevents post actions.
             stdout_task.abort();
             stderr_task.abort();
+            let _ = stdout_task.await;
+            let _ = stderr_task.await;
+        } else {
+            let mut stdout_task = stdout_task;
+            let mut stderr_task = stderr_task;
+            let drained = tokio::time::timeout(OUTPUT_DRAIN_TIMEOUT, async {
+                let _ = (&mut stdout_task).await;
+                let _ = (&mut stderr_task).await;
+            })
+            .await;
+            if drained.is_err() {
+                terminate_process_group(process_group);
+                stdout_task.abort();
+                stderr_task.abort();
+                let _ = stdout_task.await;
+                let _ = stderr_task.await;
+            }
         }
-        let _ = stdout_task.await;
-        let _ = stderr_task.await;
         if let Some(store) = self.workspace.as_ref() {
             store.verify_all_named()?;
         }
+        process_group_guard.disarm();
         Ok(outcome)
+    }
+}
+
+fn terminate_process_group(process_group: Option<i32>) {
+    let Some(process_group) = process_group.filter(|group| *group > 0) else {
+        return;
+    };
+    unsafe {
+        libc::kill(-process_group, libc::SIGKILL);
     }
 }
 

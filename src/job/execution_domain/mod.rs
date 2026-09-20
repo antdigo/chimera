@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::num::NonZeroUsize;
@@ -174,8 +175,169 @@ pub struct ExecutionDomain {
     attempt_dir: PathBuf,
     paths: DomainPaths,
     environment: DomainEnvironment,
+    command_mapping: DomainCommandMapping,
     workspace_reader: DomainWorkspaceReader,
     explicit_destroy: bool,
+}
+
+#[derive(Clone)]
+enum DomainCommandMapping {
+    Trusted,
+    #[cfg(target_os = "linux")]
+    Sandboxed(Vec<(PathBuf, DomainPath)>),
+}
+
+impl DomainCommandMapping {
+    #[cfg(target_os = "linux")]
+    fn map_path(&self, path: &Path) -> Result<DomainPath, ExecutionDomainError> {
+        match self {
+            Self::Trusted => path
+                .to_str()
+                .ok_or(ExecutionDomainError::InvalidDomainPath)
+                .and_then(DomainPath::parse),
+            #[cfg(target_os = "linux")]
+            Self::Sandboxed(mappings) => {
+                if mappings
+                    .iter()
+                    .any(|(_, target)| path.starts_with(target.as_str()))
+                {
+                    return path
+                        .to_str()
+                        .ok_or(ExecutionDomainError::InvalidDomainPath)
+                        .and_then(DomainPath::parse);
+                }
+                let (source, mut target) = mappings
+                    .iter()
+                    .filter(|(source, _)| path.starts_with(source))
+                    .max_by_key(|(source, _)| source.components().count())
+                    .map(|(source, target)| (source, target.clone()))
+                    .ok_or(ExecutionDomainError::InvalidDomainPath)?;
+                let relative = path
+                    .strip_prefix(source)
+                    .map_err(|_| ExecutionDomainError::InvalidDomainPath)?;
+                for component in relative.components() {
+                    let std::path::Component::Normal(component) = component else {
+                        return Err(ExecutionDomainError::InvalidDomainPath);
+                    };
+                    target = target.join(
+                        component
+                            .to_str()
+                            .ok_or(ExecutionDomainError::InvalidDomainPath)?,
+                    )?;
+                }
+                Ok(target)
+            }
+        }
+    }
+
+    fn target(
+        &self,
+        program: &OsStr,
+        args: &[&OsStr],
+        cwd: &Path,
+        env: &HashMap<String, String>,
+    ) -> Result<CommandTarget, ExecutionDomainError> {
+        #[cfg(not(target_os = "linux"))]
+        let _ = env;
+        match self {
+            Self::Trusted => Ok(CommandTarget::Trusted {
+                program: program.to_os_string(),
+                args: args.iter().map(|arg| (*arg).to_os_string()).collect(),
+                cwd: cwd.to_path_buf(),
+            }),
+            #[cfg(target_os = "linux")]
+            Self::Sandboxed(_) => {
+                let program_path = Path::new(program);
+                let program = if program_path.is_absolute() {
+                    self.map_path(program_path)?
+                } else {
+                    let program = program
+                        .to_str()
+                        .ok_or(ExecutionDomainError::InvalidDomainPath)?;
+                    env.get("PATH")
+                        .into_iter()
+                        .flat_map(|path| path.split(':'))
+                        .filter(|path| !path.is_empty())
+                        .find_map(|directory| {
+                            self.map_path(Path::new(directory).join(program).as_path())
+                                .ok()
+                        })
+                        .ok_or(ExecutionDomainError::InvalidDomainPath)?
+                };
+                let args = args
+                    .iter()
+                    .map(|arg| {
+                        let value = arg
+                            .to_str()
+                            .ok_or(ExecutionDomainError::InvalidDomainPath)?;
+                        let path = Path::new(arg);
+                        if path.is_absolute() {
+                            self.map_path(path).map(|path| path.as_str().to_owned())
+                        } else {
+                            Ok(value.to_owned())
+                        }
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(CommandTarget::Sandboxed {
+                    program,
+                    args,
+                    cwd: self.map_path(cwd)?,
+                })
+            }
+        }
+    }
+
+    fn environment(
+        &self,
+        supplied: &HashMap<String, String>,
+        owned: &DomainEnvironment,
+    ) -> Result<HashMap<String, String>, ExecutionDomainError> {
+        #[cfg(not(target_os = "linux"))]
+        let _ = owned;
+        match self {
+            Self::Trusted => Ok(supplied.clone()),
+            #[cfg(target_os = "linux")]
+            Self::Sandboxed(_) => {
+                let mut mapped = supplied.clone();
+                for reserved in [
+                    "GITHUB_ENV",
+                    "GITHUB_PATH",
+                    "GITHUB_OUTPUT",
+                    "GITHUB_STATE",
+                    "GITHUB_STEP_SUMMARY",
+                    "GITHUB_EVENT_PATH",
+                ] {
+                    mapped.remove(reserved);
+                }
+                for key in [
+                    "GITHUB_WORKSPACE",
+                    "RUNNER_TEMP",
+                    "RUNNER_TOOL_CACHE",
+                    "GITHUB_ACTION_PATH",
+                ] {
+                    if let Some(value) = mapped.get(key).cloned() {
+                        mapped.insert(
+                            key.into(),
+                            self.map_path(Path::new(&value))?.as_str().into(),
+                        );
+                    }
+                }
+                if let Some(path) = mapped.get("PATH").cloned() {
+                    let path = path
+                        .split(':')
+                        .filter(|part| !part.is_empty())
+                        .map(|part| self.map_path(Path::new(part)))
+                        .collect::<Result<Vec<_>, _>>()?
+                        .into_iter()
+                        .map(|part| part.as_str().to_owned())
+                        .collect::<Vec<_>>()
+                        .join(":");
+                    mapped.insert("PATH".into(), path);
+                }
+                owned.merge(&mapped, "sandbox command")
+            }
+        }
+    }
 }
 
 impl std::fmt::Debug for ExecutionDomain {
@@ -681,6 +843,24 @@ impl ExecutionDomain {
             .map_err(|_| ExecutionDomainError::PoisonedRoot {
                 path: self.root.clone(),
             })?
+    }
+
+    pub(crate) fn command_target(
+        &self,
+        program: &OsStr,
+        args: &[&OsStr],
+        cwd: &Path,
+        env: &HashMap<String, String>,
+    ) -> Result<CommandTarget, ExecutionDomainError> {
+        self.command_mapping.target(program, args, cwd, env)
+    }
+
+    pub(crate) fn command_environment(
+        &self,
+        supplied: &HashMap<String, String>,
+    ) -> Result<HashMap<String, String>, ExecutionDomainError> {
+        self.command_mapping
+            .environment(supplied, &self.environment)
     }
 
     pub async fn prepare_step(&self, event: &[u8]) -> Result<StepFilesId, ExecutionDomainError> {

@@ -39,7 +39,7 @@ const ALIASES: &[(&str, &str)] = &[
     ("lib64", "/usr/lib64"),
 ];
 
-// The supervisor promotes this builder with its ownership capabilities in B9.
+// The supervisor promotes this configuration builder at the activation seam.
 #[cfg(test)]
 pub(in crate::job::execution_domain::linux) struct ImmutableInputs {
     pub tool_cache: PathBuf,
@@ -118,7 +118,6 @@ impl RootfsPlan {
         })
     }
 
-    #[cfg(test)]
     pub(in crate::job::execution_domain::linux) fn validate(
         &self,
     ) -> Result<(), ExecutionDomainError> {
