@@ -156,6 +156,9 @@ impl DomainWorkspaceReader {
             limits,
         };
         traversal.enumerate(root.fd.as_raw_fd(), Path::new(""), 0)?;
+        if matched.is_empty() {
+            return Ok(String::new());
+        }
 
         let mut total = 0u64;
         let mut hasher = Sha256::new();
@@ -199,9 +202,6 @@ impl DomainWorkspaceReader {
             {
                 return Err(failure(FailureCategory::IdentityMismatch));
             }
-        }
-        if total == 0 {
-            return Ok(String::new());
         }
         Ok(format!("{:x}", hasher.finalize()))
     }

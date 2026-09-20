@@ -6,6 +6,8 @@ use sha2::{Digest, Sha256};
 use super::{DomainWorkspaceReader, ReadLimits};
 use crate::job::execution_domain::{ExecutionDomainError, FailureCategory};
 
+const EMPTY_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
 fn assert_category(error: ExecutionDomainError, expected: FailureCategory) {
     let ExecutionDomainError::Backend { category, .. } = error else {
         panic!("expected backend failure, got {error:?}");
@@ -26,7 +28,24 @@ fn hashes_sorted_deduplicated_regular_files() {
     expected.update(b"a");
     expected.update(b"b");
     assert_eq!(digest, format!("{:x}", expected.finalize()));
-    assert_eq!(reader.hash_files(&["*.none".into()]).unwrap(), "");
+}
+
+#[test]
+fn distinguishes_no_matches_from_one_or_multiple_empty_files() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("a.empty"), []).unwrap();
+    std::fs::write(temp.path().join("b.empty"), []).unwrap();
+    let reader = DomainWorkspaceReader::new(temp.path().to_path_buf()).unwrap();
+
+    let no_matches = reader.hash_files(&["*.none".into()]).unwrap();
+    let one_empty = reader.hash_files(&["a.empty".into()]).unwrap();
+    let multiple_empty = reader
+        .hash_files(&["*.empty".into(), "a.*".into()])
+        .unwrap();
+
+    assert_eq!(no_matches, "");
+    assert_eq!(one_empty, EMPTY_SHA256);
+    assert_eq!(multiple_empty, EMPTY_SHA256);
 }
 
 #[test]

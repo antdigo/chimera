@@ -2154,3 +2154,29 @@ fn hashfiles_prefers_domain_reader_over_host_workspace_fallback() {
     expected.update(b"domain");
     assert_eq!(digest, format!("{:x}", expected.finalize()));
 }
+
+#[test]
+fn domain_reader_matches_trusted_hashfiles_for_empty_files() {
+    use crate::job::execution_domain::DomainWorkspaceReader;
+
+    let workspace = tempfile::tempdir().unwrap();
+    std::fs::write(workspace.path().join("a.empty"), []).unwrap();
+    std::fs::write(workspace.path().join("b.empty"), []).unwrap();
+
+    let mut trusted = empty_ctx();
+    trusted.workspace_path = Some(workspace.path().to_string_lossy().into_owned());
+    let trusted_digest = parse_and_eval("hashFiles('*.empty', 'a.*')", &trusted)
+        .unwrap()
+        .to_display();
+
+    let mut sandboxed = empty_ctx();
+    sandboxed.workspace_path = Some(workspace.path().to_string_lossy().into_owned());
+    sandboxed.workspace_reader =
+        Some(DomainWorkspaceReader::new(workspace.path().to_path_buf()).unwrap());
+    let sandboxed_digest = parse_and_eval("hashFiles('*.empty', 'a.*')", &sandboxed)
+        .unwrap()
+        .to_display();
+
+    assert_ne!(trusted_digest, "");
+    assert_eq!(sandboxed_digest, trusted_digest);
+}
