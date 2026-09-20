@@ -19,24 +19,56 @@ async fn explicit_clients_route_to_distinct_unix_endpoints() {
 }
 
 #[tokio::test]
-async fn refused_explicit_endpoint_does_not_fall_back_to_a_live_probe() {
-    let refused_dir = tempfile::Builder::new()
-        .prefix("ch-ep-refused-")
-        .tempdir_in("/tmp")
-        .unwrap();
-    let socket_path = refused_dir.path().join("docker.sock");
-    let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
-    drop(listener);
-    let refused_endpoint = DockerEndpoint::unix_socket(&socket_path).unwrap();
+async fn absent_explicit_endpoint_does_not_fall_back_to_ambient_live_probe() {
+    const CHILD_MARKER: &str = "CHIMERA_ABSENT_ENDPOINT_CHILD";
+
+    if std::env::var_os(CHILD_MARKER).is_some() {
+        let absent_dir = tempfile::Builder::new()
+            .prefix("ch-ep-absent-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let explicit_endpoint =
+            DockerEndpoint::unix_socket(&absent_dir.path().join("docker.sock")).unwrap();
+        let operation_failed = match chimera::docker::client::connect(&explicit_endpoint) {
+            Ok(client) => tokio::time::timeout(std::time::Duration::from_secs(2), client.ping())
+                .await
+                .expect("explicit Docker operation must remain bounded")
+                .is_err(),
+            Err(_) => true,
+        };
+
+        assert!(operation_failed);
+        return;
+    }
+
     let live = EngineProbe::start("unexpected-fallback").await.unwrap();
-    let client = chimera::docker::client::connect(&refused_endpoint).unwrap();
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        tokio::process::Command::new(std::env::current_exe().unwrap())
+            .kill_on_drop(true)
+            .args([
+                "--exact",
+                "absent_explicit_endpoint_does_not_fall_back_to_ambient_live_probe",
+                "--nocapture",
+            ])
+            .env(CHILD_MARKER, "1")
+            .env("DOCKER_HOST", live.endpoint().socket_address())
+            .output(),
+    )
+    .await
+    .expect("explicit endpoint child must remain bounded")
+    .unwrap();
 
-    let ping = tokio::time::timeout(std::time::Duration::from_secs(2), client.ping())
-        .await
-        .unwrap();
-
-    assert!(ping.is_err());
-    assert!(live.requests().is_empty());
+    assert!(
+        live.requests().is_empty(),
+        "explicit endpoint operation reached the ambient Docker endpoint"
+    );
+    assert!(
+        output.status.success(),
+        "explicit endpoint child failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
 }
 
 #[tokio::test]
