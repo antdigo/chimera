@@ -34,11 +34,11 @@ pub async fn ensure_image(
 ) -> Result<()> {
     match docker.inspect_image(image).await {
         Ok(_) => {
-            debug!(image, "image already present");
+            debug!("Docker image already present");
             return Ok(());
         }
         Err(_) => {
-            info!(image, "pulling image");
+            info!("pulling Docker image");
         }
     }
 
@@ -57,10 +57,10 @@ pub async fn ensure_image(
 
     let mut stream = docker.create_image(Some(opts), None, docker_creds);
     while let Some(result) = stream.next().await {
-        result.with_context(|| format!("pulling image {image}"))?;
+        result.context("pulling Docker image")?;
     }
 
-    info!(image, "image pulled successfully");
+    info!("Docker image pulled successfully");
     Ok(())
 }
 

@@ -16,6 +16,7 @@ use super::client::ensure_image;
 use super::container::{JobContainerSpec, ServiceContainerSpec};
 use super::network::{create_job_network, get_network_gateway, remove_network};
 use super::options::parse_options;
+use super::output::DockerErrorDiagnostic;
 
 const STOP_TIMEOUT_SECS: i64 = 5;
 const HEALTH_CHECK_TIMEOUT: Duration = Duration::from_secs(300);
@@ -107,7 +108,7 @@ impl JobDockerResources {
         // Resolve gateway IP so containers can reach host-bound services (e.g. cache server)
         match get_network_gateway(&self.docker, &network_name).await {
             Ok(gw) => self.host_gateway_ip = Some(gw),
-            Err(e) => warn!(error = %e, "could not resolve network gateway"),
+            Err(_) => warn!("could not resolve network gateway"),
         }
 
         // Start service containers
@@ -115,10 +116,7 @@ impl JobDockerResources {
             ensure_image(&self.docker, &svc.image, svc.credentials.as_ref()).await?;
 
             let alias = svc.alias.clone().unwrap_or_else(|| format!("svc-{i}"));
-            let container_name = format!(
-                "chimera-{}-{}-svc-{alias}",
-                params.runner_name, params.job_id
-            );
+            let container_name = service_container_name(params.runner_name, params.job_id, i);
 
             let port_bindings = parse_port_bindings(&svc.ports);
             let env_list: Vec<String> = svc
@@ -214,9 +212,8 @@ impl JobDockerResources {
             }
 
             info!(
-                container = %container_name,
-                image = %svc.image,
-                alias = %alias,
+                container = %container.id,
+                service_index = i,
                 "service container started"
             );
         }
@@ -314,7 +311,6 @@ impl JobDockerResources {
 
             info!(
                 container = %container_name,
-                image = %spec.image,
                 "job container started"
             );
 
@@ -434,7 +430,15 @@ pub(crate) async fn stop_and_remove(docker: &Docker, container_id: &str, label: 
         t: STOP_TIMEOUT_SECS,
     };
     if let Err(e) = docker.stop_container(container_id, Some(stop_opts)).await {
-        debug!(container = %container_id, error = %e, "{label}: stop failed (may already be stopped)");
+        let diagnostic = DockerErrorDiagnostic::from(&e);
+        debug!(
+            container = %container_id,
+            error_kind = diagnostic.kind,
+            status_code = ?diagnostic.status_code,
+            error_code = ?diagnostic.error_code,
+            column = ?diagnostic.column,
+            "{label}: stop failed (may already be stopped)"
+        );
     }
 
     let remove_opts = RemoveContainerOptions {
@@ -446,7 +450,15 @@ pub(crate) async fn stop_and_remove(docker: &Docker, container_id: &str, label: 
         .remove_container(container_id, Some(remove_opts))
         .await
     {
-        warn!(container = %container_id, error = %e, "{label}: remove failed");
+        let diagnostic = DockerErrorDiagnostic::from(&e);
+        warn!(
+            container = %container_id,
+            error_kind = diagnostic.kind,
+            status_code = ?diagnostic.status_code,
+            error_code = ?diagnostic.error_code,
+            column = ?diagnostic.column,
+            "{label}: remove failed"
+        );
     } else {
         debug!(container = %container_id, "{label}: removed");
     }
@@ -516,7 +528,33 @@ async fn wait_for_healthy(docker: &Docker, container_id: &str, container_name: &
     }
 }
 
-/// Fetch and log the last 50 lines from a container's stdout/stderr.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ContainerTailSummary {
+    chunk_count: usize,
+    byte_count: usize,
+}
+
+impl ContainerTailSummary {
+    fn record(&mut self, chunk: &LogOutput) {
+        let message = match chunk {
+            LogOutput::StdOut { message } | LogOutput::StdErr { message } => message,
+            _ => return,
+        };
+        self.chunk_count += 1;
+        self.byte_count += message.len();
+    }
+}
+
+#[cfg(test)]
+fn summarize_container_tail(chunks: &[LogOutput]) -> ContainerTailSummary {
+    let mut summary = ContainerTailSummary::default();
+    for chunk in chunks {
+        summary.record(chunk);
+    }
+    summary
+}
+
+/// Fetch and summarize the last 50 lines from a container's stdout/stderr.
 async fn log_container_tail(docker: &Docker, container_id: &str, container_name: &str) {
     let opts = LogsOptions::<String> {
         stdout: true,
@@ -525,23 +563,18 @@ async fn log_container_tail(docker: &Docker, container_id: &str, container_name:
         ..Default::default()
     };
     let mut stream = docker.logs(container_id, Some(opts));
-    let mut lines = Vec::new();
+    let mut summary = ContainerTailSummary::default();
     while let Some(Ok(chunk)) = stream.next().await {
-        let text = match &chunk {
-            LogOutput::StdOut { message } | LogOutput::StdErr { message } => {
-                String::from_utf8_lossy(message).to_string()
-            }
-            _ => continue,
-        };
-        lines.push(text);
+        summary.record(&chunk);
     }
-    if lines.is_empty() {
+    if summary.chunk_count == 0 {
         error!(container = %container_name, "no container logs available");
     } else {
         error!(
             container = %container_name,
-            logs = %lines.join(""),
-            "container logs (last 50 lines)"
+            chunk_count = summary.chunk_count,
+            byte_count = summary.byte_count,
+            "container log summary (last 50 lines)"
         );
     }
 }
@@ -559,16 +592,21 @@ fn log_health_check_results(
     else {
         return;
     };
-    for entry in health_log.iter().rev().take(3).rev() {
-        let output = entry.output.as_deref().unwrap_or("");
-        let exit_code = entry.exit_code.unwrap_or(-1);
-        error!(
-            container = %container_name,
-            exit_code = exit_code,
-            output = %output.trim(),
-            "health check probe result"
-        );
-    }
+    let record_count = health_log.len().min(3);
+    let last_exit_code = health_log
+        .last()
+        .and_then(|entry| entry.exit_code)
+        .unwrap_or(-1);
+    error!(
+        container = %container_name,
+        record_count,
+        last_exit_code,
+        "health check probe summary"
+    );
+}
+
+fn service_container_name(runner_name: &str, job_id: &str, service_index: usize) -> String {
+    format!("chimera-{runner_name}-{job_id}-svc-{service_index}")
 }
 
 /// Extract port mappings from an inspected container.

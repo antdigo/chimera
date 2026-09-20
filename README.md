@@ -3,7 +3,7 @@
 
 Protocol-compatible GitHub Actions runner replacement, written from scratch in Rust.
 
-Chimera is a single, fast binary that manages multiple runners concurrently. Run it as a systemd service, in a Docker container, or just in a terminal. It speaks the same registration and job execution protocol as the official runner, so it **works with any existing workflow without modification**.
+Chimera is a single, fast binary that manages multiple runners concurrently. Run it as a systemd service, in a Docker container, or just in a terminal. It speaks the same registration and job execution protocol as the official runner and runs existing workflows within the documented host-platform capability boundaries below.
 
 ## Install
 
@@ -117,6 +117,39 @@ refuses startup when stale `job-resources` exist rather than deleting them autom
 Follow the [operator recovery procedure](docs/job-docker-config.md) before removing
 an exact stale attempt directory.
 
+### Private `/tmp` for Linux host jobs
+
+On Linux, every host process runs in a private user and mount namespace. Chimera bind
+mounts a mode-`0700` directory from the job's unique attempt resource over `/tmp`, so
+unchanged scripts that use absolute `/tmp` paths cannot collide with another job. The
+same directory is reused by all host steps in that attempt and is removed with the
+attempt resources. If namespace or bind-mount setup fails, Chimera does not execute the
+workflow command.
+
+The Chimera root and host-job workspaces must live outside `/tmp`, because the private
+mount intentionally hides the host's `/tmp` from workflow commands. On Linux, Chimera
+canonicalizes its root before deriving host-job workspace paths and refuses startup when
+that root is inside the host temp tree.
+The kernel must allow the daemon user to create unprivileged user namespaces. Ubuntu
+installations with AppArmor's unprivileged-user-namespace restriction enabled must grant
+Chimera an appropriate profile or disable that restriction for the dedicated worker. A
+container running Chimera also needs a seccomp/AppArmor policy that permits user and
+mount namespace setup; the CI test container uses `seccomp=unconfined` and
+`apparmor=unconfined`.
+
+The namespace maps the daemon's effective UID and primary GID, but not supplementary
+groups. For rootful Docker, configure the service's primary group as the group owning
+the Docker socket (normally `Group=docker`); rootless Docker sockets owned by the daemon
+user need no group change. For an unprivileged daemon, setuid/setgid executables and file
+capabilities whose owning IDs are not mapped into the job namespace cannot elevate the
+host step; this includes the usual setuid-root `sudo`. Pre-provision host dependencies or
+use a job container instead of invoking `sudo` from a host step. This `/tmp` boundary does
+not replace full tenant isolation from host files and processes.
+
+macOS builds do not provide the Linux namespace boundary. Concurrent macOS host jobs that
+use fixed absolute `/tmp` names are unsupported; use unique paths in those workflows or
+run the deployment profile on Linux.
+
 ## Supported features
 
 - Host and container step execution (`run:`, `container:`, `services:`)
@@ -154,6 +187,7 @@ Requires=docker.service
 [Service]
 Type=simple
 User=chimera
+Group=docker
 ExecStart=/usr/local/bin/chimera start
 Restart=on-failure
 RestartSec=5

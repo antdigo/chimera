@@ -19,6 +19,9 @@ pub enum JobDockerConfigError {
         path: PathBuf,
         reason: &'static str,
     },
+    ChimeraRootUnderHostTmp {
+        path: PathBuf,
+    },
     PoisonedRoot {
         path: PathBuf,
     },
@@ -61,6 +64,11 @@ impl std::fmt::Display for JobDockerConfigError {
             Self::UnsafeRoot { path, reason } => write!(
                 formatter,
                 "unsafe-job-resource-root: {reason}: {}",
+                path.display()
+            ),
+            Self::ChimeraRootUnderHostTmp { path } => write!(
+                formatter,
+                "chimera-root-under-host-tmp: Linux host-job isolation hides /tmp; move the Chimera root outside /tmp: {}",
                 path.display()
             ),
             Self::PoisonedRoot { path } => write!(
@@ -206,6 +214,8 @@ pub struct JobDockerConfig {
     config_dir: PathBuf,
     config_dir_env: String,
     config_file: PathBuf,
+    private_tmp: PathBuf,
+    private_tmp_identity: DirectoryIdentity,
     cleaned: bool,
 }
 
@@ -270,6 +280,7 @@ impl JobResourceRoot {
         validate_bound_private_directory(&self.canonical_path, self.identity)?;
         let attempt_dir = self.canonical_path.join(attempt_id.simple().to_string());
         let config_dir = attempt_dir.join("docker");
+        let private_tmp = attempt_dir.join("tmp");
         let config_dir_env = utf8_path(&config_dir)?.to_owned();
         let config_file = config_dir.join("config.json");
         match create_private_dir(&attempt_dir, "creating job attempt directory") {
@@ -286,6 +297,9 @@ impl JobResourceRoot {
             let attempt_identity =
                 directory_identity(&attempt_dir, "reading job attempt directory identity")?;
             create_private_dir(&config_dir, "creating Docker config directory")?;
+            create_private_dir(&private_tmp, "creating private job temp directory")?;
+            let private_tmp_identity =
+                directory_identity(&private_tmp, "reading private job temp identity")?;
             let mut file = OpenOptions::new()
                 .write(true)
                 .create_new(true)
@@ -299,11 +313,11 @@ impl JobResourceRoot {
             fs::set_permissions(&config_file, fs::Permissions::from_mode(0o600)).map_err(
                 |source| io_error("setting Docker config permissions", &config_file, source),
             )?;
-            Ok(attempt_identity)
+            Ok((attempt_identity, private_tmp_identity))
         })();
 
-        let attempt_identity = match creation {
-            Ok(identity) => identity,
+        let (attempt_identity, private_tmp_identity) = match creation {
+            Ok(identities) => identities,
             Err(create) => {
                 return match fs::remove_dir_all(&attempt_dir) {
                     Ok(()) => Err(create),
@@ -329,6 +343,8 @@ impl JobResourceRoot {
             config_dir,
             config_dir_env,
             config_file,
+            private_tmp,
+            private_tmp_identity,
             cleaned: false,
         })
     }
@@ -341,6 +357,10 @@ impl JobDockerConfig {
 
     pub fn config_file(&self) -> &Path {
         &self.config_file
+    }
+
+    pub fn private_tmp(&self) -> &Path {
+        &self.private_tmp
     }
 
     pub fn attempt_dir(&self) -> &Path {
@@ -417,7 +437,11 @@ impl JobDockerConfig {
             });
         }
 
-        validate_removal_tree(&self.attempt_dir)?;
+        validate_attempt_removal_tree(
+            &self.attempt_dir,
+            &self.private_tmp,
+            self.private_tmp_identity,
+        )?;
         fs::remove_dir_all(&self.attempt_dir).map_err(|source| JobDockerConfigError::Cleanup {
             path: self.attempt_dir.clone(),
             source,
@@ -534,6 +558,63 @@ fn validate_removal_tree(path: &Path) -> Result<(), JobDockerConfigError> {
         for entry in entries {
             let entry = entry.map_err(|source| io_error("reading cleanup entry", path, source))?;
             validate_removal_tree(&entry.path())?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_attempt_removal_tree(
+    attempt_dir: &Path,
+    private_tmp: &Path,
+    private_tmp_identity: DirectoryIdentity,
+) -> Result<(), JobDockerConfigError> {
+    let entries = fs::read_dir(attempt_dir)
+        .map_err(|source| io_error("reading cleanup directory", attempt_dir, source))?;
+    for entry in entries {
+        let entry =
+            entry.map_err(|source| io_error("reading cleanup entry", attempt_dir, source))?;
+        let path = entry.path();
+        if path == private_tmp {
+            prepare_private_tmp_for_removal(&path, private_tmp_identity)?;
+        } else {
+            validate_removal_tree(&path)?;
+        }
+    }
+    Ok(())
+}
+
+fn prepare_private_tmp_for_removal(
+    private_tmp: &Path,
+    expected_identity: DirectoryIdentity,
+) -> Result<(), JobDockerConfigError> {
+    let metadata = fs::symlink_metadata(private_tmp)
+        .map_err(|source| io_error("reading private temp cleanup metadata", private_tmp, source))?;
+    validate_bound_directory(private_tmp, expected_identity, &metadata)?;
+    prepare_owned_directory_tree_for_removal(private_tmp, &metadata)
+}
+
+fn prepare_owned_directory_tree_for_removal(
+    path: &Path,
+    metadata: &fs::Metadata,
+) -> Result<(), JobDockerConfigError> {
+    if metadata.uid() != unsafe { libc::geteuid() } {
+        return Err(JobDockerConfigError::UnsafeEntry {
+            path: path.to_path_buf(),
+        });
+    }
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+        .map_err(|source| io_error("restoring cleanup directory permissions", path, source))?;
+
+    let entries = fs::read_dir(path)
+        .map_err(|source| io_error("reading private temp cleanup directory", path, source))?;
+    for entry in entries {
+        let entry =
+            entry.map_err(|source| io_error("reading private temp cleanup entry", path, source))?;
+        let child = entry.path();
+        let child_metadata = fs::symlink_metadata(&child)
+            .map_err(|source| io_error("reading private temp cleanup entry", &child, source))?;
+        if child_metadata.is_dir() && !child_metadata.file_type().is_symlink() {
+            prepare_owned_directory_tree_for_removal(&child, &child_metadata)?;
         }
     }
     Ok(())

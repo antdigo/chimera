@@ -1,11 +1,12 @@
 use std::sync::Arc;
 
 use chrono::Utc;
-use tokio::sync::{RwLock, mpsc};
+use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::warn;
 
 use super::JobClient;
+use super::secret_masker::SharedSecretMasker;
 use crate::utils::format_log_timestamp;
 
 #[derive(Clone)]
@@ -18,18 +19,36 @@ pub struct LogLine {
 pub struct LogSender {
     tx: mpsc::Sender<LogLine>,
     job_tx: Option<mpsc::Sender<LogLine>>,
-    masks: Arc<RwLock<Vec<String>>>,
+    secret_masker: SharedSecretMasker,
     feed: Option<(super::live_feed::FeedSender, String)>,
 }
 
 impl LogSender {
     #[cfg(test)]
-    pub fn new_for_test(tx: mpsc::Sender<LogLine>, masks: Arc<RwLock<Vec<String>>>) -> Self {
+    pub(crate) fn new_for_test(
+        tx: mpsc::Sender<LogLine>,
+        secret_masker: SharedSecretMasker,
+    ) -> Self {
         Self {
             tx,
             job_tx: None,
-            masks,
+            secret_masker,
             feed: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_test_with_feed(
+        tx: mpsc::Sender<LogLine>,
+        secret_masker: SharedSecretMasker,
+        feed: super::live_feed::FeedSender,
+        step_id: String,
+    ) -> Self {
+        Self {
+            tx,
+            job_tx: None,
+            secret_masker,
+            feed: Some((feed, step_id)),
         }
     }
 
@@ -75,14 +94,7 @@ impl LogSender {
     }
 
     async fn apply_masks(&self, content: &str) -> String {
-        let masks = self.masks.read().await;
-        let mut result = content.to_string();
-        for mask in masks.iter() {
-            if !mask.is_empty() {
-                result = result.replace(mask, "***");
-            }
-        }
-        result
+        self.secret_masker.read().await.mask(content)
     }
 }
 
@@ -123,12 +135,12 @@ impl StepLogger {
     /// Lines are streamed incrementally to an Azure Append Blob. The blob is
     /// left unsealed during execution so GitHub's UI can read partial content,
     /// and sealed when the step finishes.
-    pub fn results(
+    pub(crate) fn results(
         client: Arc<JobClient>,
         plan_id: String,
         job_id: String,
         step_id: String,
-        masks: Arc<RwLock<Vec<String>>>,
+        secret_masker: SharedSecretMasker,
         feed: Option<(super::live_feed::FeedSender, String)>,
         job_tx: Option<mpsc::Sender<LogLine>>,
     ) -> Self {
@@ -136,7 +148,7 @@ impl StepLogger {
         let sender = LogSender {
             tx,
             job_tx,
-            masks,
+            secret_masker,
             feed,
         };
         let target = BlobTarget::Step {
@@ -152,11 +164,11 @@ impl StepLogger {
     }
 
     /// Create a StepLogger for the legacy VSS API (streams to GitHub).
-    pub async fn legacy(
+    pub(crate) async fn legacy(
         client: Arc<JobClient>,
         plan_id: &str,
         step_name: &str,
-        masks: Arc<RwLock<Vec<String>>>,
+        secret_masker: SharedSecretMasker,
         feed: Option<(super::live_feed::FeedSender, String)>,
     ) -> Self {
         let log_id = client
@@ -170,7 +182,7 @@ impl StepLogger {
         let sender = LogSender {
             tx,
             job_tx: None,
-            masks,
+            secret_masker,
             feed,
         };
         let handle = tokio::spawn(vss_upload_task(client, plan_id.to_string(), log_id, rx));
@@ -215,12 +227,12 @@ impl StepLogger {
 
     /// Test-only: creates a Results logger that collects lines without uploading.
     #[cfg(test)]
-    pub fn results_for_test(masks: Arc<RwLock<Vec<String>>>) -> Self {
+    pub(crate) fn results_for_test(secret_masker: SharedSecretMasker) -> Self {
         let (tx, rx) = mpsc::channel::<LogLine>(256);
         let sender = LogSender {
             tx,
             job_tx: None,
-            masks,
+            secret_masker,
             feed: None,
         };
         let handle = tokio::spawn(simple_log_collector(rx));

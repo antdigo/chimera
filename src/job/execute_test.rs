@@ -106,7 +106,7 @@ fn test_step() -> Step {
 
 fn test_job_state() -> JobState {
     JobState::new(
-        Arc::new(RwLock::new(Vec::new())),
+        crate::job::secret_masker::shared_masker_for_test(&[]),
         HashMap::new(),
         serde_json::json!({}),
     )
@@ -116,7 +116,7 @@ fn test_job_state() -> JobState {
 fn step_debug_secret_name_is_case_insensitive() {
     let secrets = HashMap::from([("actions_step_debug".to_string(), "true".to_string())]);
     let state = JobState::new(
-        Arc::new(RwLock::new(Vec::new())),
+        crate::job::secret_masker::shared_masker_for_test(&[]),
         secrets,
         serde_json::json!({}),
     );
@@ -133,9 +133,7 @@ async fn context_data_secret_overrides_variable_regardless_of_case() {
         "contextData": { "secrets": { "DEPLOY_TOKEN": "new" } }
     }))
     .unwrap();
-    let masks = Arc::new(RwLock::new(Vec::new()));
-
-    let secrets = collect_secrets(&manifest, &masks).await;
+    let secrets = collect_secrets(&manifest);
 
     assert_eq!(secrets.len(), 1);
     assert_eq!(
@@ -146,6 +144,39 @@ async fn context_data_secret_overrides_variable_regardless_of_case() {
         find_case_insensitive(&secrets, "deploy_token").unwrap(),
         "new"
     );
+}
+
+#[tokio::test]
+async fn allowed_secrets_keep_empty_values_and_exclude_service_credentials() {
+    let manifest: JobManifest = serde_json::from_value(serde_json::json!({
+        "variables": {
+            "EMPTY_VARIABLE": { "value": "", "isSecret": true },
+            "system.github.token": { "value": "ghs_job_token", "isSecret": true },
+            "system.accessToken": { "value": "service-token", "isSecret": true }
+        },
+        "contextData": {
+            "secrets": {
+                "APP_KEY": "app-value",
+                "EMPTY_CONTEXT": "",
+                "system.accessToken": "context-service-token"
+            }
+        }
+    }))
+    .unwrap();
+    let secrets = collect_secrets(&manifest);
+
+    assert_eq!(secrets.get("EMPTY_VARIABLE").map(String::as_str), Some(""));
+    assert_eq!(secrets.get("EMPTY_CONTEXT").map(String::as_str), Some(""));
+    assert_eq!(
+        secrets.get("APP_KEY").map(String::as_str),
+        Some("app-value")
+    );
+    assert_eq!(
+        secrets.get("GITHUB_TOKEN").map(String::as_str),
+        Some("ghs_job_token")
+    );
+    assert!(find_case_insensitive(&secrets, "system.github.token").is_none());
+    assert!(find_case_insensitive(&secrets, "system.accessToken").is_none());
 }
 
 fn test_workspace() -> (tempfile::TempDir, Workspace) {
@@ -285,12 +316,12 @@ fn make_action_step(id: &str, context_name: &str) -> Step {
 #[tokio::test]
 async fn echo_step_stdout_captured() {
     let (_tmp, ws, client, _mock) = setup_execute().await;
-    let masks = Arc::new(RwLock::new(Vec::new()));
+    let masks = crate::job::secret_masker::shared_masker_for_test(&[]);
     let logger = StepLogger::legacy(client, "plan", "step", masks, None).await;
 
     let step = make_step("1", "echo hello world");
     let mut state = JobState::new(
-        Arc::new(RwLock::new(Vec::new())),
+        crate::job::secret_masker::shared_masker_for_test(&[]),
         HashMap::new(),
         serde_json::json!({}),
     );
@@ -316,12 +347,12 @@ async fn echo_step_stdout_captured() {
 #[tokio::test]
 async fn nonzero_exit_returns_failed() {
     let (_tmp, ws, client, _mock) = setup_execute().await;
-    let masks = Arc::new(RwLock::new(Vec::new()));
+    let masks = crate::job::secret_masker::shared_masker_for_test(&[]);
     let logger = StepLogger::legacy(client, "plan", "step", masks, None).await;
 
     let step = make_step("1", "exit 1");
     let mut state = JobState::new(
-        Arc::new(RwLock::new(Vec::new())),
+        crate::job::secret_masker::shared_masker_for_test(&[]),
         HashMap::new(),
         serde_json::json!({}),
     );
@@ -347,12 +378,12 @@ async fn nonzero_exit_returns_failed() {
 #[tokio::test]
 async fn set_env_updates_job_state() {
     let (_tmp, ws, client, _mock) = setup_execute().await;
-    let masks = Arc::new(RwLock::new(Vec::new()));
+    let masks = crate::job::secret_masker::shared_masker_for_test(&[]);
     let logger = StepLogger::legacy(client, "plan", "step", masks, None).await;
 
     let step = make_step("1", "echo '::set-env name=MY_KEY::my_val'");
     let mut state = JobState::new(
-        Arc::new(RwLock::new(Vec::new())),
+        crate::job::secret_masker::shared_masker_for_test(&[]),
         HashMap::new(),
         serde_json::json!({}),
     );
@@ -378,12 +409,12 @@ async fn set_env_updates_job_state() {
 #[tokio::test]
 async fn add_path_updates_path() {
     let (_tmp, ws, client, _mock) = setup_execute().await;
-    let masks = Arc::new(RwLock::new(Vec::new()));
+    let masks = crate::job::secret_masker::shared_masker_for_test(&[]);
     let logger = StepLogger::legacy(client, "plan", "step", masks, None).await;
 
     let step = make_step("1", "echo '::add-path::/opt/custom/bin'");
     let mut state = JobState::new(
-        Arc::new(RwLock::new(Vec::new())),
+        crate::job::secret_masker::shared_masker_for_test(&[]),
         HashMap::new(),
         serde_json::json!({}),
     );
@@ -409,12 +440,12 @@ async fn add_path_updates_path() {
 #[tokio::test]
 async fn set_output_populates_outputs() {
     let (_tmp, ws, client, _mock) = setup_execute().await;
-    let masks = Arc::new(RwLock::new(Vec::new()));
+    let masks = crate::job::secret_masker::shared_masker_for_test(&[]);
     let logger = StepLogger::legacy(client, "plan", "step", masks, None).await;
 
     let step = make_step("1", "echo '::set-output name=result::42'");
     let mut state = JobState::new(
-        Arc::new(RwLock::new(Vec::new())),
+        crate::job::secret_masker::shared_masker_for_test(&[]),
         HashMap::new(),
         serde_json::json!({}),
     );
@@ -440,12 +471,12 @@ async fn set_output_populates_outputs() {
 #[tokio::test]
 async fn env_propagation_across_steps() {
     let (_tmp, ws, client, _mock) = setup_execute().await;
-    let masks = Arc::new(RwLock::new(Vec::new()));
+    let masks = crate::job::secret_masker::shared_masker_for_test(&[]);
     let logger = StepLogger::legacy(client, "plan", "step", masks, None).await;
 
     let step1 = make_step("1", "echo '::set-env name=STEP1_VAR::hello'");
     let mut state = JobState::new(
-        Arc::new(RwLock::new(Vec::new())),
+        crate::job::secret_masker::shared_masker_for_test(&[]),
         HashMap::new(),
         serde_json::json!({}),
     );
@@ -667,6 +698,80 @@ async fn secrets_from_context_data_resolved() {
 }
 
 #[tokio::test]
+async fn step_diagnostics_omit_secret_bearing_manifest_fields() {
+    let (tmp, ws, client, _mock) = setup_execute().await;
+    let manifest: JobManifest = serde_json::from_value(serde_json::json!({
+        "plan": { "planId": "p", "jobId": "j", "timelineId": "t" },
+        "steps": [{
+            "id": "safe-step-id",
+            "displayName": "CANARY-STEP-DIAGNOSTIC",
+            "reference": { "name": "script", "type": "script" },
+            "inputs": { "script": "true" },
+            "condition": "'CANARY-STEP-DIAGNOSTIC' == 'different'",
+            "order": 1
+        }],
+        "variables": {
+            "TRACE_SECRET": { "value": "CANARY-STEP-DIAGNOSTIC", "isSecret": true },
+            "EMPTY_KEY_SECRET": { "value": "CANARY-EMPTY-OUTPUT-KEY", "isSecret": true },
+            "VALUE_KEY_SECRET": { "value": "CANARY-VALUE-OUTPUT-KEY", "isSecret": true }
+        },
+        "jobOutputs": {
+            "CANARY-EMPTY-OUTPUT-KEY": "${{ '' }}",
+            "CANARY-VALUE-OUTPUT-KEY": "${{ secrets.OUTPUT_VALUE }}"
+        },
+        "resources": { "endpoints": [] },
+        "contextData": { "secrets": { "OUTPUT_VALUE": "CANARY-OUTPUT-VALUE" } },
+        "jobContainer": null,
+        "serviceContainers": null
+    }))
+    .unwrap();
+    let (_resources, docker_config) = test_docker_config();
+    let base_env = host_base_env(&docker_config);
+    let action_cache = ActionCache::new(tmp.path().join("actions"), reqwest::Client::new());
+    let docker_action_builder = crate::docker::build::DockerActionBuilder::new();
+    let node_runtimes = crate::node::NodeRuntimes::single("node".into());
+    let execution = JobExecutionContext::new(&docker_config, None, &node_runtimes);
+    let captured = crate::testing::TracingWriter::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .with_ansi(false)
+        .without_time()
+        .with_writer(captured.clone())
+        .finish();
+    let dispatch = tracing::Dispatch::new(subscriber);
+    let _guard = tracing::dispatcher::set_default(&dispatch);
+
+    let result = run_all_steps(
+        &manifest,
+        &client,
+        &ws,
+        &base_env,
+        "test-runner",
+        &action_cache,
+        &docker_action_builder,
+        None,
+        "fake-token",
+        CancellationToken::new(),
+        &execution,
+        None,
+    )
+    .await
+    .unwrap();
+    let trace = captured.text();
+
+    assert_eq!(result.0, JobConclusion::Succeeded);
+    assert!(trace.contains("safe-step-id"), "{trace}");
+    for canary in [
+        "CANARY-STEP-DIAGNOSTIC",
+        "CANARY-EMPTY-OUTPUT-KEY",
+        "CANARY-VALUE-OUTPUT-KEY",
+        "CANARY-OUTPUT-VALUE",
+    ] {
+        assert!(!trace.contains(canary), "trace leaked {canary}: {trace}");
+    }
+}
+
+#[tokio::test]
 async fn cancel_token_returns_cancelled_between_steps() {
     let (tmp, ws, client, _mock) = setup_execute().await;
 
@@ -737,12 +842,12 @@ async fn cancel_token_returns_cancelled_between_steps() {
 #[tokio::test]
 async fn cancel_token_kills_running_process() {
     let (_tmp, ws, client, _mock) = setup_execute().await;
-    let masks = Arc::new(RwLock::new(Vec::new()));
+    let masks = crate::job::secret_masker::shared_masker_for_test(&[]);
     let logger = StepLogger::legacy(client, "plan", "step", masks, None).await;
 
     let step = make_step("1", "sleep 60");
     let mut state = JobState::new(
-        Arc::new(RwLock::new(Vec::new())),
+        crate::job::secret_masker::shared_masker_for_test(&[]),
         HashMap::new(),
         serde_json::json!({}),
     );
@@ -888,6 +993,520 @@ fn host_command_explicitly_overrides_inherited_docker_config() {
         .unwrap();
 
     assert_eq!(configured, std::ffi::OsStr::new(&env[DOCKER_CONFIG_ENV]));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn host_command_rejects_credential_helper_from_private_tmp_path() {
+    let test_root = std::env::var_os("CARGO_TARGET_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("target"));
+    std::fs::create_dir_all(&test_root).unwrap();
+    let temp = tempfile::tempdir_in(test_root).unwrap();
+    let root = JobResourceRoot::prepare(&temp.path().join("job-resources")).unwrap();
+    let config = root.create_docker_config().unwrap();
+    let directory_name = format!("chimera-helper-{}", uuid::Uuid::new_v4().simple());
+    let private_bin = config.private_tmp().join(&directory_name);
+    std::fs::create_dir(&private_bin).unwrap();
+    write_executable(&private_bin.join("docker-credential-pass"));
+    let mut env = host_base_env(&config);
+    env.insert("PATH".into(), format!("/tmp/{directory_name}"));
+
+    let error = host_command("/usr/bin/true", &[], &env, temp.path(), &config).unwrap_err();
+
+    assert!(matches!(
+        error.downcast_ref::<JobDockerConfigError>(),
+        Some(JobDockerConfigError::ImplicitCredentialStore {
+            helper: "docker-credential-pass"
+        })
+    ));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn host_command_rejects_credential_helper_from_relative_private_tmp_path() {
+    let test_root = std::env::var_os("CARGO_TARGET_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("target"));
+    std::fs::create_dir_all(&test_root).unwrap();
+    let temp = tempfile::tempdir_in(test_root).unwrap();
+    let root = JobResourceRoot::prepare(&temp.path().join("job-resources")).unwrap();
+    let config = root.create_docker_config().unwrap();
+    let directory_name = format!("chimera-helper-{}", uuid::Uuid::new_v4().simple());
+    let private_bin = config.private_tmp().join(&directory_name);
+    std::fs::create_dir(&private_bin).unwrap();
+    write_executable(&private_bin.join("docker-credential-secretservice"));
+    let mut env = host_base_env(&config);
+    env.insert("PATH".into(), ".".into());
+    let working_dir = std::path::PathBuf::from("/tmp").join(&directory_name);
+
+    let error = host_command("/usr/bin/true", &[], &env, &working_dir, &config).unwrap_err();
+
+    assert!(matches!(
+        error.downcast_ref::<JobDockerConfigError>(),
+        Some(JobDockerConfigError::ImplicitCredentialStore {
+            helper: "docker-credential-secretservice"
+        })
+    ));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn host_command_rejects_credential_helper_through_symlink_into_private_tmp() {
+    let test_root = std::env::var_os("CARGO_TARGET_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("target"));
+    std::fs::create_dir_all(&test_root).unwrap();
+    let temp = tempfile::tempdir_in(test_root).unwrap();
+    let root = JobResourceRoot::prepare(&temp.path().join("job-resources")).unwrap();
+    let config = root.create_docker_config().unwrap();
+    let directory_name = format!("chimera-helper-{}", uuid::Uuid::new_v4().simple());
+    let private_bin = config.private_tmp().join(&directory_name);
+    std::fs::create_dir(&private_bin).unwrap();
+    write_executable(&private_bin.join("docker-credential-pass"));
+    let path_link = temp.path().join("private-tmp-bin");
+    std::os::unix::fs::symlink(format!("/tmp/{directory_name}"), &path_link).unwrap();
+    let mut env = host_base_env(&config);
+    env.insert("PATH".into(), path_link.to_string_lossy().into_owned());
+
+    let error = host_command("/usr/bin/true", &[], &env, temp.path(), &config).unwrap_err();
+
+    assert!(matches!(
+        error.downcast_ref::<JobDockerConfigError>(),
+        Some(JobDockerConfigError::ImplicitCredentialStore {
+            helper: "docker-credential-pass"
+        })
+    ));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn host_command_rejects_credential_helper_through_symlink_within_private_tmp() {
+    let test_root = std::env::var_os("CARGO_TARGET_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("target"));
+    std::fs::create_dir_all(&test_root).unwrap();
+    let temp = tempfile::tempdir_in(test_root).unwrap();
+    let root = JobResourceRoot::prepare(&temp.path().join("job-resources")).unwrap();
+    let config = root.create_docker_config().unwrap();
+    let real_name = format!("chimera-helper-real-{}", uuid::Uuid::new_v4().simple());
+    let link_name = format!("chimera-helper-link-{}", uuid::Uuid::new_v4().simple());
+    let private_bin = config.private_tmp().join(&real_name);
+    std::fs::create_dir(&private_bin).unwrap();
+    write_executable(&private_bin.join("docker-credential-secretservice"));
+    std::os::unix::fs::symlink(
+        format!("/tmp/{real_name}"),
+        config.private_tmp().join(&link_name),
+    )
+    .unwrap();
+    let mut env = host_base_env(&config);
+    env.insert("PATH".into(), format!("/tmp/{link_name}"));
+
+    let error = host_command("/usr/bin/true", &[], &env, temp.path(), &config).unwrap_err();
+
+    assert!(matches!(
+        error.downcast_ref::<JobDockerConfigError>(),
+        Some(JobDockerConfigError::ImplicitCredentialStore {
+            helper: "docker-credential-secretservice"
+        })
+    ));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn host_command_skips_inaccessible_path_entry() {
+    let test_root = std::env::var_os("CARGO_TARGET_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("target"));
+    std::fs::create_dir_all(&test_root).unwrap();
+    let temp = tempfile::tempdir_in(test_root).unwrap();
+    let root = JobResourceRoot::prepare(&temp.path().join("job-resources")).unwrap();
+    let config = root.create_docker_config().unwrap();
+    let inaccessible = temp.path().join("inaccessible");
+    std::fs::create_dir(&inaccessible).unwrap();
+    std::fs::set_permissions(&inaccessible, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let mut env = host_base_env(&config);
+    env.insert(
+        "PATH".into(),
+        format!("{}:/usr/bin:/bin", inaccessible.display()),
+    );
+
+    let result = host_command("/usr/bin/true", &[], &env, temp.path(), &config);
+    std::fs::set_permissions(&inaccessible, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    result.unwrap();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn host_command_resets_symlink_budget_after_working_directory_lookup() {
+    let test_root = std::env::var_os("CARGO_TARGET_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("target"));
+    std::fs::create_dir_all(&test_root).unwrap();
+    let temp = tempfile::tempdir_in(test_root).unwrap();
+    let root = JobResourceRoot::prepare(&temp.path().join("job-resources")).unwrap();
+    let config = root.create_docker_config().unwrap();
+    let final_directory = temp.path().join("resolved-working-directory");
+    let real_bin = final_directory.join("real-bin");
+    std::fs::create_dir_all(&real_bin).unwrap();
+    write_executable(&real_bin.join("docker-credential-pass"));
+    std::os::unix::fs::symlink("real-bin", final_directory.join("bin")).unwrap();
+
+    let mut target = final_directory;
+    for index in (0..40).rev() {
+        let link = temp.path().join(format!("cwd-link-{index}"));
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        target = link;
+    }
+    let mut env = host_base_env(&config);
+    env.insert("PATH".into(), "bin:/usr/bin:/bin".into());
+
+    let error = host_command("/usr/bin/true", &[], &env, &target, &config).unwrap_err();
+
+    assert!(matches!(
+        error.downcast_ref::<JobDockerConfigError>(),
+        Some(JobDockerConfigError::ImplicitCredentialStore {
+            helper: "docker-credential-pass"
+        })
+    ));
+}
+
+#[cfg(target_os = "linux")]
+fn hmac_sha256_hex(key: &[u8], body: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write as _;
+
+    let mut key_block = [0_u8; 64];
+    if key.len() > key_block.len() {
+        key_block[..32].copy_from_slice(&Sha256::digest(key));
+    } else {
+        key_block[..key.len()].copy_from_slice(key);
+    }
+    let mut inner_pad = [0x36_u8; 64];
+    let mut outer_pad = [0x5c_u8; 64];
+    for index in 0..key_block.len() {
+        inner_pad[index] ^= key_block[index];
+        outer_pad[index] ^= key_block[index];
+    }
+    let inner = Sha256::new()
+        .chain_update(inner_pad)
+        .chain_update(body)
+        .finalize();
+    let digest = Sha256::new()
+        .chain_update(outer_pad)
+        .chain_update(inner)
+        .finalize();
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        write!(&mut hex, "{byte:02x}").unwrap();
+    }
+    hex
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn concurrent_webhook_flows_get_private_absolute_tmp() {
+    const JOBS: usize = 20;
+    const WEBHOOK_SECRET: &str = "synthetic-webhook-secret";
+
+    let test_root = std::env::var_os("CARGO_TARGET_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("target"));
+    std::fs::create_dir_all(&test_root).unwrap();
+    let temp = tempfile::tempdir_in(test_root).unwrap();
+    let root = JobResourceRoot::prepare(&temp.path().join("job-resources")).unwrap();
+    let barrier = temp.path().join("barrier");
+    std::fs::create_dir(&barrier).unwrap();
+
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path_regex("^/deploy$"))
+        .respond_with(|request: &wiremock::Request| {
+            let body: serde_json::Value = request.body_json().unwrap();
+            let canary = body["canary"].as_str().unwrap();
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "deploy_id": format!("deploy:{canary}")
+            }))
+        })
+        .expect(JOBS as u64)
+        .mount(&mock_server)
+        .await;
+
+    let (log_tx, _log_rx) = tokio::sync::mpsc::channel(256);
+    let log_sender = LogSender::new_for_test(
+        log_tx,
+        crate::job::secret_masker::shared_masker_for_test(&[]),
+    );
+    let mut runs = Vec::new();
+    for index in 0..JOBS {
+        let config = root.create_docker_config().unwrap();
+        let workspace_root = temp.path().join(format!("workspace-{index}"));
+        let workspace = Workspace::create(
+            &workspace_root.join("work"),
+            &workspace_root.join("runner-tmp"),
+            &workspace_root.join("tool-cache"),
+            "test-runner",
+            "owner/repo",
+        )
+        .unwrap();
+        let mut base_env = host_base_env(&config);
+        base_env.insert("PATH".into(), "/usr/bin:/bin".into());
+        base_env.insert("CANARY".into(), format!("job-{index}"));
+        base_env.insert("BARRIER_DIR".into(), barrier.to_string_lossy().into_owned());
+        base_env.insert(
+            "WEBHOOK_URL".into(),
+            format!("{}/deploy", mock_server.uri()),
+        );
+        base_env.insert("WEBHOOK_SECRET".into(), WEBHOOK_SECRET.into());
+        base_env.insert(
+            "GITHUB_OUTPUT".into(),
+            workspace.output_file().to_string_lossy().into_owned(),
+        );
+        let script = r#"
+            set -eu
+            payload_file=/tmp/deploy-payload.json
+            response_file=/tmp/deploy-response.json
+            trap 'rm -f "$payload_file" "$response_file"' EXIT
+
+            wait_at_barrier() {
+                phase=$1
+                : > "$BARRIER_DIR/$CANARY.$phase.ready"
+                while test ! -e "$BARRIER_DIR/$phase.release"; do sleep 0.01; done
+            }
+
+            printf '{"run_id":"%s","canary":"%s"}' \
+                "$CANARY" "$CANARY" > "$payload_file"
+            wait_at_barrier payload
+
+            signature=$(openssl dgst -sha256 -hmac "$WEBHOOK_SECRET" \
+                "$payload_file" | sed 's/^.*= //')
+            wait_at_barrier hmac
+
+            curl --fail --silent --show-error \
+                --request POST \
+                --header 'Content-Type: application/json' \
+                --header "X-Webhook-Signature: sha256=$signature" \
+                --data-binary "@$payload_file" \
+                "$WEBHOOK_URL" > "$response_file"
+            wait_at_barrier response
+
+            deploy_id=$(sed -n 's/.*"deploy_id":"\([^"]*\)".*/\1/p' \
+                "$response_file")
+            test -n "$deploy_id"
+            printf 'deploy_id=%s\n' "$deploy_id" >> "$GITHUB_OUTPUT"
+        "#;
+        let step = make_step(&format!("webhook-{index}"), script);
+        let sender = log_sender.clone();
+        runs.push(tokio::spawn(async move {
+            let mut state = test_job_state();
+            let result = run_host_step(
+                &step,
+                &mut state,
+                &workspace,
+                &base_env,
+                &sender,
+                &CancellationToken::new(),
+                &config,
+            )
+            .await;
+            let outputs = workspace.read_output_file();
+            (result, outputs, config)
+        }));
+    }
+
+    for phase in ["payload", "hmac", "response"] {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let suffix = format!(".{phase}.ready");
+                let ready = std::fs::read_dir(&barrier)
+                    .unwrap()
+                    .map(Result::unwrap)
+                    .filter(|entry| entry.file_name().to_string_lossy().ends_with(&suffix))
+                    .count();
+                if ready == JOBS {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("host commands did not reach the {phase} barrier"));
+        std::fs::write(barrier.join(format!("{phase}.release")), "go").unwrap();
+    }
+
+    let mut completed = futures::future::join_all(runs)
+        .await
+        .into_iter()
+        .map(Result::unwrap)
+        .collect::<Vec<_>>();
+    for (index, (result, outputs, config)) in completed.iter_mut().enumerate() {
+        assert_eq!(
+            result.as_ref().unwrap().conclusion,
+            StepConclusion::Succeeded
+        );
+        assert_eq!(
+            outputs.as_ref().unwrap().get("deploy_id"),
+            Some(&format!("deploy:job-{index}"))
+        );
+        assert_eq!(
+            std::fs::read_dir(config.private_tmp()).unwrap().count(),
+            0,
+            "EXIT trap left files in {}",
+            config.private_tmp().display()
+        );
+        let attempt_dir = config.attempt_dir().to_path_buf();
+        config.cleanup().unwrap();
+        assert!(!attempt_dir.exists(), "job {index} cleanup");
+    }
+
+    let requests = mock_server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), JOBS);
+    let mut seen = std::collections::HashSet::new();
+    for request in requests {
+        let body: serde_json::Value = request.body_json().unwrap();
+        let canary = body["canary"].as_str().unwrap();
+        assert_eq!(body["run_id"].as_str(), Some(canary));
+        let expected_body = format!(r#"{{"run_id":"{canary}","canary":"{canary}"}}"#);
+        assert_eq!(request.body, expected_body.as_bytes());
+        let expected_signature = hmac_sha256_hex(WEBHOOK_SECRET.as_bytes(), &request.body);
+        let signature = request
+            .headers
+            .get("x-webhook-signature")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(signature, format!("sha256={expected_signature}"));
+        assert!(seen.insert(canary.to_owned()), "duplicate canary {canary}");
+    }
+    assert_eq!(seen.len(), JOBS);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn host_command_fails_closed_when_private_tmp_is_missing() {
+    let test_root = std::env::var_os("CARGO_TARGET_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("target"));
+    std::fs::create_dir_all(&test_root).unwrap();
+    let temp = tempfile::tempdir_in(test_root).unwrap();
+    let root = JobResourceRoot::prepare(&temp.path().join("job-resources")).unwrap();
+    let mut config = root.create_docker_config().unwrap();
+    let sentinel = temp.path().join("command-ran");
+    let script = format!("touch '{}'", sentinel.display());
+    let env = host_base_env(&config);
+    let mut command = host_command(
+        "/bin/sh",
+        &[std::ffi::OsStr::new("-c"), std::ffi::OsStr::new(&script)],
+        &env,
+        temp.path(),
+        &config,
+    )
+    .unwrap();
+    std::fs::remove_dir(config.private_tmp()).unwrap();
+
+    let error = command.spawn().unwrap_err();
+
+    assert_eq!(error.raw_os_error(), Some(libc::ENOENT));
+    assert!(!sentinel.exists());
+    config.cleanup().unwrap();
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn private_tmp_mount_precedes_working_directory_lookup() {
+    let test_root = std::env::var_os("CARGO_TARGET_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("target"));
+    std::fs::create_dir_all(&test_root).unwrap();
+    let temp = tempfile::tempdir_in(test_root).unwrap();
+    let root = JobResourceRoot::prepare(&temp.path().join("job-resources")).unwrap();
+    let mut config = root.create_docker_config().unwrap();
+    let env = host_base_env(&config);
+    let directory_name = format!("chimera-cwd-{}", uuid::Uuid::new_v4().simple());
+    let private_working_directory = std::path::PathBuf::from("/tmp").join(&directory_name);
+
+    let create_status = host_command(
+        "/bin/mkdir",
+        &[
+            std::ffi::OsStr::new("-p"),
+            private_working_directory.as_os_str(),
+        ],
+        &env,
+        temp.path(),
+        &config,
+    )
+    .unwrap()
+    .status()
+    .await
+    .unwrap();
+    assert!(create_status.success());
+
+    let use_status = host_command(
+        "/bin/sh",
+        &[
+            std::ffi::OsStr::new("-c"),
+            std::ffi::OsStr::new("printf private > relative-file"),
+        ],
+        &env,
+        &private_working_directory,
+        &config,
+    )
+    .unwrap()
+    .status()
+    .await
+    .unwrap();
+
+    assert!(use_status.success());
+    assert_eq!(
+        std::fs::read_to_string(
+            config
+                .private_tmp()
+                .join(&directory_name)
+                .join("relative-file")
+        )
+        .unwrap(),
+        "private"
+    );
+    config.cleanup().unwrap();
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn working_directory_tmp_does_not_write_to_host_tmp() {
+    let test_root = std::env::var_os("CARGO_TARGET_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("target"));
+    std::fs::create_dir_all(&test_root).unwrap();
+    let temp = tempfile::tempdir_in(test_root).unwrap();
+    let root = JobResourceRoot::prepare(&temp.path().join("job-resources")).unwrap();
+    let mut config = root.create_docker_config().unwrap();
+    let env = host_base_env(&config);
+    let file_name = format!("chimera-cwd-{}", uuid::Uuid::new_v4().simple());
+    let host_path = std::path::Path::new("/tmp").join(&file_name);
+    let private_path = config.private_tmp().join(&file_name);
+    let script = format!("printf private > '{file_name}'");
+
+    let status = host_command(
+        "/bin/sh",
+        &[std::ffi::OsStr::new("-c"), std::ffi::OsStr::new(&script)],
+        &env,
+        std::path::Path::new("/tmp"),
+        &config,
+    )
+    .unwrap()
+    .status()
+    .await
+    .unwrap();
+    let host_file_existed = host_path.exists();
+    if host_file_existed {
+        std::fs::remove_file(&host_path).unwrap();
+    }
+
+    assert!(status.success());
+    assert!(!host_file_existed, "relative write escaped to host /tmp");
+    assert_eq!(std::fs::read_to_string(private_path).unwrap(), "private");
+    config.cleanup().unwrap();
 }
 
 #[test]
@@ -1149,7 +1768,7 @@ async fn collection_error_post_propagates_directory_identity_failure() {
 #[test]
 fn action_lifecycle_suffix_bearing_identifiers_stay_main() {
     let state = JobState::new(
-        Arc::new(RwLock::new(Vec::new())),
+        crate::job::secret_masker::shared_masker_for_test(&[]),
         HashMap::new(),
         serde_json::json!({}),
     );
@@ -1174,7 +1793,7 @@ fn action_lifecycle_colliding_identifiers_keep_distinct_capabilities() {
     let plain = make_action_step("opaque-plain", "foo");
     let suffix = make_action_step("opaque-suffix", "foo_pre");
     let mut state = JobState::new(
-        Arc::new(RwLock::new(Vec::new())),
+        crate::job::secret_masker::shared_masker_for_test(&[]),
         HashMap::new(),
         serde_json::json!({}),
     );
@@ -1202,7 +1821,7 @@ fn action_lifecycle_colliding_identifiers_keep_distinct_capabilities() {
 #[test]
 fn action_lifecycle_synthetic_steps_share_explicit_instance() {
     let mut state = JobState::new(
-        Arc::new(RwLock::new(Vec::new())),
+        crate::job::secret_masker::shared_masker_for_test(&[]),
         HashMap::new(),
         serde_json::json!({}),
     );
@@ -1258,4 +1877,19 @@ fn update_job_status_transitions() {
     // Back to success
     update_job_status(&mut data, false, false);
     assert_eq!(data["job"]["status"], "success");
+}
+
+#[tokio::test]
+async fn server_mask_hint_registers_literal_encoded_forms_as_well_as_regex() {
+    let manifest: JobManifest = serde_json::from_value(serde_json::json!({
+        "mask": [{
+            "type": "regex",
+            "value": "credential-\"private\""
+        }]
+    }))
+    .unwrap();
+    let masker = crate::job::secret_masker::SecretMasker::from_manifest(&manifest).unwrap();
+
+    assert_eq!(masker.mask(r#"credential-\"private\""#), "***");
+    assert!(masker.contains_secret(r#"credential-\"private\""#));
 }

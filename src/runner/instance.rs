@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::future::Future;
+use std::io;
 use std::panic::{AssertUnwindSafe, resume_unwind};
 use std::sync::Arc;
 use std::time::Duration;
@@ -25,9 +26,10 @@ use crate::job::client::JobConclusion;
 use crate::job::docker_config::{
     JobDockerConfig, JobDockerConfigError, JobResourceCleanupFatalError, JobResourceRoot,
 };
-use crate::job::execute::{JobExecutionContext, run_all_steps};
+use crate::job::execute::{JobExecutionContext, run_all_steps_with_masker};
 use crate::job::live_feed::LiveFeed;
 use crate::job::schema::JobManifest;
+use crate::job::secret_masker::{SecretMasker, SharedSecretMasker};
 use crate::job::workspace::Workspace;
 
 use super::cancel::spawn_cancel_poller;
@@ -104,7 +106,7 @@ fn startup_error_is_transient(error: &anyhow::Error) -> bool {
     }
     matches!(
         error.downcast_ref::<BrokerError>(),
-        Some(BrokerError::ServerError(_))
+        Some(BrokerError::ServerError { .. })
             | Some(BrokerError::Connection(_))
             | Some(BrokerError::BadResponse(_))
     )
@@ -425,7 +427,7 @@ impl Runner {
                 Ok(Some(msg)) => {
                     info!(
                         message_id = msg.message_id,
-                        message_type = %msg.message_type,
+                        message_type = %msg.message_type.diagnostic_kind(),
                         "received job message"
                     );
 
@@ -486,7 +488,7 @@ impl Runner {
             }
         };
 
-        debug!(%runner_request_id, %run_service_url, "parsed job request");
+        debug!(%runner_request_id, "parsed job request");
 
         if let Err(e) = broker.ack_job(&runner_request_id).await {
             error!(error = %e, "failed to ack job");
@@ -515,7 +517,7 @@ impl Runner {
                 // the runner stops on the fatal marker itself.
                 return Err(error);
             }
-            error!(error = %error, cause = ?error, "job execution failed");
+            error!("job execution failed");
         }
 
         self.job_resources.ensure_healthy()?;
@@ -530,7 +532,7 @@ impl Runner {
         run_service_url: &str,
         cancel_token: CancellationToken,
     ) -> Result<()> {
-        info!(runner_request_id, run_service_url, "acquiring job");
+        info!(runner_request_id, "acquiring job");
 
         let mut job_client = JobClient::new(
             client.clone(),
@@ -539,34 +541,20 @@ impl Runner {
             self.credentials.info.server_url.clone(),
         );
 
-        let manifest = job_client
-            .acquire_job(runner_request_id)
-            .await
-            .context("acquiring job manifest")?;
+        let manifest = match job_client.acquire_job(runner_request_id).await {
+            Ok(manifest) => manifest,
+            Err(error) => {
+                // JobClient acquisition errors are payload-free by construction;
+                // no job-scoped masker exists until a manifest is available.
+                error!(error = %error, "job acquisition failed");
+                return Err(error.context("acquiring job manifest"));
+            }
+        };
+        let secret_masker = Arc::new(tokio::sync::RwLock::new(SecretMasker::from_manifest(
+            &manifest,
+        )?));
 
-        let var_names: Vec<&str> = manifest.variables.keys().map(|s| s.as_str()).collect();
-        let container_image = manifest
-            .job_container
-            .as_ref()
-            .map(|c| c.image.as_str())
-            .unwrap_or("none");
-        info!(
-            plan_id = %manifest.plan.plan_id,
-            job_id = %manifest.plan.job_id,
-            steps = manifest.steps.len(),
-            has_container = manifest.has_container(),
-            container_image,
-            has_services = manifest.has_services(),
-            mask_regexes = manifest.mask_regexes().len(),
-            files = ?manifest.file_table(),
-            variables = ?var_names,
-            "job acquired"
-        );
-
-        for ep in &manifest.resources.endpoints {
-            let data_keys: Vec<&str> = ep.data.keys().map(|s| s.as_str()).collect();
-            debug!(endpoint = %ep.name, url = %ep.url, data_keys = ?data_keys, "manifest endpoint");
-        }
+        log_job_acquired(&manifest);
 
         job_client
             .configure_from_manifest(&manifest)
@@ -580,13 +568,21 @@ impl Runner {
 
         let job_client = Arc::new(job_client);
         let result = self
-            .run_job(&manifest, &job_client, client, cancel_token, &repo)
+            .run_job(
+                &manifest,
+                &job_client,
+                client,
+                cancel_token,
+                &repo,
+                &secret_masker,
+            )
             .await;
 
         match result {
             Ok(()) => Ok(()),
             Err(error) if error.downcast_ref::<CompletionPublicationError>().is_some() => {
-                error!(error = %error, cause = ?error, "job completion request failed; not retrying completion");
+                let masked_error = mask_error_chain(&error, &secret_masker).await;
+                error!(error = %masked_error, "job completion request failed; not retrying completion");
                 Err(error)
             }
             Err(error)
@@ -594,15 +590,18 @@ impl Runner {
                     .downcast_ref::<JobResourceCleanupFatalError>()
                     .is_some() =>
             {
-                error!(error = %error, cause = ?error, "job completed after cleanup failure; stopping runner");
+                let masked_error = mask_error_chain(&error, &secret_masker).await;
+                error!(error = %masked_error, "job completed after cleanup failure; stopping runner");
                 Err(error)
             }
             Err(error) => {
-                error!(error = %error, cause = ?error, "job failed before completion, reporting failure to GitHub");
+                let masked_error = mask_error_chain(&error, &secret_masker).await;
+                error!(error = %masked_error, "job failed before completion, reporting failure to GitHub");
                 if let Err(report_error) =
-                    report_setup_failure(&job_client, &manifest, &error).await
+                    report_setup_failure(&job_client, &manifest, &error, &secret_masker).await
                 {
-                    error!(error = %report_error, "failed to report setup failure to GitHub");
+                    let masked_report_error = mask_error_chain(&report_error, &secret_masker).await;
+                    error!(error = %masked_report_error, "failed to report setup failure to GitHub");
                 }
                 Err(error)
             }
@@ -616,12 +615,15 @@ impl Runner {
         client: &reqwest::Client,
         cancel_token: CancellationToken,
         repo: &str,
+        secret_masker: &SharedSecretMasker,
     ) -> Result<()> {
         let cache_scope = cache_scope_for_job(manifest, repo);
-        let mut docker_config = self
-            .job_resources
-            .create_docker_config()
-            .context("creating per-job Docker config")?;
+        let job_resources = self.job_resources.clone();
+        let mut docker_config =
+            tokio::task::spawn_blocking(move || job_resources.create_docker_config())
+                .await
+                .context("joining per-job resource creation task")?
+                .context("creating per-job Docker config")?;
         let attempt_id = docker_config.attempt_id();
         info!(%attempt_id, "created job Docker config");
 
@@ -635,15 +637,32 @@ impl Runner {
         {
             Ok(capability_id) => capability_id,
             Err(registration_error) => {
-                let cleanup_result = docker_config.cleanup();
+                let cleanup_path = docker_config.attempt_dir().to_path_buf();
+                let cleanup_result = tokio::task::spawn_blocking(move || docker_config.cleanup())
+                    .await
+                    .unwrap_or_else(|source| {
+                        Err(JobDockerConfigError::Cleanup {
+                            path: cleanup_path,
+                            source: io::Error::other(format!(
+                                "per-job resource cleanup task failed: {source}"
+                            )),
+                        })
+                    });
                 match &cleanup_result {
                     Ok(()) => info!(%attempt_id, "cleaned job Docker config"),
-                    Err(cleanup_error) => error!(
-                        category = "job-resource-cleanup",
-                        %attempt_id,
-                        error = %cleanup_error,
-                        "job Docker config cleanup failed"
-                    ),
+                    Err(cleanup_error) => {
+                        let masked_error = mask_error_chain(
+                            &anyhow::Error::msg(cleanup_error.to_string()),
+                            secret_masker,
+                        )
+                        .await;
+                        error!(
+                            category = "job-resource-cleanup",
+                            %attempt_id,
+                            error = %masked_error,
+                            "job Docker config cleanup failed"
+                        );
+                    }
                 }
                 return match cleanup_result {
                     Ok(()) => Err(registration_error),
@@ -667,18 +686,36 @@ impl Runner {
                         repo,
                         &cache_scope,
                         &docker_config,
+                        secret_masker,
                     )
                     .await;
 
-                let cleanup_result = docker_config.cleanup();
+                let cleanup_path = docker_config.attempt_dir().to_path_buf();
+                let cleanup_result = tokio::task::spawn_blocking(move || docker_config.cleanup())
+                    .await
+                    .unwrap_or_else(|source| {
+                        Err(JobDockerConfigError::Cleanup {
+                            path: cleanup_path,
+                            source: io::Error::other(format!(
+                                "per-job resource cleanup task failed: {source}"
+                            )),
+                        })
+                    });
                 match &cleanup_result {
                     Ok(()) => info!(%attempt_id, "cleaned job Docker config"),
-                    Err(cleanup_error) => error!(
-                        category = "job-resource-cleanup",
-                        %attempt_id,
-                        error = %cleanup_error,
-                        "job Docker config cleanup failed"
-                    ),
+                    Err(cleanup_error) => {
+                        let masked_error = mask_error_chain(
+                            &anyhow::Error::msg(cleanup_error.to_string()),
+                            secret_masker,
+                        )
+                        .await;
+                        error!(
+                            category = "job-resource-cleanup",
+                            %attempt_id,
+                            error = %masked_error,
+                            "job Docker config cleanup failed"
+                        );
+                    }
                 }
                 (execution_result, cleanup_result)
             })
@@ -696,7 +733,7 @@ impl Runner {
 
     #[expect(
         clippy::too_many_arguments,
-        reason = "the job lifecycle boundary keeps execution, cache scope, and cleanup ownership explicit"
+        reason = "the job lifecycle boundary keeps execution, cache scope, cleanup ownership, and secret masking explicit"
     )]
     async fn run_job_body(
         &self,
@@ -707,6 +744,7 @@ impl Runner {
         repo: &str,
         cache_scope: &CacheScope,
         docker_config: &JobDockerConfig,
+        secret_masker: &SharedSecretMasker,
     ) -> Result<JobExecutionOutcome> {
         let workspace = Workspace::create(
             &self.paths.work_dir(),
@@ -774,6 +812,7 @@ impl Runner {
                 &node_runtimes,
                 &mut docker_resources,
                 docker_config,
+                secret_masker,
             )
             .await
         }
@@ -783,7 +822,8 @@ impl Runner {
             resources.cleanup().await;
         }
         if let Err(cleanup_error) = workspace.cleanup() {
-            warn!(error = %cleanup_error, "workspace cleanup failed");
+            let masked_error = mask_error_chain(&cleanup_error, secret_masker).await;
+            warn!(error = %masked_error, "workspace cleanup failed");
         }
 
         execution_result
@@ -801,6 +841,7 @@ impl Runner {
         node_runtimes: &crate::node::NodeRuntimes,
         docker_resources: &mut Option<JobDockerResources>,
         docker_config: &JobDockerConfig,
+        secret_masker: &SharedSecretMasker,
     ) -> Result<JobExecutionOutcome> {
         // Choose env builder based on execution mode
         let mut base_env = if manifest.has_container() {
@@ -879,7 +920,7 @@ impl Runner {
 
         let execution =
             JobExecutionContext::new(docker_config, docker_resources.as_ref(), node_runtimes);
-        let job_result = run_all_steps(
+        let job_result = run_all_steps_with_masker(
             manifest,
             job_client,
             workspace,
@@ -893,6 +934,7 @@ impl Runner {
             cancel_token.clone(),
             &execution,
             live_feed.as_ref().map(|f| f.sender()),
+            secret_masker.clone(),
         )
         .await;
 
@@ -964,7 +1006,7 @@ impl Runner {
                     if msg.message_type != MessageType::RunnerJobRequest {
                         info!(
                             message_id = msg.message_id,
-                            message_type = %msg.message_type,
+                            message_type = %msg.message_type.diagnostic_kind(),
                             "received control message while idle, skipping"
                         );
                         // Control messages (JobCancellation, BrokerMigration, etc)
@@ -983,7 +1025,7 @@ impl Runner {
                     // not deleted. No delete needed here.
                     info!(
                         message_id = msg.message_id,
-                        message_type = %msg.message_type,
+                        message_type = %msg.message_type.diagnostic_kind(),
                         "received job message"
                     );
                     return Ok(Some(msg));
@@ -1038,6 +1080,33 @@ impl Runner {
             }
         }
     }
+}
+
+fn log_job_acquired(manifest: &JobManifest) {
+    info!(
+        plan_id = %manifest.plan.plan_id,
+        job_id = %manifest.plan.job_id,
+        steps = manifest.steps.len(),
+        variable_count = manifest.variables.len(),
+        endpoint_count = manifest.resources.endpoints.len(),
+        has_container = manifest.has_container(),
+        has_services = manifest.has_services(),
+        mask_hint_count = manifest.mask_regexes().len(),
+        "job acquired"
+    );
+
+    for (index, endpoint) in manifest.resources.endpoints.iter().enumerate() {
+        debug!(
+            index,
+            data_field_count = endpoint.data.len(),
+            "manifest endpoint"
+        );
+    }
+}
+
+async fn mask_error_chain(error: &anyhow::Error, masker: &SharedSecretMasker) -> String {
+    let rendered = format!("{error:#}");
+    masker.read().await.mask(&rendered)
 }
 
 #[cfg(test)]

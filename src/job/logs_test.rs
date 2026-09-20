@@ -77,7 +77,7 @@ async fn flush_on_sender_drop() {
         .mount(&mock_server)
         .await;
 
-    let masks = Arc::new(RwLock::new(Vec::new()));
+    let masks = crate::job::secret_masker::shared_masker_for_test(&[]);
     let logger = StepLogger::legacy(client, "plan-1", "step-1", masks, None).await;
 
     logger.sender().send("hello world".into()).await;
@@ -96,7 +96,7 @@ async fn flush_on_interval() {
         .mount(&mock_server)
         .await;
 
-    let masks = Arc::new(RwLock::new(Vec::new()));
+    let masks = crate::job::secret_masker::shared_masker_for_test(&[]);
     let logger = StepLogger::legacy(client, "plan-1", "step-1", masks, None).await;
 
     logger.sender().send("line 1".into()).await;
@@ -118,7 +118,7 @@ async fn flush_on_large_buffer() {
         .mount(&mock_server)
         .await;
 
-    let masks = Arc::new(RwLock::new(Vec::new()));
+    let masks = crate::job::secret_masker::shared_masker_for_test(&[]);
     let logger = StepLogger::legacy(client, "plan-1", "step-1", masks, None).await;
 
     let big_line = "x".repeat(70_000);
@@ -151,7 +151,7 @@ async fn masking_replaces_secrets() {
         .mount(&mock_server)
         .await;
 
-    let masks = Arc::new(RwLock::new(vec!["supersecret".to_string()]));
+    let masks = crate::job::secret_masker::shared_masker_for_test(&["supersecret"]);
     let logger = StepLogger::legacy(client, "plan-1", "step-1", masks, None).await;
 
     logger
@@ -168,8 +168,51 @@ async fn masking_replaces_secrets() {
 }
 
 #[tokio::test]
+async fn legacy_vss_masks_multiline_and_json_encoded_canaries() {
+    let (mock_server, client) = setup_log_server().await;
+    mount_create_log(&mock_server).await;
+
+    let uploaded = Arc::new(tokio::sync::Mutex::new(String::new()));
+    let sink = uploaded.clone();
+    Mock::given(method("POST"))
+        .and(path_regex(r"/_apis/pipelines/workflows/.*/logs/\d+"))
+        .respond_with(move |req: &wiremock::Request| {
+            let body = String::from_utf8_lossy(&req.body).to_string();
+            let sink = sink.clone();
+            tokio::spawn(async move { sink.lock().await.push_str(&body) });
+            ResponseTemplate::new(200)
+        })
+        .mount(&mock_server)
+        .await;
+
+    let secret = "two-lines\nquote-\"slash\\";
+    let masks = crate::job::secret_masker::shared_masker_for_test(&[secret]);
+    let logger = StepLogger::legacy(client, "plan-1", "step-1", masks, None).await;
+
+    logger.sender().send("safe-one=two-lines".into()).await;
+    logger
+        .sender()
+        .send("safe-two=quote-\"slash\\".into())
+        .await;
+    logger
+        .sender()
+        .send(r#"safe-json=two-lines\nquote-\"slash\\"#.into())
+        .await;
+    logger.finish().await;
+    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+    let content = uploaded.lock().await;
+    assert!(content.contains("safe-one=***"));
+    assert!(content.contains("safe-two=***"));
+    assert!(content.contains("safe-json=***"));
+    assert!(!content.contains("two-lines"));
+    assert!(!content.contains("quote-\"slash\\"));
+    assert!(!content.contains(r#"two-lines\nquote-\"slash\\"#));
+}
+
+#[tokio::test]
 async fn collector_collects_lines() {
-    let masks = Arc::new(RwLock::new(Vec::new()));
+    let masks = crate::job::secret_masker::shared_masker_for_test(&[]);
     let logger = StepLogger::results_for_test(masks);
 
     logger.sender().send("line one".into()).await;
@@ -183,7 +226,7 @@ async fn collector_collects_lines() {
 
 #[tokio::test]
 async fn collector_masks_secrets() {
-    let masks = Arc::new(RwLock::new(vec!["secret123".to_string()]));
+    let masks = crate::job::secret_masker::shared_masker_for_test(&["secret123"]);
     let logger = StepLogger::results_for_test(masks);
 
     logger.sender().send("token is secret123 here".into()).await;
@@ -191,6 +234,40 @@ async fn collector_masks_secrets() {
     let collected = logger.finish().await.expect("should collect lines");
     assert!(!collected.text.contains("secret123"));
     assert!(collected.text.contains("***"));
+}
+
+#[tokio::test]
+async fn collector_applies_regex_mask_hints() {
+    let masks =
+        crate::job::secret_masker::shared_masker_with_regex_for_test(&[], &[r"credential-[0-9]+"]);
+    let logger = StepLogger::results_for_test(masks);
+
+    logger
+        .sender()
+        .send("token is credential-12345 here".into())
+        .await;
+
+    let collected = logger.finish().await.expect("should collect lines");
+    assert!(!collected.text.contains("credential-12345"));
+    assert!(collected.text.contains("***"));
+}
+
+#[tokio::test]
+async fn collector_merges_overlapping_value_and_regex_masks() {
+    let masks = crate::job::secret_masker::shared_masker_with_regex_for_test(
+        &["secret"],
+        &[r"secret-[0-9]+"],
+    );
+    let logger = StepLogger::results_for_test(masks);
+
+    logger
+        .sender()
+        .send("token is secret-12345 here".into())
+        .await;
+
+    let collected = logger.finish().await.expect("should collect lines");
+    assert!(collected.text.contains("token is *** here"));
+    assert!(!collected.text.contains("12345"));
 }
 
 /// Mount the Results endpoints a blob collector needs, recording every line that
@@ -237,6 +314,96 @@ async fn mount_results_blob(
     (appended, metadata_calls)
 }
 
+async fn mount_distinct_results_blob(
+    mock_server: &MockServer,
+    signed_url_path: &str,
+    metadata_path: &str,
+    blob_path: &str,
+) -> Arc<tokio::sync::Mutex<String>> {
+    Mock::given(method("POST"))
+        .and(path_regex(format!(".*{signed_url_path}$")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "logs_url": format!("{}{blob_path}?sig=x", mock_server.uri()),
+            "blob_storage_type": "BLOB_STORAGE_TYPE_AZURE",
+        })))
+        .mount(mock_server)
+        .await;
+
+    let appended = Arc::new(tokio::sync::Mutex::new(String::new()));
+    let sink = appended.clone();
+    Mock::given(method("PUT"))
+        .and(path_regex(format!(r"{blob_path}$")))
+        .respond_with(move |req: &wiremock::Request| {
+            let body = String::from_utf8_lossy(&req.body).to_string();
+            let sink = sink.clone();
+            tokio::spawn(async move { sink.lock().await.push_str(&body) });
+            ResponseTemplate::new(201)
+        })
+        .mount(mock_server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path_regex(format!(".*{metadata_path}$")))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(mock_server)
+        .await;
+
+    appended
+}
+
+#[tokio::test]
+async fn results_step_and_job_blobs_receive_identical_masked_content() {
+    let (mock_server, client) = setup_results_server().await;
+    let step_blob = mount_distinct_results_blob(
+        &mock_server,
+        "GetStepLogsSignedBlobURL",
+        "CreateStepLogsMetadata",
+        "/step-blob",
+    )
+    .await;
+    let job_blob = mount_distinct_results_blob(
+        &mock_server,
+        "GetJobLogsSignedBlobURL",
+        "CreateJobLogsMetadata",
+        "/job-blob",
+    )
+    .await;
+
+    let secret = "two-lines\nquote-\"slash\\";
+    let masks = crate::job::secret_masker::shared_masker_for_test(&[secret]);
+    let job_logger = JobLogger::new(client.clone(), "plan-1".into(), "job-1".into());
+    let step = StepLogger::results(
+        client,
+        "plan-1".into(),
+        "job-1".into(),
+        "step-1".into(),
+        masks,
+        None,
+        Some(job_logger.sender()),
+    );
+
+    step.sender().send("safe-one=two-lines".into()).await;
+    step.sender().send("safe-two=quote-\"slash\\".into()).await;
+    step.sender()
+        .send(r#"safe-json=two-lines\nquote-\"slash\\"#.into())
+        .await;
+    step.finish().await;
+    job_logger.finish().await;
+    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+    let step_content = step_blob.lock().await.clone();
+    let job_content = job_blob.lock().await.clone();
+    assert_eq!(step_content, job_content);
+    for content in [&step_content, &job_content] {
+        assert!(content.contains("safe-one=***"));
+        assert!(content.contains("safe-two=***"));
+        assert!(content.contains("safe-json=***"));
+        assert!(!content.contains("two-lines"));
+        assert!(!content.contains("quote-\"slash\\"));
+        assert!(!content.contains(r#"two-lines\nquote-\"slash\\"#));
+    }
+}
+
 #[tokio::test]
 async fn job_logger_streams_and_publishes_once() {
     let (mock_server, client) = setup_results_server().await;
@@ -248,7 +415,7 @@ async fn job_logger_streams_and_publishes_once() {
     .await;
 
     let job_logger = JobLogger::new(client.clone(), "plan-1".into(), "job-1".into());
-    let masks = Arc::new(RwLock::new(Vec::new()));
+    let masks = crate::job::secret_masker::shared_masker_for_test(&[]);
     let step = StepLogger::results(
         client,
         "plan-1".into(),
@@ -302,7 +469,7 @@ async fn step_without_job_logger_still_uploads_its_own_blob() {
     )
     .await;
 
-    let masks = Arc::new(RwLock::new(Vec::new()));
+    let masks = crate::job::secret_masker::shared_masker_for_test(&[]);
     let step = StepLogger::results(
         client,
         "plan-1".into(),

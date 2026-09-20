@@ -1,7 +1,19 @@
 use std::collections::HashMap;
+#[cfg(target_os = "linux")]
+use std::collections::VecDeque;
 use std::ffi::OsStr;
+#[cfg(target_os = "linux")]
+use std::ffi::{CStr, CString, OsString};
+#[cfg(target_os = "linux")]
+use std::io;
+#[cfg(target_os = "linux")]
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
+#[cfg(target_os = "linux")]
+use std::os::unix::process::CommandExt;
+#[cfg(target_os = "linux")]
+use std::path::Component;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -20,6 +32,7 @@ use super::expression::ExprContext;
 use super::live_feed::FeedSender;
 use super::logs::{JobLogger, LogLine, LogSender, StepLogger};
 use super::schema::{JobManifest, Step};
+use super::secret_masker::{SecretMasker, SharedSecretMasker};
 use super::timeline::{TimelineLogRef, TimelineRecord, TimelineResult, TimelineState};
 use super::workspace::Workspace;
 use crate::docker::build::{BuiltDockerImage, DockerActionBuilder, DockerBuildScope, RegistryAuth};
@@ -108,7 +121,7 @@ pub struct JobState {
     pub env: HashMap<String, String>,
     pub path_prepends: Vec<String>,
     pub outputs: HashMap<String, String>,
-    pub masks: Arc<RwLock<Vec<String>>>,
+    pub(crate) secret_masker: SharedSecretMasker,
     /// Per-action state for pre→post transfer via SaveState workflow command.
     /// Key: action context_name, Value: map of state name→value.
     pub action_states: HashMap<String, HashMap<String, String>>,
@@ -135,8 +148,8 @@ pub struct JobState {
 }
 
 impl JobState {
-    pub fn new(
-        masks: Arc<RwLock<Vec<String>>>,
+    pub(crate) fn new(
+        secret_masker: SharedSecretMasker,
         secrets: HashMap<String, String>,
         context_data: serde_json::Value,
     ) -> Self {
@@ -146,7 +159,7 @@ impl JobState {
             env: HashMap::new(),
             path_prepends: Vec::new(),
             outputs: HashMap::new(),
-            masks,
+            secret_masker,
             action_states: HashMap::new(),
             step_outputs: HashMap::new(),
             step_outcomes: HashMap::new(),
@@ -389,8 +402,6 @@ pub async fn run_host_step(
 
     debug!(
         step_id = %step.id,
-        step_name = %step.display_name,
-        step_ref = %step.reference.name,
         "running host step"
     );
 
@@ -453,7 +464,6 @@ pub async fn run_container_step(
 
     debug!(
         step_id = %step.id,
-        step_name = %step.display_name,
         "running container step"
     );
 
@@ -497,6 +507,7 @@ const IMPLICIT_DOCKER_CREDENTIAL_HELPERS: [&str; 2] =
 fn validate_host_docker_capabilities(
     env: &HashMap<String, String>,
     working_dir: &Path,
+    private_tmp: &Path,
 ) -> Result<(), JobDockerConfigError> {
     let inherited_path = env
         .get("PATH")
@@ -513,14 +524,12 @@ fn validate_host_docker_capabilities(
 
     for helper in IMPLICIT_DOCKER_CREDENTIAL_HELPERS {
         for entry in std::env::split_paths(effective_path) {
-            let directory = if entry.as_os_str().is_empty() {
-                working_dir.to_path_buf()
-            } else if entry.is_absolute() {
-                entry
-            } else {
-                working_dir.join(entry)
-            };
-            let candidate = directory.join(helper);
+            let candidate =
+                match host_credential_helper_path(&entry, helper, working_dir, private_tmp) {
+                    Ok(candidate) => candidate,
+                    Err(error) if host_capability_path_is_unavailable(&error) => continue,
+                    Err(error) => return Err(error),
+                };
             let Ok(metadata) = std::fs::metadata(candidate) else {
                 continue;
             };
@@ -532,7 +541,161 @@ fn validate_host_docker_capabilities(
     Ok(())
 }
 
-fn host_command(
+#[cfg(target_os = "linux")]
+fn host_credential_helper_path(
+    path_entry: &Path,
+    helper: &str,
+    working_dir: &Path,
+    private_tmp: &Path,
+) -> Result<PathBuf, JobDockerConfigError> {
+    let child_candidate = if path_entry.is_absolute() {
+        path_entry.join(helper)
+    } else {
+        let resolved_working_dir = resolve_child_path(working_dir, private_tmp)?;
+        resolved_working_dir.join(path_entry).join(helper)
+    };
+    host_path_for_private_tmp(&child_candidate, private_tmp)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn host_credential_helper_path(
+    path_entry: &Path,
+    helper: &str,
+    working_dir: &Path,
+    _private_tmp: &Path,
+) -> Result<PathBuf, JobDockerConfigError> {
+    let directory = if path_entry.as_os_str().is_empty() {
+        working_dir.to_path_buf()
+    } else if path_entry.is_absolute() {
+        path_entry.to_path_buf()
+    } else {
+        working_dir.join(path_entry)
+    };
+    Ok(directory.join(helper))
+}
+
+#[cfg(target_os = "linux")]
+fn host_capability_path_is_unavailable(error: &JobDockerConfigError) -> bool {
+    matches!(
+        error,
+        JobDockerConfigError::Io { source, .. }
+            if source.kind() == io::ErrorKind::PermissionDenied
+                || source.raw_os_error() == Some(libc::ELOOP)
+    )
+}
+
+#[cfg(not(target_os = "linux"))]
+fn host_capability_path_is_unavailable(_error: &JobDockerConfigError) -> bool {
+    false
+}
+
+#[cfg(target_os = "linux")]
+fn host_path_for_private_tmp(
+    child_path: &Path,
+    private_tmp: &Path,
+) -> Result<PathBuf, JobDockerConfigError> {
+    let resolved = resolve_child_path(child_path, private_tmp)?;
+    Ok(project_private_tmp_path(&resolved, private_tmp))
+}
+
+#[cfg(target_os = "linux")]
+fn resolve_child_path(
+    child_path: &Path,
+    private_tmp: &Path,
+) -> Result<PathBuf, JobDockerConfigError> {
+    let absolute = if child_path.is_absolute() {
+        child_path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|source| JobDockerConfigError::Io {
+                operation: "resolving host capability path",
+                path: child_path.to_path_buf(),
+                source,
+            })?
+            .join(child_path)
+    };
+    let mut pending = child_path_components(&absolute);
+    let mut resolved = PathBuf::from("/");
+    let mut symlink_hops = 0;
+
+    while let Some(component) = pending.pop_front() {
+        if component == OsStr::new("..") {
+            resolved.pop();
+            continue;
+        }
+
+        let child_candidate = resolved.join(&component);
+        let host_candidate = project_private_tmp_path(&child_candidate, private_tmp);
+        match std::fs::symlink_metadata(&host_candidate) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                symlink_hops += 1;
+                if symlink_hops > 40 {
+                    return Err(JobDockerConfigError::Io {
+                        operation: "resolving host capability symlink",
+                        path: child_path.to_path_buf(),
+                        source: io::Error::from_raw_os_error(libc::ELOOP),
+                    });
+                }
+                let target = std::fs::read_link(&host_candidate).map_err(|source| {
+                    JobDockerConfigError::Io {
+                        operation: "reading host capability symlink",
+                        path: host_candidate,
+                        source,
+                    }
+                })?;
+                let target = if target.is_absolute() {
+                    target
+                } else {
+                    resolved.join(target)
+                };
+                let mut target_components = child_path_components(&target);
+                target_components.append(&mut pending);
+                pending = target_components;
+                resolved = PathBuf::from("/");
+            }
+            Ok(_) => resolved.push(component),
+            Err(source)
+                if matches!(
+                    source.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                ) =>
+            {
+                resolved.push(component);
+            }
+            Err(source) => {
+                return Err(JobDockerConfigError::Io {
+                    operation: "resolving host capability path",
+                    path: host_candidate,
+                    source,
+                });
+            }
+        }
+    }
+
+    Ok(resolved)
+}
+
+#[cfg(target_os = "linux")]
+fn child_path_components(path: &Path) -> VecDeque<OsString> {
+    path.components()
+        .filter_map(|component| match component {
+            Component::RootDir | Component::CurDir => None,
+            Component::ParentDir => Some(OsString::from("..")),
+            Component::Normal(part) => Some(part.to_os_string()),
+            Component::Prefix(_) => unreachable!("Unix paths do not have prefixes"),
+        })
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+fn project_private_tmp_path(child_path: &Path, private_tmp: &Path) -> PathBuf {
+    match child_path.strip_prefix("/tmp") {
+        Ok(relative) => private_tmp.join(relative),
+        Err(_) => child_path.to_path_buf(),
+    }
+}
+
+fn build_host_command(
     program: &str,
     args: &[&OsStr],
     env: &HashMap<String, String>,
@@ -543,17 +706,150 @@ fn host_command(
         .get(DOCKER_CONFIG_ENV)
         .context("host step is missing runner-owned DOCKER_CONFIG")?;
     docker_config.validate_override(configured, "host spawn")?;
-    validate_host_docker_capabilities(env, working_dir)?;
 
     let mut command = Command::new(program);
+    command.args(args);
+
+    #[cfg(target_os = "linux")]
+    configure_private_tmp(&mut command, docker_config.private_tmp(), working_dir)?;
+
+    #[cfg(not(target_os = "linux"))]
+    command.current_dir(working_dir);
+
     command
-        .args(args)
-        .current_dir(working_dir)
         .env_remove(DOCKER_CONFIG_ENV)
         .envs(env)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
     Ok(command)
+}
+
+#[cfg(test)]
+fn host_command(
+    program: &str,
+    args: &[&OsStr],
+    env: &HashMap<String, String>,
+    working_dir: &Path,
+    docker_config: &JobDockerConfig,
+) -> Result<Command> {
+    validate_host_docker_capabilities(env, working_dir, docker_config.private_tmp())?;
+    build_host_command(program, args, env, working_dir, docker_config)
+}
+
+async fn host_command_for_process(
+    program: &str,
+    args: &[&OsStr],
+    env: &HashMap<String, String>,
+    working_dir: &Path,
+    docker_config: &JobDockerConfig,
+) -> Result<Command> {
+    let validation_env = env.clone();
+    let validation_working_dir = working_dir.to_path_buf();
+    let validation_private_tmp = docker_config.private_tmp().to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        validate_host_docker_capabilities(
+            &validation_env,
+            &validation_working_dir,
+            &validation_private_tmp,
+        )
+    })
+    .await
+    .context("joining host capability validation task")??;
+
+    build_host_command(program, args, env, working_dir, docker_config)
+}
+
+#[cfg(target_os = "linux")]
+fn configure_private_tmp(
+    command: &mut Command,
+    private_tmp: &Path,
+    working_dir: &Path,
+) -> Result<()> {
+    let source = CString::new(private_tmp.as_os_str().as_bytes())
+        .context("private job temp path contains a NUL byte")?;
+    let working_dir = CString::new(working_dir.as_os_str().as_bytes())
+        .context("host working directory contains a NUL byte")?;
+    let uid = unsafe { libc::geteuid() };
+    let gid = unsafe { libc::getegid() };
+    let uid_map = format!("{uid} {uid} 1\n").into_bytes();
+    let gid_map = format!("{gid} {gid} 1\n").into_bytes();
+
+    // SAFETY: after fork, the closure performs only raw async-signal-safe syscalls and
+    // reads buffers/C strings fully allocated before `pre_exec`; it does not allocate,
+    // log, or acquire process-global locks.
+    unsafe {
+        command.as_std_mut().pre_exec(move || {
+            if libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNS) == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            write_proc_file(c"/proc/self/setgroups", b"deny\n")?;
+            write_proc_file(c"/proc/self/uid_map", &uid_map)?;
+            write_proc_file(c"/proc/self/gid_map", &gid_map)?;
+
+            if libc::mount(
+                std::ptr::null(),
+                c"/".as_ptr(),
+                std::ptr::null(),
+                (libc::MS_PRIVATE | libc::MS_REC) as libc::c_ulong,
+                std::ptr::null(),
+            ) == -1
+            {
+                return Err(io::Error::last_os_error());
+            }
+            if libc::mount(
+                source.as_ptr(),
+                c"/tmp".as_ptr(),
+                std::ptr::null(),
+                libc::MS_BIND as libc::c_ulong,
+                std::ptr::null(),
+            ) == -1
+            {
+                return Err(io::Error::last_os_error());
+            }
+            if libc::chdir(working_dir.as_ptr()) == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+unsafe fn write_proc_file(path: &CStr, value: &[u8]) -> io::Result<()> {
+    let file = unsafe { libc::open(path.as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC) };
+    if file == -1 {
+        return Err(io::Error::last_os_error());
+    }
+
+    let mut written = 0;
+    while written < value.len() {
+        let result = unsafe {
+            libc::write(
+                file,
+                value[written..].as_ptr().cast(),
+                value.len() - written,
+            )
+        };
+        if result == -1 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            unsafe { libc::close(file) };
+            return Err(error);
+        }
+        if result == 0 {
+            unsafe { libc::close(file) };
+            return Err(io::Error::from_raw_os_error(libc::EIO));
+        }
+        written += result as usize;
+    }
+
+    if unsafe { libc::close(file) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 /// Shared process runner used by host steps, node actions, and composite steps.
@@ -569,7 +865,8 @@ pub async fn run_process(
     timeout: Duration,
     cancel_token: &CancellationToken,
 ) -> Result<StepResult> {
-    let mut child = host_command(program, args, env, working_dir, docker_config)?
+    let mut child = host_command_for_process(program, args, env, working_dir, docker_config)
+        .await?
         .spawn()
         .with_context(|| format!("spawning {program}"))?;
 
@@ -578,7 +875,7 @@ pub async fn run_process(
 
     let processor = OutputProcessor::new(
         log_sender.clone(),
-        job_state.masks.clone(),
+        job_state.secret_masker.clone(),
         job_state.debug_enabled,
     );
 
@@ -748,6 +1045,41 @@ pub async fn run_all_steps(
     execution: &JobExecutionContext<'_>,
     feed_sender: Option<&FeedSender>,
 ) -> Result<(JobConclusion, HashMap<String, String>)> {
+    let secret_masker = Arc::new(RwLock::new(SecretMasker::from_manifest(manifest)?));
+    run_all_steps_with_masker(
+        manifest,
+        job_client,
+        workspace,
+        base_env,
+        runner_name,
+        action_cache,
+        docker_action_builder,
+        registry_auth,
+        access_token,
+        cancel_token,
+        execution,
+        feed_sender,
+        secret_masker,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_all_steps_with_masker(
+    manifest: &JobManifest,
+    job_client: &Arc<JobClient>,
+    workspace: &Workspace,
+    base_env: &HashMap<String, String>,
+    runner_name: &str,
+    action_cache: &ActionCache,
+    docker_action_builder: &DockerActionBuilder,
+    registry_auth: Option<&RegistryAuth>,
+    access_token: &str,
+    cancel_token: CancellationToken,
+    execution: &JobExecutionContext<'_>,
+    feed_sender: Option<&FeedSender>,
+    secret_masker: SharedSecretMasker,
+) -> Result<(JobConclusion, HashMap<String, String>)> {
     let server = manifest
         .context_data
         .get("github")
@@ -763,10 +1095,13 @@ pub async fn run_all_steps(
     };
     let docker_build_scope = DockerBuildScope::new(runner_name, github_scope);
 
-    let masks = collect_secret_masks(manifest);
-    let secrets = collect_secrets(manifest, &masks).await;
+    let secrets = collect_secrets(manifest);
 
-    let mut job_state = JobState::new(masks.clone(), secrets, manifest.context_data.clone());
+    let mut job_state = JobState::new(
+        secret_masker.clone(),
+        secrets,
+        manifest.context_data.clone(),
+    );
 
     // Populate the `job` context for expression evaluation
     if let serde_json::Value::Object(ref mut map) = job_state.context_data {
@@ -820,17 +1155,13 @@ pub async fn run_all_steps(
             {
                 Ok(Some(collected)) => collected,
                 Ok(None) => continue,
-                Err(error) => {
+                Err(_) => {
                     // A local action only becomes resolvable once an earlier
                     // step (typically checkout) has materialized it, and a
                     // step behind a false condition may reference an action
                     // that never resolves at all: discovery failures must not
                     // fail the job before those steps can decide.
-                    warn!(
-                        step_id = %step.id,
-                        error = %error,
-                        "deferring action resolution to step execution"
-                    );
+                    warn!(step_id = %step.id, "deferring action resolution to step execution");
                     continue;
                 }
             };
@@ -880,7 +1211,7 @@ pub async fn run_all_steps(
             trackers[tracker_idx].resolve_name(&condition_ctx);
             if !super::expression::evaluate_condition(pre_step.condition.as_deref(), &condition_ctx)
             {
-                debug!(step = %pre_step.display_name, "skipping pre step (condition not met)");
+                debug!(step_id = %pre_step.id, "skipping pre step (condition not met)");
                 let now = format_timeline_timestamp(Utc::now());
                 trackers[tracker_idx].mark_started();
                 trackers[tracker_idx].mark_completed(ResultsConclusion::Skipped);
@@ -918,7 +1249,7 @@ pub async fn run_all_steps(
                 &manifest.plan.job_id,
                 &pre_step.id,
                 &pre_step.display_name,
-                masks.clone(),
+                secret_masker.clone(),
                 feed_sender,
                 job_log_tx.as_ref(),
             )
@@ -984,7 +1315,7 @@ pub async fn run_all_steps(
                 job_cancelled = true;
             } else if conclusion == StepConclusion::Failed {
                 if pre_step.continue_on_error {
-                    info!(step = %pre_step.display_name, "pre step failed but continue_on_error is set");
+                    info!(step_id = %pre_step.id, "pre step failed but continue_on_error is set");
                 } else {
                     job_failed = true;
                 }
@@ -1000,7 +1331,11 @@ pub async fn run_all_steps(
         }
 
         if let Some(condition) = &step.condition {
-            debug!(step = %step.display_name, condition, "step has condition");
+            debug!(
+                step_id = %step.id,
+                has_condition = !condition.is_empty(),
+                "step has condition"
+            );
         }
 
         // Check condition before starting the step — skipped steps get no
@@ -1009,7 +1344,7 @@ pub async fn run_all_steps(
         let condition_ctx = ExprContext::new(base_env, &job_state, job_failed, job_cancelled);
         trackers[idx].resolve_name(&condition_ctx);
         if !super::expression::evaluate_condition(step.condition.as_deref(), &condition_ctx) {
-            debug!(step = %step.display_name, "skipping step (condition not met)");
+            debug!(step_id = %step.id, "skipping step (condition not met)");
             let now = format_timeline_timestamp(Utc::now());
             trackers[idx].mark_started();
             trackers[idx].mark_completed(ResultsConclusion::Skipped);
@@ -1059,7 +1394,7 @@ pub async fn run_all_steps(
             &manifest.plan.job_id,
             &step.id,
             &step.display_name,
-            masks.clone(),
+            secret_masker.clone(),
             feed_sender,
             job_log_tx.as_ref(),
         )
@@ -1164,7 +1499,7 @@ pub async fn run_all_steps(
             job_cancelled = true;
         } else if conclusion == StepConclusion::Failed {
             if step.continue_on_error {
-                info!(step = %step.display_name, "step failed but continue_on_error is set");
+                info!(step_id = %step.id, "step failed but continue_on_error is set");
             } else {
                 job_failed = true;
             }
@@ -1215,7 +1550,7 @@ pub async fn run_all_steps(
                 post_step.condition.as_deref(),
                 &condition_ctx,
             ) {
-                debug!(step = %post_step.display_name, "skipping post step (condition not met)");
+                debug!(step_id = %post_step.id, "skipping post step (condition not met)");
                 let now = format_timeline_timestamp(Utc::now());
                 trackers[tracker_idx].mark_started();
                 trackers[tracker_idx].mark_completed(ResultsConclusion::Skipped);
@@ -1253,7 +1588,7 @@ pub async fn run_all_steps(
                 &manifest.plan.job_id,
                 &post_step.id,
                 &post_step.display_name,
-                masks.clone(),
+                secret_masker.clone(),
                 feed_sender,
                 job_log_tx.as_ref(),
             )
@@ -1316,7 +1651,7 @@ pub async fn run_all_steps(
 
             // Post steps don't affect job conclusion
             if conclusion == StepConclusion::Failed {
-                info!(step = %post_step.display_name, "post step failed (does not affect job conclusion)");
+                info!(step_id = %post_step.id, "post step failed (does not affect job conclusion)");
             }
         }
     }
@@ -1328,13 +1663,21 @@ pub async fn run_all_steps(
         logger.finish().await;
     }
 
-    // Reconstruct job-level outputs from all step outputs.
-    // The server uses these for `needs.X.outputs.Y` resolution in dependent jobs.
-    for step in &manifest.steps {
-        let key = step.context_name.as_deref().unwrap_or(&step.id);
-        if let Some(outs) = job_state.step_outputs.get(key) {
-            merge_case_insensitive(&mut job_state.outputs, outs.clone());
+    let mut output_env = base_env.clone();
+    output_env.extend(job_state.env.clone());
+    let output_ctx = ExprContext::new(&output_env, &job_state, job_failed, job_cancelled);
+    let mut job_outputs = HashMap::new();
+    for (key, expression) in &manifest.job_outputs {
+        let value = super::expression::resolve_template(expression, &output_ctx);
+        if value.is_empty() {
+            debug!("skipping empty job output");
+            continue;
         }
+        if secret_masker.read().await.contains_secret(&value) {
+            warn!("skipping job output because it may contain a secret");
+            continue;
+        }
+        insert_case_insensitive(&mut job_outputs, key.clone(), value);
     }
 
     let conclusion = if job_cancelled {
@@ -1344,7 +1687,7 @@ pub async fn run_all_steps(
     } else {
         JobConclusion::Succeeded
     };
-    Ok((conclusion, job_state.outputs.clone()))
+    Ok((conclusion, job_outputs))
 }
 
 /// Build the secrets map for `secrets.<name>` expression resolution.
@@ -1354,14 +1697,7 @@ pub async fn run_all_steps(
 /// secret variable, and the `GITHUB_TOKEN` alias — the latter is only filled
 /// from the `system.github.token` variable when no earlier source provided a
 /// token. The map never holds two keys differing only by case.
-///
-/// Values inserted here (the alias fallback and contextData secrets) are also
-/// pushed to the mask list; variable values must already be masked by
-/// `collect_secret_masks` before this runs.
-async fn collect_secrets(
-    manifest: &JobManifest,
-    masks: &Arc<RwLock<Vec<String>>>,
-) -> HashMap<String, String> {
+fn collect_secrets(manifest: &JobManifest) -> HashMap<String, String> {
     // The official ToSecretsContext excludes the dotted system token names:
     // they reach workflows only through the canonical `github.token` /
     // `GITHUB_TOKEN` aliases, never as literal `secrets['system.github.token']`.
@@ -1370,7 +1706,6 @@ async fn collect_secrets(
     let mut secrets: HashMap<String, String> = HashMap::new();
     for (k, v) in manifest.variables.iter() {
         if v.is_secret
-            && !v.value.is_empty()
             && !EXCLUDED_SECRET_VARIABLES
                 .iter()
                 .any(|name| k.eq_ignore_ascii_case(name))
@@ -1386,7 +1721,6 @@ async fn collect_secrets(
         && let Some(token) = manifest.github_token()
         && !token.is_empty()
     {
-        masks.write().await.push(token.to_string());
         secrets.insert("GITHUB_TOKEN".to_string(), token.to_string());
     }
 
@@ -1398,27 +1732,19 @@ async fn collect_secrets(
         .and_then(|v| v.as_object())
     {
         for (k, v) in ctx_secrets {
-            if let Some(s) = v.as_str()
-                && !s.is_empty()
+            if EXCLUDED_SECRET_VARIABLES
+                .iter()
+                .any(|name| k.eq_ignore_ascii_case(name))
             {
-                // Add to mask list so secret values are redacted in logs
-                masks.write().await.push(s.to_string());
+                continue;
+            }
+            if let Some(s) = v.as_str() {
                 insert_case_insensitive(&mut secrets, k.clone(), s.to_string());
             }
         }
     }
 
     secrets
-}
-
-fn collect_secret_masks(manifest: &JobManifest) -> Arc<RwLock<Vec<String>>> {
-    let masks: Vec<String> = manifest
-        .variables
-        .values()
-        .filter(|v| v.is_secret && !v.value.is_empty())
-        .map(|v| v.value.clone())
-        .collect();
-    Arc::new(RwLock::new(masks))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1429,7 +1755,7 @@ async fn create_step_logger(
     job_id: &str,
     step_id: &str,
     step_name: &str,
-    masks: Arc<RwLock<Vec<String>>>,
+    secret_masker: SharedSecretMasker,
     feed_sender: Option<&FeedSender>,
     job_log_tx: Option<&mpsc::Sender<LogLine>>,
 ) -> StepLogger {
@@ -1440,12 +1766,12 @@ async fn create_step_logger(
             plan_id.to_string(),
             job_id.to_string(),
             step_id.to_string(),
-            masks,
+            secret_masker,
             feed,
             job_log_tx.cloned(),
         )
     } else {
-        StepLogger::legacy(client.clone(), plan_id, step_name, masks, feed).await
+        StepLogger::legacy(client.clone(), plan_id, step_name, secret_masker, feed).await
     }
 }
 
@@ -1473,7 +1799,7 @@ async fn execute_step(
 
     log_sender.send_banner(runner_name, has_docker).await;
     debug!(
-        step = %step.display_name,
+        step_id = %step.id,
         is_script = step.is_script(),
         has_docker,
         "executing step"

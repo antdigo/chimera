@@ -1,8 +1,49 @@
 use super::*;
 use crate::github::auth::TokenManager;
 use crate::job::timeline;
+use std::io::Write;
+use std::sync::Mutex;
+use tracing_subscriber::fmt::MakeWriter;
 use wiremock::matchers::{body_json, header, method, path, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
+
+#[derive(Clone, Default)]
+struct CapturedWriter(Arc<Mutex<Vec<u8>>>);
+
+impl Write for CapturedWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'writer> MakeWriter<'writer> for CapturedWriter {
+    type Writer = Self;
+
+    fn make_writer(&'writer self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+impl CapturedWriter {
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+    }
+}
+
+fn debug_dispatch(writer: CapturedWriter) -> tracing::Dispatch {
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .with_ansi(false)
+        .without_time()
+        .with_writer(writer)
+        .finish();
+    tracing::Dispatch::new(subscriber)
+}
 
 async fn setup() -> (MockServer, Arc<TokenManager>) {
     let mock_server = MockServer::start().await;
@@ -81,6 +122,137 @@ async fn acquire_job_timeout_error() {
     let client = make_client(&mock_server, tm, false);
     let result = client.acquire_job("req-123").await;
     assert!(result.is_err());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn acquire_job_semantic_error_omits_raw_and_normalized_canary() {
+    let (mock_server, tm) = setup().await;
+    Mock::given(method("POST"))
+        .and(path("/acquirejob"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "variables": "CANARY-MANIFEST",
+            "jobContainer": { "image": "CANARY-MANIFEST" }
+        })))
+        .mount(&mock_server)
+        .await;
+    let captured = CapturedWriter::default();
+    let dispatch = debug_dispatch(captured.clone());
+    let _guard = tracing::dispatcher::set_default(&dispatch);
+
+    let error = make_client(&mock_server, tm, false)
+        .acquire_job("req-123")
+        .await
+        .unwrap_err();
+    let combined = format!("{}\n{}", error, captured.text());
+
+    assert!(
+        error
+            .to_string()
+            .contains("deserializing normalized job manifest")
+    );
+    assert!(!combined.contains("CANARY-MANIFEST"));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn acquire_job_syntax_error_reports_category_and_position_without_body() {
+    let (mock_server, tm) = setup().await;
+    let body = r#"{"CANARY-SYNTAX":"#;
+    Mock::given(method("POST"))
+        .and(path("/acquirejob"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(body))
+        .mount(&mock_server)
+        .await;
+    let captured = CapturedWriter::default();
+    let dispatch = debug_dispatch(captured.clone());
+    let _guard = tracing::dispatcher::set_default(&dispatch);
+
+    let error = make_client(&mock_server, tm, false)
+        .acquire_job("req-123")
+        .await
+        .unwrap_err();
+    let message = error.to_string();
+
+    assert!(message.contains("parsing raw job manifest JSON failed"));
+    assert!(message.contains("Eof"));
+    assert!(message.contains("line 1"));
+    assert!(message.contains("column"));
+    assert!(!format!("{message}\n{}", captured.text()).contains("CANARY-SYNTAX"));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn acquire_job_http_error_reports_status_and_length_without_response_body() {
+    let (mock_server, tm) = setup().await;
+    let body = "CANARY-HTTP-BODY";
+    Mock::given(method("POST"))
+        .and(path("/acquirejob"))
+        .respond_with(ResponseTemplate::new(503).set_body_string(body))
+        .mount(&mock_server)
+        .await;
+
+    let error = make_client(&mock_server, tm, false)
+        .acquire_job("req-123")
+        .await
+        .unwrap_err()
+        .to_string();
+
+    assert!(error.contains("503 Service Unavailable"));
+    assert!(error.contains(&format!("response body {} bytes", body.len())));
+    assert!(!error.contains(body));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn job_api_error_responses_never_include_response_body() {
+    let (mock_server, tm) = setup().await;
+    const CANARY: &str = "CANARY-API-BODY";
+    Mock::given(path_regex(r"^/(renewjob|completejob|twirp/|_apis/|blob$)"))
+        .respond_with(ResponseTemplate::new(500).set_body_string(CANARY))
+        .mount(&mock_server)
+        .await;
+
+    let mut client = make_client(&mock_server, tm, true);
+    client.set_results_url(mock_server.uri());
+    let signed = SignedUrlResponse {
+        logs_url: format!("{}/blob?sig=x", mock_server.uri()),
+        blob_storage_type: "BLOB_STORAGE_TYPE_AZURE".into(),
+    };
+    let captured = CapturedWriter::default();
+    let dispatch = debug_dispatch(captured.clone());
+    let _guard = tracing::dispatcher::set_default(&dispatch);
+    let mut returned_errors = Vec::new();
+
+    client.renew_job("p", "j").await.unwrap();
+    if let Err(error) = client
+        .complete_job("p", "j", JobConclusion::Failed, &serde_json::json!({}), &[])
+        .await
+    {
+        returned_errors.push(error.to_string());
+    }
+    client.update_steps("p", "j", &[]).await.unwrap();
+    if let Err(error) = client.get_job_log_signed_url("p", "j").await {
+        returned_errors.push(error.to_string());
+    }
+    for result in [
+        client.create_append_blob(&signed).await,
+        client.append_blob_block(&signed, "safe-content").await,
+    ] {
+        if let Err(error) = result {
+            returned_errors.push(error.to_string());
+        }
+    }
+    client.seal_blob(&signed).await.unwrap();
+    client.create_job_log_metadata("p", "j", 1).await.unwrap();
+    client
+        .create_step_log_metadata("p", "j", "s", 1)
+        .await
+        .unwrap();
+    if let Err(error) = client.create_log("p", "step").await {
+        returned_errors.push(error.to_string());
+    }
+    client.upload_log_lines("p", 1, "safe").await.unwrap();
+    client.update_timeline("p", "t", &[]).await.unwrap();
+
+    let combined = format!("{}\n{}", returned_errors.join("\n"), captured.text());
+    assert!(!combined.contains(CANARY), "API body leaked: {combined}");
 }
 
 #[tokio::test]

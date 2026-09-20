@@ -1,5 +1,41 @@
 use super::*;
 
+#[tokio::test]
+async fn log_sender_masks_before_websocket_feed_fan_out() {
+    use futures::StreamExt;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
+        let message = websocket.next().await.unwrap().unwrap();
+        serde_json::from_str::<serde_json::Value>(&message.into_text().unwrap()).unwrap()
+    });
+
+    let feed = LiveFeed::connect(&format!("http://{address}/feed"), "token")
+        .await
+        .expect("live feed should connect");
+    let masks = crate::job::secret_masker::shared_masker_for_test(&["feed-\"canary\\"]);
+    let (tx, _rx) = tokio::sync::mpsc::channel(4);
+    let sender = crate::job::logs::LogSender::new_for_test_with_feed(
+        tx,
+        masks,
+        feed.sender().clone(),
+        "step-1".into(),
+    );
+
+    sender.send(r#"safe=feed-\"canary\\"#.into()).await;
+    let payload = tokio::time::timeout(tokio::time::Duration::from_secs(2), server)
+        .await
+        .expect("feed message timeout")
+        .unwrap();
+    assert_eq!(payload["Value"], serde_json::json!(["safe=***"]));
+
+    drop(sender);
+    feed.close().await;
+}
+
 #[test]
 fn truncate_line_short_string_unchanged() {
     assert_eq!(truncate_line("hello", 1024), "hello");

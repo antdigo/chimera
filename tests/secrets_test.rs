@@ -5,6 +5,26 @@ use std::collections::HashMap;
 use chimera::job::client::JobConclusion;
 use common::*;
 
+fn serialize_secrets_step() -> serde_json::Value {
+    script_step_env(
+        "serialize",
+        r#"
+        printf '%s' "$ALL_SECRETS" | jq -e 'type == "object"' >/dev/null
+        printf '%s' "$ALL_SECRETS" > "$GITHUB_WORKSPACE/all-secrets.json"
+        "#,
+        HashMap::from([("ALL_SECRETS".into(), "${{ toJSON(secrets) }}".into())]),
+    )
+}
+
+async fn read_serialized_secrets(env: &TestEnv) -> (String, serde_json::Value) {
+    let serialized =
+        tokio::fs::read_to_string(env.workspace.workspace_dir().join("all-secrets.json"))
+            .await
+            .unwrap();
+    let parsed = serde_json::from_str(&serialized).unwrap();
+    (serialized, parsed)
+}
+
 #[tokio::test]
 async fn secrets_from_context_data() {
     let env = TestEnv::setup().await;
@@ -60,6 +80,73 @@ async fn multiple_secrets() {
     );
     let (conclusion, _) = env.run(&manifest).await.unwrap();
     assert_eq!(conclusion, JobConclusion::Succeeded);
+}
+
+#[tokio::test]
+async fn root_secrets_object_matches_captured_github_runner_output() {
+    let env = TestEnv::setup().await;
+    let manifest = manifest_with_variables(
+        vec![serialize_secrets_step()],
+        &env.mock_server.uri(),
+        serde_json::json!({
+            "secrets": {
+                "QUOTED": "say \"hello\"",
+                "UNICODE": "секрет 🔐",
+                "MULTILINE": "first\nsecond",
+                "EMPTY_CONTEXT": "",
+                "system.accessToken": "must-not-escape"
+            }
+        }),
+        serde_json::json!({
+            "EMPTY_VARIABLE": { "value": "", "isSecret": true }
+        }),
+    );
+
+    let (conclusion, _) = env.run(&manifest).await.unwrap();
+    let (serialized, actual) = read_serialized_secrets(&env).await;
+    assert_eq!(conclusion, JobConclusion::Succeeded);
+    let github_runner_capture: serde_json::Value = serde_json::from_str(include_str!(
+        "fixtures/github_runner_v2_337_0_tojson_secrets.json"
+    ))
+    .unwrap();
+
+    assert_eq!(actual, github_runner_capture);
+    assert!(serialized.contains(r#"say \"hello\""#));
+    assert!(serialized.contains(r#"first\nsecond"#));
+    assert!(serialized.contains("секрет 🔐"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn twenty_concurrent_secret_contexts_do_not_mix() {
+    let runs = (0..20).map(|run_id| async move {
+        let env = TestEnv::setup().await;
+        let unique_key = format!("ONLY_{run_id}");
+        let unique_value = format!("value-{run_id}");
+        let manifest = manifest_with_steps_and_context(
+            vec![serialize_secrets_step()],
+            &env.mock_server.uri(),
+            serde_json::json!({
+                "secrets": {
+                    "RUN_ID": run_id.to_string(),
+                    unique_key.clone(): unique_value.clone()
+                }
+            }),
+        );
+
+        let (conclusion, _) = env.run(&manifest).await.unwrap();
+        let (_, actual) = read_serialized_secrets(&env).await;
+
+        assert_eq!(conclusion, JobConclusion::Succeeded);
+        assert_eq!(
+            actual,
+            serde_json::json!({
+                "RUN_ID": run_id.to_string(),
+                unique_key: unique_value
+            })
+        );
+    });
+
+    futures::future::join_all(runs).await;
 }
 
 // The system job token is delivered as a lowercase `github_token` variable;
@@ -227,4 +314,57 @@ async fn fallback_token_is_masked_when_variable_not_flagged_secret() {
         !logs.contains("ghs_unflagged_token"),
         "unflagged system token leaked into uploaded logs"
     );
+}
+
+#[tokio::test]
+async fn synthetic_canaries_are_absent_from_uploaded_logs() {
+    let mut env = TestEnv::setup().await;
+    let step = script_step_env(
+        "s1",
+        r#"
+        printf 'stdout=%s\n' "$PLAIN"
+        printf 'stderr=%s\n' "$PLAIN" >&2
+        printf 'multiline=%s\n' "$MULTILINE"
+        printf 'json=LINE_ONE_41\\nLINE_TWO_41\n'
+        printf 'json=quote-\\"slash\\\\-41\n'
+        printf '::warning::%s\n' "$PLAIN"
+        printf '::error::%s\n' "$QUOTED"
+        echo safe-before-failure
+        exit 1
+        "#,
+        HashMap::from([
+            ("PLAIN".into(), "${{ secrets.PLAIN }}".into()),
+            ("MULTILINE".into(), "${{ secrets.MULTILINE }}".into()),
+            ("QUOTED".into(), "${{ secrets.QUOTED }}".into()),
+        ]),
+    );
+    let manifest = manifest_with_steps_and_context(
+        vec![step],
+        &env.mock_server.uri(),
+        serde_json::json!({
+            "secrets": {
+                "PLAIN": "PLAIN_CANARY_41",
+                "MULTILINE": "LINE_ONE_41\nLINE_TWO_41",
+                "QUOTED": "quote-\"slash\\-41"
+            }
+        }),
+    );
+    env.configure_from_manifest(&manifest);
+
+    let (conclusion, _) = env.run(&manifest).await.unwrap();
+    assert_eq!(conclusion, JobConclusion::Failed);
+
+    let legacy = env.uploaded_legacy_log_text().await;
+    assert!(legacy.contains("safe-before-failure"));
+    assert!(legacy.contains("***"));
+    for canary in [
+        "PLAIN_CANARY_41",
+        "LINE_ONE_41",
+        "LINE_TWO_41",
+        "quote-\"slash\\-41",
+        r#"LINE_ONE_41\nLINE_TWO_41"#,
+        r#"quote-\"slash\\-41"#,
+    ] {
+        assert!(!legacy.contains(canary), "canary leaked: {canary}");
+    }
 }

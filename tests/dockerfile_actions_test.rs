@@ -65,7 +65,7 @@ async fn dockerfile_action_builds_and_propagates_exit_code() {
         "#!/bin/sh\necho result=ok >> \"$GITHUB_OUTPUT\"\n",
     )
     .unwrap();
-    let manifest = manifest_with_steps(
+    let mut manifest = manifest_with_steps(
         vec![local_action_step(
             "docker",
             ".github/actions/dockerfile-basic",
@@ -73,6 +73,10 @@ async fn dockerfile_action_builds_and_propagates_exit_code() {
         )],
         &env.mock_server.uri(),
     );
+    manifest.job_outputs = HashMap::from([(
+        "result".to_string(),
+        "${{ steps.docker.outputs.result }}".to_string(),
+    )]);
     env.configure_from_manifest(&manifest);
 
     let (conclusion, outputs) = env.run(&manifest).await.unwrap();
@@ -600,7 +604,7 @@ runs:
         "#!/bin/sh\nset -eu\ntest \"$STATE_phase\" = main\necho post >> /github/workspace/phases\n",
     )
     .unwrap();
-    let manifest = manifest_with_steps(
+    let mut manifest = manifest_with_steps(
         vec![local_action_step(
             "phases",
             ".github/actions/phases",
@@ -608,6 +612,10 @@ runs:
         )],
         &env.mock_server.uri(),
     );
+    manifest.job_outputs = HashMap::from([(
+        "result".to_string(),
+        "${{ steps.phases.outputs.result }}".to_string(),
+    )]);
     env.configure_from_manifest(&manifest);
 
     let (conclusion, outputs) = env.run(&manifest).await.unwrap();
@@ -676,13 +684,23 @@ runs:
         "environment": null,
         "contextName": "inline"
     });
-    let manifest = manifest_with_steps(
+    let mut manifest = manifest_with_steps(
         vec![
             local_action_step("prebuilt", ".github/actions/prebuilt", HashMap::new()),
             inline,
         ],
         &env.mock_server.uri(),
     );
+    manifest.job_outputs = HashMap::from([
+        (
+            "prebuilt".to_string(),
+            "${{ steps.prebuilt.outputs.prebuilt }}".to_string(),
+        ),
+        (
+            "inline".to_string(),
+            "${{ steps.inline.outputs.inline }}".to_string(),
+        ),
+    ]);
     env.configure_from_manifest(&manifest);
 
     let (conclusion, outputs) = env.run(&manifest).await.unwrap();

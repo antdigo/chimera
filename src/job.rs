@@ -7,7 +7,9 @@ pub mod expression;
 pub mod live_feed;
 pub mod logs;
 pub mod manifest;
+pub mod masking;
 pub mod schema;
+pub(crate) mod secret_masker;
 pub mod timeline;
 pub mod workspace;
 

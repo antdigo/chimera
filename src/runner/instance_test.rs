@@ -1,9 +1,12 @@
 use std::collections::HashMap;
+use std::io::Write;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use tempfile::TempDir;
 use tokio::sync::watch;
+use tracing_subscriber::fmt::MakeWriter;
 use wiremock::matchers::{method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -14,6 +17,135 @@ use crate::github::broker::{BrokerClient, MessageType};
 use crate::job::docker_config::JobDockerConfigError;
 
 use super::*;
+
+#[derive(Clone, Default)]
+struct TracingWriter(Arc<Mutex<Vec<u8>>>);
+
+impl Write for TracingWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'writer> MakeWriter<'writer> for TracingWriter {
+    type Writer = Self;
+
+    fn make_writer(&'writer self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+impl TracingWriter {
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+    }
+}
+
+#[test]
+fn acquired_job_trace_contains_only_safe_structural_fields() {
+    let manifest: JobManifest = serde_json::from_value(serde_json::json!({
+        "plan": { "planId": "safe-plan", "jobId": "safe-job", "timelineId": "safe-timeline" },
+        "steps": [{
+            "id": "safe-step",
+            "reference": { "type": "script" },
+            "inputs": {},
+            "order": 1
+        }],
+        "variables": {
+            "CANARY_VARIABLE_NAME": { "value": "CANARY_VARIABLE_VALUE", "isSecret": true }
+        },
+        "resources": { "endpoints": [{
+            "name": "CANARY_ENDPOINT_NAME",
+            "url": "https://CANARY-ENDPOINT.invalid",
+            "authorization": null,
+            "data": { "CANARY_DATA_KEY": "CANARY_DATA_VALUE" }
+        }]},
+        "contextData": {},
+        "jobContainer": { "image": "CANARY-CONTAINER-IMAGE" },
+        "serviceContainers": null,
+        "mask": [{ "type": "regex", "value": "CANARY-MASK" }],
+        "fileTable": ["CANARY-FILENAME"]
+    }))
+    .unwrap();
+    let captured = TracingWriter::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .with_ansi(false)
+        .without_time()
+        .with_writer(captured.clone())
+        .finish();
+    let dispatch = tracing::Dispatch::new(subscriber);
+    let _guard = tracing::dispatcher::set_default(&dispatch);
+
+    log_job_acquired(&manifest);
+    let trace = captured.text();
+
+    for field in [
+        "steps",
+        "variable_count",
+        "endpoint_count",
+        "has_container",
+        "has_services",
+        "mask_hint_count",
+    ] {
+        assert!(trace.contains(field), "missing field {field}: {trace}");
+    }
+    for canary in [
+        "CANARY_VARIABLE_NAME",
+        "CANARY_VARIABLE_VALUE",
+        "CANARY_ENDPOINT_NAME",
+        "CANARY-ENDPOINT",
+        "CANARY_DATA_KEY",
+        "CANARY_DATA_VALUE",
+        "CANARY-CONTAINER-IMAGE",
+        "CANARY-MASK",
+        "CANARY-FILENAME",
+    ] {
+        assert!(!trace.contains(canary), "trace leaked {canary}: {trace}");
+    }
+}
+
+#[tokio::test]
+async fn masked_error_chain_hides_nested_source() {
+    let source = anyhow::anyhow!("source contains CANARY-NESTED");
+    let error = source.context("safe setup stage");
+    let masker = crate::job::secret_masker::shared_masker_for_test(&["CANARY-NESTED"]);
+
+    let rendered = mask_error_chain(&error, &masker).await;
+
+    assert!(rendered.contains("safe setup stage"));
+    assert!(rendered.contains("***"));
+    assert!(!rendered.contains("CANARY-NESTED"));
+}
+
+#[tokio::test]
+async fn concurrent_jobs_keep_secret_sets_isolated() {
+    let (tx_a, mut rx_a) = tokio::sync::mpsc::channel(1);
+    let (tx_b, mut rx_b) = tokio::sync::mpsc::channel(1);
+    let sender_a = crate::job::logs::LogSender::new_for_test(
+        tx_a,
+        crate::job::secret_masker::shared_masker_for_test(&["secret-a"]),
+    );
+    let sender_b = crate::job::logs::LogSender::new_for_test(
+        tx_b,
+        crate::job::secret_masker::shared_masker_for_test(&["secret-b"]),
+    );
+
+    tokio::join!(
+        sender_a.send("job-a=secret-a,other=secret-b".into()),
+        sender_b.send("job-b=secret-b,other=secret-a".into()),
+    );
+    let line_a = rx_a.recv().await.unwrap().content;
+    let line_b = rx_b.recv().await.unwrap().content;
+
+    assert_eq!(line_a, "job-a=***,other=secret-b");
+    assert_eq!(line_b, "job-b=***,other=secret-a");
+}
 
 async fn setup() -> (MockServer, Arc<TokenManager>, watch::Sender<bool>) {
     let mock_server = MockServer::start().await;
@@ -133,6 +265,9 @@ async fn registration_failure_cleans_docker_config_without_revoking_existing_cap
     )
     .await
     .unwrap();
+    let secret_masker = Arc::new(tokio::sync::RwLock::new(
+        SecretMasker::from_manifest(&manifest).unwrap(),
+    ));
 
     let error = runner
         .run_job(
@@ -141,6 +276,7 @@ async fn registration_failure_cleans_docker_config_without_revoking_existing_cap
             &reqwest::Client::new(),
             CancellationToken::new(),
             "owner/test-repo",
+            &secret_masker,
         )
         .await
         .unwrap_err();
@@ -277,12 +413,13 @@ async fn poll_loop_returns_job_request() {
 #[tokio::test]
 async fn poll_loop_skips_control_then_returns_job() {
     let (mock_server, tm, shutdown_tx) = setup().await;
+    let canary = "CANARY-IDLE-UNKNOWN-MESSAGE-TYPE";
 
     Mock::given(method("GET"))
         .and(path("/message"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "messageId": 1,
-            "messageType": "AgentRefresh",
+            "messageType": canary,
             "body": null
         })))
         .up_to_n_times(1)
@@ -314,10 +451,22 @@ async fn poll_loop_skips_control_then_returns_job() {
 
     let (_temp, runner) = make_runner();
     let mut rx = shutdown_tx.subscribe();
+    let captured = crate::testing::TracingWriter::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .with_ansi(false)
+        .without_time()
+        .with_writer(captured.clone())
+        .finish();
+    let dispatch = tracing::Dispatch::new(subscriber);
+    let _guard = tracing::dispatcher::set_default(&dispatch);
     let result = runner.poll_loop(&broker, &mut rx).await.unwrap();
     let msg = result.expect("should return job after skipping control message");
     assert_eq!(msg.message_id, 2);
     assert_eq!(msg.message_type, MessageType::RunnerJobRequest);
+    let trace = captured.text();
+    assert!(trace.contains("message_type=Unknown"), "{trace}");
+    assert!(!trace.contains(canary), "{trace}");
 }
 
 #[tokio::test]
@@ -1093,8 +1242,11 @@ fn startup_error_transient_classification() {
         .context("parsing token exchange response");
     assert!(startup_error_is_transient(&auth_bad_response));
 
-    let broker_server = anyhow::Error::new(BrokerError::ServerError("503: blip".into()))
-        .context("creating broker session");
+    let broker_server = anyhow::Error::new(BrokerError::ServerError {
+        status: 503,
+        response_body_bytes: 4,
+    })
+    .context("creating broker session");
     assert!(startup_error_is_transient(&broker_server));
 
     let broker_connection = anyhow::Error::new(BrokerError::Connection("reset".into()))
@@ -1322,6 +1474,38 @@ async fn successful_job_reports_failed_when_docker_config_cleanup_fails() {
         authority.authorize("synthetic", &scope).await.unwrap_err(),
         CacheAuthError::Unauthorized,
     );
+}
+
+#[tokio::test]
+async fn finish_job_serializes_only_the_execution_outcome_outputs() {
+    use wiremock::matchers::body_json;
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/completejob"))
+        .and(body_json(serde_json::json!({
+            "planId": "plan",
+            "jobId": "job",
+            "conclusion": "succeeded",
+            "outputs": {
+                "published": { "value": "release-42" }
+            },
+            "stepResults": []
+        })))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let client = finish_client(&server).await;
+    let manifest = finish_manifest(&server.uri());
+    let execution = Ok(JobExecutionOutcome {
+        conclusion: JobConclusion::Succeeded,
+        outputs: HashMap::from([("published".to_string(), "release-42".to_string())]),
+    });
+
+    finish_job(&client, &manifest, execution, Ok(()))
+        .await
+        .unwrap();
 }
 
 #[tokio::test]

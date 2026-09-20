@@ -3,6 +3,8 @@ use bollard::Docker;
 use bollard::network::CreateNetworkOptions;
 use tracing::{debug, warn};
 
+use super::output::DockerErrorDiagnostic;
+
 /// Create a bridge network for a job. Returns the network name.
 pub async fn create_job_network(
     docker: &Docker,
@@ -48,7 +50,15 @@ pub async fn get_network_gateway(docker: &Docker, network_name: &str) -> Result<
 /// Remove a network by name. Logs a warning on failure rather than propagating.
 pub async fn remove_network(docker: &Docker, name: &str) {
     if let Err(e) = docker.remove_network(name).await {
-        warn!(network = %name, error = %e, "failed to remove network");
+        let diagnostic = DockerErrorDiagnostic::from(&e);
+        warn!(
+            network = %name,
+            error_kind = diagnostic.kind,
+            status_code = ?diagnostic.status_code,
+            error_code = ?diagnostic.error_code,
+            column = ?diagnostic.column,
+            "failed to remove network"
+        );
     } else {
         debug!(network = %name, "removed network");
     }

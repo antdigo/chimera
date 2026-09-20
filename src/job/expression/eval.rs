@@ -145,11 +145,19 @@ fn resolve_property(segments: &[PropertySegment], ctx: &ExprContext) -> Result<V
 
             let from_context = walk_json(ctx.context_data, segments, ctx)?;
             if from_context == Value::Null {
-                debug!(input = %key, "no value for input in env or context data");
+                debug!("no value for input in env or context data");
             }
             Ok(from_context)
         }
         "secrets" => {
+            if rest.is_empty() {
+                return Ok(Value::Object(
+                    ctx.secrets
+                        .iter()
+                        .map(|(key, value)| (key.clone(), Value::String(value.clone())))
+                        .collect(),
+                ));
+            }
             let key = rest
                 .first()
                 .map(|s| segment_to_key(s, ctx))
@@ -173,7 +181,7 @@ fn resolve_property(segments: &[PropertySegment], ctx: &ExprContext) -> Result<V
         }
         "needs" | "matrix" | "strategy" | "job" => walk_json(ctx.context_data, segments, ctx),
         _ => {
-            debug!(context = root, "unknown expression context");
+            debug!("unknown expression context");
             Ok(Value::Null)
         }
     }

@@ -1,6 +1,32 @@
+use std::io::Write;
+use std::sync::{Arc, Mutex};
+
 use bollard::models::HostConfig;
+use tracing_subscriber::fmt::MakeWriter;
 
 use super::*;
+
+#[derive(Clone, Default)]
+struct CapturedWriter(Arc<Mutex<Vec<u8>>>);
+
+impl Write for CapturedWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'writer> MakeWriter<'writer> for CapturedWriter {
+    type Writer = Self;
+
+    fn make_writer(&'writer self) -> Self::Writer {
+        self.clone()
+    }
+}
 
 // ── parse_options ────────────────────────────────────────────────────
 
@@ -39,6 +65,27 @@ fn empty() {
     assert!(!opts.privileged);
     assert!(opts.cap_add.is_empty());
     assert!(opts.health_check.is_none());
+}
+
+#[test]
+fn unknown_options_warning_omits_manifest_tokens() {
+    let captured = CapturedWriter::default();
+    let output = Arc::clone(&captured.0);
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::WARN)
+        .with_ansi(false)
+        .without_time()
+        .with_writer(captured)
+        .finish();
+
+    tracing::subscriber::with_default(subscriber, || {
+        parse_options(Some("--env TOKEN=CANARY-OPTION-SECRET"));
+    });
+
+    let warning = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+    assert!(warning.contains("ignoring unrecognized container option"));
+    assert!(!warning.contains("--env"), "{warning}");
+    assert!(!warning.contains("CANARY-OPTION-SECRET"), "{warning}");
 }
 
 #[test]

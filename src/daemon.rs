@@ -205,9 +205,48 @@ pub fn is_process_alive(pid: u32) -> bool {
 }
 
 fn prepare_daemon_root(paths: &ChimeraPaths) -> Result<(PidLock, JobResourceRoot)> {
+    #[cfg(target_os = "linux")]
+    {
+        let lexical_root = lexical_absolute_path(&paths.root)?;
+        let canonical_root = std::fs::canonicalize(&paths.root)
+            .with_context(|| format!("canonicalizing Chimera root {}", paths.root.display()))?;
+        let canonical_host_tmp =
+            std::fs::canonicalize("/tmp").context("canonicalizing host /tmp")?;
+        if lexical_root.starts_with("/tmp") || canonical_root.starts_with(&canonical_host_tmp) {
+            return Err(
+                JobDockerConfigError::ChimeraRootUnderHostTmp { path: lexical_root }.into(),
+            );
+        }
+    }
     let pid_lock = PidLock::acquire(&paths.pid_file()).context("acquiring PID lock")?;
     let job_resources = JobResourceRoot::prepare(&paths.job_resources_dir())?;
     Ok((pid_lock, job_resources))
+}
+
+#[cfg(target_os = "linux")]
+fn lexical_absolute_path(path: &Path) -> Result<PathBuf> {
+    use std::path::Component;
+
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .context("reading current directory for Chimera root")?
+            .join(path)
+    };
+    let mut normalized = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::RootDir => normalized.push("/"),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::Normal(part) => normalized.push(part),
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+        }
+    }
+    Ok(normalized)
 }
 
 // --- Runner state ---
@@ -364,11 +403,15 @@ pub struct Daemon {
 }
 
 impl Daemon {
-    pub fn load(paths: ChimeraPaths) -> Result<Self> {
+    pub fn load(mut paths: ChimeraPaths) -> Result<Self> {
         let root_lock = RootLock::acquire(&paths.root).map_err(|error| {
             let context = format!("acquiring root storage lock: {error}");
             anyhow::Error::new(error).context(context)
         })?;
+        paths.root = paths
+            .root
+            .canonicalize()
+            .with_context(|| format!("canonicalizing daemon root {}", paths.root.display()))?;
         let config = load_config(&paths.config_file()).context("loading config")?;
 
         Ok(Self {

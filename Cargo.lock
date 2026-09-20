@@ -324,6 +324,7 @@ dependencies = [
  "glob",
  "hostname",
  "libc",
+ "regex",
  "reqwest",
  "rsa",
  "serde",
