@@ -2,7 +2,7 @@ use std::ffi::{CStr, CString};
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -34,6 +34,7 @@ struct Binding {
 pub(in super::super) struct BoundDir {
     binding: Arc<Binding>,
     poisoned: Arc<AtomicBool>,
+    root_path: Arc<PathBuf>,
 }
 
 impl std::fmt::Debug for BoundDir {
@@ -84,6 +85,7 @@ impl BoundDir {
         let directory = Self {
             binding,
             poisoned: Arc::new(AtomicBool::new(false)),
+            root_path: Arc::new(path.to_owned()),
         };
         directory.verify_binding()?;
         Ok(directory)
@@ -91,7 +93,9 @@ impl BoundDir {
 
     pub(in super::super) fn verify_binding(&self) -> Result<(), ExecutionDomainError> {
         if self.poisoned.load(Ordering::Acquire) {
-            return Err(failure(FailureCategory::IdentityMismatch));
+            return Err(ExecutionDomainError::PoisonedRoot {
+                path: self.root_path.as_ref().clone(),
+            });
         }
         verify_chain(&self.binding).inspect_err(|_| self.poison())
     }
@@ -110,6 +114,7 @@ impl BoundDir {
                 parent: Some((Arc::clone(&self.binding), name.to_owned())),
             }),
             poisoned: Arc::clone(&self.poisoned),
+            root_path: Arc::clone(&self.root_path),
         };
         child.verify_binding()?;
         Ok(child)
@@ -182,8 +187,9 @@ impl BoundDir {
             .checked_add(1)
             .ok_or_else(|| failure(FailureCategory::InvalidInput))?;
         read(&mut (&mut file).take(bound as u64), &mut bytes).map_err(io_failure)?;
-        let after = metadata(file.as_raw_fd())?;
-        self.validate_regular(&after, limit)?;
+        let after = metadata(file.as_raw_fd()).inspect_err(|_| self.poison())?;
+        self.validate_regular(&after, limit)
+            .inspect_err(|_| self.poison())?;
         if bytes.len() > limit
             || bytes.len() as u64 != after.stx_size
             || before.stx_size != after.stx_size
@@ -192,6 +198,7 @@ impl BoundDir {
             || before.stx_ctime.tv_sec != after.stx_ctime.tv_sec
             || before.stx_ctime.tv_nsec != after.stx_ctime.tv_nsec
         {
+            self.poison();
             return Err(failure(FailureCategory::IdentityMismatch));
         }
         self.verify_entry(name, &before)?;
@@ -237,8 +244,8 @@ impl BoundDir {
     where
         F: FnMut(RawFd, SyncKind) -> io::Result<()>,
     {
+        component(name)?;
         let result = (|| {
-            component(name)?;
             self.verify_binding()?;
             let previous = self.optional_metadata(name)?;
             if new && previous.is_some() {
@@ -310,11 +317,22 @@ impl BoundDir {
         name: &CStr,
         expected: &libc::statx,
     ) -> Result<(), ExecutionDomainError> {
+        self.verify_named_entry(name, expected, true)
+    }
+
+    fn verify_named_entry(
+        &self,
+        name: &CStr,
+        expected: &libc::statx,
+        check_links: bool,
+    ) -> Result<(), ExecutionDomainError> {
         self.verify_binding()?;
-        let current = stat_at(self.fd(), name).map_err(io_failure)?;
+        let current = stat_at(self.fd(), name)
+            .map_err(io_failure)
+            .inspect_err(|_| self.poison())?;
         if identity(&current) != identity(expected)
             || current.stx_mode != expected.stx_mode
-            || current.stx_nlink != expected.stx_nlink
+            || (check_links && current.stx_nlink != expected.stx_nlink)
         {
             self.poison();
             return Err(failure(FailureCategory::IdentityMismatch));
@@ -341,8 +359,8 @@ impl BoundDir {
     /// Only the cgroup-empty teardown driver may enable this in production (Task 10).
     #[cfg(test)]
     pub(super) fn remove_tree(&self, name: &CStr) -> Result<(), ExecutionDomainError> {
+        component(name)?;
         let result = (|| {
-            component(name)?;
             let attempt = self.child(name)?;
             // Inventory the whole tree before the first unlink so unknown control
             // entries and mounts preserve all available recovery evidence.
@@ -408,10 +426,17 @@ impl BoundDir {
                     if mode != libc::S_IFREG && policy != RemovalPolicy::Writable {
                         return Err(failure(FailureCategory::IdentityMismatch));
                     }
-                    if mode == libc::S_IFREG && metadata.stx_nlink != 1 {
+                    if mode == libc::S_IFREG
+                        && policy != RemovalPolicy::Writable
+                        && metadata.stx_nlink != 1
+                    {
                         return Err(failure(FailureCategory::IdentityMismatch));
                     }
-                    entries.push(RemovalEntry::Leaf(name, Box::new(metadata)));
+                    entries.push(RemovalEntry::Leaf {
+                        name,
+                        expected: Box::new(metadata),
+                        writable: policy == RemovalPolicy::Writable,
+                    });
                 }
                 // A socket name alone does not prove ownership. No managed runtime
                 // creates owned sockets yet; admission is added with its owner.
@@ -432,8 +457,14 @@ impl BoundDir {
                         libc::unlinkat(self.fd(), name.as_ptr(), libc::AT_REMOVEDIR)
                     })?;
                 }
-                RemovalEntry::Leaf(name, expected) => {
-                    self.verify_entry(&name, &expected)?;
+                RemovalEntry::Leaf {
+                    name,
+                    expected,
+                    writable,
+                } => {
+                    // Earlier unlinks of the same inode change nlink. The name,
+                    // inode, mode and mount binding still prove which leaf is removed.
+                    self.verify_named_entry(&name, &expected, !writable)?;
                     checked(unsafe { libc::unlinkat(self.fd(), name.as_ptr(), 0) })?;
                 }
             }
@@ -454,7 +485,11 @@ enum RemovalPolicy {
 #[cfg(test)]
 enum RemovalEntry {
     Directory(CString, BoundDir, Vec<RemovalEntry>),
-    Leaf(CString, Box<libc::statx>),
+    Leaf {
+        name: CString,
+        expected: Box<libc::statx>,
+        writable: bool,
+    },
 }
 
 #[cfg(test)]

@@ -17,7 +17,7 @@ mod docker_paths;
 mod error;
 mod filesystem;
 mod journal;
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", test))]
 mod linux;
 
 #[cfg(test)]

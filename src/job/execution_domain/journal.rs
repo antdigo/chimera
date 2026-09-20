@@ -1,9 +1,5 @@
-use std::fs;
-#[cfg(not(target_os = "linux"))]
-use std::fs::{File, OpenOptions};
-#[cfg(not(target_os = "linux"))]
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
-#[cfg(not(target_os = "linux"))]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
@@ -11,18 +7,15 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::ExecutionDomainError;
-use super::filesystem::io_error;
-#[cfg(not(target_os = "linux"))]
-use super::filesystem::{DirectoryIdentity, directory_identity, validate_bound_directory};
-#[cfg(target_os = "linux")]
+use super::filesystem::{
+    DirectoryIdentity, directory_identity, io_error, validate_bound_directory,
+};
+#[cfg(all(target_os = "linux", test))]
 use super::linux::dirfd::BoundDir;
 
 const JOURNAL_VERSION: u32 = 1;
 const JOURNAL_FILE: &str = "journal.json";
-#[cfg(not(target_os = "linux"))]
 const NEXT_JOURNAL_FILE: &str = "journal.json.next";
-#[cfg(target_os = "linux")]
-const MAX_JOURNAL_BYTES: usize = 4096;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -45,12 +38,16 @@ struct JournalRecord {
 }
 
 #[derive(Debug)]
+enum JournalDirectory {
+    Trusted(DirectoryIdentity),
+    #[cfg(all(target_os = "linux", test))]
+    Strict(BoundDir),
+}
+
+#[derive(Debug)]
 pub(super) struct DomainLifecycle {
     attempt_dir: PathBuf,
-    #[cfg(not(target_os = "linux"))]
-    attempt_identity: DirectoryIdentity,
-    #[cfg(target_os = "linux")]
-    directory: BoundDir,
+    directory: JournalDirectory,
     attempt_id: Uuid,
     state: DomainState,
 }
@@ -62,18 +59,49 @@ impl DomainLifecycle {
     ) -> Result<Self, ExecutionDomainError> {
         let lifecycle = Self::bind(attempt_dir, attempt_id, DomainState::Provisioning)?;
         lifecycle.refuse_next()?;
-        #[cfg(target_os = "linux")]
-        lifecycle.directory.write_new(
-            c"journal.json",
-            &lifecycle.record_bytes(DomainState::Provisioning)?,
-        )?;
-        #[cfg(not(target_os = "linux"))]
-        {
-            let path = lifecycle.attempt_dir.join(JOURNAL_FILE);
-            let mut file = new_journal(&path)?;
-            lifecycle.write_record(&mut file, &path, DomainState::Provisioning)?;
-            lifecycle.sync_directory()?;
+        let path = lifecycle.attempt_dir.join(JOURNAL_FILE);
+        let mut file = new_journal(&path)?;
+        lifecycle.write_record(&mut file, &path, DomainState::Provisioning)?;
+        lifecycle.sync_directory()?;
+        Ok(lifecycle)
+    }
+
+    // Task 9 must select this storage for real sandbox domains before activation.
+    // Today's production lifecycle is exclusively trusted-host on every platform.
+    #[cfg(all(target_os = "linux", test))]
+    pub(super) fn create_strict(
+        attempt_dir: &Path,
+        attempt_id: Uuid,
+    ) -> Result<Self, ExecutionDomainError> {
+        let directory = BoundDir::open_root(attempt_dir)?;
+        let lifecycle = Self {
+            attempt_dir: attempt_dir.to_owned(),
+            directory: JournalDirectory::Strict(directory),
+            attempt_id,
+            state: DomainState::Provisioning,
+        };
+        lifecycle.refuse_next()?;
+        if let JournalDirectory::Strict(directory) = &lifecycle.directory {
+            directory.write_new(
+                c"journal.json",
+                &lifecycle.record_bytes(DomainState::Provisioning)?,
+            )?;
         }
+        Ok(lifecycle)
+    }
+
+    #[cfg(all(target_os = "linux", test))]
+    pub(super) fn load_strict(attempt_dir: &Path) -> Result<Self, ExecutionDomainError> {
+        let mut lifecycle = Self {
+            attempt_dir: attempt_dir.to_owned(),
+            directory: JournalDirectory::Strict(BoundDir::open_root(attempt_dir)?),
+            attempt_id: Uuid::nil(),
+            state: DomainState::Provisioning,
+        };
+        lifecycle.refuse_next()?;
+        let record = lifecycle.read_record()?;
+        lifecycle.attempt_id = record.attempt_id;
+        lifecycle.state = record.state;
         Ok(lifecycle)
     }
 
@@ -99,22 +127,13 @@ impl DomainLifecycle {
                 path: attempt_dir.to_owned(),
             });
         }
-        #[cfg(not(target_os = "linux"))]
         let attempt_dir = fs::canonicalize(attempt_dir)
             .map_err(|source| io_error("canonicalizing journal directory", attempt_dir, source))?;
-        #[cfg(target_os = "linux")]
-        let attempt_dir = attempt_dir.to_owned();
-        #[cfg(not(target_os = "linux"))]
         let attempt_identity =
             directory_identity(&attempt_dir, "reading journal directory identity")?;
-        #[cfg(target_os = "linux")]
-        let directory = BoundDir::open_root(&attempt_dir)?;
         Ok(Self {
             attempt_dir,
-            #[cfg(not(target_os = "linux"))]
-            attempt_identity,
-            #[cfg(target_os = "linux")]
-            directory,
+            directory: JournalDirectory::Trusted(attempt_identity),
             attempt_id,
             state,
         })
@@ -139,19 +158,7 @@ impl DomainLifecycle {
                 path: self.attempt_dir.join(JOURNAL_FILE),
             });
         }
-        #[cfg(target_os = "linux")]
-        self.directory
-            .write_atomic(c"journal.json", &self.record_bytes(to)?)?;
-        #[cfg(not(target_os = "linux"))]
-        {
-            let next = self.attempt_dir.join(NEXT_JOURNAL_FILE);
-            let mut file = new_journal(&next)?;
-            self.write_record(&mut file, &next, to)?;
-            let journal = self.attempt_dir.join(JOURNAL_FILE);
-            fs::rename(&next, &journal)
-                .map_err(|source| io_error("replacing lifecycle journal", &journal, source))?;
-            self.sync_directory()?;
-        }
+        self.write_next(to)?;
         self.state = to;
         Ok(())
     }
@@ -168,65 +175,38 @@ impl DomainLifecycle {
     }
 
     fn validate_directory(&self) -> Result<(), ExecutionDomainError> {
-        #[cfg(target_os = "linux")]
-        {
-            self.directory.verify_binding()
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            let metadata = fs::symlink_metadata(&self.attempt_dir).map_err(|source| {
-                io_error("reading journal directory", &self.attempt_dir, source)
-            })?;
-            validate_bound_directory(&self.attempt_dir, self.attempt_identity, &metadata)
+        match &self.directory {
+            JournalDirectory::Trusted(identity) => {
+                let metadata = fs::symlink_metadata(&self.attempt_dir).map_err(|source| {
+                    io_error("reading journal directory", &self.attempt_dir, source)
+                })?;
+                validate_bound_directory(&self.attempt_dir, *identity, &metadata)
+            }
+            #[cfg(all(target_os = "linux", test))]
+            JournalDirectory::Strict(directory) => directory.verify_binding(),
         }
     }
 
     fn refuse_next(&self) -> Result<(), ExecutionDomainError> {
-        #[cfg(target_os = "linux")]
-        {
-            self.directory.refuse_entry(c"journal.json.next")
+        #[cfg(all(target_os = "linux", test))]
+        if let JournalDirectory::Strict(directory) = &self.directory {
+            return directory.refuse_entry(c"journal.json.next");
         }
-        #[cfg(not(target_os = "linux"))]
-        {
-            let path = self.attempt_dir.join(NEXT_JOURNAL_FILE);
-            match fs::symlink_metadata(&path) {
-                Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(()),
-                Err(source) => Err(io_error(
-                    "checking pending lifecycle journal",
-                    &path,
-                    source,
-                )),
-                Ok(_) => Err(ExecutionDomainError::UnsafeEntry { path }),
-            }
+        let path = self.attempt_dir.join(NEXT_JOURNAL_FILE);
+        match fs::symlink_metadata(&path) {
+            Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(source) => Err(io_error(
+                "checking pending lifecycle journal",
+                &path,
+                source,
+            )),
+            Ok(_) => Err(ExecutionDomainError::UnsafeEntry { path }),
         }
     }
 
     fn read_record(&self) -> Result<JournalRecord, ExecutionDomainError> {
         let path = self.attempt_dir.join(JOURNAL_FILE);
-        #[cfg(target_os = "linux")]
-        let bytes = self
-            .directory
-            .read_regular(c"journal.json", MAX_JOURNAL_BYTES)?;
-        #[cfg(not(target_os = "linux"))]
-        let bytes = {
-            // NONBLOCK also makes special-file replacement fail without hanging on a FIFO.
-            let mut file = OpenOptions::new()
-                .read(true)
-                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
-                .open(&path)
-                .map_err(|source| io_error("opening lifecycle journal", &path, source))?;
-            if !file
-                .metadata()
-                .map_err(|source| io_error("reading lifecycle journal metadata", &path, source))?
-                .is_file()
-            {
-                return Err(ExecutionDomainError::UnsafeEntry { path });
-            }
-            let mut bytes = Vec::new();
-            file.read_to_end(&mut bytes)
-                .map_err(|source| io_error("reading lifecycle journal", &path, source))?;
-            bytes
-        };
+        let bytes = self.read_bytes(&path)?;
         let record: JournalRecord =
             serde_json::from_slice(&bytes).map_err(|source| invalid_journal(&path, source))?;
         if record.version != JOURNAL_VERSION {
@@ -238,7 +218,47 @@ impl DomainLifecycle {
         Ok(record)
     }
 
-    #[cfg(target_os = "linux")]
+    fn read_bytes(&self, path: &Path) -> Result<Vec<u8>, ExecutionDomainError> {
+        #[cfg(all(target_os = "linux", test))]
+        if let JournalDirectory::Strict(directory) = &self.directory {
+            return directory.read_regular(c"journal.json", 4096);
+        }
+        // NONBLOCK also makes special-file replacement fail without hanging on a FIFO.
+        let mut file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+            .open(path)
+            .map_err(|source| io_error("opening lifecycle journal", path, source))?;
+        if !file
+            .metadata()
+            .map_err(|source| io_error("reading lifecycle journal metadata", path, source))?
+            .is_file()
+        {
+            return Err(ExecutionDomainError::UnsafeEntry {
+                path: path.to_owned(),
+            });
+        }
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)
+            .map_err(|source| io_error("reading lifecycle journal", path, source))?;
+        Ok(bytes)
+    }
+
+    fn write_next(&self, state: DomainState) -> Result<(), ExecutionDomainError> {
+        #[cfg(all(target_os = "linux", test))]
+        if let JournalDirectory::Strict(directory) = &self.directory {
+            return directory.write_atomic(c"journal.json", &self.record_bytes(state)?);
+        }
+        let next = self.attempt_dir.join(NEXT_JOURNAL_FILE);
+        let mut file = new_journal(&next)?;
+        self.write_record(&mut file, &next, state)?;
+        let journal = self.attempt_dir.join(JOURNAL_FILE);
+        fs::rename(&next, &journal)
+            .map_err(|source| io_error("replacing lifecycle journal", &journal, source))?;
+        self.sync_directory()
+    }
+
+    #[cfg(all(target_os = "linux", test))]
     fn record_bytes(&self, state: DomainState) -> Result<Vec<u8>, ExecutionDomainError> {
         serde_json::to_vec(&JournalRecord {
             version: JOURNAL_VERSION,
@@ -248,7 +268,6 @@ impl DomainLifecycle {
         .map_err(|source| invalid_journal(&self.attempt_dir.join(JOURNAL_FILE), source))
     }
 
-    #[cfg(not(target_os = "linux"))]
     fn write_record(
         &self,
         file: &mut File,
@@ -267,7 +286,6 @@ impl DomainLifecycle {
             .map_err(|source| io_error("syncing lifecycle journal", path, source))
     }
 
-    #[cfg(not(target_os = "linux"))]
     fn sync_directory(&self) -> Result<(), ExecutionDomainError> {
         let dir = OpenOptions::new()
             .read(true)
@@ -279,7 +297,6 @@ impl DomainLifecycle {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
 fn new_journal(path: &Path) -> Result<File, ExecutionDomainError> {
     let file = OpenOptions::new()
         .write(true)

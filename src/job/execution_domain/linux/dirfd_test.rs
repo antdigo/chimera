@@ -3,6 +3,7 @@ use std::fs;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::os::unix::net::UnixListener;
 
+use super::super::{ExecutionDomainError, FailureCategory};
 use super::dirfd::{BoundDir, SyncKind};
 
 struct Fixture {
@@ -31,6 +32,95 @@ impl Fixture {
     fn assert_canary(&self) {
         assert_eq!(fs::read(self.canary()).unwrap(), b"keep");
     }
+}
+
+#[test]
+fn post_read_changes_poison_the_shared_root_before_returning() {
+    for mutation in ["grow", "shrink", "time", "hardlink", "disappear", "replace"] {
+        let fixture = Fixture::new();
+        let work = fixture.root.create_child(c"work", 0o700).unwrap();
+        fs::write(fixture.path("work/state"), b"safe").unwrap();
+        let result = work.read_regular_with(c"state", 4, |reader, bytes| {
+            let count = reader.read_to_end(bytes)?;
+            match mutation {
+                "grow" => fs::write(fixture.path("work/state"), b"grew!").unwrap(),
+                "shrink" => fs::write(fixture.path("work/state"), b"s").unwrap(),
+                "time" => fs::File::open(fixture.path("work/state"))
+                    .unwrap()
+                    .set_modified(std::time::SystemTime::UNIX_EPOCH)
+                    .unwrap(),
+                "hardlink" => {
+                    fs::hard_link(fixture.path("work/state"), fixture.path("other-link")).unwrap()
+                }
+                "disappear" => fs::remove_file(fixture.path("work/state")).unwrap(),
+                _ => {
+                    fs::rename(fixture.path("work/state"), fixture.path("saved")).unwrap();
+                    fs::write(fixture.path("work/state"), b"safe").unwrap();
+                }
+            }
+            Ok(count)
+        });
+
+        assert!(result.is_err(), "{mutation}");
+        assert!(
+            matches!(
+                fixture.root.verify_binding(),
+                Err(ExecutionDomainError::PoisonedRoot { .. })
+            ),
+            "{mutation}"
+        );
+        assert!(
+            matches!(
+                fixture.root.write_atomic(c"after", b"no"),
+                Err(ExecutionDomainError::PoisonedRoot { .. })
+            ),
+            "{mutation}"
+        );
+        assert!(!fixture.path("after").exists());
+        fixture.assert_canary();
+    }
+}
+
+#[test]
+fn invalid_input_does_not_poison_an_otherwise_healthy_root() {
+    let fixture = Fixture::new();
+    let error = fixture.root.write_atomic(c"../outside", b"no").unwrap_err();
+    assert!(matches!(
+        error,
+        ExecutionDomainError::Backend {
+            category: FailureCategory::InvalidInput,
+            ..
+        }
+    ));
+    fixture.root.verify_binding().unwrap();
+    assert!(fixture.root.read_regular(c"absent", 10).is_err());
+    fixture.root.verify_binding().unwrap();
+    fixture.root.write_atomic(c"allowed", b"yes").unwrap();
+    fixture.assert_canary();
+}
+
+#[test]
+fn removal_unlinks_multiple_writable_hardlinks_without_changing_outside_bytes() {
+    let fixture = Fixture::new();
+    let attempt = fixture.root.create_child(c"attempt", 0o700).unwrap();
+    attempt.create_child(c"work", 0o700).unwrap();
+    fs::hard_link(fixture.canary(), fixture.path("attempt/work/first")).unwrap();
+    fs::hard_link(fixture.canary(), fixture.path("attempt/work/second")).unwrap();
+
+    fixture.root.remove_tree(c"attempt").unwrap();
+    assert!(!fixture.path("attempt").exists());
+    fixture.assert_canary();
+}
+
+#[test]
+fn removal_still_refuses_hardlinked_control_metadata() {
+    let fixture = Fixture::new();
+    fixture.root.create_child(c"attempt", 0o700).unwrap();
+    fs::hard_link(fixture.canary(), fixture.path("attempt/journal.json")).unwrap();
+
+    assert!(fixture.root.remove_tree(c"attempt").is_err());
+    assert!(fixture.path("attempt/journal.json").exists());
+    fixture.assert_canary();
 }
 
 #[test]
