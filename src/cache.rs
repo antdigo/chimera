@@ -6,3 +6,6 @@ pub mod manager;
 pub mod server;
 pub mod store;
 pub mod upload;
+
+#[cfg(test)]
+mod test_support;

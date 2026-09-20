@@ -10,7 +10,7 @@ use super::auth::CapabilityId;
 use super::entry::{CacheEntry, EntryIndex, load_entries_from_disk};
 use super::error::CacheError;
 use super::store::BlobStore;
-use super::upload::UploadTracker;
+use super::upload::{LockedUpload, UploadTracker};
 
 pub struct CacheStats {
     pub hits: AtomicU64,
@@ -34,6 +34,8 @@ pub struct CacheManager {
     max_bytes: u64,
     pub stats: CacheStats,
     entries_dir: PathBuf,
+    #[cfg(test)]
+    before_entry_publish: super::test_support::PausePoint,
 }
 
 impl CacheManager {
@@ -97,6 +99,8 @@ impl CacheManager {
             max_bytes,
             stats: CacheStats::new(),
             entries_dir,
+            #[cfg(test)]
+            before_entry_publish: Default::default(),
         };
 
         // Run initial eviction in case max_gb was lowered
@@ -165,6 +169,19 @@ impl CacheManager {
         self.uploads.write_chunk(owner, id, offset, data).await
     }
 
+    pub(crate) async fn lock_upload(&self, owner: &CapabilityId, id: u64) -> Result<LockedUpload> {
+        self.uploads.lock(owner, id).await
+    }
+
+    pub(crate) async fn write_chunk_locked(
+        &self,
+        locked: LockedUpload,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<()> {
+        self.uploads.write_chunk_locked(locked, offset, data).await
+    }
+
     /// Commit an upload: finalize the blob and create a cache entry.
     pub async fn commit_upload(
         &self,
@@ -172,8 +189,17 @@ impl CacheManager {
         id: u64,
         expected_size: u64,
     ) -> Result<()> {
+        let locked = self.uploads.lock(owner, id).await?;
+        self.commit_upload_locked(locked, expected_size).await
+    }
+
+    pub(crate) async fn commit_upload_locked(
+        &self,
+        locked: LockedUpload,
+        expected_size: u64,
+    ) -> Result<()> {
         let (key, version, scope_repo, scope_ref, tmp_path, size) =
-            self.uploads.commit(owner, id, expected_size).await?;
+            self.uploads.commit_locked(locked, expected_size).await?;
 
         let hash = self
             .store
@@ -197,6 +223,9 @@ impl CacheManager {
             last_accessed_at: Utc::now(),
         };
 
+        #[cfg(test)]
+        self.before_entry_publish.wait().await;
+
         entry
             .persist(&self.entries_dir)
             .context("persisting entry")?;
@@ -216,6 +245,23 @@ impl CacheManager {
         self.evict().await;
 
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn arm_before_upload_write(&self) -> std::sync::Arc<super::test_support::Pause> {
+        self.uploads.before_write.arm()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn arm_before_upload_session_wait(
+        &self,
+    ) -> std::sync::Arc<super::test_support::Pause> {
+        self.uploads.before_session_wait.arm()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn arm_before_entry_publish(&self) -> std::sync::Arc<super::test_support::Pause> {
+        self.before_entry_publish.arm()
     }
 
     /// Get the filesystem path for a blob.

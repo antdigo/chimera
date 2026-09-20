@@ -1,9 +1,9 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
 use chrono::{DateTime, Duration, Utc};
 use thiserror::Error;
-use tokio::sync::RwLock;
+use tokio::sync::{OwnedRwLockReadGuard, RwLock};
 use uuid::Uuid;
 
 pub const JOB_CAPABILITY_LIFETIME: Duration = Duration::minutes(6 * 60 + 10);
@@ -35,6 +35,7 @@ pub struct AuthorizedJob {
     capability_id: CapabilityId,
     claims: JobCapabilityClaims,
     expires_at: DateTime<Utc>,
+    operation_gate: Arc<RwLock<()>>,
 }
 
 impl AuthorizedJob {
@@ -73,6 +74,7 @@ struct JobCapability {
     claims: JobCapabilityClaims,
     expires_at: DateTime<Utc>,
     revoked: bool,
+    operation_gate: Arc<RwLock<()>>,
 }
 
 struct DownloadGrant {
@@ -101,7 +103,10 @@ impl AuthorityState {
 pub struct CacheAuthority {
     state: RwLock<AuthorityState>,
     revoked: Mutex<HashSet<CapabilityId>>,
+    operation_gates: Mutex<HashMap<CapabilityId, Weak<RwLock<()>>>>,
     now: Arc<dyn Fn() -> DateTime<Utc> + Send + Sync>,
+    #[cfg(test)]
+    pub(crate) before_download_start: super::test_support::PausePoint,
 }
 
 impl Default for CacheAuthority {
@@ -115,7 +120,10 @@ impl CacheAuthority {
         Self {
             state: RwLock::new(AuthorityState::default()),
             revoked: Mutex::new(HashSet::new()),
+            operation_gates: Mutex::new(HashMap::new()),
             now: Arc::new(Utc::now),
+            #[cfg(test)]
+            before_download_start: Default::default(),
         }
     }
 
@@ -124,7 +132,9 @@ impl CacheAuthority {
         Self {
             state: RwLock::new(AuthorityState::default()),
             revoked: Mutex::new(HashSet::new()),
+            operation_gates: Mutex::new(HashMap::new()),
             now,
+            before_download_start: Default::default(),
         }
     }
 
@@ -140,6 +150,12 @@ impl CacheAuthority {
 
     fn is_revoked(&self, id: &CapabilityId) -> bool {
         self.revoked().contains(id)
+    }
+
+    fn operation_gates(&self) -> MutexGuard<'_, HashMap<CapabilityId, Weak<RwLock<()>>>> {
+        self.operation_gates
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// Invalidate a capability synchronously so a lifecycle guard can revoke
@@ -169,13 +185,19 @@ impl CacheAuthority {
             return Err(CacheAuthError::DuplicateToken);
         }
 
+        let operation_gate = Arc::new(RwLock::new(()));
         revoked.remove(&id);
+        let mut operation_gates = self.operation_gates();
+        operation_gates.retain(|_, gate| gate.strong_count() > 0);
+        operation_gates.insert(id.clone(), Arc::downgrade(&operation_gate));
+        drop(operation_gates);
         state.jobs.insert(
             id.clone(),
             JobCapability {
                 claims,
                 expires_at: issued_at + JOB_CAPABILITY_LIFETIME,
                 revoked: false,
+                operation_gate,
             },
         );
         Ok(id)
@@ -209,16 +231,47 @@ impl CacheAuthority {
             capability_id: id,
             claims: capability.claims.clone(),
             expires_at: capability.expires_at.to_owned(),
+            operation_gate: capability.operation_gate.clone(),
         })
     }
 
     pub async fn revoke(&self, id: &CapabilityId) {
-        let mut state = self.state.write().await;
+        let operation_gate = self.operation_gates().get(id).and_then(Weak::upgrade);
         self.revoke_immediately(id);
+
+        let _exclusive = match operation_gate {
+            Some(operation_gate) => Some(operation_gate.write_owned().await),
+            None => None,
+        };
+
+        let mut state = self.state.write().await;
         if let Some(capability) = state.jobs.get_mut(id) {
             capability.revoked = true;
         }
         state.downloads.retain(|_, grant| &grant.parent != id);
+        self.operation_gates().remove(id);
+    }
+
+    pub(crate) async fn admit(
+        &self,
+        job: &AuthorizedJob,
+    ) -> Result<CacheOperationPermit, CacheAuthError> {
+        let guard = job.operation_gate.clone().read_owned().await;
+        let state = self.state.read().await;
+        let now = self.now();
+        let capability = state
+            .jobs
+            .get(job.capability_id())
+            .ok_or(CacheAuthError::Unauthorized)?;
+        if capability.revoked
+            || self.is_revoked(job.capability_id())
+            || capability.expires_at <= now
+            || !Arc::ptr_eq(&capability.operation_gate, &job.operation_gate)
+        {
+            return Err(CacheAuthError::Unauthorized);
+        }
+
+        Ok(CacheOperationPermit { _guard: guard })
     }
 
     pub async fn issue_download(
@@ -234,6 +287,9 @@ impl CacheAuthority {
             .jobs
             .get(job.capability_id())
             .ok_or(CacheAuthError::Unauthorized)?;
+        if !Arc::ptr_eq(&parent.operation_gate, &job.operation_gate) {
+            return Err(CacheAuthError::Unauthorized);
+        }
         let expires_at = parent.expires_at.to_owned();
         let grant = Uuid::new_v4();
         state.downloads.insert(
@@ -265,6 +321,63 @@ impl CacheAuthority {
         }
 
         Ok(blob_hash)
+    }
+
+    pub(crate) async fn authorize_download_start(
+        &self,
+        grant: Uuid,
+    ) -> Result<AuthorizedDownload, CacheAuthError> {
+        let operation_gate = {
+            let state = self.state.read().await;
+            let download = state
+                .downloads
+                .get(&grant)
+                .ok_or(CacheAuthError::DownloadNotFound)?;
+            state
+                .jobs
+                .get(&download.parent)
+                .map(|capability| capability.operation_gate.clone())
+                .ok_or(CacheAuthError::DownloadNotFound)?
+        };
+        let guard = operation_gate.clone().read_owned().await;
+        let state = self.state.read().await;
+        let now = self.now();
+        let download = state
+            .downloads
+            .get(&grant)
+            .ok_or(CacheAuthError::DownloadNotFound)?;
+        let parent = state
+            .jobs
+            .get(&download.parent)
+            .ok_or(CacheAuthError::DownloadNotFound)?;
+        if download.expires_at <= now
+            || parent.revoked
+            || self.is_revoked(&download.parent)
+            || parent.expires_at <= now
+            || !Arc::ptr_eq(&parent.operation_gate, &operation_gate)
+        {
+            return Err(CacheAuthError::DownloadNotFound);
+        }
+
+        Ok(AuthorizedDownload {
+            blob_hash: download.blob_hash.clone(),
+            _guard: guard,
+        })
+    }
+}
+
+pub(crate) struct CacheOperationPermit {
+    _guard: OwnedRwLockReadGuard<()>,
+}
+
+pub(crate) struct AuthorizedDownload {
+    blob_hash: String,
+    _guard: OwnedRwLockReadGuard<()>,
+}
+
+impl AuthorizedDownload {
+    pub(crate) fn blob_hash(&self) -> &str {
+        &self.blob_hash
     }
 }
 

@@ -4,7 +4,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use axum::Router;
 use axum::body::Body;
-use axum::extract::rejection::PathRejection;
+use axum::extract::rejection::{JsonRejection, PathRejection};
 use axum::extract::{DefaultBodyLimit, FromRequestParts, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, Uri, header::AUTHORIZATION, request::Parts};
 use axum::response::{IntoResponse, Response};
@@ -279,8 +279,12 @@ async fn handle_reserve(
     AuthorizedCacheRequest(authorized): AuthorizedCacheRequest,
     State(state): State<CacheServerState>,
     Path((_scope_repo, _scope_ref, _default_ref)): Path<(String, String, String)>,
-    axum::Json(body): axum::Json<ReserveBody>,
+    body: Result<axum::Json<ReserveBody>, JsonRejection>,
 ) -> Response {
+    let axum::Json(body) = match body {
+        Ok(body) => body,
+        Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+    };
     let scope = authorized.scope();
 
     info!(
@@ -291,7 +295,11 @@ async fn handle_reserve(
         "cache reserve"
     );
 
-    match state
+    let permit = match state.authority.admit(&authorized).await {
+        Ok(permit) => permit,
+        Err(_) => return StatusCode::UNAUTHORIZED.into_response(),
+    };
+    let result = state
         .manager
         .reserve_upload(
             authorized.capability_id().clone(),
@@ -301,8 +309,9 @@ async fn handle_reserve(
             scope.repo.clone(),
             scope.git_ref.clone(),
         )
-        .await
-    {
+        .await;
+    drop(permit);
+    match result {
         Ok(id) => {
             let resp = ReserveResponse { cache_id: id };
             (StatusCode::OK, axum::Json(resp)).into_response()
@@ -346,11 +355,24 @@ async fn handle_upload_chunk(
         "cache upload chunk"
     );
 
-    match state
+    let locked = state
         .manager
-        .write_chunk(authorized.capability_id(), id, start, &body)
-        .await
-    {
+        .lock_upload(authorized.capability_id(), id)
+        .await;
+    let permit = match state.authority.admit(&authorized).await {
+        Ok(permit) => permit,
+        Err(_) => return StatusCode::UNAUTHORIZED.into_response(),
+    };
+    let locked = match locked {
+        Ok(locked) => locked,
+        Err(e) => {
+            debug!(error = %e, id, "upload chunk failed");
+            return StatusCode::NOT_FOUND.into_response();
+        }
+    };
+    let result = state.manager.write_chunk_locked(locked, start, &body).await;
+    drop(permit);
+    match result {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => {
             debug!(error = %e, id, "upload chunk failed");
@@ -363,8 +385,12 @@ async fn handle_commit(
     AuthorizedCacheRequest(authorized): AuthorizedCacheRequest,
     State(state): State<CacheServerState>,
     Path((_scope_repo, _scope_ref, _default_ref, id)): Path<(String, String, String, u64)>,
-    axum::Json(body): axum::Json<CommitBody>,
+    body: Result<axum::Json<CommitBody>, JsonRejection>,
 ) -> Response {
+    let axum::Json(body) = match body {
+        Ok(body) => body,
+        Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+    };
     let scope = authorized.scope();
 
     info!(
@@ -375,11 +401,24 @@ async fn handle_commit(
         "cache commit"
     );
 
-    match state
+    let locked = state
         .manager
-        .commit_upload(authorized.capability_id(), id, body.size)
-        .await
-    {
+        .lock_upload(authorized.capability_id(), id)
+        .await;
+    let permit = match state.authority.admit(&authorized).await {
+        Ok(permit) => permit,
+        Err(_) => return StatusCode::UNAUTHORIZED.into_response(),
+    };
+    let locked = match locked {
+        Ok(locked) => locked,
+        Err(e) => {
+            debug!(error = %e, id, "commit failed");
+            return StatusCode::NOT_FOUND.into_response();
+        }
+    };
+    let result = state.manager.commit_upload_locked(locked, body.size).await;
+    drop(permit);
+    match result {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => {
             debug!(error = %e, id, "commit failed");
@@ -423,22 +462,32 @@ async fn handle_download(
     };
     let content_length = metadata.len().to_string();
 
-    match tokio::fs::File::open(&blob_path).await {
-        Ok(file) => {
-            let stream = tokio_util::io::ReaderStream::new(file);
-            let body = Body::from_stream(stream);
-            (
-                StatusCode::OK,
-                [
-                    (axum::http::header::CONTENT_TYPE, "application/octet-stream"),
-                    (axum::http::header::CONTENT_LENGTH, content_length.as_str()),
-                ],
-                body,
-            )
-                .into_response()
-        }
-        Err(_) => StatusCode::NOT_FOUND.into_response(),
-    }
+    let file = match tokio::fs::File::open(&blob_path).await {
+        Ok(file) => file,
+        Err(_) => return StatusCode::NOT_FOUND.into_response(),
+    };
+
+    #[cfg(test)]
+    state.authority.before_download_start.wait().await;
+
+    let authorized_download = match state.authority.authorize_download_start(grant).await {
+        Ok(authorized_download) if authorized_download.blob_hash() == hash => authorized_download,
+        Ok(_) | Err(_) => return StatusCode::NOT_FOUND.into_response(),
+    };
+
+    let stream = tokio_util::io::ReaderStream::new(file);
+    let body = Body::from_stream(stream);
+    let response = (
+        StatusCode::OK,
+        [
+            (axum::http::header::CONTENT_TYPE, "application/octet-stream"),
+            (axum::http::header::CONTENT_LENGTH, content_length.as_str()),
+        ],
+        body,
+    )
+        .into_response();
+    drop(authorized_download);
+    response
 }
 
 async fn handle_unknown(uri: Uri) -> Response {

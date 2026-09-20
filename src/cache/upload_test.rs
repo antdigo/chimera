@@ -14,6 +14,94 @@ fn make_tracker(tmp: &TempDir) -> UploadTracker {
 }
 
 #[tokio::test]
+async fn stalled_upload_does_not_block_an_independent_session() {
+    let tmp = TempDir::new().unwrap();
+    let tracker = std::sync::Arc::new(make_tracker(&tmp));
+    let owner = owner("parallel-owner");
+    let a = tracker
+        .reserve(
+            owner.clone(),
+            "job".into(),
+            "a".into(),
+            "v".into(),
+            "repo".into(),
+            "ref".into(),
+        )
+        .await
+        .unwrap();
+    let pause = tracker.before_write.arm();
+    let writer = {
+        let tracker = tracker.clone();
+        let owner = owner.clone();
+        tokio::spawn(async move { tracker.write_chunk(&owner, a, 0, b"first").await })
+    };
+    pause.reached.notified().await;
+
+    let independent = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        let b = tracker
+            .reserve(
+                owner.clone(),
+                "job".into(),
+                "b".into(),
+                "v".into(),
+                "repo".into(),
+                "ref".into(),
+            )
+            .await
+            .unwrap();
+        tracker.write_chunk(&owner, b, 0, b"second").await.unwrap();
+        let (_, _, _, _, path, size) = tracker.commit(&owner, b, 6).await.unwrap();
+        assert_eq!(size, 6);
+        assert_eq!(tokio::fs::read(path).await.unwrap(), b"second");
+    })
+    .await;
+    pause.resume.notify_one();
+    writer.await.unwrap().unwrap();
+    assert!(
+        independent.is_ok(),
+        "session A's stalled file write blocked session B"
+    );
+}
+
+#[tokio::test]
+async fn commit_waits_for_write_and_consumes_before_queued_late_write() {
+    let tmp = TempDir::new().unwrap();
+    let tracker = make_tracker(&tmp);
+    let owner = owner("ordered-owner");
+    let id = tracker
+        .reserve(
+            owner.clone(),
+            "job".into(),
+            "key".into(),
+            "v".into(),
+            "repo".into(),
+            "ref".into(),
+        )
+        .await
+        .unwrap();
+    let pause = tracker.before_write.arm();
+    let write = tracker.write_chunk(&owner, id, 0, b"first");
+    tokio::pin!(write);
+    assert!(futures::poll!(&mut write).is_pending());
+    pause.reached.notified().await;
+    let commit = tracker.commit(&owner, id, 5);
+    tokio::pin!(commit);
+    assert!(futures::poll!(&mut commit).is_pending());
+    let late = tracker.write_chunk(&owner, id, 0, b"wrong");
+    tokio::pin!(late);
+    assert!(futures::poll!(&mut late).is_pending());
+    pause.resume.notify_one();
+    write.await.unwrap();
+    let (_, _, _, _, path, _) = commit.await.unwrap();
+    let error = late.await.unwrap_err();
+    assert!(matches!(
+        error.downcast_ref::<CacheError>(),
+        Some(CacheError::UploadNotFound(_))
+    ));
+    assert_eq!(tokio::fs::read(path).await.unwrap(), b"first");
+}
+
+#[tokio::test]
 async fn reserve_and_commit() {
     let tmp = TempDir::new().unwrap();
     let tracker = make_tracker(&tmp);

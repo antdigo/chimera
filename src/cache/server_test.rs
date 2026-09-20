@@ -1,8 +1,9 @@
-use std::sync::Arc;
+use std::convert::Infallible;
+use std::sync::{Arc, Mutex};
 
 use axum::body::Bytes;
 use axum::http::{Request, StatusCode};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use tempfile::TempDir;
 use tower::ServiceExt;
 
@@ -11,12 +12,418 @@ use crate::cache::auth::{
     CacheAuthority, CacheScope, CapabilityId, JOB_CAPABILITY_LIFETIME, JobCapabilityClaims,
 };
 use crate::cache::manager::CacheManager;
+use crate::cache::test_support::Pause;
 
 const SCOPE_REPO: &str = "owner/repo";
 const SCOPE_REF: &str = "refs/heads/main";
 const DEFAULT_REF: &str = "refs/heads/main";
 const TOKEN_A: &str = "runtime-token-a";
 const TOKEN_B: &str = "runtime-token-b";
+
+#[derive(Clone, Copy)]
+enum Invalidation {
+    Revoke,
+    Expire,
+}
+
+impl Invalidation {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Revoke => "revoke",
+            Self::Expire => "expiry",
+        }
+    }
+}
+
+fn test_claims() -> JobCapabilityClaims {
+    JobCapabilityClaims {
+        scope: CacheScope {
+            repo: SCOPE_REPO.into(),
+            git_ref: SCOPE_REF.into(),
+            default_ref: DEFAULT_REF.into(),
+        },
+        job_id: "job-a".into(),
+    }
+}
+
+fn paused_body(bytes: &'static [u8]) -> (Body, Arc<Pause>) {
+    let pause = Arc::new(Pause::default());
+    let body_pause = pause.clone();
+    let stream = futures::stream::once(async move {
+        body_pause.reached.notify_one();
+        body_pause.resume.notified().await;
+        Ok::<Bytes, Infallible>(Bytes::from_static(bytes))
+    });
+    (Body::from_stream(stream), pause)
+}
+
+async fn make_clocked_test_app(
+    tmp: &TempDir,
+) -> (
+    Router,
+    SharedManager,
+    Arc<CacheAuthority>,
+    Arc<Mutex<DateTime<Utc>>>,
+    CapabilityId,
+) {
+    let manager = make_test_manager(tmp).await;
+    let started_at = Utc::now();
+    let clock_value = Arc::new(Mutex::new(started_at));
+    let clock_reader = clock_value.clone();
+    let authority = Arc::new(CacheAuthority::with_clock(Arc::new(move || {
+        *clock_reader.lock().unwrap()
+    })));
+    let capability_id = authority
+        .register_job(TOKEN_A, test_claims(), started_at)
+        .await
+        .unwrap();
+    (
+        router(manager.clone(), authority.clone()),
+        manager,
+        authority,
+        clock_value,
+        capability_id,
+    )
+}
+
+async fn invalidate(
+    invalidation: Invalidation,
+    authority: &CacheAuthority,
+    capability_id: &CapabilityId,
+    clock: &Mutex<DateTime<Utc>>,
+) {
+    match invalidation {
+        Invalidation::Revoke => authority.revoke(capability_id).await,
+        Invalidation::Expire => {
+            let mut now = clock.lock().unwrap();
+            *now = *now + JOB_CAPABILITY_LIFETIME + chrono::Duration::seconds(1);
+        }
+    }
+}
+
+async fn reactivate(authority: &CacheAuthority, clock: &Mutex<DateTime<Utc>>) {
+    let issued_at = *clock.lock().unwrap();
+    authority
+        .register_job(TOKEN_A, test_claims(), issued_at)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn invalid_json_is_bad_request_after_authentication() {
+    let tmp = TempDir::new().unwrap();
+    let (app, _, authority) = make_test_app(&tmp).await;
+    let prefix = scope_prefix(SCOPE_REPO, SCOPE_REF, DEFAULT_REF);
+    for suffix in ["", "/1"] {
+        for body in ["{", r#"{"key":42,"version":false,"size":"wrong"}"#] {
+            for token in [TOKEN_A, "unknown", ""] {
+                let request = bearer(
+                    Request::builder()
+                        .method("POST")
+                        .uri(format!("{prefix}/_apis/artifactcache/caches{suffix}"))
+                        .header("content-type", "application/json"),
+                    token,
+                )
+                .body(Body::from(body))
+                .unwrap();
+                let expected = if token == TOKEN_A {
+                    StatusCode::BAD_REQUEST
+                } else {
+                    StatusCode::UNAUTHORIZED
+                };
+                assert_eq!(
+                    app.clone().oneshot(request).await.unwrap().status(),
+                    expected
+                );
+            }
+        }
+    }
+    authority.revoke(&CapabilityId::from_token(TOKEN_A)).await;
+    let request = bearer(
+        Request::builder()
+            .method("POST")
+            .uri(format!("{prefix}/_apis/artifactcache/caches"))
+            .header("content-type", "application/json"),
+        TOKEN_A,
+    )
+    .body(Body::from("{"))
+    .unwrap();
+    assert_eq!(
+        app.oneshot(request).await.unwrap().status(),
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+#[tokio::test]
+async fn delayed_reserve_rechecks_revocation_and_expiry_before_mutation() {
+    for invalidation in [Invalidation::Revoke, Invalidation::Expire] {
+        let tmp = TempDir::new().unwrap();
+        let (app, _, authority, clock, capability_id) = make_clocked_test_app(&tmp).await;
+        let prefix = scope_prefix(SCOPE_REPO, SCOPE_REF, DEFAULT_REF);
+        let (body, pause) = paused_body(br#"{"key":"late","version":"v1"}"#);
+        let request = bearer(
+            Request::builder()
+                .method("POST")
+                .uri(format!("{prefix}/_apis/artifactcache/caches"))
+                .header("content-type", "application/json"),
+            TOKEN_A,
+        )
+        .body(body)
+        .unwrap();
+        let request_app = app.clone();
+        let response = tokio::spawn(async move { request_app.oneshot(request).await });
+        pause.reached.notified().await;
+
+        invalidate(invalidation, &authority, &capability_id, &clock).await;
+        pause.resume.notify_one();
+
+        assert_eq!(
+            response.await.unwrap().unwrap().status(),
+            StatusCode::UNAUTHORIZED,
+            "{} after reserve authentication",
+            invalidation.label(),
+        );
+        reactivate(&authority, &clock).await;
+        assert_eq!(reserve(&app, &prefix, TOKEN_A, "valid", "v1").await, 1);
+    }
+}
+
+#[tokio::test]
+async fn delayed_patch_rechecks_revocation_and_expiry_before_mutation() {
+    for invalidation in [Invalidation::Revoke, Invalidation::Expire] {
+        let tmp = TempDir::new().unwrap();
+        let (app, _, authority, clock, capability_id) = make_clocked_test_app(&tmp).await;
+        let prefix = scope_prefix(SCOPE_REPO, SCOPE_REF, DEFAULT_REF);
+        let cache_id = reserve(&app, &prefix, TOKEN_A, "late-patch", "v1").await;
+        let (body, pause) = paused_body(b"x");
+        let request = bearer(
+            Request::builder()
+                .method("PATCH")
+                .uri(format!("{prefix}/_apis/artifactcache/caches/{cache_id}"))
+                .header("content-range", "bytes 0-0/*"),
+            TOKEN_A,
+        )
+        .body(body)
+        .unwrap();
+        let request_app = app.clone();
+        let response = tokio::spawn(async move { request_app.oneshot(request).await });
+        pause.reached.notified().await;
+
+        invalidate(invalidation, &authority, &capability_id, &clock).await;
+        pause.resume.notify_one();
+
+        assert_eq!(
+            response.await.unwrap().unwrap().status(),
+            StatusCode::UNAUTHORIZED,
+            "{} after PATCH authentication",
+            invalidation.label(),
+        );
+        reactivate(&authority, &clock).await;
+        assert_eq!(
+            commit(&app, &prefix, TOKEN_A, cache_id, 0).await,
+            StatusCode::NO_CONTENT,
+            "{} allowed a delayed PATCH to mutate the session",
+            invalidation.label(),
+        );
+    }
+}
+
+#[tokio::test]
+async fn delayed_commit_rechecks_revocation_and_expiry_before_publication() {
+    for invalidation in [Invalidation::Revoke, Invalidation::Expire] {
+        let tmp = TempDir::new().unwrap();
+        let (app, manager, authority, clock, capability_id) = make_clocked_test_app(&tmp).await;
+        let prefix = scope_prefix(SCOPE_REPO, SCOPE_REF, DEFAULT_REF);
+        let cache_id = reserve(&app, &prefix, TOKEN_A, "late-commit", "v1").await;
+        assert_eq!(
+            upload(&app, &prefix, TOKEN_A, cache_id, b"x").await,
+            StatusCode::NO_CONTENT,
+        );
+        let (body, pause) = paused_body(br#"{"size":1}"#);
+        let request = bearer(
+            Request::builder()
+                .method("POST")
+                .uri(format!("{prefix}/_apis/artifactcache/caches/{cache_id}"))
+                .header("content-type", "application/json"),
+            TOKEN_A,
+        )
+        .body(body)
+        .unwrap();
+        let request_app = app.clone();
+        let response = tokio::spawn(async move { request_app.oneshot(request).await });
+        pause.reached.notified().await;
+
+        invalidate(invalidation, &authority, &capability_id, &clock).await;
+        pause.resume.notify_one();
+
+        assert_eq!(
+            response.await.unwrap().unwrap().status(),
+            StatusCode::UNAUTHORIZED,
+            "{} after commit authentication",
+            invalidation.label(),
+        );
+        assert!(
+            manager
+                .lookup(
+                    &["late-commit".into()],
+                    "v1",
+                    SCOPE_REPO,
+                    SCOPE_REF,
+                    DEFAULT_REF,
+                )
+                .await
+                .is_none(),
+            "{} allowed a delayed commit to publish an entry",
+            invalidation.label(),
+        );
+        reactivate(&authority, &clock).await;
+        assert_eq!(
+            commit(&app, &prefix, TOKEN_A, cache_id, 1).await,
+            StatusCode::NO_CONTENT,
+            "{} consumed the session before rejecting delayed commit",
+            invalidation.label(),
+        );
+    }
+}
+
+#[tokio::test]
+async fn queued_patch_rechecks_authority_after_waiting_for_its_session() {
+    let tmp = TempDir::new().unwrap();
+    let (app, manager, authority) = make_test_app(&tmp).await;
+    let prefix = scope_prefix(SCOPE_REPO, SCOPE_REF, DEFAULT_REF);
+    let cache_id = reserve(&app, &prefix, TOKEN_A, "queued", "v1").await;
+    let pause = manager.arm_before_upload_write();
+    let first_request = bearer(
+        Request::builder()
+            .method("PATCH")
+            .uri(format!("{prefix}/_apis/artifactcache/caches/{cache_id}"))
+            .header("content-range", "bytes 0-0/*"),
+        TOKEN_A,
+    )
+    .body(Body::from("a"))
+    .unwrap();
+    let first_app = app.clone();
+    let first_response = tokio::spawn(async move { first_app.oneshot(first_request).await });
+    pause.reached.notified().await;
+
+    let session_wait = manager.arm_before_upload_session_wait();
+    let second_request = bearer(
+        Request::builder()
+            .method("PATCH")
+            .uri(format!("{prefix}/_apis/artifactcache/caches/{cache_id}"))
+            .header("content-range", "bytes 0-0/*"),
+        TOKEN_A,
+    )
+    .body(Body::from("b"))
+    .unwrap();
+    let second_response = app.clone().oneshot(second_request);
+    tokio::pin!(second_response);
+    assert!(futures::poll!(&mut second_response).is_pending());
+    session_wait.reached.notified().await;
+    session_wait.resume.notify_one();
+    assert!(futures::poll!(&mut second_response).is_pending());
+
+    let capability_id = CapabilityId::from_token(TOKEN_A);
+    let mut revoke = Box::pin(authority.revoke(&capability_id));
+    let revoke_pending = futures::poll!(&mut revoke).is_pending();
+    pause.resume.notify_one();
+    assert_eq!(
+        first_response.await.unwrap().unwrap().status(),
+        StatusCode::NO_CONTENT,
+    );
+    if revoke_pending {
+        revoke.await;
+    }
+    let second_status = second_response.await.unwrap().status();
+
+    assert!(
+        revoke_pending,
+        "revoke returned while an admitted write was in flight"
+    );
+    assert_eq!(second_status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn revoke_waits_for_admitted_commit_publication() {
+    let tmp = TempDir::new().unwrap();
+    let (app, manager, authority) = make_test_app(&tmp).await;
+    let prefix = scope_prefix(SCOPE_REPO, SCOPE_REF, DEFAULT_REF);
+    let cache_id = reserve(&app, &prefix, TOKEN_A, "admitted", "v1").await;
+    assert_eq!(
+        upload(&app, &prefix, TOKEN_A, cache_id, b"x").await,
+        StatusCode::NO_CONTENT,
+    );
+    let pause = manager.arm_before_entry_publish();
+    let request = bearer(
+        Request::builder()
+            .method("POST")
+            .uri(format!("{prefix}/_apis/artifactcache/caches/{cache_id}"))
+            .header("content-type", "application/json"),
+        TOKEN_A,
+    )
+    .body(Body::from(r#"{"size":1}"#))
+    .unwrap();
+    let response = tokio::spawn(async move { app.oneshot(request).await });
+    pause.reached.notified().await;
+
+    let capability_id = CapabilityId::from_token(TOKEN_A);
+    let mut revoke = Box::pin(authority.revoke(&capability_id));
+    let revoke_pending = futures::poll!(&mut revoke).is_pending();
+    pause.resume.notify_one();
+    assert_eq!(
+        response.await.unwrap().unwrap().status(),
+        StatusCode::NO_CONTENT,
+    );
+    if revoke_pending {
+        revoke.await;
+    }
+
+    assert!(
+        revoke_pending,
+        "revoke returned before an admitted commit finished publication",
+    );
+    assert!(
+        manager
+            .lookup(
+                &["admitted".into()],
+                "v1",
+                SCOPE_REPO,
+                SCOPE_REF,
+                DEFAULT_REF,
+            )
+            .await
+            .is_some(),
+    );
+}
+
+#[tokio::test]
+async fn download_rechecks_revocation_and_expiry_before_response_start() {
+    for invalidation in [Invalidation::Revoke, Invalidation::Expire] {
+        let tmp = TempDir::new().unwrap();
+        let (app, _, authority, clock, capability_id) = make_clocked_test_app(&tmp).await;
+        let prefix = scope_prefix(SCOPE_REPO, SCOPE_REF, DEFAULT_REF);
+        let (_, archive_location) =
+            authorized_roundtrip(&app, &prefix, TOKEN_A, "download-race", b"secret").await;
+        let path = archive_location
+            .strip_prefix("http://localhost:9999")
+            .unwrap();
+        let pause = authority.before_download_start.arm();
+        let request = Request::builder().uri(path).body(Body::empty()).unwrap();
+        let request_app = app.clone();
+        let response = tokio::spawn(async move { request_app.oneshot(request).await });
+        pause.reached.notified().await;
+
+        invalidate(invalidation, &authority, &capability_id, &clock).await;
+        pause.resume.notify_one();
+
+        assert_eq!(
+            response.await.unwrap().unwrap().status(),
+            StatusCode::NOT_FOUND,
+            "{} before download start",
+            invalidation.label(),
+        );
+    }
+}
 
 #[tokio::test]
 async fn unmatched_download_paths_do_not_log_live_grants() {

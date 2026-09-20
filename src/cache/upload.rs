@@ -1,10 +1,11 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result};
 use tokio::io::AsyncWriteExt;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, OwnedMutexGuard, RwLock};
 
 use super::auth::CapabilityId;
 use super::error::CacheError;
@@ -20,13 +21,22 @@ struct UploadSession {
     bytes_written: u64,
 }
 
+pub(crate) struct LockedUpload {
+    id: u64,
+    session: OwnedMutexGuard<Option<UploadSession>>,
+}
+
 /// Manages chunked upload sessions for the cache API.
 ///
 /// Flow: reserve() -> write_chunk() -> commit()
 pub struct UploadTracker {
     next_id: AtomicU64,
-    sessions: RwLock<HashMap<u64, UploadSession>>,
+    sessions: RwLock<HashMap<u64, Arc<Mutex<Option<UploadSession>>>>>,
     tmp_dir: PathBuf,
+    #[cfg(test)]
+    pub(crate) before_write: super::test_support::PausePoint,
+    #[cfg(test)]
+    pub(crate) before_session_wait: super::test_support::PausePoint,
 }
 
 impl UploadTracker {
@@ -35,6 +45,10 @@ impl UploadTracker {
             next_id: AtomicU64::new(1),
             sessions: RwLock::new(HashMap::new()),
             tmp_dir,
+            #[cfg(test)]
+            before_write: Default::default(),
+            #[cfg(test)]
+            before_session_wait: Default::default(),
         }
     }
 
@@ -67,7 +81,10 @@ impl UploadTracker {
             bytes_written: 0,
         };
 
-        self.sessions.write().await.insert(id, session);
+        self.sessions
+            .write()
+            .await
+            .insert(id, Arc::new(Mutex::new(Some(session))));
         Ok(id)
     }
 
@@ -79,16 +96,57 @@ impl UploadTracker {
         offset: u64,
         data: &[u8],
     ) -> Result<()> {
-        // Hold write lock for the entire operation to prevent races with commit().
-        // The lock scope covers both the file I/O and the bytes_written update,
-        // ensuring the session can't be removed mid-write.
-        let mut sessions = self.sessions.write().await;
-        let session = sessions
-            .get_mut(&id)
-            .ok_or(CacheError::UploadNotFound(id))?;
-        if &session.owner_capability_id != owner {
+        let locked = self.lock(owner, id).await?;
+        self.write_chunk_locked(locked, offset, data).await
+    }
+
+    pub(crate) async fn lock(&self, owner: &CapabilityId, id: u64) -> Result<LockedUpload> {
+        let session = self.session(id).await?;
+        let locked = self.lock_session(session).await;
+        let current = locked.as_ref().ok_or(CacheError::UploadNotFound(id))?;
+        if &current.owner_capability_id != owner {
             return Err(CacheError::UploadNotFound(id).into());
         }
+
+        Ok(LockedUpload {
+            id,
+            session: locked,
+        })
+    }
+
+    async fn lock_session(
+        &self,
+        session: Arc<Mutex<Option<UploadSession>>>,
+    ) -> OwnedMutexGuard<Option<UploadSession>> {
+        #[cfg(test)]
+        {
+            match session.clone().try_lock_owned() {
+                Ok(locked) => locked,
+                Err(_) => {
+                    self.before_session_wait.wait().await;
+                    session.lock_owned().await
+                }
+            }
+        }
+        #[cfg(not(test))]
+        {
+            session.lock_owned().await
+        }
+    }
+
+    pub(crate) async fn write_chunk_locked(
+        &self,
+        mut locked: LockedUpload,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<()> {
+        let session = locked
+            .session
+            .as_mut()
+            .ok_or(CacheError::UploadNotFound(locked.id))?;
+
+        #[cfg(test)]
+        self.before_write.wait().await;
 
         let mut file = tokio::fs::OpenOptions::new()
             .write(true)
@@ -117,14 +175,20 @@ impl UploadTracker {
         id: u64,
         expected_size: u64,
     ) -> Result<(String, String, String, String, PathBuf, u64)> {
-        let session = {
-            let mut sessions = self.sessions.write().await;
-            let session = sessions.get(&id).ok_or(CacheError::UploadNotFound(id))?;
-            if &session.owner_capability_id != owner {
-                return Err(CacheError::UploadNotFound(id).into());
-            }
-            sessions.remove(&id).ok_or(CacheError::UploadNotFound(id))?
-        };
+        let locked = self.lock(owner, id).await?;
+        self.commit_locked(locked, expected_size).await
+    }
+
+    pub(crate) async fn commit_locked(
+        &self,
+        mut locked: LockedUpload,
+        expected_size: u64,
+    ) -> Result<(String, String, String, String, PathBuf, u64)> {
+        let session = locked
+            .session
+            .take()
+            .ok_or(CacheError::UploadNotFound(locked.id))?;
+        self.sessions.write().await.remove(&locked.id);
 
         if session.bytes_written != expected_size {
             // Clean up tmp file on mismatch
@@ -137,7 +201,7 @@ impl UploadTracker {
         }
 
         tracing::debug!(
-            upload_id = id,
+            upload_id = locked.id,
             owner_job_id = %session.owner_job_id,
             bytes = session.bytes_written,
             "cache upload session committed"
@@ -151,6 +215,15 @@ impl UploadTracker {
             session.tmp_path,
             session.bytes_written,
         ))
+    }
+
+    async fn session(&self, id: u64) -> Result<Arc<Mutex<Option<UploadSession>>>> {
+        self.sessions
+            .read()
+            .await
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| CacheError::UploadNotFound(id).into())
     }
 
     /// Clean up stale tmp files in the tmp directory (from previous crashes).
