@@ -51,19 +51,10 @@ pub async fn run_docker_image_action(
 
     trace_inline_docker_action(&plan);
 
-    let owned_docker;
-    let docker = match execution.docker_resources() {
-        Some(resources) => resources.docker(),
-        None => {
-            owned_docker = crate::docker::client::connect(
-                &crate::docker::endpoint::DockerEndpoint::trusted_host(),
-            )?;
-            &owned_docker
-        }
-    };
+    let docker = execution.docker_client()?;
 
     let result = run_docker_container(RunDockerParams {
-        docker,
+        docker: &docker,
         image,
         pull_if_missing: true,
         deadline,
@@ -109,16 +100,7 @@ pub(crate) async fn run_docker_metadata_action(
         }
     };
 
-    let owned_docker;
-    let docker = match execution.docker_resources() {
-        Some(resources) => resources.docker(),
-        None => {
-            owned_docker = crate::docker::client::connect(
-                &crate::docker::endpoint::DockerEndpoint::trusted_host(),
-            )?;
-            &owned_docker
-        }
-    };
+    let docker = execution.docker_client()?;
 
     let selected_image = match resolve_metadata_image(metadata)? {
         MetadataImage::Prebuilt(image) => SelectedDockerImage::Prebuilt(image.to_string()),
@@ -127,7 +109,7 @@ pub(crate) async fn run_docker_metadata_action(
             let reusable = job_state.docker_action_images.get(&action_key).cloned();
             let outcome = docker_action_builder
                 .build(DockerBuildRequest {
-                    docker,
+                    docker: &docker,
                     action_dir,
                     dockerfile,
                     scope: docker_build_scope,
@@ -179,7 +161,7 @@ pub(crate) async fn run_docker_metadata_action(
     trace_docker_metadata_action(&selected_image, entrypoint.is_some(), resolved_args.len());
 
     let result = run_docker_container(RunDockerParams {
-        docker,
+        docker: &docker,
         image: selected_image.image(),
         pull_if_missing: selected_image.pull_if_missing(),
         deadline,

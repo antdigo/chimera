@@ -841,9 +841,7 @@ impl Runner {
                 .context("ensuring node binaries")?;
 
             if manifest.has_container() || manifest.has_services() {
-                let docker = crate::docker::client::connect(
-                    &crate::docker::endpoint::DockerEndpoint::trusted_host(),
-                )?;
+                let docker = crate::docker::client::connect(domain.docker_endpoint())?;
                 crate::docker::client::ping(&docker).await?;
                 let mut resources = JobDockerResources::new(docker);
                 let services = manifest.service_containers.as_deref().unwrap_or_default();

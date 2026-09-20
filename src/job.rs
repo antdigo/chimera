@@ -14,3 +14,9 @@ pub mod timeline;
 pub mod workspace;
 
 pub use client::JobClient;
+
+#[cfg(test)]
+use crate::docker::endpoint::DockerEndpoint;
+#[cfg(test)]
+#[path = "../tests/common/docker_endpoint.rs"]
+pub(crate) mod docker_endpoint_test_support;

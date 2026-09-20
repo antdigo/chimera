@@ -1,4 +1,4 @@
-#[derive(Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DockerEndpoint {
     socket_address: String,
 }

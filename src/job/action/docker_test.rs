@@ -6,11 +6,14 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use super::*;
+use crate::docker::endpoint::DockerEndpoint;
 use crate::job::action::metadata::{ActionInput, ActionRuns, ActionRuntime};
 use crate::job::execution_domain::{DOCKER_CONFIG_ENV, ExecutionDomainRoot};
 use crate::job::logs::LogSender;
 use crate::job::schema::{StepReference, StepReferenceKind};
 use crate::job::workspace::Workspace;
+
+use crate::job::docker_endpoint_test_support::EngineProbe;
 
 struct TraceWriter(Arc<Mutex<Vec<u8>>>);
 
@@ -550,6 +553,154 @@ fn test_docker_config(tmp: &tempfile::TempDir) -> crate::job::execution_domain::
     futures::executor::block_on(root.reserve())
         .and_then(|permit| permit.provision())
         .unwrap()
+}
+
+const DOCKER_ACTION_ENDPOINT_CHILD_CASE: &str = "CHIMERA_DOCKER_ACTION_ENDPOINT_CHILD_CASE";
+
+async fn run_docker_action_endpoint_child(test_name: &str, endpoint: &DockerEndpoint) {
+    let output = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test_name, "--nocapture"])
+            .env(DOCKER_ACTION_ENDPOINT_CHILD_CASE, "run")
+            .env("DOCKER_HOST", endpoint.socket_address())
+            .output(),
+    )
+    .await
+    .expect("Docker action endpoint child must remain bounded")
+    .unwrap();
+
+    assert!(
+        output.status.success(),
+        "Docker action endpoint child failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+fn isolate_action_from_current_docker_host() {
+    // The exact-test child runs this test alone. Changing its environment after
+    // domain provisioning proves action routing uses the retained domain endpoint.
+    unsafe { std::env::set_var("DOCKER_HOST", "unix:///absent/action-fallback.sock") };
+}
+
+fn action_endpoint_fixture() -> (
+    tempfile::TempDir,
+    Workspace,
+    JobState,
+    LogSender,
+    crate::job::execution_domain::ExecutionDomain,
+    crate::node::NodeRuntimes,
+) {
+    let (workspace_temp, workspace) = action_workspace();
+    let state = action_job_state();
+    let masks = crate::job::secret_masker::shared_masker_for_test(&[]);
+    let (log_tx, _log_rx) = tokio::sync::mpsc::channel(32);
+    let log_sender = LogSender::new_for_test(log_tx, masks);
+    let domain = test_docker_config(&workspace_temp);
+    let node_runtimes = crate::node::NodeRuntimes::single("node".into());
+    (
+        workspace_temp,
+        workspace,
+        state,
+        log_sender,
+        domain,
+        node_runtimes,
+    )
+}
+
+#[tokio::test]
+async fn docker_action_inline_routes_image_operation_to_domain_endpoint() {
+    if std::env::var_os(DOCKER_ACTION_ENDPOINT_CHILD_CASE).is_some() {
+        let (_temp, workspace, mut state, log_sender, domain, node_runtimes) =
+            action_endpoint_fixture();
+        isolate_action_from_current_docker_host();
+        let execution = JobExecutionContext::new(&domain, None, &node_runtimes);
+
+        let error = run_docker_image_action(
+            "fixture-image",
+            &docker_action_step(None),
+            &mut state,
+            &workspace,
+            &HashMap::new(),
+            &log_sender,
+            Instant::now() + Duration::from_secs(2),
+            &CancellationToken::new(),
+            &execution,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            format!("{error:#}").contains("synthetic endpoint probe failure"),
+            "unexpected inline Docker action error: {error:#}"
+        );
+        return;
+    }
+
+    let probe = EngineProbe::start_failing_images().await.unwrap();
+    run_docker_action_endpoint_child(
+        "job::action::docker::docker_test::docker_action_inline_routes_image_operation_to_domain_endpoint",
+        probe.endpoint(),
+    )
+    .await;
+    assert!(
+        probe
+            .requests()
+            .iter()
+            .any(|request| request.contains("/images/fixture-image/"))
+    );
+}
+
+#[tokio::test]
+async fn docker_action_metadata_routes_image_operation_to_domain_endpoint() {
+    if std::env::var_os(DOCKER_ACTION_ENDPOINT_CHILD_CASE).is_some() {
+        let (temp, workspace, mut state, log_sender, domain, node_runtimes) =
+            action_endpoint_fixture();
+        isolate_action_from_current_docker_host();
+        let action_root = temp.path().join("action");
+        std::fs::create_dir(&action_root).unwrap();
+        let action_dir = TrustedActionDirectory::resolve(&action_root, Path::new(".")).unwrap();
+        let execution = JobExecutionContext::new(&domain, None, &node_runtimes);
+
+        let error = run_docker_metadata_action(
+            &action_dir,
+            &make_docker_metadata("fixture-image"),
+            "main",
+            &docker_action_step(None),
+            &mut state,
+            &workspace,
+            &HashMap::new(),
+            &log_sender,
+            &DockerActionBuilder::new(),
+            &DockerBuildScope::new("test-runner", "test/endpoint-routing"),
+            None,
+            Instant::now() + Duration::from_secs(2),
+            &CancellationToken::new(),
+            &execution,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            format!("{error:#}").contains("synthetic endpoint probe failure"),
+            "unexpected metadata Docker action error: {error:#}"
+        );
+        return;
+    }
+
+    let probe = EngineProbe::start_failing_images().await.unwrap();
+    run_docker_action_endpoint_child(
+        "job::action::docker::docker_test::docker_action_metadata_routes_image_operation_to_domain_endpoint",
+        probe.endpoint(),
+    )
+    .await;
+    assert!(
+        probe
+            .requests()
+            .iter()
+            .any(|request| request.contains("/images/fixture-image/"))
+    );
 }
 
 #[tokio::test]

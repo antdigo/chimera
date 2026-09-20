@@ -3,6 +3,7 @@ use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::PermissionsExt;
 
 use super::*;
+use crate::docker::endpoint::DockerEndpoint;
 use crate::github::auth::TokenManager;
 use crate::job::action::ActionCache;
 use crate::job::client::JobConclusion;
@@ -13,6 +14,8 @@ use crate::job::schema::{StepReference, StepReferenceKind};
 use tokio_util::sync::CancellationToken;
 use wiremock::matchers::{method, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
+
+use crate::job::docker_endpoint_test_support::EngineProbe;
 
 async fn setup_execute() -> (tempfile::TempDir, Workspace, Arc<JobClient>, MockServer) {
     let tmp = tempfile::tempdir().unwrap();
@@ -204,6 +207,122 @@ fn test_docker_config() -> (tempfile::TempDir, ExecutionDomain) {
         .and_then(|permit| permit.provision())
         .unwrap();
     (temp, config)
+}
+
+const DOCKER_CONTEXT_CHILD_CASE: &str = "CHIMERA_DOCKER_CONTEXT_CHILD_CASE";
+
+async fn run_docker_context_child(
+    test_name: &str,
+    case: &str,
+    docker_host: &str,
+    resource_endpoint: Option<&DockerEndpoint>,
+) {
+    let mut command = tokio::process::Command::new(std::env::current_exe().unwrap());
+    command
+        .args(["--exact", test_name, "--nocapture"])
+        .env(DOCKER_CONTEXT_CHILD_CASE, case)
+        .env("DOCKER_HOST", docker_host);
+    if let Some(endpoint) = resource_endpoint {
+        command.env(
+            "CHIMERA_DOCKER_CONTEXT_RESOURCE_ENDPOINT",
+            endpoint.socket_address(),
+        );
+    }
+
+    let output = tokio::time::timeout(Duration::from_secs(5), command.output())
+        .await
+        .expect("Docker context child must remain bounded")
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "Docker context child {case} failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+#[tokio::test]
+async fn docker_context_exposes_snapshotted_endpoint_and_fails_selected_missing_socket() {
+    if std::env::var_os(DOCKER_CONTEXT_CHILD_CASE).as_deref()
+        == Some(std::ffi::OsStr::new("missing"))
+    {
+        let (_temp, domain) = test_docker_config();
+        let node_runtimes = crate::node::NodeRuntimes::single("node".into());
+        let execution = JobExecutionContext::new(&domain, None, &node_runtimes);
+
+        assert_eq!(execution.docker_endpoint(), domain.docker_endpoint());
+        assert!(execution.docker_client().is_err());
+        return;
+    }
+
+    run_docker_context_child(
+        "job::execute::execute_test::docker_context_exposes_snapshotted_endpoint_and_fails_selected_missing_socket",
+        "missing",
+        "unix:///absent/context.sock",
+        None,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn docker_context_without_resources_routes_to_the_domain_endpoint() {
+    if std::env::var_os(DOCKER_CONTEXT_CHILD_CASE).as_deref()
+        == Some(std::ffi::OsStr::new("domain"))
+    {
+        let (_temp, domain) = test_docker_config();
+        let node_runtimes = crate::node::NodeRuntimes::single("node".into());
+        let execution = JobExecutionContext::new(&domain, None, &node_runtimes);
+
+        assert_eq!(execution.docker_endpoint(), domain.docker_endpoint());
+        assert_eq!(
+            execution.docker_client().unwrap().ping().await.unwrap(),
+            "engine-a"
+        );
+        return;
+    }
+
+    let probe = EngineProbe::start("engine-a").await.unwrap();
+    run_docker_context_child(
+        "job::execute::execute_test::docker_context_without_resources_routes_to_the_domain_endpoint",
+        "domain",
+        probe.endpoint().socket_address(),
+        None,
+    )
+    .await;
+    assert_eq!(probe.requests().len(), 1);
+}
+
+#[tokio::test]
+async fn docker_context_with_resources_reuses_the_resource_client() {
+    if std::env::var_os(DOCKER_CONTEXT_CHILD_CASE).as_deref()
+        == Some(std::ffi::OsStr::new("resources"))
+    {
+        let endpoint = std::env::var("CHIMERA_DOCKER_CONTEXT_RESOURCE_ENDPOINT").unwrap();
+        let socket_path = endpoint.strip_prefix("unix://").unwrap();
+        let endpoint = DockerEndpoint::unix_socket(std::path::Path::new(socket_path)).unwrap();
+        let docker = crate::docker::client::connect(&endpoint).unwrap();
+        let docker_resources = JobDockerResources::new(docker);
+        let (_temp, domain) = test_docker_config();
+        let node_runtimes = crate::node::NodeRuntimes::single("node".into());
+        let execution = JobExecutionContext::new(&domain, Some(&docker_resources), &node_runtimes);
+
+        assert_eq!(
+            execution.docker_client().unwrap().ping().await.unwrap(),
+            "engine-b"
+        );
+        return;
+    }
+
+    let probe = EngineProbe::start("engine-b").await.unwrap();
+    run_docker_context_child(
+        "job::execute::execute_test::docker_context_with_resources_reuses_the_resource_client",
+        "resources",
+        "unix:///absent/domain.sock",
+        Some(probe.endpoint()),
+    )
+    .await;
+    assert_eq!(probe.requests().len(), 1);
 }
 
 fn step_with_environment(key: &str, value: &str) -> Step {
