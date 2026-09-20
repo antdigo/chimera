@@ -1037,6 +1037,108 @@ async fn linux_backend_manager_cancel_sends_correlated_shutdown_reason() {
 }
 
 #[cfg(target_os = "linux")]
+#[tokio::test]
+async fn stalled_linux_control_send_does_not_block_a_trusted_domain() {
+    use std::os::fd::AsRawFd;
+
+    use super::super::protocol::{Message, Request, Response};
+
+    let temp = tempfile::tempdir().unwrap();
+    let root =
+        ExecutionDomainRoot::prepare(&temp.path().join("domains"), NonZeroUsize::new(1).unwrap())
+            .unwrap();
+    let trusted = root
+        .reserve()
+        .await
+        .unwrap()
+        .provision(AttemptIdentity::new())
+        .await
+        .unwrap();
+    let (mut linux, mut peer) = linux_backend_for_test();
+    let send_buffer: libc::c_int = 1024;
+    assert_eq!(
+        unsafe {
+            libc::setsockopt(
+                linux.kernel.control.control_fd().as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_SNDBUF,
+                (&raw const send_buffer).cast(),
+                std::mem::size_of_val(&send_buffer) as libc::socklen_t,
+            )
+        },
+        0
+    );
+    let mut spec = sandboxed_spec();
+    spec.env
+        .insert("STALL_FRAME".into(), "x".repeat(512 * 1024));
+    let (stalled_output, _stalled_events) = tokio::sync::mpsc::channel(1);
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let stalled = super::manager_runtime().unwrap().spawn(async move {
+        let _ = started_tx.send(());
+        let result = linux
+            .run(
+                spec,
+                stalled_output,
+                tokio_util::sync::CancellationToken::new(),
+                super::ManagerCancellation::new(),
+            )
+            .await;
+        (linux, result)
+    });
+    started_rx.await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let (output, mut events) = tokio::sync::mpsc::channel(4);
+    let healthy = tokio::time::timeout(std::time::Duration::from_millis(500), async {
+        trusted.cancel(CancelReason::User).await.unwrap();
+        let outcome = trusted
+            .run(
+                trusted_spec(&trusted, "printf healthy-progress"),
+                output,
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let event = events.recv().await.unwrap();
+        (outcome, event)
+    })
+    .await;
+
+    let responder = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let Message::Request(Request::Run { command_id, .. }) = peer.receive(deadline).unwrap()
+        else {
+            panic!("expected stalled Run request")
+        };
+        peer.send(
+            Message::Response(Response::CommandStarted { command_id }),
+            deadline,
+        )
+        .unwrap();
+        peer.send(
+            Message::Response(Response::CommandFinished {
+                command_id,
+                outcome: CommandOutcome::Exited(0),
+            }),
+            deadline,
+        )
+        .unwrap();
+    });
+    let (mut linux, stalled_result) = stalled.await.unwrap();
+    responder.join().unwrap();
+    assert_eq!(stalled_result.unwrap(), CommandOutcome::Exited(0));
+    linux.kernel.launcher.kill().unwrap();
+    linux.kernel.launcher.wait().unwrap();
+
+    let (outcome, event) = healthy.expect("stalled Linux control blocked the manager runtime");
+    assert_eq!(outcome, CommandOutcome::Exited(0));
+    assert!(
+        matches!(event, super::super::CommandEvent::Stdout(bytes) if bytes == b"healthy-progress")
+    );
+    trusted.destroy().await.unwrap();
+}
+
+#[cfg(target_os = "linux")]
 #[test]
 fn idle_linux_command_cancel_never_sends_domain_shutdown() {
     use std::sync::atomic::{AtomicBool, Ordering};

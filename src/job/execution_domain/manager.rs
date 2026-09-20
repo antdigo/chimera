@@ -751,6 +751,12 @@ impl LinuxBackend {
     ) -> Result<CommandOutcome, ExecutionDomainError> {
         use super::protocol::{Message, Request, Response};
 
+        #[derive(Clone, Copy)]
+        enum PendingSend {
+            Run,
+            Cancel,
+        }
+
         if !matches!(spec.target, super::CommandTarget::Sandboxed { .. }) {
             return Err(backend_failure(super::FailureCategory::InvalidInput));
         }
@@ -758,51 +764,75 @@ impl LinuxBackend {
         let deadline = std::time::Instant::now()
             .checked_add(spec.timeout + std::time::Duration::from_secs(5))
             .ok_or_else(|| backend_failure(super::FailureCategory::InvalidInput))?;
-        self.kernel.control.send(
-            Message::Request(Request::Run { command_id, spec }),
-            deadline,
-        )?;
+        self.kernel
+            .control
+            .start_send(Message::Request(Request::Run { command_id, spec }))?;
+        let mut pending_send = Some(PendingSend::Run);
+        let mut run_flushed = false;
         let mut started = false;
-        let mut cancel_sent = false;
+        let mut cancel_reason = None;
+        let mut cancel_started = false;
+        let mut terminal = None;
         loop {
-            if cancelled.is_cancelled() && !cancel_sent {
-                self.kernel.control.send(
-                    Message::Request(Request::CancelCommand {
-                        command_id,
-                        reason: CancelReason::User,
-                    }),
-                    deadline,
-                )?;
-                cancel_sent = true;
+            if std::time::Instant::now() >= deadline {
+                return Err(backend_failure(super::FailureCategory::Timeout));
             }
-            if manager_cancelled.token.is_cancelled() && !cancel_sent {
-                self.kernel.control.send(
-                    Message::Request(Request::CancelCommand {
-                        command_id,
-                        reason: manager_cancelled.reason(),
-                    }),
-                    deadline,
-                )?;
-                cancel_sent = true;
+            if pending_send.is_none()
+                && let Some(result) = terminal.take()
+            {
+                return result;
             }
-            if output.is_closed() && !cancel_sent {
-                self.kernel.control.send(
-                    Message::Request(Request::CancelCommand {
+            if cancel_reason.is_none() && cancelled.is_cancelled() {
+                cancel_reason = Some(CancelReason::User);
+            }
+            if cancel_reason.is_none() && manager_cancelled.token.is_cancelled() {
+                cancel_reason = Some(manager_cancelled.reason());
+            }
+            if cancel_reason.is_none() && output.is_closed() {
+                cancel_reason = Some(CancelReason::HandleDropped);
+            }
+            if let Some(sending) = pending_send
+                && self.kernel.control.try_flush()?
+            {
+                if matches!(sending, PendingSend::Run) {
+                    run_flushed = true;
+                }
+                pending_send = None;
+            }
+            if run_flushed
+                && pending_send.is_none()
+                && !cancel_started
+                && let Some(reason) = cancel_reason.clone()
+            {
+                self.kernel
+                    .control
+                    .start_send(Message::Request(Request::CancelCommand {
                         command_id,
-                        reason: CancelReason::HandleDropped,
-                    }),
-                    deadline,
-                )?;
-                cancel_sent = true;
+                        reason,
+                    }))?;
+                pending_send = Some(PendingSend::Cancel);
+                cancel_started = true;
+            }
+            if pending_send.is_none()
+                && let Some(result) = terminal.take()
+            {
+                return result;
+            }
+            if terminal.is_some() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                continue;
             }
             let Some(message) = self.kernel.control.try_receive()? else {
-                if std::time::Instant::now() >= deadline {
-                    return Err(backend_failure(super::FailureCategory::Timeout));
-                }
                 tokio::select! {
-                    _ = cancelled.cancelled(), if !cancel_sent => {}
-                    _ = manager_cancelled.cancelled(), if !cancel_sent => {}
-                    _ = output.closed(), if !cancel_sent => {}
+                    _ = cancelled.cancelled(), if cancel_reason.is_none() => {
+                        cancel_reason = Some(CancelReason::User);
+                    }
+                    _ = manager_cancelled.cancelled(), if cancel_reason.is_none() => {
+                        cancel_reason = Some(manager_cancelled.reason());
+                    }
+                    _ = output.closed(), if cancel_reason.is_none() => {
+                        cancel_reason = Some(CancelReason::HandleDropped);
+                    }
                     _ = tokio::time::sleep(std::time::Duration::from_millis(5)) => {}
                 }
                 continue;
@@ -819,46 +849,27 @@ impl LinuxBackend {
                 Response::CommandRejected {
                     command_id: actual,
                     category,
-                } if actual == command_id => return Err(backend_failure(category)),
+                } if actual == command_id => {
+                    terminal = Some(Err(backend_failure(category)));
+                }
                 Response::Output {
                     command_id: actual,
                     event,
                 } if actual == command_id && started => {
-                    if !cancel_sent {
+                    if cancel_reason.is_none() {
                         let send = output.send(event);
                         tokio::pin!(send);
                         tokio::select! {
                             result = &mut send => {
                                 if result.is_err() {
-                                    self.kernel.control.send(
-                                        Message::Request(Request::CancelCommand {
-                                            command_id,
-                                            reason: CancelReason::HandleDropped,
-                                        }),
-                                        deadline,
-                                    )?;
-                                    cancel_sent = true;
+                                    cancel_reason = Some(CancelReason::HandleDropped);
                                 }
                             }
                             _ = cancelled.cancelled() => {
-                                self.kernel.control.send(
-                                    Message::Request(Request::CancelCommand {
-                                        command_id,
-                                        reason: CancelReason::User,
-                                    }),
-                                    deadline,
-                                )?;
-                                cancel_sent = true;
+                                cancel_reason = Some(CancelReason::User);
                             }
                             _ = manager_cancelled.cancelled() => {
-                                self.kernel.control.send(
-                                    Message::Request(Request::CancelCommand {
-                                        command_id,
-                                        reason: manager_cancelled.reason(),
-                                    }),
-                                    deadline,
-                                )?;
-                                cancel_sent = true;
+                                cancel_reason = Some(manager_cancelled.reason());
                             }
                         }
                     }
@@ -866,7 +877,9 @@ impl LinuxBackend {
                 Response::CommandFinished {
                     command_id: actual,
                     outcome,
-                } if actual == command_id && started => return Ok(outcome),
+                } if actual == command_id && started => {
+                    terminal = Some(Ok(outcome));
+                }
                 _ => return Err(backend_failure(super::FailureCategory::Protocol)),
             }
         }
