@@ -7,8 +7,9 @@ use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
 use super::metadata::ActionMetadata;
+use crate::docker::output::OutputProcessor;
 use crate::job::execute::{
-    JobExecutionContext, JobState, StepResult, build_step_env, finish_step_transaction,
+    JobExecutionContext, JobState, StepResult, build_step_env, complete_step_transaction,
     prepare_step_transaction, run_process,
 };
 use crate::job::expression::ExprContext;
@@ -109,20 +110,30 @@ pub async fn run_node_action(
         );
 
         let state_id = prepare_step_transaction(execution.docker_config(), workspace).await?;
+        let processor = OutputProcessor::new(
+            log_sender.clone(),
+            job_state.secret_masker.clone(),
+            job_state.debug_enabled,
+        );
         let result = crate::docker::exec::docker_exec(
             resources.docker(),
             container_id,
             vec![resources.node_path(node_major).into(), container_script],
             &env,
             "/github/workspace",
-            job_state,
-            log_sender,
+            &processor,
             timeout,
             cancel_token,
-            job_state.debug_enabled,
         )
         .await;
-        finish_step_transaction(execution.docker_config(), state_id, job_state).await?;
+        let result = complete_step_transaction(
+            execution.docker_config(),
+            state_id,
+            &processor,
+            job_state,
+            result,
+        )
+        .await;
 
         rekey_action_state(job_state, step);
         return result;

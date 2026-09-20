@@ -27,7 +27,7 @@ use crate::docker::output::{DockerErrorDiagnostic, DockerLogFramer, OutputProces
 use crate::docker::resources::JobDockerResources;
 use crate::job::execute::{
     JobExecutionContext, JobState, StepConclusion, StepResult, build_step_env,
-    finish_step_transaction, is_reserved_command_file_env, prepare_step_transaction,
+    complete_step_transaction, is_reserved_command_file_env, prepare_step_transaction,
 };
 use crate::job::execution_domain::DOCKER_CONFIG_ENV;
 use crate::job::expression::ExprContext;
@@ -55,6 +55,11 @@ pub async fn run_docker_image_action(
     let docker = execution.docker_client()?;
 
     let state_id = prepare_step_transaction(execution.docker_config(), workspace).await?;
+    let processor = OutputProcessor::new(
+        log_sender.clone(),
+        job_state.secret_masker.clone(),
+        job_state.debug_enabled,
+    );
     let result = run_docker_container(RunDockerParams {
         docker: &docker,
         image,
@@ -63,16 +68,20 @@ pub async fn run_docker_image_action(
         entrypoint: plan.entrypoint.as_deref(),
         args: &plan.args,
         env: &plan.env,
-        job_state,
+        processor: &processor,
         workspace,
-        log_sender,
         cancel_token,
         docker_resources: execution.docker_resources(),
     })
     .await;
-    let snapshot = finish_step_transaction(execution.docker_config(), state_id, job_state).await;
-    let result = result?;
-    snapshot?;
+    let result = complete_step_transaction(
+        execution.docker_config(),
+        state_id,
+        &processor,
+        job_state,
+        result,
+    )
+    .await?;
 
     rekey_action_state(job_state, step);
     Ok(result)
@@ -166,6 +175,11 @@ pub(crate) async fn run_docker_metadata_action(
     trace_docker_metadata_action(&selected_image, entrypoint.is_some(), resolved_args.len());
 
     let state_id = prepare_step_transaction(execution.docker_config(), workspace).await?;
+    let processor = OutputProcessor::new(
+        log_sender.clone(),
+        job_state.secret_masker.clone(),
+        job_state.debug_enabled,
+    );
     let result = run_docker_container(RunDockerParams {
         docker: &docker,
         image: selected_image.image(),
@@ -174,16 +188,20 @@ pub(crate) async fn run_docker_metadata_action(
         entrypoint: entrypoint.as_deref(),
         args: &resolved_args,
         env: &env,
-        job_state,
+        processor: &processor,
         workspace,
-        log_sender,
         cancel_token,
         docker_resources: execution.docker_resources(),
     })
     .await;
-    let snapshot = finish_step_transaction(execution.docker_config(), state_id, job_state).await;
-    let result = result?;
-    snapshot?;
+    let result = complete_step_transaction(
+        execution.docker_config(),
+        state_id,
+        &processor,
+        job_state,
+        result,
+    )
+    .await?;
 
     rekey_action_state(job_state, step);
     Ok(result)
@@ -419,9 +437,8 @@ struct RunDockerParams<'a> {
     entrypoint: Option<&'a str>,
     args: &'a [String],
     env: &'a HashMap<String, String>,
-    job_state: &'a mut JobState,
+    processor: &'a OutputProcessor,
     workspace: &'a Workspace,
-    log_sender: &'a LogSender,
     cancel_token: &'a CancellationToken,
     docker_resources: Option<&'a JobDockerResources>,
 }
@@ -570,11 +587,9 @@ async fn launch_ready_action_container(
     let result = start_and_stream_logs(
         docker,
         &container.id,
-        params.job_state,
-        params.log_sender,
+        params.processor,
         params.deadline,
         params.cancel_token,
-        params.job_state.debug_enabled,
     )
     .await;
 
@@ -827,11 +842,9 @@ fn build_bind_mounts(workspace: &Workspace) -> Result<Vec<String>> {
 async fn start_and_stream_logs(
     docker: &Docker,
     container_id: &str,
-    job_state: &mut JobState,
-    log_sender: &LogSender,
+    processor: &OutputProcessor,
     deadline: Instant,
     cancel_token: &CancellationToken,
-    debug_enabled: bool,
 ) -> Result<StepResult> {
     let start = within_lifecycle_budget(
         deadline,
@@ -850,11 +863,6 @@ async fn start_and_stream_logs(
         return Ok(interrupted);
     }
 
-    let processor = OutputProcessor::new(
-        log_sender.clone(),
-        job_state.secret_masker.clone(),
-        debug_enabled,
-    );
     let docker_for_logs = docker.clone();
     let container_id_for_logs = container_id.to_string();
     let processor_for_logs = processor.clone();
@@ -926,16 +934,6 @@ async fn start_and_stream_logs(
     };
     if let Err(error) = joined {
         warn!(error = %error, "Docker action stream task panicked");
-    }
-
-    let apply = within_lifecycle_budget(
-        deadline,
-        cancel_token,
-        processor.apply_to_job_state(job_state),
-    )
-    .await;
-    if let Err(interrupted) = lifecycle_value(apply, "applying Docker action output") {
-        return Ok(interrupted);
     }
 
     let inspect = within_lifecycle_budget(

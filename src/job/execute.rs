@@ -160,6 +160,75 @@ pub struct JobState {
     pub debug_enabled: bool,
 }
 
+#[derive(Default)]
+pub(crate) struct BufferedWorkflowState {
+    env: Vec<(String, String)>,
+    path: Vec<String>,
+    output: Vec<(String, String)>,
+    state: Vec<(String, String)>,
+}
+
+impl BufferedWorkflowState {
+    pub(crate) fn new(
+        env: Vec<(String, String)>,
+        path: Vec<String>,
+        output: Vec<(String, String)>,
+        state: Vec<(String, String)>,
+    ) -> Self {
+        Self {
+            env,
+            path,
+            output,
+            state,
+        }
+    }
+
+    fn apply(self, job_state: &mut JobState) {
+        for (key, value) in self.env {
+            job_state.env.insert(key, value);
+        }
+        job_state.path_prepends.extend(self.path);
+        for (key, value) in self.output {
+            insert_case_insensitive(&mut job_state.outputs, key, value);
+        }
+        for (key, value) in self.state {
+            insert_case_insensitive(
+                job_state.action_states.entry(String::new()).or_default(),
+                key,
+                value,
+            );
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn env(&self) -> &[(String, String)] {
+        &self.env
+    }
+
+    #[cfg(test)]
+    pub(crate) fn path(&self) -> &[String] {
+        &self.path
+    }
+
+    #[cfg(test)]
+    pub(crate) fn output(&self) -> &[(String, String)] {
+        &self.output
+    }
+
+    #[cfg(test)]
+    pub(crate) fn state(&self) -> &[(String, String)] {
+        &self.state
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.env.is_empty()
+            && self.path.is_empty()
+            && self.output.is_empty()
+            && self.state.is_empty()
+    }
+}
+
 impl JobState {
     pub(crate) fn new(
         secret_masker: SharedSecretMasker,
@@ -494,22 +563,24 @@ pub async fn run_container_step(
         None => "/github/workspace".into(),
     };
 
-    let debug_enabled = job_state.debug_enabled;
     let state_id = prepare_step_transaction(domain, workspace).await?;
+    let processor = OutputProcessor::new(
+        log_sender.clone(),
+        job_state.secret_masker.clone(),
+        job_state.debug_enabled,
+    );
     let result = crate::docker::exec::docker_exec(
         docker_resources.docker(),
         container_id,
         vec!["bash".into(), "-e".into(), "-c".into(), script],
         &env,
         &working_dir,
-        job_state,
-        log_sender,
+        &processor,
         timeout,
         cancel_token,
-        debug_enabled,
     )
     .await;
-    finish_step_transaction(domain, state_id, job_state).await?;
+    let result = complete_step_transaction(domain, state_id, &processor, job_state, result).await;
 
     // Re-key saved state from the empty-key bucket into the correct action-keyed bucket
     if let Some(unnamed_state) = job_state.action_states.remove("") {
@@ -739,10 +810,14 @@ pub async fn run_process(
     let consume = consume_command_events(&mut events, &processor, log_sender);
     let run = domain.run(spec, output, cancel_token.clone());
     let (outcome, ()) = tokio::join!(run, consume);
-    let snapshot = finish_step_transaction(domain, state_id, job_state).await;
-    let outcome = outcome?;
-    snapshot?;
-    processor.apply_to_job_state(job_state).await;
+    let outcome = complete_step_transaction(
+        domain,
+        state_id,
+        &processor,
+        job_state,
+        outcome.map_err(anyhow::Error::from),
+    )
+    .await?;
     let conclusion = match outcome {
         CommandOutcome::Exited(0) => StepConclusion::Succeeded,
         CommandOutcome::Cancelled => StepConclusion::Cancelled,
@@ -762,13 +837,34 @@ pub(crate) async fn prepare_step_transaction(
     Ok(domain.prepare_step(&event).await?)
 }
 
+#[cfg(test)]
 pub(crate) async fn finish_step_transaction(
     domain: &ExecutionDomain,
     state_id: crate::job::execution_domain::StepFilesId,
     job_state: &mut JobState,
 ) -> Result<()> {
     let snapshot = domain.read_step(state_id).await?;
-    apply_step_snapshot(snapshot, domain, job_state)
+    apply_step_snapshot(
+        snapshot,
+        BufferedWorkflowState::default(),
+        domain,
+        job_state,
+    )
+}
+
+pub(crate) async fn complete_step_transaction<T>(
+    domain: &ExecutionDomain,
+    state_id: crate::job::execution_domain::StepFilesId,
+    processor: &OutputProcessor,
+    job_state: &mut JobState,
+    command_result: Result<T>,
+) -> Result<T> {
+    // Terminal state validation has deterministic priority over a command error:
+    // a corrupted bridge must never be hidden by a simultaneous spawn/transport failure.
+    let snapshot = domain.read_step(state_id).await?;
+    let commands = processor.take_workflow_state().await;
+    apply_step_snapshot(snapshot, commands, domain, job_state)?;
+    command_result
 }
 
 async fn consume_command_events(
@@ -843,21 +939,27 @@ async fn drain_log_lines(buffer: &mut Vec<u8>, sender: &LogSender) {
 
 fn apply_step_snapshot(
     snapshot: crate::job::execution_domain::StepStateSnapshot,
+    commands: BufferedWorkflowState,
     domain: &ExecutionDomain,
     job_state: &mut JobState,
 ) -> Result<()> {
     let parsed = snapshot.parse()?;
-    for (key, value) in &parsed.env {
-        if is_reserved_command_file_env(key) {
-            return Err(ExecutionDomainError::ReservedEnvironmentOverride {
-                source: "GITHUB_ENV",
-            }
-            .into());
-        }
-        if key == DOCKER_CONFIG_ENV {
-            domain.validate_override(value, "GITHUB_ENV")?;
-        }
-    }
+    validate_step_environment(
+        parsed
+            .env
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str())),
+        domain,
+    )?;
+    validate_step_environment(
+        commands
+            .env
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str())),
+        domain,
+    )?;
+
+    commands.apply(job_state);
     merge_case_insensitive(&mut job_state.outputs, parsed.output);
     job_state.env.extend(parsed.env);
     job_state.path_prepends.extend(parsed.path);
@@ -867,6 +969,24 @@ fn apply_step_snapshot(
     );
     if !parsed.summary.is_empty() {
         job_state.step_summaries.push(parsed.summary);
+    }
+    Ok(())
+}
+
+fn validate_step_environment<'a>(
+    entries: impl IntoIterator<Item = (&'a str, &'a str)>,
+    domain: &ExecutionDomain,
+) -> Result<()> {
+    for (key, value) in entries {
+        if is_reserved_command_file_env(key) {
+            return Err(ExecutionDomainError::ReservedEnvironmentOverride {
+                source: "GITHUB_ENV",
+            }
+            .into());
+        }
+        if key == DOCKER_CONFIG_ENV {
+            domain.validate_override(value, "GITHUB_ENV")?;
+        }
     }
     Ok(())
 }

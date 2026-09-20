@@ -9,8 +9,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
 use super::output::{DockerErrorDiagnostic, DockerLogFramer, OutputProcessor};
-use crate::job::execute::{JobState, StepConclusion, StepResult};
-use crate::job::logs::LogSender;
+use crate::job::execute::{StepConclusion, StepResult};
 
 /// Run a command inside a running container via `docker exec`.
 ///
@@ -23,11 +22,9 @@ pub async fn docker_exec(
     cmd: Vec<String>,
     env: &HashMap<String, String>,
     working_dir: &str,
-    job_state: &mut JobState,
-    log_sender: &LogSender,
+    processor: &OutputProcessor,
     timeout: Duration,
     cancel_token: &CancellationToken,
-    debug_enabled: bool,
 ) -> Result<StepResult> {
     let env_list: Vec<String> = env.iter().map(|(k, v)| format!("{k}={v}")).collect();
 
@@ -54,12 +51,6 @@ pub async fn docker_exec(
     let StartExecResults::Attached { mut output, .. } = exec_output else {
         anyhow::bail!("docker exec did not return attached output");
     };
-
-    let processor = OutputProcessor::new(
-        log_sender.clone(),
-        job_state.secret_masker.clone(),
-        debug_enabled,
-    );
 
     let stream_processor = processor.clone();
     let stream_task = tokio::spawn(async move {
@@ -118,8 +109,6 @@ pub async fn docker_exec(
     if let Err(conclusion) = result {
         return Ok(StepResult { conclusion });
     }
-
-    processor.apply_to_job_state(job_state).await;
 
     // Check exit code
     let inspect = docker

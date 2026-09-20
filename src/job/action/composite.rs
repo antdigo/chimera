@@ -10,9 +10,10 @@ use tracing::debug;
 use super::download::{ActionCache, TrustedActionDirectory};
 use super::metadata::ActionMetadata;
 use crate::docker::build::{DockerActionBuilder, DockerBuildScope, RegistryAuth};
+use crate::docker::output::OutputProcessor;
 use crate::job::execute::{
     JobExecutionContext, JobState, StepConclusion, StepResult, build_step_env,
-    finish_step_transaction, is_reserved_command_file_env, prepare_step_transaction, run_process,
+    complete_step_transaction, is_reserved_command_file_env, prepare_step_transaction, run_process,
 };
 use crate::job::execution_domain::DOCKER_CONFIG_ENV;
 use crate::job::expression::ExprContext;
@@ -264,21 +265,30 @@ async fn run_nested_script(
         };
 
         let state_id = prepare_step_transaction(execution.docker_config(), workspace).await?;
+        let processor = OutputProcessor::new(
+            log_sender.clone(),
+            job_state.secret_masker.clone(),
+            job_state.debug_enabled,
+        );
         let result = crate::docker::exec::docker_exec(
             resources.docker(),
             container_id,
             vec![shell.into(), "-e".into(), "-c".into(), resolved_script],
             &step_env,
             &working_dir,
-            job_state,
-            log_sender,
+            &processor,
             timeout,
             cancel_token,
-            job_state.debug_enabled,
         )
         .await;
-        finish_step_transaction(execution.docker_config(), state_id, job_state).await?;
-        return result;
+        return complete_step_transaction(
+            execution.docker_config(),
+            state_id,
+            &processor,
+            job_state,
+            result,
+        )
+        .await;
     }
 
     // Host mode

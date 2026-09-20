@@ -467,6 +467,152 @@ async fn failed_spawn_still_closes_the_step_transaction() {
     config.read_step(next).await.unwrap();
 }
 
+#[tokio::test]
+async fn shell_malformed_state_discards_all_mutations_and_closes_transaction() {
+    let (_temp, workspace) = test_workspace();
+    let (_resources, domain) = test_docker_config();
+    let mut state = test_job_state();
+    let env = host_base_env(&domain);
+    let (log_tx, _log_rx) = tokio::sync::mpsc::channel(8);
+    let log_sender = LogSender::new_for_test(
+        log_tx,
+        crate::job::secret_masker::shared_masker_for_test(&[]),
+    );
+    let step = make_step(
+        "malformed-shell",
+        "printf '%s\\n' '::set-env name=STDOUT_ENV::leak' \
+         '::set-output name=stdout_output::leak' \
+         '::add-path::/stdout/leak' \
+         '::save-state name=stdout_state::leak'; \
+         printf 'FILE_ENV=leak\\n' > \"$GITHUB_ENV\"; \
+         printf '\\377' >> \"$GITHUB_ENV\"; \
+         printf 'file_output=leak\\n' > \"$GITHUB_OUTPUT\"",
+    );
+
+    let error = run_host_step(
+        &step,
+        &mut state,
+        &workspace,
+        &env,
+        &log_sender,
+        &CancellationToken::new(),
+        &domain,
+    )
+    .await
+    .unwrap_err();
+
+    assert!(error.downcast_ref::<ExecutionDomainError>().is_some());
+    assert!(state.env.is_empty());
+    assert!(state.outputs.is_empty());
+    assert!(state.path_prepends.is_empty());
+    assert!(state.action_states.is_empty());
+    assert!(state.step_summaries.is_empty());
+    let next = domain.prepare_step(b"{}").await.unwrap();
+    domain.read_step(next).await.unwrap();
+}
+
+#[tokio::test]
+async fn command_files_win_collisions_with_buffered_stdout_commands() {
+    let (_temp, workspace) = test_workspace();
+    let (_resources, domain) = test_docker_config();
+    let mut state = test_job_state();
+    let env = host_base_env(&domain);
+    let (log_tx, _log_rx) = tokio::sync::mpsc::channel(8);
+    let log_sender = LogSender::new_for_test(
+        log_tx,
+        crate::job::secret_masker::shared_masker_for_test(&[]),
+    );
+    let step = make_step(
+        "state-order",
+        "printf '%s\\n' '::set-env name=COLLISION::stdout' \
+         '::set-output name=collision::stdout' \
+         '::add-path::/stdout/path' \
+         '::save-state name=collision::stdout'; \
+         printf 'COLLISION=file\\n' > \"$GITHUB_ENV\"; \
+         printf 'collision=file\\n' > \"$GITHUB_OUTPUT\"; \
+         printf '/file/path\\n' > \"$GITHUB_PATH\"; \
+         printf 'collision=file\\n' > \"$GITHUB_STATE\"",
+    );
+
+    let result = run_host_step(
+        &step,
+        &mut state,
+        &workspace,
+        &env,
+        &log_sender,
+        &CancellationToken::new(),
+        &domain,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(result.conclusion, StepConclusion::Succeeded);
+    assert_eq!(state.env.get("COLLISION").map(String::as_str), Some("file"));
+    assert_eq!(
+        state.outputs.get("collision").map(String::as_str),
+        Some("file")
+    );
+    assert_eq!(state.path_prepends, ["/stdout/path", "/file/path"]);
+    assert_eq!(
+        state
+            .action_states
+            .get("state-order")
+            .and_then(|values| values.get("collision"))
+            .map(String::as_str),
+        Some("file")
+    );
+}
+
+#[tokio::test]
+async fn snapshot_failure_has_priority_over_command_failure_without_partial_mutation() {
+    let (_temp, workspace) = test_workspace();
+    let (_resources, domain) = test_docker_config();
+    domain.bind_workspace(&workspace).await.unwrap();
+    let state_id = domain.prepare_step(b"{}").await.unwrap();
+    std::fs::remove_file(workspace.env_file()).unwrap();
+    std::fs::write(workspace.env_file(), "FILE_ENV=leak\n").unwrap();
+
+    let (log_tx, _log_rx) = tokio::sync::mpsc::channel(8);
+    let processor = OutputProcessor::new(
+        LogSender::new_for_test(
+            log_tx,
+            crate::job::secret_masker::shared_masker_for_test(&[]),
+        ),
+        crate::job::secret_masker::shared_masker_for_test(&[]),
+        false,
+    );
+    processor
+        .process_line("::set-env name=STDOUT_ENV::leak")
+        .await;
+    let mut state = test_job_state();
+    let command_result: Result<StepResult> = Err(anyhow::anyhow!("spawn canary"));
+
+    let error =
+        complete_step_transaction(&domain, state_id, &processor, &mut state, command_result)
+            .await
+            .unwrap_err();
+
+    assert!(
+        matches!(
+            error.downcast_ref::<ExecutionDomainError>(),
+            Some(ExecutionDomainError::Backend {
+                category: crate::job::execution_domain::FailureCategory::IdentityMismatch,
+                ..
+            })
+        ),
+        "snapshot failure must win: {error}"
+    );
+    assert!(state.env.is_empty());
+    let next_error = domain.prepare_step(b"{}").await.unwrap_err();
+    assert!(matches!(
+        next_error,
+        ExecutionDomainError::Backend {
+            category: crate::job::execution_domain::FailureCategory::IdentityMismatch,
+            ..
+        }
+    ));
+}
+
 #[test]
 fn matching_override_is_allowed() {
     let (_temp, workspace) = test_workspace();
