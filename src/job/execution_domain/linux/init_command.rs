@@ -20,6 +20,18 @@ pub(super) struct PreparedCommand {
 }
 
 impl PreparedCommand {
+    pub(super) fn with_state(
+        mut spec: CommandSpec,
+        steps: &super::super::step_files::StepFiles,
+    ) -> Result<Self, ExecutionDomainError> {
+        let id = spec
+            .state
+            .take()
+            .ok_or_else(|| failure(FailureCategory::InvalidInput))?;
+        spec.env = steps.environment(&id, &spec.env)?;
+        Self::new(spec)
+    }
+
     pub(super) fn new(spec: CommandSpec) -> Result<Self, ExecutionDomainError> {
         let CommandTarget::Sandboxed { program, args, cwd } = spec.target else {
             return Err(failure(FailureCategory::InvalidInput));

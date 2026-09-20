@@ -1,6 +1,6 @@
 #[cfg(all(target_os = "linux", test))]
 mod cgroup;
-#[cfg(all(target_os = "linux", test))]
+#[cfg(target_os = "linux")]
 pub(super) mod dirfd;
 #[cfg(target_os = "linux")]
 mod hardening;
@@ -12,6 +12,8 @@ pub(super) mod launcher;
 #[path = "launcher_test.rs"]
 mod launcher_test;
 pub(super) mod rootfs;
+#[cfg(target_os = "linux")]
+mod step_files;
 
 #[cfg(all(target_os = "linux", test))]
 #[path = "rootfs_test.rs"]

@@ -55,6 +55,13 @@ pub(super) enum Request {
         id: StepFilesId,
         event: Vec<u8>,
     },
+    PrepareStepChunk {
+        request_id: u64,
+        id: StepFilesId,
+        total_bytes: u32,
+        chunk_index: u32,
+        bytes: Vec<u8>,
+    },
     ReadStep {
         id: StepFilesId,
     },
@@ -227,6 +234,24 @@ fn header(bytes: &[u8]) -> Result<(u16, u64, u32), ExecutionDomainError> {
 }
 
 fn validate_message(message: &Message) -> Result<(), ExecutionDomainError> {
+    match message {
+        Message::Request(Request::PrepareStep { event, .. }) if event.len() > EVENT_LIMIT => {
+            return Err(failure(FailureCategory::Protocol));
+        }
+        Message::Request(Request::PrepareStepChunk {
+            request_id,
+            total_bytes,
+            bytes,
+            ..
+        }) if *request_id == 0
+            || *total_bytes as usize > EVENT_LIMIT
+            || bytes.len() > OUTPUT_CHUNK_BYTES
+            || bytes.len() > *total_bytes as usize =>
+        {
+            return Err(failure(FailureCategory::Protocol));
+        }
+        _ => {}
+    }
     if let Message::Response(Response::SnapshotChunk {
         request_id,
         total_bytes,
@@ -292,6 +317,10 @@ pub(super) struct ControlConnection {
 }
 
 impl ControlConnection {
+    #[cfg(target_os = "linux")]
+    pub(super) fn last_request_id(&self) -> u64 {
+        self.incoming - 1
+    }
     #[cfg(target_os = "linux")]
     pub(super) fn control_fd(&self) -> std::os::fd::BorrowedFd<'_> {
         use std::os::fd::AsFd;
@@ -449,7 +478,13 @@ impl ControlConnection {
             None
         };
         let expected = ExpectedResponse::for_request(&request);
-        self.send(Message::Request(request), deadline)?;
+        if let Request::PrepareStep { id, event } = request {
+            for chunk in event_chunks(request_id, &id, &event)? {
+                self.send(Message::Request(chunk), deadline)?;
+            }
+        } else {
+            self.send(Message::Request(request), deadline)?;
+        }
         match self.receive(deadline)? {
             Message::Response(chunk @ Response::SnapshotChunk { .. }) => {
                 let Some(id) = step else {
@@ -641,7 +676,9 @@ impl ExpectedResponse {
             Request::Hello => Self::Hello,
             Request::Run { command_id, .. } => Self::Started(*command_id),
             Request::CancelCommand { command_id, .. } => Self::Finished(*command_id),
-            Request::PrepareStep { id, .. } => Self::Prepared(id.clone()),
+            Request::PrepareStep { id, .. } | Request::PrepareStepChunk { id, .. } => {
+                Self::Prepared(id.clone())
+            }
             Request::ReadStep { id } => Self::Snapshot(id.clone()),
             Request::Shutdown { .. } => Self::Shutdown,
         }
@@ -665,8 +702,102 @@ impl ExpectedResponse {
     }
 }
 
-// These state producers/consumers are promoted with state handling in Task 8.
+const EVENT_LIMIT: usize = 4 * 1024 * 1024;
+
 #[cfg(test)]
+pub(super) fn event_chunks(
+    request_id: u64,
+    id: &StepFilesId,
+    event: &[u8],
+) -> Result<Vec<Request>, ExecutionDomainError> {
+    if request_id == 0 || event.len() > EVENT_LIMIT {
+        return Err(failure(FailureCategory::Protocol));
+    }
+    let chunks: Vec<_> = if event.is_empty() {
+        vec![&[][..]]
+    } else {
+        event.chunks(OUTPUT_CHUNK_BYTES).collect()
+    };
+    Ok(chunks
+        .into_iter()
+        .enumerate()
+        .map(|(index, bytes)| Request::PrepareStepChunk {
+            request_id,
+            id: id.clone(),
+            total_bytes: event.len() as u32,
+            chunk_index: index as u32,
+            bytes: bytes.to_vec(),
+        })
+        .collect())
+}
+
+pub(super) struct EventAssembler {
+    request_id: u64,
+    id: StepFilesId,
+    index: u32,
+    total: Option<u32>,
+    bytes: Vec<u8>,
+    finished: bool,
+}
+
+impl EventAssembler {
+    pub(super) fn new(request_id: u64, id: StepFilesId) -> Self {
+        Self {
+            request_id,
+            id,
+            index: 0,
+            total: None,
+            bytes: Vec::new(),
+            finished: false,
+        }
+    }
+
+    pub(super) fn push(
+        &mut self,
+        request: Request,
+    ) -> Result<Option<Vec<u8>>, ExecutionDomainError> {
+        let result = self.push_inner(request);
+        if result.is_err() {
+            self.finished = true;
+        }
+        result
+    }
+
+    fn push_inner(&mut self, request: Request) -> Result<Option<Vec<u8>>, ExecutionDomainError> {
+        let Request::PrepareStepChunk {
+            request_id,
+            id,
+            total_bytes,
+            chunk_index,
+            bytes,
+        } = request
+        else {
+            return Err(failure(FailureCategory::Protocol));
+        };
+        if self.finished
+            || request_id == 0
+            || request_id != self.request_id
+            || id != self.id
+            || chunk_index != self.index
+            || total_bytes as usize > EVENT_LIMIT
+            || self.total.is_some_and(|total| total != total_bytes)
+            || bytes.len() > OUTPUT_CHUNK_BYTES
+            || self.bytes.len() + bytes.len() > total_bytes as usize
+            || bytes.is_empty() && total_bytes != 0
+        {
+            return Err(failure(FailureCategory::Protocol));
+        }
+        self.total = Some(total_bytes);
+        self.bytes.extend(bytes);
+        self.index += 1;
+        if self.bytes.len() != total_bytes as usize {
+            return Ok(None);
+        }
+        self.finished = true;
+        Ok(Some(std::mem::take(&mut self.bytes)))
+    }
+}
+
 pub(super) fn snapshot_chunks(
     request_id: u64,
     id: &StepFilesId,

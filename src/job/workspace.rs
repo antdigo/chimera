@@ -157,11 +157,7 @@ impl Workspace {
     pub fn read_path_file(&self) -> Result<Vec<String>> {
         let content = std::fs::read_to_string(&self.path_file)
             .with_context(|| format!("reading path file {}", self.path_file.display()))?;
-        Ok(content
-            .lines()
-            .filter(|l| !l.is_empty())
-            .map(|l| l.to_string())
-            .collect())
+        Ok(parse_path_file(&content))
     }
 
     /// Read GITHUB_OUTPUT file (same format as GITHUB_ENV).
@@ -177,6 +173,33 @@ impl Workspace {
         let content = std::fs::read_to_string(&self.state_file)
             .with_context(|| format!("reading state file {}", self.state_file.display()))?;
         parse_context_file(&content)
+    }
+
+    /// Clear per-step files between steps so each step starts with empty files.
+    pub fn prepare_step_state(&self, event: &[u8]) -> Result<()> {
+        for path in [
+            &self.env_file,
+            &self.path_file,
+            &self.output_file,
+            &self.state_file,
+            &self.step_summary_file,
+        ] {
+            std::fs::write(path, []).context("clearing host workflow command file")?;
+        }
+        std::fs::write(&self.event_file, event).context("writing host workflow event file")
+    }
+
+    /// Host-only adapter: sandbox snapshots arrive over the private control socket.
+    pub fn step_state_snapshot(&self) -> Result<super::execution_domain::StepStateSnapshot> {
+        let read =
+            |path| std::fs::read_to_string(path).context("reading host workflow command file");
+        Ok(super::execution_domain::StepStateSnapshot {
+            env: read(&self.env_file)?,
+            path: read(&self.path_file)?,
+            output: read(&self.output_file)?,
+            state: read(&self.state_file)?,
+            summary: read(&self.step_summary_file)?,
+        })
     }
 
     /// Clear per-step files between steps so each step starts with empty files.
@@ -238,7 +261,7 @@ fn cleanup_workspace_resources<const N: usize>(
     }
 }
 
-fn parse_env_file(content: &str) -> Result<HashMap<String, String>> {
+pub(crate) fn parse_env_file(content: &str) -> Result<HashMap<String, String>> {
     // Env names are case-sensitive on Linux, so a plain collect is correct.
     Ok(parse_file_entries(content).into_iter().collect())
 }
@@ -246,12 +269,20 @@ fn parse_env_file(content: &str) -> Result<HashMap<String, String>> {
 /// Parse an outputs/state file: same line format as the env file, but keys
 /// land in case-insensitive context dictionaries officially, so a later
 /// entry replaces an earlier one that differs only by case.
-fn parse_context_file(content: &str) -> Result<HashMap<String, String>> {
+pub(crate) fn parse_context_file(content: &str) -> Result<HashMap<String, String>> {
     let mut result = HashMap::new();
     for (key, value) in parse_file_entries(content) {
         crate::utils::insert_case_insensitive(&mut result, key, value);
     }
     Ok(result)
+}
+
+pub(crate) fn parse_path_file(content: &str) -> Vec<String> {
+    content
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(str::to_owned)
+        .collect()
 }
 
 fn parse_file_entries(content: &str) -> Vec<(String, String)> {

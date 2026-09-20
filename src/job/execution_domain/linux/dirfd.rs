@@ -100,9 +100,8 @@ impl BoundDir {
         verify_chain(&self.binding).inspect_err(|_| self.poison())
     }
 
-    // Creation and removal become lifecycle consumers only after the manager and
-    // cgroup-empty proof exist. Keep the destructive entry point absent in production.
-    #[cfg(test)]
+    // Creation is also used inside init for private workflow command files.
+    // Destructive removal remains gated on the manager's cgroup-empty proof.
     pub(super) fn child(&self, name: &CStr) -> Result<Self, ExecutionDomainError> {
         component(name)?;
         self.verify_binding()?;
@@ -120,7 +119,6 @@ impl BoundDir {
         Ok(child)
     }
 
-    #[cfg(test)]
     pub(super) fn create_child(
         &self,
         name: &CStr,
@@ -159,6 +157,7 @@ impl BoundDir {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(in super::super) fn read_regular(
         &self,
         name: &CStr,
@@ -167,6 +166,19 @@ impl BoundDir {
         self.read_regular_with(name, limit, |reader, bytes| reader.read_to_end(bytes))
     }
 
+    pub(super) fn read_bound_regular(
+        &self,
+        name: &CStr,
+        original: &OwnedFd,
+        limit: usize,
+    ) -> Result<Vec<u8>, ExecutionDomainError> {
+        let original = metadata(original.as_raw_fd())?;
+        self.read_regular_bound_with(name, limit, Some(&original), |reader, bytes| {
+            reader.read_to_end(bytes)
+        })
+    }
+
+    #[cfg(test)]
     pub(super) fn read_regular_with<F>(
         &self,
         name: &CStr,
@@ -176,10 +188,26 @@ impl BoundDir {
     where
         F: FnOnce(&mut dyn Read, &mut Vec<u8>) -> io::Result<usize>,
     {
+        self.read_regular_bound_with(name, limit, None, read)
+    }
+
+    fn read_regular_bound_with<F>(
+        &self,
+        name: &CStr,
+        limit: usize,
+        original: Option<&libc::statx>,
+        read: F,
+    ) -> Result<Vec<u8>, ExecutionDomainError>
+    where
+        F: FnOnce(&mut dyn Read, &mut Vec<u8>) -> io::Result<usize>,
+    {
         component(name)?;
         self.verify_binding()?;
         let fd = open_at(self.fd(), name, READ_FLAGS, 0, RESOLVE_POLICY)?;
         let before = metadata(fd.as_raw_fd())?;
+        if original.is_some_and(|original| identity(&before) != identity(original)) {
+            return Err(failure(FailureCategory::IdentityMismatch));
+        }
         self.validate_regular(&before, limit)?;
         let mut file = File::from(fd);
         let mut bytes = Vec::new();
@@ -206,6 +234,7 @@ impl BoundDir {
         Ok(bytes)
     }
 
+    #[cfg(test)]
     pub(in super::super) fn write_atomic(
         &self,
         name: &CStr,
@@ -218,10 +247,11 @@ impl BoundDir {
         &self,
         name: &CStr,
         bytes: &[u8],
-    ) -> Result<(), ExecutionDomainError> {
+    ) -> Result<OwnedFd, ExecutionDomainError> {
         self.write_with_sync(name, bytes, true, sync)
     }
 
+    #[cfg(test)]
     pub(super) fn write_atomic_with_sync<F>(
         &self,
         name: &CStr,
@@ -232,6 +262,7 @@ impl BoundDir {
         F: FnMut(RawFd, SyncKind) -> io::Result<()>,
     {
         self.write_with_sync(name, bytes, false, sync_file)
+            .map(drop)
     }
 
     fn write_with_sync<F>(
@@ -240,7 +271,7 @@ impl BoundDir {
         bytes: &[u8],
         new: bool,
         mut sync_file: F,
-    ) -> Result<(), ExecutionDomainError>
+    ) -> Result<OwnedFd, ExecutionDomainError>
     where
         F: FnMut(RawFd, SyncKind) -> io::Result<()>,
     {
@@ -291,7 +322,8 @@ impl BoundDir {
             )?;
             sync_file(self.fd(), SyncKind::Directory).map_err(io_failure)?;
             self.verify_entry(name, &written)?;
-            self.verify_binding()
+            self.verify_binding()?;
+            Ok(file.into())
         })();
         result.inspect_err(|_| self.poison())
     }
@@ -497,14 +529,17 @@ pub(super) fn directory_entries(fd: RawFd) -> Result<Vec<CString>, ExecutionDoma
     directory_entries_stream(fd)?.collect()
 }
 
+#[cfg(test)]
 pub(super) struct DirectoryEntries(*mut libc::DIR);
 
+#[cfg(test)]
 impl Drop for DirectoryEntries {
     fn drop(&mut self) {
         unsafe { libc::closedir(self.0) };
     }
 }
 
+#[cfg(test)]
 pub(super) fn directory_entries_stream(
     fd: RawFd,
 ) -> Result<DirectoryEntries, ExecutionDomainError> {
@@ -520,6 +555,7 @@ pub(super) fn directory_entries_stream(
     Ok(DirectoryEntries(directory))
 }
 
+#[cfg(test)]
 impl Iterator for DirectoryEntries {
     type Item = Result<CString, ExecutionDomainError>;
 

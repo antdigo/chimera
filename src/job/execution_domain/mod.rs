@@ -24,6 +24,10 @@ mod protocol;
 #[cfg(test)]
 #[path = "protocol_test.rs"]
 mod protocol_test;
+mod state_bridge;
+#[cfg(test)]
+#[path = "state_bridge_test.rs"]
+mod state_bridge_test;
 
 /// Dispatch reserved bootstrap modes before constructing any async runtime.
 pub fn internal_entry() -> Option<i32> {
@@ -60,6 +64,7 @@ pub use contracts::{
 };
 pub use docker_paths::DockerPaths;
 pub use error::{ExecutionDomainCleanupFatalError, ExecutionDomainError};
+pub use state_bridge::ParsedStepState;
 
 use filesystem::{
     DirectoryIdentity, create_private_dir, directory_identity, io_error, sync_bound_directory,

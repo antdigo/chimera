@@ -317,6 +317,22 @@ fn snapshot_chunks_round_trip_across_utf8_boundaries_and_validate_totals() {
     let mut duplicate = SnapshotAssembler::new(9, id.clone());
     duplicate.push(chunks[0].clone()).unwrap();
     assert!(duplicate.push(chunks[0].clone()).is_err());
+    let mut wrong_field = chunks[0].clone();
+    if let Response::SnapshotChunk { field, .. } = &mut wrong_field {
+        *field = SnapshotField::State;
+    }
+    assert!(
+        SnapshotAssembler::new(9, id.clone())
+            .push(wrong_field)
+            .is_err()
+    );
+    let mut wrong_total = chunks[1].clone();
+    if let Response::SnapshotChunk { total_bytes, .. } = &mut wrong_total {
+        *total_bytes -= 1;
+    }
+    let mut inconsistent = SnapshotAssembler::new(9, id.clone());
+    inconsistent.push(chunks[0].clone()).unwrap();
+    assert!(inconsistent.push(wrong_total).is_err());
     for (length, bytes) in [
         (1024 * 1024 + 1, vec![]),
         (1, vec![1, 2]),
@@ -366,6 +382,60 @@ fn snapshot_transport_uses_bounded_frames_and_correlates_request() {
         matches!(response, Response::StepSnapshot { snapshot: ref value, .. } if *value == snapshot())
     );
     peer.join().unwrap();
+}
+
+#[test]
+fn event_chunk_assembly_checks_identity_order_and_limits() {
+    let id = super::StepFilesId::new();
+    let event = vec![0xff; 4 * 1024 * 1024];
+    let chunks = event_chunks(3, &id, &event).unwrap();
+    let mut assembly = EventAssembler::new(3, id.clone());
+    let mut result = None;
+    for request in chunks.clone() {
+        assert!(
+            encode(&Frame {
+                version: 1,
+                sequence: 1,
+                attempt: identity(),
+                message: Message::Request(request.clone())
+            })
+            .is_ok()
+        );
+        result = assembly.push(request).unwrap();
+    }
+    assert_eq!(result.unwrap(), event);
+    assert!(assembly.push(chunks[0].clone()).is_err());
+    assert!(event_chunks(3, &id, &vec![0; 4 * 1024 * 1024 + 1]).is_err());
+    assert!(
+        EventAssembler::new(4, id.clone())
+            .push(chunks[0].clone())
+            .is_err()
+    );
+    assert!(
+        EventAssembler::new(3, super::StepFilesId::new())
+            .push(chunks[0].clone())
+            .is_err()
+    );
+    assert!(
+        EventAssembler::new(3, id.clone())
+            .push(chunks[1].clone())
+            .is_err()
+    );
+    let mut duplicate = EventAssembler::new(3, id.clone());
+    duplicate.push(chunks[0].clone()).unwrap();
+    assert!(duplicate.push(chunks[0].clone()).is_err());
+    let mut wrong_total = chunks[1].clone();
+    if let Request::PrepareStepChunk { total_bytes, .. } = &mut wrong_total {
+        *total_bytes -= 1;
+    }
+    let mut assembly = EventAssembler::new(3, id.clone());
+    assembly.push(chunks[0].clone()).unwrap();
+    assert!(assembly.push(wrong_total).is_err());
+    let empty = event_chunks(1, &id, &[]).unwrap();
+    assert_eq!(
+        EventAssembler::new(1, id).push(empty[0].clone()).unwrap(),
+        Some(vec![])
+    );
 }
 
 #[test]

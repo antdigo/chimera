@@ -5,12 +5,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use super::super::protocol::{
-    ControlConnection, Message, OutboundQueue, Request, Response, failure,
+    ControlConnection, EventAssembler, Message, OutboundQueue, Request, Response, failure,
+    snapshot_chunks,
 };
 use super::super::{
-    AttemptIdentity, CancelReason, CommandSpec, ExecutionDomainError, FailureCategory,
+    AttemptIdentity, CancelReason, CommandSpec, ExecutionDomainError, FailureCategory, StepFilesId,
 };
 use super::hardening::{ChildPolicy, retain_init_capabilities};
+use super::step_files::StepFiles;
 #[path = "init_command.rs"]
 mod command;
 use command::{PreparedCommand, RunningCommand};
@@ -98,6 +100,7 @@ pub(super) fn serve(
                     ) {
                         Ok(proof) => {
                             let policy = ChildPolicy::workflow(&proof)?;
+                            let steps = StepFiles::create(std::path::Path::new("/run/chimera"))?;
                             retain_init_capabilities()?;
                             connection.send(
                                 Message::Response(Response::KernelReady),
@@ -114,6 +117,9 @@ pub(super) fn serve(
                                 write_deadline: None,
                                 terminal_error: None,
                                 last_command_id: 0,
+                                steps,
+                                event: None,
+                                snapshot: Default::default(),
                             }
                             .run();
                         }
@@ -172,6 +178,9 @@ struct InitRuntime {
     write_deadline: Option<Instant>,
     terminal_error: Option<ExecutionDomainError>,
     last_command_id: u64,
+    steps: StepFiles,
+    event: Option<EventAssembler>,
+    snapshot: std::collections::VecDeque<Response>,
 }
 
 impl InitRuntime {
@@ -232,21 +241,30 @@ impl InitRuntime {
                 self.cancel_active(CancelReason::Shutdown)?;
                 self.enqueue(Response::ShuttingDown)
             }
-            Message::Request(Request::PrepareStep { .. } | Request::ReadStep { .. }) => {
-                self.reject(FailureCategory::NotReady)
-            }
+            Message::Request(
+                request @ (Request::PrepareStep { .. }
+                | Request::PrepareStepChunk { .. }
+                | Request::ReadStep { .. }),
+            ) => self.state_request(request),
             _ => self.reject(FailureCategory::Protocol),
         }
     }
 
-    fn run_command(&mut self, id: u64, spec: CommandSpec) -> Result<(), ExecutionDomainError> {
-        if self.active.is_some() {
+    fn run_command(&mut self, id: u64, mut spec: CommandSpec) -> Result<(), ExecutionDomainError> {
+        if self.active.is_some() || self.event.is_some() || !self.snapshot.is_empty() {
             return self.reject_command(id, FailureCategory::Unavailable);
         }
         if id == 0 || id <= self.last_command_id {
             return self.reject_command(id, FailureCategory::Protocol);
         }
-        let prepared = match PreparedCommand::new(spec) {
+        if spec.state.is_none() {
+            let step = StepFilesId::new();
+            if self.steps.prepare(step.clone(), b"{}").is_err() {
+                return self.reject_command(id, FailureCategory::InvalidInput);
+            }
+            spec.state = Some(step);
+        }
+        let prepared = match PreparedCommand::with_state(spec, &self.steps) {
             Ok(prepared) => prepared,
             Err(_) => return self.reject_command(id, FailureCategory::InvalidInput),
         };
@@ -270,6 +288,50 @@ impl InitRuntime {
         }
     }
 
+    fn state_request(&mut self, request: Request) -> Result<(), ExecutionDomainError> {
+        if self.stopping || self.active.is_some() || !self.snapshot.is_empty() {
+            return self.reject(FailureCategory::Unavailable);
+        }
+        match request {
+            Request::PrepareStep { id, event } if self.event.is_none() => {
+                if self.steps.prepare(id.clone(), &event).is_err() {
+                    return self.reject(FailureCategory::InvalidInput);
+                }
+                self.enqueue(Response::StepPrepared { id })
+            }
+            request @ Request::PrepareStepChunk { .. } => {
+                let Request::PrepareStepChunk { id, .. } = &request else {
+                    unreachable!()
+                };
+                let id = id.clone();
+                let assembler = self.event.get_or_insert_with(|| {
+                    EventAssembler::new(self.connection.last_request_id(), id.clone())
+                });
+                match assembler.push(request) {
+                    Ok(Some(event)) => {
+                        self.event = None;
+                        if self.steps.prepare(id.clone(), &event).is_err() {
+                            return self.reject(FailureCategory::InvalidInput);
+                        }
+                        self.enqueue(Response::StepPrepared { id })
+                    }
+                    Ok(None) => Ok(()),
+                    Err(error) => Err(error),
+                }
+            }
+            Request::ReadStep { id } if self.event.is_none() => {
+                let snapshot = match self.steps.read(&id) {
+                    Ok(snapshot) => snapshot,
+                    Err(_) => return self.reject(FailureCategory::InvalidInput),
+                };
+                self.snapshot =
+                    snapshot_chunks(self.connection.last_request_id(), &id, &snapshot)?.into();
+                Ok(())
+            }
+            _ => self.reject(FailureCategory::Protocol),
+        }
+    }
+
     fn cancel_active(&mut self, reason: CancelReason) -> Result<(), ExecutionDomainError> {
         if let Some(command) = &mut self.active {
             command.cancel(reason)?;
@@ -281,6 +343,8 @@ impl InitRuntime {
         self.connected = false;
         self.stopping = true;
         self.outbound = OutboundQueue::new();
+        self.snapshot.clear();
+        self.event = None;
         self.terminal_error = Some(error);
         self.cancel_active(CancelReason::HandleDropped)
     }
@@ -303,6 +367,12 @@ impl InitRuntime {
     }
 
     fn output(&mut self) -> Result<(), ExecutionDomainError> {
+        if self.connected
+            && self.outbound.has_capacity()
+            && let Some(chunk) = self.snapshot.pop_front()
+        {
+            self.enqueue(chunk)?;
+        }
         for stderr in [false, true] {
             if self.connected && !self.outbound.has_capacity() {
                 break;

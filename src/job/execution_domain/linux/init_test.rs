@@ -45,6 +45,58 @@ fn command_preparation_clears_inherited_environment_and_rejects_reserved_overrid
     assert!(PreparedCommand::new(bad).is_err());
 }
 
+#[test]
+fn command_state_binding_injects_private_files_and_rejects_any_override() {
+    let root = tempfile::tempdir().unwrap();
+    let mut steps = StepFiles::create(root.path()).unwrap();
+    let id = StepFilesId::new();
+    steps.prepare(id.clone(), b"{}").unwrap();
+    let spec = CommandSpec {
+        target: CommandTarget::Sandboxed {
+            program: DomainPath::parse("/bin/sh").unwrap(),
+            args: vec![],
+            cwd: DomainPath::parse("/").unwrap(),
+        },
+        env: HashMap::new(),
+        timeout: Duration::from_secs(1),
+        state: Some(id.clone()),
+    };
+    let prepared = PreparedCommand::with_state(spec.clone(), &steps).unwrap();
+    let env: Vec<_> = prepared
+        .env
+        .iter()
+        .map(|value| value.to_str().unwrap())
+        .collect();
+    assert!(
+        env.contains(
+            &format!(
+                "GITHUB_EVENT_PATH=/run/chimera/steps/{}/event.json",
+                id.component()
+            )
+            .as_str()
+        )
+    );
+    assert!(
+        env.contains(&format!("GITHUB_STATE=/run/chimera/steps/{}/state", id.component()).as_str())
+    );
+    for key in [
+        "GITHUB_ENV",
+        "GITHUB_PATH",
+        "GITHUB_OUTPUT",
+        "GITHUB_STATE",
+        "GITHUB_STEP_SUMMARY",
+        "GITHUB_EVENT_PATH",
+    ] {
+        let mut bad = spec.clone();
+        bad.env.insert(key.into(), "/CANARY".into());
+        let error = PreparedCommand::with_state(bad, &steps).err().unwrap();
+        assert!(!format!("{error:?}").contains("CANARY"));
+    }
+    let mut unknown = spec;
+    unknown.state = Some(StepFilesId::new());
+    assert!(PreparedCommand::with_state(unknown, &steps).is_err());
+}
+
 use super::super::hardening::hardening_test::{fixture_policy, native_child};
 use crate::job::execution_domain::{CommandEvent, CommandTarget, DomainPath};
 use std::collections::HashMap;
@@ -78,6 +130,9 @@ impl Fixture {
                 write_deadline: None,
                 terminal_error: None,
                 last_command_id: 0,
+                steps: StepFiles::create(root.path()).unwrap(),
+                event: None,
+                snapshot: Default::default(),
             };
             let result = runtime.run();
             unsafe { libc::_exit(if result.is_ok() { 0 } else { 1 }) };
@@ -165,6 +220,71 @@ impl Drop for Fixture {
             }
         }
     }
+}
+
+#[test]
+#[ignore = "requires disposable user/mount namespaces and Landlock"]
+fn native_state_protocol_roundtrip_and_command_binding() {
+    if !native_child(
+        "job::execution_domain::linux::init::init_test::native_state_protocol_roundtrip_and_command_binding",
+    ) {
+        return;
+    }
+    let mut fixture = Fixture::start();
+    let id = StepFilesId::new();
+    let response = fixture
+        .connection
+        .request(Request::PrepareStep {
+            id: id.clone(),
+            event: vec![b' '; 4 * 1024 * 1024],
+        })
+        .unwrap();
+    assert!(matches!(response, Response::StepPrepared { id: actual } if actual == id));
+    let directory = fixture.root.path().join("steps").join(id.component());
+    let env = format!("TOKEN={}\n", "x".repeat(100_000));
+    std::fs::write(directory.join("env"), &env).unwrap();
+    let response = fixture
+        .connection
+        .request(Request::ReadStep { id: id.clone() })
+        .unwrap();
+    assert!(matches!(response, Response::StepSnapshot { snapshot, .. } if snapshot.env == env));
+    fixture.send(Request::Run {
+        command_id: 1,
+        spec: CommandSpec {
+            target: CommandTarget::Sandboxed {
+                program: DomainPath::parse("/bin/sh").unwrap(),
+                args: vec!["-c".into(), "printf '%s' \"$GITHUB_ENV\"".into()],
+                cwd: DomainPath::parse(fixture.root.path().to_str().unwrap()).unwrap(),
+            },
+            env: HashMap::new(),
+            timeout: Duration::from_secs(5),
+            state: Some(id.clone()),
+        },
+    });
+    assert!(matches!(
+        fixture.receive(),
+        Response::CommandStarted { command_id: 1 }
+    ));
+    let (outcome, stdout, _) = fixture.finish(1);
+    assert_eq!(outcome, CommandOutcome::Exited(0));
+    assert_eq!(
+        stdout,
+        format!("/run/chimera/steps/{}/env", id.component()).as_bytes()
+    );
+    let next = StepFilesId::new();
+    fixture
+        .connection
+        .request(Request::PrepareStep {
+            id: next.clone(),
+            event: b"{}".to_vec(),
+        })
+        .unwrap();
+    let response = fixture
+        .connection
+        .request(Request::ReadStep { id: next })
+        .unwrap();
+    assert!(matches!(response, Response::StepSnapshot { snapshot, .. } if snapshot.env.is_empty()));
+    fixture.shutdown();
 }
 
 #[test]
