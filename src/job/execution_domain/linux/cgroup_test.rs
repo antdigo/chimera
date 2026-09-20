@@ -2,11 +2,12 @@ use super::super::{AttemptIdentity, ExecutionDomainError, FailureCategory};
 use super::cgroup::{CgroupFilesystem, CgroupRoot, KernelCgroupFs};
 use super::cgroup::{CgroupOperation, creation_operations, validate_controllers};
 use crate::config::resources::{IoMax, ResourceLimits, ValidatedLimits};
+use std::collections::HashSet;
 use std::ffi::CStr;
 use std::fs::{self, File};
 use std::io::{self, Seek, SeekFrom};
 use std::os::fd::{AsRawFd, RawFd};
-use std::os::unix::fs::symlink;
+use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -22,7 +23,16 @@ struct FixtureFs {
     wrong_filesystem: Mutex<bool>,
     omit_domain_membership: Mutex<bool>,
     read_delay: Mutex<Option<ReadDelay>>,
+    readonly_child_control: Mutex<Option<(String, String)>>,
+    omit_child_control: Mutex<bool>,
+    visited_directories: Mutex<HashSet<PathBuf>>,
+    scan_gate: Mutex<Option<ScanGate>>,
     observed: Mutex<Vec<(String, String)>>,
+}
+
+struct ScanGate {
+    started: Arc<AtomicBool>,
+    release: Arc<AtomicBool>,
 }
 
 struct ReadDelay {
@@ -74,7 +84,17 @@ fn seed(path: &Path, limits: &ValidatedLimits) {
 }
 
 impl CgroupFilesystem for FixtureFs {
-    fn verify_filesystem(&self, _fd: RawFd) -> io::Result<()> {
+    fn verify_filesystem(&self, fd: RawFd) -> io::Result<()> {
+        let path = fd_path(fd);
+        if path.is_dir() {
+            self.visited_directories.lock().unwrap().insert(path);
+            if let Some(gate) = self.scan_gate.lock().unwrap().take() {
+                gate.started.store(true, Ordering::Release);
+                while !gate.release.load(Ordering::Acquire) {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
+        }
         if *self.wrong_filesystem.lock().unwrap() {
             Err(io::Error::from_raw_os_error(libc::ENODEV))
         } else {
@@ -88,6 +108,17 @@ impl CgroupFilesystem for FixtureFs {
         seed(&fd_path(parent).join(name.to_str().unwrap()), &limits());
         if name == c"domain" && *self.omit_domain_membership.lock().unwrap() {
             fs::remove_file(fd_path(parent).join("domain/cgroup.procs"))?;
+        }
+        if let Some((group, control)) = self.readonly_child_control.lock().unwrap().as_ref() {
+            let component = name.to_str().unwrap();
+            if component == group || group == "attempt" && component.starts_with("attempt-") {
+                let path = fd_path(parent).join(component).join(control);
+                if *self.omit_child_control.lock().unwrap() {
+                    fs::remove_file(path)?;
+                } else {
+                    fs::set_permissions(path, fs::Permissions::from_mode(0o444))?;
+                }
+            }
         }
         Ok(())
     }
@@ -149,6 +180,145 @@ impl CgroupFilesystem for FixtureFs {
             fs::remove_file(entry.path())?;
         }
         KernelCgroupFs.remove(parent, name, child)
+    }
+}
+
+#[test]
+fn delegated_root_controls_can_be_read_only_for_the_service_user() {
+    assert_ne!(
+        unsafe { libc::geteuid() },
+        0,
+        "run the Linux fixture as its unprivileged UID"
+    );
+    for kill_mode in [0o444, 0o000] {
+        let fixture = Fixture::new();
+        fs::set_permissions(
+            fixture.temp.path().join("cgroup.kill"),
+            fs::Permissions::from_mode(kill_mode),
+        )
+        .unwrap();
+        fs::set_permissions(
+            fixture.temp.path().join("memory.swap.max"),
+            fs::Permissions::from_mode(0o444),
+        )
+        .unwrap();
+        let root = fixture.ready();
+        root.create_attempt(AttemptIdentity::new(), &limits())
+            .unwrap();
+    }
+}
+
+#[test]
+fn owned_attempt_and_domain_controls_must_still_be_writable() {
+    assert_ne!(
+        unsafe { libc::geteuid() },
+        0,
+        "run the Linux fixture as its unprivileged UID"
+    );
+    for group in ["attempt", "domain"] {
+        for control in [
+            "cgroup.kill",
+            "memory.swap.max",
+            "memory.max",
+            "cpu.max",
+            "pids.max",
+            "io.max",
+        ] {
+            for missing in [false, true] {
+                let fixture = Fixture::new();
+                let root = fixture.ready();
+                *fixture.fs.readonly_child_control.lock().unwrap() =
+                    Some((group.into(), control.into()));
+                *fixture.fs.omit_child_control.lock().unwrap() = missing;
+                assert!(
+                    root.create_attempt(AttemptIdentity::new(), &limits())
+                        .is_err(),
+                    "{group}/{control}, missing={missing}"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn wide_inventory_stops_before_opening_over_budget_children() {
+    let fixture = Fixture::new();
+    let root = fixture.ready();
+    let id = AttemptIdentity::new();
+    let attempt = root.create_attempt(id, &limits()).unwrap();
+    let domain = fixture.attempt_path(id).join("domain");
+    for index in 0..4200 {
+        fs::create_dir(domain.join(format!("child-{index}"))).unwrap();
+    }
+    fixture.fs.visited_directories.lock().unwrap().clear();
+    assert!(attempt.wait_empty(Duration::from_secs(10)).await.is_err());
+    let count = fixture.fs.visited_directories.lock().unwrap().len();
+    assert!(
+        count <= 4096,
+        "opened {count} groups before enforcing the 4096-node budget"
+    );
+}
+
+#[tokio::test]
+async fn deep_inventory_stops_before_opening_over_depth_children() {
+    let fixture = Fixture::new();
+    let root = fixture.ready();
+    let id = AttemptIdentity::new();
+    let attempt = root.create_attempt(id, &limits()).unwrap();
+    let mut path = fixture.attempt_path(id).join("domain");
+    for _ in 0..80 {
+        path.push("child");
+        fs::create_dir(&path).unwrap();
+    }
+    fixture.fs.visited_directories.lock().unwrap().clear();
+    assert!(attempt.wait_empty(Duration::from_secs(10)).await.is_err());
+    let count = fixture.fs.visited_directories.lock().unwrap().len();
+    assert!(
+        count <= 64,
+        "opened {count} groups before enforcing the 64-level budget"
+    );
+}
+
+#[tokio::test]
+async fn timed_out_inventory_continuation_is_still_hard_bounded() {
+    let fixture = Fixture::new();
+    let root = fixture.ready();
+    let id = AttemptIdentity::new();
+    let attempt = root.create_attempt(id, &limits()).unwrap();
+    let domain = fixture.attempt_path(id).join("domain");
+    for index in 0..4200 {
+        fs::create_dir(domain.join(format!("child-{index}"))).unwrap();
+    }
+    fixture.fs.visited_directories.lock().unwrap().clear();
+    let started = Arc::new(AtomicBool::new(false));
+    let release = Arc::new(AtomicBool::new(false));
+    *fixture.fs.scan_gate.lock().unwrap() = Some(ScanGate {
+        started: started.clone(),
+        release: release.clone(),
+    });
+    let references = Arc::strong_count(&fixture.fs);
+    let result = attempt.wait_empty(Duration::from_millis(30)).await;
+    release.store(true, Ordering::Release);
+    assert!(started.load(Ordering::Acquire));
+    assert!(matches!(
+        result,
+        Err(ExecutionDomainError::Backend {
+            category: FailureCategory::Timeout,
+            ..
+        })
+    ));
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let visited = fixture.fs.visited_directories.lock().unwrap().len();
+        if visited >= 4096 && Arc::strong_count(&fixture.fs) == references {
+            assert!(visited <= 4096, "timed-out worker opened {visited} groups");
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "bounded worker did not finish"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
     }
 }
 

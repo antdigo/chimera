@@ -15,6 +15,41 @@ const CONTROLLERS: [&str; 4] = ["cpu", "memory", "pids", "io"];
 const ENABLE: &str = "+cpu +memory +pids +io";
 const READ_LIMIT: u64 = 1024 * 1024;
 const MAX_GROUPS: usize = 4096;
+const MAX_DEPTH: usize = 64;
+const MAX_ENTRIES: usize = MAX_GROUPS * 128;
+
+struct TraversalBudget {
+    groups: usize,
+    entries: usize,
+}
+
+impl TraversalBudget {
+    fn new() -> Self {
+        Self {
+            groups: MAX_GROUPS - 1,
+            entries: MAX_ENTRIES,
+        }
+    }
+
+    fn entry(&mut self) -> Result<(), ExecutionDomainError> {
+        self.entries = self
+            .entries
+            .checked_sub(1)
+            .ok_or_else(|| failure(FailureCategory::Unavailable))?;
+        Ok(())
+    }
+
+    fn child(&mut self, depth: usize) -> Result<(), ExecutionDomainError> {
+        if depth >= MAX_DEPTH {
+            return Err(failure(FailureCategory::Unavailable));
+        }
+        self.groups = self
+            .groups
+            .checked_sub(1)
+            .ok_or_else(|| failure(FailureCategory::Unavailable))?;
+        Ok(())
+    }
+}
 
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum CgroupOperation {
@@ -129,12 +164,12 @@ impl<F: CgroupFilesystem> CgroupRoot<F> {
         if directory.read(c"cgroup.type")?.trim() != "domain" {
             return Err(failure(FailureCategory::Unsupported));
         }
-        for name in [
-            c"cgroup.kill",
-            c"cgroup.procs",
-            c"cgroup.subtree_control",
-            c"memory.swap.max",
-        ] {
+        // systemd retains ownership of service-root resource controls. Delegate=
+        // grants membership/subtree management, not writes to these ancestors.
+        for name in [c"cgroup.kill", c"memory.swap.max"] {
+            directory.open_control(name, libc::O_PATH)?;
+        }
+        for name in [c"cgroup.procs", c"cgroup.subtree_control"] {
             directory.open_control(name, libc::O_WRONLY)?;
         }
         directory.read(c"memory.swap.max")?;
@@ -165,9 +200,7 @@ impl<F: CgroupFilesystem> CgroupRoot<F> {
             }
             Err(error) => return Err(io_failure(error)),
         };
-        if supervisor.members()?.iter().any(|pid| *pid != self_pid)
-            || !supervisor.children()?.is_empty()
-        {
+        if supervisor.members()?.iter().any(|pid| *pid != self_pid) || supervisor.has_children()? {
             return Err(failure(FailureCategory::Unavailable));
         }
         supervisor.write(c"cgroup.procs", "0")?;
@@ -210,7 +243,13 @@ impl<F: CgroupFilesystem> CgroupRoot<F> {
                 CgroupOperation::VerifyLimits => verify_limits(required(&directory)?, limits)?,
                 CgroupOperation::EnableControllers => required(&directory)?.enable_controllers()?,
                 CgroupOperation::CreateDomain => {
-                    domain = Some(required(&directory)?.create(c"domain")?)
+                    let created = required(&directory)?.create(c"domain")?;
+                    for (name, _) in limits.writes() {
+                        let name = CString::new(name)
+                            .map_err(|_| failure(FailureCategory::InvalidInput))?;
+                        created.open_control(&name, libc::O_WRONLY)?;
+                    }
+                    domain = Some(created);
                 }
                 CgroupOperation::OpenMembership => {
                     // No launcher descriptor exists until every limit has been
@@ -352,13 +391,12 @@ impl<F: CgroupFilesystem> CgroupDir<F> {
 
     fn open_control(&self, name: &CStr, flags: i32) -> Result<OwnedFd, ExecutionDomainError> {
         self.verify()?;
-        let fd = dirfd::open_at(
-            self.bound.fd(),
-            name,
-            flags | libc::O_CLOEXEC | libc::O_NONBLOCK | libc::O_NOFOLLOW,
-            0,
-            dirfd::RESOLVE_POLICY,
-        )?;
+        let flags = if flags & libc::O_PATH != 0 {
+            flags | libc::O_CLOEXEC | libc::O_NOFOLLOW
+        } else {
+            flags | libc::O_CLOEXEC | libc::O_NONBLOCK | libc::O_NOFOLLOW
+        };
+        let fd = dirfd::open_at(self.bound.fd(), name, flags, 0, dirfd::RESOLVE_POLICY)?;
         let metadata = dirfd::metadata(fd.as_raw_fd())?;
         let parent = dirfd::metadata(self.bound.fd())?;
         if u32::from(metadata.stx_mode) & libc::S_IFMT != libc::S_IFREG
@@ -434,43 +472,70 @@ impl<F: CgroupFilesystem> CgroupDir<F> {
         value.ok_or_else(|| failure(FailureCategory::IdentityMismatch))
     }
 
-    fn children(self: &Arc<Self>) -> Result<Vec<Arc<Self>>, ExecutionDomainError> {
+    fn has_children(&self) -> Result<bool, ExecutionDomainError> {
         self.verify()?;
-        let mut children = Vec::new();
-        for name in dirfd::directory_entries(self.bound.fd())? {
-            let metadata = dirfd::stat_at(self.bound.fd(), &name).map_err(io_failure)?;
-            match u32::from(metadata.stx_mode) & libc::S_IFMT {
-                libc::S_IFDIR => children.push(self.child(&name)?),
-                libc::S_IFREG => {
-                    // Some kernel controls (notably cgroup.kill) are write-only.
-                    let parent = dirfd::metadata(self.bound.fd())?;
-                    if metadata.stx_nlink != 1
-                        || metadata.stx_mnt_id != parent.stx_mnt_id
-                        || metadata.stx_dev_major != parent.stx_dev_major
-                        || metadata.stx_dev_minor != parent.stx_dev_minor
-                    {
-                        return Err(failure(FailureCategory::IdentityMismatch));
-                    }
-                }
-                _ => return Err(failure(FailureCategory::IdentityMismatch)),
+        let mut budget = TraversalBudget::new();
+        let mut entries = dirfd::directory_entries_stream(self.bound.fd())?;
+        loop {
+            budget.entry()?;
+            let Some(name) = entries.next() else {
+                break;
+            };
+            if self.entry_is_directory(&name?)? {
+                return Ok(true);
             }
         }
         self.verify()?;
-        Ok(children)
+        Ok(false)
+    }
+
+    fn entry_is_directory(&self, name: &CStr) -> Result<bool, ExecutionDomainError> {
+        let metadata = dirfd::stat_at(self.bound.fd(), name).map_err(io_failure)?;
+        let parent = dirfd::metadata(self.bound.fd())?;
+        if metadata.stx_mnt_id != parent.stx_mnt_id
+            || metadata.stx_dev_major != parent.stx_dev_major
+            || metadata.stx_dev_minor != parent.stx_dev_minor
+        {
+            return Err(failure(FailureCategory::IdentityMismatch));
+        }
+        match u32::from(metadata.stx_mode) & libc::S_IFMT {
+            libc::S_IFDIR => Ok(true),
+            libc::S_IFREG if metadata.stx_nlink == 1 => Ok(false),
+            _ => Err(failure(FailureCategory::IdentityMismatch)),
+        }
     }
 
     fn tree(self: &Arc<Self>) -> Result<Vec<Arc<Self>>, ExecutionDomainError> {
-        let mut groups = vec![Arc::clone(self)];
-        let mut index = 0;
-        while index < groups.len() {
-            let children = groups[index].children()?;
-            if children.len() > MAX_GROUPS.saturating_sub(groups.len()) {
-                return Err(failure(FailureCategory::Unavailable));
-            }
-            groups.extend(children);
-            index += 1;
-        }
+        let mut groups = Vec::new();
+        self.collect_tree(0, &mut TraversalBudget::new(), &mut groups)?;
         Ok(groups)
+    }
+
+    fn collect_tree(
+        self: &Arc<Self>,
+        depth: usize,
+        budget: &mut TraversalBudget,
+        groups: &mut Vec<Arc<Self>>,
+    ) -> Result<(), ExecutionDomainError> {
+        self.verify()?;
+        groups.push(Arc::clone(self));
+        let mut entries = dirfd::directory_entries_stream(self.bound.fd())?;
+        loop {
+            // Reserve work before readdir allocates the next name, and reserve
+            // each node/depth before opening its bound descriptor. Both budgets
+            // are shared across the entire tree, including detached timed-out scans.
+            budget.entry()?;
+            let Some(name) = entries.next() else {
+                break;
+            };
+            let name = name?;
+            if self.entry_is_directory(&name)? {
+                budget.child(depth + 1)?;
+                let child = self.child(&name)?;
+                child.collect_tree(depth + 1, budget, groups)?;
+            }
+        }
+        self.verify()
     }
 
     fn recursively_empty(self: &Arc<Self>) -> Result<bool, ExecutionDomainError> {

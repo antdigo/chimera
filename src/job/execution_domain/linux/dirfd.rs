@@ -494,15 +494,21 @@ enum RemovalEntry {
 
 #[cfg(test)]
 pub(super) fn directory_entries(fd: RawFd) -> Result<Vec<CString>, ExecutionDomainError> {
-    use std::os::fd::IntoRawFd;
+    directory_entries_stream(fd)?.collect()
+}
 
-    struct DirectoryStream(*mut libc::DIR);
-    impl Drop for DirectoryStream {
-        fn drop(&mut self) {
-            unsafe { libc::closedir(self.0) };
-        }
+pub(super) struct DirectoryEntries(*mut libc::DIR);
+
+impl Drop for DirectoryEntries {
+    fn drop(&mut self) {
+        unsafe { libc::closedir(self.0) };
     }
+}
 
+pub(super) fn directory_entries_stream(
+    fd: RawFd,
+) -> Result<DirectoryEntries, ExecutionDomainError> {
+    use std::os::fd::IntoRawFd;
     let duplicate = open_at(fd, c".", DIRECTORY_FLAGS, 0, RESOLVE_POLICY)?;
     let raw = duplicate.into_raw_fd();
     let directory = unsafe { libc::fdopendir(raw) };
@@ -511,25 +517,30 @@ pub(super) fn directory_entries(fd: RawFd) -> Result<Vec<CString>, ExecutionDoma
         unsafe { libc::close(raw) };
         return Err(io_failure(error));
     }
-    let directory = DirectoryStream(directory);
-    let mut names = Vec::new();
-    loop {
-        unsafe { *libc::__errno_location() = 0 };
-        let entry = unsafe { libc::readdir(directory.0) };
-        if entry.is_null() {
-            let error = io::Error::last_os_error();
-            if error.raw_os_error() != Some(0) {
-                return Err(io_failure(error));
+    Ok(DirectoryEntries(directory))
+}
+
+impl Iterator for DirectoryEntries {
+    type Item = Result<CString, ExecutionDomainError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            unsafe { *libc::__errno_location() = 0 };
+            let entry = unsafe { libc::readdir(self.0) };
+            if entry.is_null() {
+                let error = io::Error::last_os_error();
+                return if error.raw_os_error() == Some(0) {
+                    None
+                } else {
+                    Some(Err(io_failure(error)))
+                };
             }
-            break;
-        }
-        let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
-        if name != c"." && name != c".." {
-            component(name)?;
-            names.push(name.to_owned());
+            let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
+            if name != c"." && name != c".." {
+                return Some(component(name).map(|()| name.to_owned()));
+            }
         }
     }
-    Ok(names)
 }
 
 fn verify_chain(binding: &Binding) -> Result<(), ExecutionDomainError> {
