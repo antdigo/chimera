@@ -7,11 +7,11 @@ use anyhow::{Context, Result};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{Mutex, OwnedMutexGuard, RwLock};
 
-use super::auth::CapabilityId;
+use super::auth::CapabilityEpoch;
 use super::error::CacheError;
 
 struct UploadSession {
-    owner_capability_id: CapabilityId,
+    owner_epoch: CapabilityEpoch,
     owner_job_id: String,
     key: String,
     version: String,
@@ -53,9 +53,9 @@ impl UploadTracker {
     }
 
     /// Reserve a new upload session. Returns the cache ID.
-    pub async fn reserve(
+    pub(crate) async fn reserve(
         &self,
-        owner_capability_id: CapabilityId,
+        owner_epoch: CapabilityEpoch,
         owner_job_id: String,
         key: String,
         version: String,
@@ -71,7 +71,7 @@ impl UploadTracker {
             .with_context(|| format!("creating upload file {}", tmp_path.display()))?;
 
         let session = UploadSession {
-            owner_capability_id,
+            owner_epoch,
             owner_job_id,
             key,
             version,
@@ -89,9 +89,10 @@ impl UploadTracker {
     }
 
     /// Write a chunk to an upload session at the given offset.
-    pub async fn write_chunk(
+    #[cfg(test)]
+    pub(crate) async fn write_chunk(
         &self,
-        owner: &CapabilityId,
+        owner: &CapabilityEpoch,
         id: u64,
         offset: u64,
         data: &[u8],
@@ -100,11 +101,11 @@ impl UploadTracker {
         self.write_chunk_locked(locked, offset, data).await
     }
 
-    pub(crate) async fn lock(&self, owner: &CapabilityId, id: u64) -> Result<LockedUpload> {
+    pub(crate) async fn lock(&self, owner: &CapabilityEpoch, id: u64) -> Result<LockedUpload> {
         let session = self.session(id).await?;
         let locked = self.lock_session(session).await;
         let current = locked.as_ref().ok_or(CacheError::UploadNotFound(id))?;
-        if &current.owner_capability_id != owner {
+        if &current.owner_epoch != owner {
             return Err(CacheError::UploadNotFound(id).into());
         }
 
@@ -169,9 +170,10 @@ impl UploadTracker {
 
     /// Commit an upload session. Returns (key, version, scope_repo, scope_ref, tmp_path, bytes_written).
     /// The caller is responsible for storing the blob and cleaning up.
-    pub async fn commit(
+    #[cfg(test)]
+    pub(crate) async fn commit(
         &self,
-        owner: &CapabilityId,
+        owner: &CapabilityEpoch,
         id: u64,
         expected_size: u64,
     ) -> Result<(String, String, String, String, PathBuf, u64)> {

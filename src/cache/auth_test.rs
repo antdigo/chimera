@@ -51,7 +51,7 @@ async fn capability_authorizes_only_its_registered_scope_until_revoked() {
         )
         .await
         .unwrap();
-    assert_eq!(authorized.capability_id(), &id);
+    assert_eq!(authorized.capability_id(), id.capability_id());
     assert_eq!(authorized.job_id(), "job-a");
     assert_eq!(authorized.expires_at(), issued_at + JOB_CAPABILITY_LIFETIME);
 
@@ -158,6 +158,108 @@ async fn duplicate_active_token_cannot_replace_original_claims() {
 }
 
 #[tokio::test]
+async fn token_reuse_waits_for_old_epoch_revoke_and_old_cleanup_cannot_revoke_new_epoch() {
+    let authority = CacheAuthority::new();
+    let issued_at = Utc::now();
+    let old = authority
+        .register_job("reused-token", claims("old-job", "org/old"), issued_at)
+        .await
+        .unwrap();
+    let old_job = authority.authenticate("reused-token").await.unwrap();
+    let old_operation = authority.admit(&old_job).await.unwrap();
+
+    let revoke = authority.revoke(&old);
+    tokio::pin!(revoke);
+    assert!(futures::poll!(&mut revoke).is_pending());
+    assert_eq!(
+        authority
+            .register_job(
+                "reused-token",
+                claims("new-job", "org/new"),
+                issued_at + Duration::seconds(1),
+            )
+            .await
+            .unwrap_err(),
+        CacheAuthError::DuplicateToken,
+    );
+
+    drop(old_operation);
+    revoke.await;
+    let _new = authority
+        .register_job(
+            "reused-token",
+            claims("new-job", "org/new"),
+            issued_at + Duration::seconds(1),
+        )
+        .await
+        .unwrap();
+
+    // A delayed cleanup using the old lifecycle handle must target only the old epoch.
+    let authorized = authority
+        .authorize(
+            "reused-token",
+            &scope("org/new", "refs/heads/feature", "refs/heads/main"),
+        )
+        .await
+        .unwrap();
+    let grant = authority
+        .issue_download(&authorized, "a".repeat(64))
+        .await
+        .unwrap();
+    authority.revoke_immediately(&old);
+    assert!(
+        authority
+            .authorize(
+                "reused-token",
+                &scope("org/new", "refs/heads/feature", "refs/heads/main"),
+            )
+            .await
+            .is_ok()
+    );
+    authority.revoke(&old).await;
+    let authorized = authority
+        .authorize(
+            "reused-token",
+            &scope("org/new", "refs/heads/feature", "refs/heads/main"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(authorized.job_id(), "new-job");
+    assert_eq!(
+        authority.resolve_download(grant).await.unwrap(),
+        "a".repeat(64)
+    );
+}
+
+#[tokio::test]
+async fn late_cleanup_of_expired_epoch_does_not_revoke_reused_token() {
+    let issued_at = Utc.timestamp_opt(0, 0).single().unwrap();
+    let (timestamp, now) = clock(issued_at);
+    let authority = CacheAuthority::with_clock(now);
+    let old = authority
+        .register_job("reused-token", claims("old-job", "org/old"), issued_at)
+        .await
+        .unwrap();
+
+    let reused_at = issued_at + JOB_CAPABILITY_LIFETIME + Duration::seconds(1);
+    timestamp.store(reused_at.timestamp(), Ordering::SeqCst);
+    let _new = authority
+        .register_job("reused-token", claims("new-job", "org/new"), reused_at)
+        .await
+        .unwrap();
+
+    authority.revoke(&old).await;
+    let authorized = authority
+        .authorize(
+            "reused-token",
+            &scope("org/new", "refs/heads/feature", "refs/heads/main"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(authorized.job_id(), "new-job");
+}
+
+#[tokio::test]
 async fn download_grant_is_blob_bound_and_dies_with_parent() {
     let authority = CacheAuthority::new();
     let id = authority
@@ -253,7 +355,12 @@ async fn assert_opportunistic_pruning(issue_grant: bool) {
     authority.revoke(&ids[1]).await;
     authority.revoke_immediately(&ids[2]);
     // An orphan must not survive even if its parent was already removed.
-    authority.state.write().await.jobs.remove(&ids[3]);
+    authority
+        .state
+        .write()
+        .await
+        .jobs
+        .remove(ids[3].capability_id());
     authority.revoke_immediately(&ids[3]);
     timestamp.store(
         (issued_at + JOB_CAPABILITY_LIFETIME).timestamp(),

@@ -1,4 +1,6 @@
+use std::future::Future;
 use std::net::SocketAddr;
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -11,8 +13,10 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, patch, post};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use futures::FutureExt;
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
+use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
@@ -202,6 +206,38 @@ impl FromRequestParts<CacheServerState> for AuthorizedCacheRequest {
 
 // --- Handlers ---
 
+fn spawn_storage_operation<T, F>(
+    operation: &'static str,
+    future: F,
+) -> JoinHandle<Result<T, StatusCode>>
+where
+    T: Send + 'static,
+    F: Future<Output = Result<T, StatusCode>> + Send + 'static,
+{
+    tokio::spawn(async move {
+        match AssertUnwindSafe(future).catch_unwind().await {
+            Ok(result) => result,
+            Err(_) => {
+                tracing::error!(operation, "cache storage operation panicked");
+                Err(StatusCode::INTERNAL_SERVER_ERROR)
+            }
+        }
+    })
+}
+
+async fn await_storage_operation<T>(
+    operation: &'static str,
+    task: JoinHandle<Result<T, StatusCode>>,
+) -> Result<T, StatusCode> {
+    match task.await {
+        Ok(result) => result,
+        Err(error) => {
+            tracing::error!(operation, error = %error, "cache storage operation task failed");
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
 async fn handle_lookup(
     AuthorizedCacheRequest(authorized): AuthorizedCacheRequest,
     State(state): State<CacheServerState>,
@@ -209,7 +245,7 @@ async fn handle_lookup(
     headers: HeaderMap,
     Query(query): Query<LookupQuery>,
 ) -> Response {
-    let scope = authorized.scope();
+    let scope = authorized.scope().clone();
 
     // @actions/cache encodes commas in keys with encodeURIComponent (%2C).
     // The HTTP client may re-encode the percent sign, producing %252C on the
@@ -230,26 +266,40 @@ async fn handle_lookup(
         "cache lookup"
     );
 
-    let entry = state
-        .manager
-        .lookup(
-            &keys,
-            &query.version,
-            &scope.repo,
-            &scope.git_ref,
-            &scope.default_ref,
-        )
-        .await;
-    match entry {
-        Some(entry) => {
-            let grant = match state
-                .authority
-                .issue_download(&authorized, entry.blob_hash.clone())
-                .await
-            {
-                Ok(grant) => grant,
-                Err(_) => return StatusCode::UNAUTHORIZED.into_response(),
-            };
+    let permit = match state.authority.admit(&authorized).await {
+        Ok(permit) => permit,
+        Err(_) => return StatusCode::UNAUTHORIZED.into_response(),
+    };
+    let manager = state.manager.clone();
+    let authority = state.authority.clone();
+    let version = query.version.clone();
+    let scope_repo = scope.repo.clone();
+    let scope_ref = scope.git_ref.clone();
+    let default_ref = scope.default_ref.clone();
+    let operation = spawn_storage_operation("lookup", async move {
+        let entry = manager
+            .lookup_admitted(
+                &keys,
+                &version,
+                &scope_repo,
+                &scope_ref,
+                &default_ref,
+                &authority,
+                &permit,
+            )
+            .await
+            .map_err(|_| StatusCode::UNAUTHORIZED)?;
+        let Some(entry) = entry else {
+            return Ok(None);
+        };
+        let grant = authority
+            .issue_download(&authorized, entry.blob_hash.clone())
+            .await
+            .map_err(|_| StatusCode::UNAUTHORIZED)?;
+        Ok(Some((entry, grant)))
+    });
+    match await_storage_operation("lookup", operation).await {
+        Ok(Some((entry, grant))) => {
             let host = headers
                 .get("host")
                 .and_then(|v| v.to_str().ok())
@@ -271,7 +321,8 @@ async fn handle_lookup(
             };
             (StatusCode::OK, axum::Json(body)).into_response()
         }
-        None => StatusCode::NO_CONTENT.into_response(),
+        Ok(None) => StatusCode::NO_CONTENT.into_response(),
+        Err(status) => status.into_response(),
     }
 }
 
@@ -299,27 +350,34 @@ async fn handle_reserve(
         Ok(permit) => permit,
         Err(_) => return StatusCode::UNAUTHORIZED.into_response(),
     };
-    let result = state
-        .manager
-        .reserve_upload(
-            authorized.capability_id().clone(),
-            authorized.job_id().to_owned(),
-            body.key,
-            body.version,
-            scope.repo.clone(),
-            scope.git_ref.clone(),
-        )
-        .await;
-    drop(permit);
-    match result {
+    let manager = state.manager.clone();
+    let owner = authorized.epoch().clone();
+    let owner_job_id = authorized.job_id().to_owned();
+    let scope_repo = scope.repo.clone();
+    let scope_ref = scope.git_ref.clone();
+    let operation = spawn_storage_operation("reserve", async move {
+        let _permit = permit;
+        manager
+            .reserve_upload(
+                owner,
+                owner_job_id,
+                body.key,
+                body.version,
+                scope_repo,
+                scope_ref,
+            )
+            .await
+            .map_err(|error| {
+                tracing::error!(error = %error, "cache reserve failed");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })
+    });
+    match await_storage_operation("reserve", operation).await {
         Ok(id) => {
             let resp = ReserveResponse { cache_id: id };
             (StatusCode::OK, axum::Json(resp)).into_response()
         }
-        Err(e) => {
-            tracing::error!(error = %e, "reserve failed");
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
-        }
+        Err(status) => status.into_response(),
     }
 }
 
@@ -355,29 +413,33 @@ async fn handle_upload_chunk(
         "cache upload chunk"
     );
 
-    let locked = state
-        .manager
-        .lock_upload(authorized.capability_id(), id)
-        .await;
     let permit = match state.authority.admit(&authorized).await {
         Ok(permit) => permit,
         Err(_) => return StatusCode::UNAUTHORIZED.into_response(),
     };
-    let locked = match locked {
-        Ok(locked) => locked,
-        Err(e) => {
-            debug!(error = %e, id, "upload chunk failed");
-            return StatusCode::NOT_FOUND.into_response();
-        }
-    };
-    let result = state.manager.write_chunk_locked(locked, start, &body).await;
-    drop(permit);
-    match result {
+    let manager = state.manager.clone();
+    let authority = state.authority.clone();
+    let owner = authorized.epoch().clone();
+    let operation = spawn_storage_operation("upload-chunk", async move {
+        let locked = manager.lock_upload(&owner, id).await.map_err(|error| {
+            debug!(error = %error, id, "upload chunk failed");
+            StatusCode::NOT_FOUND
+        })?;
+        authority
+            .revalidate(&permit)
+            .await
+            .map_err(|_| StatusCode::UNAUTHORIZED)?;
+        manager
+            .write_chunk_locked(locked, start, &body)
+            .await
+            .map_err(|error| {
+                debug!(error = %error, id, "upload chunk failed");
+                StatusCode::NOT_FOUND
+            })
+    });
+    match await_storage_operation("upload-chunk", operation).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(e) => {
-            debug!(error = %e, id, "upload chunk failed");
-            StatusCode::NOT_FOUND.into_response()
-        }
+        Err(status) => status.into_response(),
     }
 }
 
@@ -401,35 +463,40 @@ async fn handle_commit(
         "cache commit"
     );
 
-    let locked = state
-        .manager
-        .lock_upload(authorized.capability_id(), id)
-        .await;
     let permit = match state.authority.admit(&authorized).await {
         Ok(permit) => permit,
         Err(_) => return StatusCode::UNAUTHORIZED.into_response(),
     };
-    let locked = match locked {
-        Ok(locked) => locked,
-        Err(e) => {
-            debug!(error = %e, id, "commit failed");
-            return StatusCode::NOT_FOUND.into_response();
-        }
-    };
-    let result = state.manager.commit_upload_locked(locked, body.size).await;
-    drop(permit);
-    match result {
+    let manager = state.manager.clone();
+    let authority = state.authority.clone();
+    let owner = authorized.epoch().clone();
+    let operation = spawn_storage_operation("commit", async move {
+        let locked = manager.lock_upload(&owner, id).await.map_err(|error| {
+            debug!(error = %error, id, "commit failed");
+            StatusCode::NOT_FOUND
+        })?;
+        authority
+            .revalidate(&permit)
+            .await
+            .map_err(|_| StatusCode::UNAUTHORIZED)?;
+        manager
+            .commit_upload_locked(locked, body.size)
+            .await
+            .map_err(|error| {
+                debug!(error = %error, id, "commit failed");
+                if error
+                    .downcast_ref::<CacheError>()
+                    .is_some_and(|error| matches!(error, CacheError::UploadNotFound(_)))
+                {
+                    StatusCode::NOT_FOUND
+                } else {
+                    StatusCode::INTERNAL_SERVER_ERROR
+                }
+            })
+    });
+    match await_storage_operation("commit", operation).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(e) => {
-            debug!(error = %e, id, "commit failed");
-            if e.downcast_ref::<CacheError>()
-                .is_some_and(|error| matches!(error, CacheError::UploadNotFound(_)))
-            {
-                StatusCode::NOT_FOUND.into_response()
-            } else {
-                StatusCode::INTERNAL_SERVER_ERROR.into_response()
-            }
-        }
+        Err(status) => status.into_response(),
     }
 }
 

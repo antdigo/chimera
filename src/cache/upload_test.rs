@@ -1,10 +1,10 @@
 use tempfile::TempDir;
 
 use super::*;
-use crate::cache::auth::CapabilityId;
+use crate::cache::auth::CapabilityEpoch;
 
-fn owner(token: &str) -> CapabilityId {
-    CapabilityId::from_token(token)
+fn owner(token: &str) -> CapabilityEpoch {
+    CapabilityEpoch::for_test(token)
 }
 
 fn make_tracker(tmp: &TempDir) -> UploadTracker {
@@ -238,11 +238,11 @@ async fn upload_not_found() {
 }
 
 #[tokio::test]
-async fn foreign_owner_cannot_write_or_consume_upload_session() {
+async fn new_epoch_with_same_token_cannot_write_or_consume_upload_session() {
     let tmp = TempDir::new().unwrap();
     let tracker = make_tracker(&tmp);
     let owner_a = owner("runtime-a");
-    let owner_b = owner("runtime-b");
+    let owner_b = owner("runtime-a");
     let id = tracker
         .reserve(
             owner_a.clone(),

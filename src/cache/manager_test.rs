@@ -4,7 +4,7 @@ use std::sync::atomic::Ordering;
 use tempfile::TempDir;
 
 use super::*;
-use crate::cache::auth::CapabilityId;
+use crate::cache::auth::CapabilityEpoch;
 
 const REPO: &str = "owner/repo";
 const MAIN_REF: &str = "refs/heads/main";
@@ -32,7 +32,7 @@ async fn upload_scoped_blob(
     git_ref: &str,
     data: &[u8],
 ) {
-    let owner = CapabilityId::from_token("manager-test-owner");
+    let owner = CapabilityEpoch::for_test("manager-test-owner");
     let id = manager
         .reserve_upload(
             owner.clone(),
@@ -172,6 +172,59 @@ async fn persist_and_reload() {
     let blob_path = manager.blob_path(&entry.blob_hash).unwrap();
     let content = std::fs::read(blob_path).unwrap();
     assert_eq!(content, b"persist data");
+}
+
+#[tokio::test]
+async fn overwrite_persists_replacement_and_releases_old_blob() {
+    let tmp = TempDir::new().unwrap();
+    let entries_dir = tmp.path().join("entries");
+    let data_dir = tmp.path().join("data");
+    let tmp_dir = tmp.path().join("tmp");
+    let manager = CacheManager::new(
+        entries_dir.clone(),
+        data_dir.clone(),
+        tmp_dir.clone(),
+        1024 * 1024,
+    )
+    .await
+    .unwrap();
+
+    upload_blob(&manager, "replace", "v1", b"old").await;
+    let old = manager
+        .lookup(&["replace".into()], "v1", REPO, MAIN_REF, MAIN_REF)
+        .await
+        .unwrap();
+    let old_blob = manager.blob_path(&old.blob_hash).unwrap();
+    upload_blob(&manager, "replace", "v1", b"replacement").await;
+    let replacement = manager
+        .entries
+        .read()
+        .await
+        .get(REPO, MAIN_REF, "replace", "v1")
+        .unwrap()
+        .clone();
+    assert_eq!(
+        tokio::fs::read(manager.blob_path(&replacement.blob_hash).unwrap())
+            .await
+            .unwrap(),
+        b"replacement",
+    );
+    assert!(!old_blob.exists(), "old unreferenced blob was retained");
+    drop(manager);
+
+    let reloaded = CacheManager::new(entries_dir, data_dir, tmp_dir, 1024 * 1024)
+        .await
+        .unwrap();
+    let replacement = reloaded
+        .lookup(&["replace".into()], "v1", REPO, MAIN_REF, MAIN_REF)
+        .await
+        .expect("replacement metadata must survive reload");
+    assert_eq!(
+        tokio::fs::read(reloaded.blob_path(&replacement.blob_hash).unwrap())
+            .await
+            .unwrap(),
+        b"replacement",
+    );
 }
 
 #[tokio::test]

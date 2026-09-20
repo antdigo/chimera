@@ -1,12 +1,14 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, Weak};
 
 use anyhow::{Context, Result};
 use chrono::Utc;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex as AsyncMutex, RwLock};
 use tracing::{debug, info, warn};
 
-use super::auth::CapabilityId;
+use super::auth::{CacheAuthError, CacheAuthority, CacheOperationPermit, CapabilityEpoch};
 use super::entry::{CacheEntry, EntryIndex, load_entries_from_disk};
 use super::error::CacheError;
 use super::store::BlobStore;
@@ -27,15 +29,25 @@ impl CacheStats {
 }
 
 /// Orchestrates blob store, entry index, upload tracker, and LRU eviction.
+///
+/// Nested acquisition order is capability gate (in the server), upload session,
+/// per-entry I/O coordination, then the in-memory index. The index is always
+/// released before filesystem or blob-refcount I/O; code that first probes the
+/// index releases that probe guard before waiting for per-entry coordination.
 pub struct CacheManager {
     store: BlobStore,
     entries: RwLock<EntryIndex>,
+    entry_io: Mutex<HashMap<String, Weak<AsyncMutex<()>>>>,
     uploads: UploadTracker,
     max_bytes: u64,
     pub stats: CacheStats,
     entries_dir: PathBuf,
     #[cfg(test)]
     before_entry_publish: super::test_support::PausePoint,
+    #[cfg(test)]
+    before_lookup_index: super::test_support::PausePoint,
+    #[cfg(test)]
+    before_lookup_persist: super::test_support::PausePoint,
 }
 
 impl CacheManager {
@@ -95,12 +107,17 @@ impl CacheManager {
         let manager = Self {
             store,
             entries: RwLock::new(index),
+            entry_io: Mutex::new(HashMap::new()),
             uploads,
             max_bytes,
             stats: CacheStats::new(),
             entries_dir,
             #[cfg(test)]
             before_entry_publish: Default::default(),
+            #[cfg(test)]
+            before_lookup_index: Default::default(),
+            #[cfg(test)]
+            before_lookup_persist: Default::default(),
         };
 
         // Run initial eviction in case max_gb was lowered
@@ -128,25 +145,116 @@ impl CacheManager {
         scope_ref: &str,
         default_ref: &str,
     ) -> Option<CacheEntry> {
-        let mut entries = self.entries.write().await;
-        match entries.lookup(keys, version, scope_repo, scope_ref, default_ref) {
-            Some(entry) => {
-                self.stats.hits.fetch_add(1, Ordering::Relaxed);
-                // Persist updated last_accessed_at
-                let _ = entry.persist(&self.entries_dir);
-                Some(entry)
+        self.lookup_inner(keys, version, scope_repo, scope_ref, default_ref, None)
+            .await
+            .expect("lookup without admission cannot fail authorization")
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "admitted lookup keeps GitHub's ordered scope inputs explicit"
+    )]
+    pub(crate) async fn lookup_admitted(
+        &self,
+        keys: &[String],
+        version: &str,
+        scope_repo: &str,
+        scope_ref: &str,
+        default_ref: &str,
+        authority: &CacheAuthority,
+        permit: &CacheOperationPermit,
+    ) -> Result<Option<CacheEntry>, CacheAuthError> {
+        self.lookup_inner(
+            keys,
+            version,
+            scope_repo,
+            scope_ref,
+            default_ref,
+            Some((authority, permit)),
+        )
+        .await
+    }
+
+    async fn lookup_inner(
+        &self,
+        keys: &[String],
+        version: &str,
+        scope_repo: &str,
+        scope_ref: &str,
+        default_ref: &str,
+        admission: Option<(&CacheAuthority, &CacheOperationPermit)>,
+    ) -> Result<Option<CacheEntry>, CacheAuthError> {
+        loop {
+            let expected_file = self
+                .entries
+                .read()
+                .await
+                .find(keys, version, scope_repo, scope_ref, default_ref)
+                .map(CacheEntry::filename);
+            let entry_io = expected_file
+                .as_deref()
+                .map(|filename| self.entry_io_lock(filename));
+            let _entry_io_guard = match &entry_io {
+                Some(lock) => Some(lock.lock().await),
+                None => None,
+            };
+
+            let mut entries = self.entries.write().await;
+            #[cfg(test)]
+            self.before_lookup_index.wait().await;
+            if let Some((authority, permit)) = admission {
+                authority.revalidate(permit).await?;
             }
-            None => {
-                self.stats.misses.fetch_add(1, Ordering::Relaxed);
-                None
+            let current_file = entries
+                .find(keys, version, scope_repo, scope_ref, default_ref)
+                .map(CacheEntry::filename);
+            if current_file != expected_file {
+                drop(entries);
+                continue;
             }
+            let entry = entries.lookup(keys, version, scope_repo, scope_ref, default_ref);
+            match &entry {
+                Some(_) => self.stats.hits.fetch_add(1, Ordering::Relaxed),
+                None => self.stats.misses.fetch_add(1, Ordering::Relaxed),
+            };
+            drop(entries);
+
+            if let Some(entry) = &entry {
+                #[cfg(test)]
+                self.before_lookup_persist.wait().await;
+                if let Err(error) = self.persist_entry(entry.clone()).await {
+                    warn!(error = %error, "failed to persist cache lookup metadata");
+                }
+            }
+            return Ok(entry);
         }
     }
 
+    fn entry_io_lock(&self, filename: &str) -> Arc<AsyncMutex<()>> {
+        let mut locks = self
+            .entry_io
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        if let Some(lock) = locks.get(filename).and_then(Weak::upgrade) {
+            return lock;
+        }
+        let lock = Arc::new(AsyncMutex::new(()));
+        locks.insert(filename.to_owned(), Arc::downgrade(&lock));
+        lock
+    }
+
+    async fn persist_entry(&self, entry: CacheEntry) -> Result<()> {
+        let entries_dir = self.entries_dir.clone();
+        tokio::task::spawn_blocking(move || entry.persist(&entries_dir))
+            .await
+            .context("joining cache entry persistence task")?
+    }
+
     /// Reserve a new upload session with scope.
-    pub async fn reserve_upload(
+    pub(crate) async fn reserve_upload(
         &self,
-        owner: CapabilityId,
+        owner: CapabilityEpoch,
         owner_job_id: String,
         key: String,
         version: String,
@@ -159,9 +267,10 @@ impl CacheManager {
     }
 
     /// Write a chunk to an upload session.
-    pub async fn write_chunk(
+    #[cfg(test)]
+    pub(crate) async fn write_chunk(
         &self,
-        owner: &CapabilityId,
+        owner: &CapabilityEpoch,
         id: u64,
         offset: u64,
         data: &[u8],
@@ -169,7 +278,11 @@ impl CacheManager {
         self.uploads.write_chunk(owner, id, offset, data).await
     }
 
-    pub(crate) async fn lock_upload(&self, owner: &CapabilityId, id: u64) -> Result<LockedUpload> {
+    pub(crate) async fn lock_upload(
+        &self,
+        owner: &CapabilityEpoch,
+        id: u64,
+    ) -> Result<LockedUpload> {
         self.uploads.lock(owner, id).await
     }
 
@@ -183,9 +296,10 @@ impl CacheManager {
     }
 
     /// Commit an upload: finalize the blob and create a cache entry.
-    pub async fn commit_upload(
+    #[cfg(test)]
+    pub(crate) async fn commit_upload(
         &self,
-        owner: &CapabilityId,
+        owner: &CapabilityEpoch,
         id: u64,
         expected_size: u64,
     ) -> Result<()> {
@@ -226,20 +340,26 @@ impl CacheManager {
         #[cfg(test)]
         self.before_entry_publish.wait().await;
 
-        entry
-            .persist(&self.entries_dir)
-            .context("persisting entry")?;
+        let entry_io = self.entry_io_lock(&entry.filename());
+        let _entry_io_guard = entry_io.lock().await;
+        if let Err(error) = self.persist_entry(entry.clone()).await {
+            self.store.decref(&entry.blob_hash).await;
+            return Err(error).context("persisting entry");
+        }
 
         // If an entry with the same scope+key+version already exists (duplicate commit),
         // decref the old blob to avoid leaking refcounts.
-        {
+        let old = {
             let mut entries = self.entries.write().await;
-            if let Some(old) = entries.remove(&scope_repo, &scope_ref, &key, &version) {
-                old.remove_file(&self.entries_dir);
-                self.store.decref(&old.blob_hash).await;
-            }
+            let old = entries.remove(&scope_repo, &scope_ref, &key, &version);
             entries.insert(entry);
+            old
+        };
+        if let Some(old) = old {
+            self.store.decref(&old.blob_hash).await;
         }
+        drop(_entry_io_guard);
+        drop(entry_io);
 
         // Run eviction if we're over limit
         self.evict().await;
@@ -264,61 +384,101 @@ impl CacheManager {
         self.before_entry_publish.arm()
     }
 
+    #[cfg(test)]
+    pub(crate) fn arm_before_lookup_index(&self) -> std::sync::Arc<super::test_support::Pause> {
+        self.before_lookup_index.arm()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn arm_before_lookup_persist(&self) -> std::sync::Arc<super::test_support::Pause> {
+        self.before_lookup_persist.arm()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn arm_before_blob_store_io(
+        &self,
+    ) -> std::sync::Arc<super::test_support::BlockingPause> {
+        self.store.before_store_io.arm()
+    }
+
     /// Get the filesystem path for a blob.
     pub fn blob_path(&self, hash: &str) -> Result<PathBuf, CacheError> {
         self.store.blob_path(hash)
     }
 
     /// Evict oldest entries until total size is under max_bytes.
-    /// Collects victims under the lock, then performs I/O (file delete, blob decref)
-    /// after releasing it to avoid blocking concurrent lookups and uploads.
+    /// Each victim is validated and removed under the index lock, then its I/O
+    /// runs under only that entry's coordination lock.
     async fn evict(&self) {
-        let victims = {
-            let mut entries = self.entries.write().await;
+        loop {
             let now = Utc::now();
             let protection_window = chrono::Duration::seconds(60);
-            let mut to_evict = Vec::new();
-
-            loop {
+            let victim = {
+                let entries = self.entries.read().await;
                 let total = entries.total_size_bytes();
                 if total <= self.max_bytes {
-                    break;
+                    return;
                 }
-
-                let candidates = entries.lru_candidates();
-                let victim = candidates
+                entries
+                    .lru_candidates()
                     .into_iter()
-                    .find(|e| now.signed_duration_since(e.last_accessed_at) > protection_window);
+                    .find(|entry| {
+                        now.signed_duration_since(entry.last_accessed_at) > protection_window
+                    })
+                    .cloned()
+            };
+            let Some(victim) = victim else {
+                debug!("no evictable entries (all within protection window)");
+                return;
+            };
 
-                let Some(victim) = victim else {
-                    debug!("no evictable entries (all within protection window)");
-                    break;
-                };
-
-                let repo = victim.scope_repo.clone();
-                let git_ref = victim.scope_ref.clone();
-                let key = victim.key.clone();
-                let version = victim.version.clone();
-
-                if let Some(removed) = entries.remove(&repo, &git_ref, &key, &version) {
-                    info!(
-                        key = removed.key,
-                        version = removed.version,
-                        scope_repo = removed.scope_repo,
-                        scope_ref = removed.scope_ref,
-                        size_bytes = removed.size_bytes,
-                        "evicting cache entry"
-                    );
-                    to_evict.push(removed);
-                }
+            let entry_io = self.entry_io_lock(&victim.filename());
+            let _entry_io_guard = entry_io.lock().await;
+            let removed = {
+                let mut entries = self.entries.write().await;
+                let unchanged = entries
+                    .get(
+                        &victim.scope_repo,
+                        &victim.scope_ref,
+                        &victim.key,
+                        &victim.version,
+                    )
+                    .is_some_and(|current| {
+                        current.blob_hash == victim.blob_hash
+                            && current.created_at == victim.created_at
+                    });
+                unchanged.then(|| {
+                    entries
+                        .remove(
+                            &victim.scope_repo,
+                            &victim.scope_ref,
+                            &victim.key,
+                            &victim.version,
+                        )
+                        .expect("validated eviction entry must still exist")
+                })
+            };
+            let Some(removed) = removed else {
+                continue;
+            };
+            info!(
+                key = removed.key,
+                version = removed.version,
+                scope_repo = removed.scope_repo,
+                scope_ref = removed.scope_ref,
+                size_bytes = removed.size_bytes,
+                "evicting cache entry"
+            );
+            let entries_dir = self.entries_dir.clone();
+            let removed_file = removed.clone();
+            if let Err(error) = tokio::task::spawn_blocking(move || {
+                removed_file.remove_file(&entries_dir);
+            })
+            .await
+            {
+                warn!(error = %error, "cache entry removal task failed");
             }
-
-            to_evict
-        };
-        // entries lock released — perform I/O without blocking other operations
-        for victim in victims {
-            victim.remove_file(&self.entries_dir);
-            self.store.decref(&victim.blob_hash).await;
+            self.store.decref(&removed.blob_hash).await;
         }
     }
 }

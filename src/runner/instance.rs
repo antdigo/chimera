@@ -12,7 +12,7 @@ use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
-use crate::cache::auth::{CacheAuthority, CacheScope, CapabilityId, JobCapabilityClaims};
+use crate::cache::auth::{CacheAuthority, CacheScope, CapabilityHandle, JobCapabilityClaims};
 use crate::config::{ChimeraPaths, RunnerCredentials, rsa_params_to_private_key};
 use crate::daemon::{DaemonState, JobInfo, RunnerPhase};
 use crate::docker::build::DockerActionBuilder;
@@ -145,7 +145,7 @@ async fn register_job_cache_capability(
     manifest: &JobManifest,
     scope: CacheScope,
     issued_at: chrono::DateTime<Utc>,
-) -> Result<CapabilityId> {
+) -> Result<CapabilityHandle> {
     authority
         .register_job(
             manifest
@@ -163,22 +163,22 @@ async fn register_job_cache_capability(
 
 struct JobCacheCapability {
     authority: Arc<CacheAuthority>,
-    capability_id: CapabilityId,
+    capability: CapabilityHandle,
     active: bool,
 }
 
 impl JobCacheCapability {
-    fn new(authority: Arc<CacheAuthority>, capability_id: CapabilityId) -> Self {
+    fn new(authority: Arc<CacheAuthority>, capability: CapabilityHandle) -> Self {
         Self {
             authority,
-            capability_id,
+            capability,
             active: true,
         }
     }
 
     async fn revoke(&mut self) {
         if self.active {
-            self.authority.revoke(&self.capability_id).await;
+            self.authority.revoke(&self.capability).await;
             self.active = false;
         }
     }
@@ -187,7 +187,7 @@ impl JobCacheCapability {
 impl Drop for JobCacheCapability {
     fn drop(&mut self) {
         if self.active {
-            self.authority.revoke_immediately(&self.capability_id);
+            self.authority.revoke_immediately(&self.capability);
         }
     }
 }

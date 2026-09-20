@@ -1,4 +1,5 @@
 use std::convert::Infallible;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
 use axum::body::Bytes;
@@ -9,7 +10,8 @@ use tower::ServiceExt;
 
 use super::*;
 use crate::cache::auth::{
-    CacheAuthority, CacheScope, CapabilityId, JOB_CAPABILITY_LIFETIME, JobCapabilityClaims,
+    CacheAuthority, CacheScope, CapabilityEpoch, CapabilityHandle, CapabilityId,
+    JOB_CAPABILITY_LIFETIME, JobCapabilityClaims,
 };
 use crate::cache::manager::CacheManager;
 use crate::cache::test_support::Pause;
@@ -64,7 +66,7 @@ async fn make_clocked_test_app(
     SharedManager,
     Arc<CacheAuthority>,
     Arc<Mutex<DateTime<Utc>>>,
-    CapabilityId,
+    CapabilityHandle,
 ) {
     let manager = make_test_manager(tmp).await;
     let started_at = Utc::now();
@@ -89,7 +91,7 @@ async fn make_clocked_test_app(
 async fn invalidate(
     invalidation: Invalidation,
     authority: &CacheAuthority,
-    capability_id: &CapabilityId,
+    capability_id: &CapabilityHandle,
     clock: &Mutex<DateTime<Utc>>,
 ) {
     match invalidation {
@@ -138,7 +140,12 @@ async fn invalid_json_is_bad_request_after_authentication() {
             }
         }
     }
-    authority.revoke(&CapabilityId::from_token(TOKEN_A)).await;
+    let handle = authority
+        .authenticate(TOKEN_A)
+        .await
+        .unwrap()
+        .lifecycle_handle();
+    authority.revoke(&handle).await;
     let request = bearer(
         Request::builder()
             .method("POST")
@@ -218,10 +225,15 @@ async fn delayed_patch_rechecks_revocation_and_expiry_before_mutation() {
             "{} after PATCH authentication",
             invalidation.label(),
         );
-        reactivate(&authority, &clock).await;
         assert_eq!(
-            commit(&app, &prefix, TOKEN_A, cache_id, 0).await,
-            StatusCode::NO_CONTENT,
+            tokio::fs::read(
+                tmp.path()
+                    .join("tmp")
+                    .join(format!("upload-{cache_id}.tmp"))
+            )
+            .await
+            .unwrap(),
+            b"",
             "{} allowed a delayed PATCH to mutate the session",
             invalidation.label(),
         );
@@ -276,14 +288,273 @@ async fn delayed_commit_rechecks_revocation_and_expiry_before_publication() {
             "{} allowed a delayed commit to publish an entry",
             invalidation.label(),
         );
-        reactivate(&authority, &clock).await;
         assert_eq!(
-            commit(&app, &prefix, TOKEN_A, cache_id, 1).await,
-            StatusCode::NO_CONTENT,
+            tokio::fs::read(
+                tmp.path()
+                    .join("tmp")
+                    .join(format!("upload-{cache_id}.tmp"))
+            )
+            .await
+            .unwrap(),
+            b"x",
             "{} consumed the session before rejecting delayed commit",
             invalidation.label(),
         );
+        reactivate(&authority, &clock).await;
+        assert_eq!(
+            commit(&app, &prefix, TOKEN_A, cache_id, 1).await,
+            StatusCode::NOT_FOUND,
+            "{} let a replacement epoch inherit the old session",
+            invalidation.label(),
+        );
     }
+}
+
+#[tokio::test]
+async fn reused_token_cannot_mutate_or_publish_previous_epoch_uploads() {
+    for invalidation in [Invalidation::Revoke, Invalidation::Expire] {
+        let tmp = TempDir::new().unwrap();
+        let (app, manager, authority, clock, capability_id) = make_clocked_test_app(&tmp).await;
+        let old_prefix = scope_prefix(SCOPE_REPO, SCOPE_REF, DEFAULT_REF);
+        let patch_id = reserve(&app, &old_prefix, TOKEN_A, "old-patch", "v1").await;
+        let commit_id = reserve(&app, &old_prefix, TOKEN_A, "old-commit", "v1").await;
+        assert_eq!(
+            upload(&app, &old_prefix, TOKEN_A, commit_id, b"old").await,
+            StatusCode::NO_CONTENT,
+        );
+
+        invalidate(invalidation, &authority, &capability_id, &clock).await;
+        let reused_at = *clock.lock().unwrap();
+        authority
+            .register_job(
+                TOKEN_A,
+                JobCapabilityClaims {
+                    scope: CacheScope {
+                        repo: "other/repo".into(),
+                        git_ref: SCOPE_REF.into(),
+                        default_ref: DEFAULT_REF.into(),
+                    },
+                    job_id: "job-b".into(),
+                },
+                reused_at,
+            )
+            .await
+            .unwrap();
+        let new_prefix = scope_prefix("other/repo", SCOPE_REF, DEFAULT_REF);
+
+        assert_eq!(
+            upload(&app, &new_prefix, TOKEN_A, patch_id, b"evil").await,
+            StatusCode::NOT_FOUND,
+            "{} let a new epoch write an old upload",
+            invalidation.label(),
+        );
+        assert_eq!(
+            tokio::fs::read(
+                tmp.path()
+                    .join("tmp")
+                    .join(format!("upload-{patch_id}.tmp"))
+            )
+            .await
+            .unwrap(),
+            b"",
+            "{} mutated the old upload",
+            invalidation.label(),
+        );
+        assert_eq!(
+            commit(&app, &new_prefix, TOKEN_A, commit_id, 3).await,
+            StatusCode::NOT_FOUND,
+            "{} let a new epoch commit an old upload",
+            invalidation.label(),
+        );
+        assert!(
+            manager
+                .lookup(
+                    &["old-commit".into()],
+                    "v1",
+                    SCOPE_REPO,
+                    SCOPE_REF,
+                    DEFAULT_REF,
+                )
+                .await
+                .is_none(),
+            "{} published the old upload",
+            invalidation.label(),
+        );
+    }
+}
+
+#[tokio::test]
+async fn queued_lookup_rechecks_revocation_and_expiry_before_mutating_index() {
+    for invalidation in [Invalidation::Revoke, Invalidation::Expire] {
+        let tmp = TempDir::new().unwrap();
+        let (app, manager, authority, clock, capability) = make_clocked_test_app(&tmp).await;
+        let prefix = scope_prefix(SCOPE_REPO, SCOPE_REF, DEFAULT_REF);
+        authorized_roundtrip(&app, &prefix, TOKEN_A, "queued-hit", b"data").await;
+        let entry_path = std::fs::read_dir(tmp.path().join("entries"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let persisted_before = std::fs::read(&entry_path).unwrap();
+        let hits_before = manager.stats.hits.load(Ordering::Relaxed);
+        let misses_before = manager.stats.misses.load(Ordering::Relaxed);
+
+        let index_pause = manager.arm_before_lookup_index();
+        let blocker_manager = manager.clone();
+        let blocker = tokio::spawn(async move {
+            blocker_manager
+                .lookup(
+                    &["blocker-miss".into()],
+                    "v1",
+                    SCOPE_REPO,
+                    SCOPE_REF,
+                    DEFAULT_REF,
+                )
+                .await
+        });
+        index_pause.reached.notified().await;
+
+        let request_app = app.clone();
+        let request_prefix = prefix.clone();
+        let response = tokio::spawn(async move {
+            lookup_status(&request_app, &request_prefix, TOKEN_A, "queued-hit", "v1").await
+        });
+        tokio::task::yield_now().await;
+        assert!(!response.is_finished(), "lookup did not queue on the index");
+
+        let status = match invalidation {
+            Invalidation::Revoke => {
+                let mut revoke = Box::pin(authority.revoke(&capability));
+                let revoke_pending = futures::poll!(&mut revoke).is_pending();
+                index_pause.resume.notify_one();
+                blocker.await.unwrap();
+                if revoke_pending {
+                    let (response, ()) = tokio::join!(response, revoke);
+                    response.unwrap()
+                } else {
+                    response.await.unwrap()
+                }
+            }
+            Invalidation::Expire => {
+                {
+                    let mut now = clock.lock().unwrap();
+                    *now = *now + JOB_CAPABILITY_LIFETIME + chrono::Duration::seconds(1);
+                }
+                index_pause.resume.notify_one();
+                blocker.await.unwrap();
+                response.await.unwrap()
+            }
+        };
+
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{}", invalidation.label());
+        assert_eq!(manager.stats.hits.load(Ordering::Relaxed), hits_before);
+        assert_eq!(
+            manager.stats.misses.load(Ordering::Relaxed),
+            misses_before + 1,
+            "only the explicit blocker miss may mutate statistics",
+        );
+        assert_eq!(std::fs::read(entry_path).unwrap(), persisted_before);
+    }
+}
+
+#[tokio::test]
+async fn stalled_lookup_persistence_does_not_block_an_unrelated_job_lookup() {
+    let tmp = TempDir::new().unwrap();
+    let (app, manager, authority) = make_test_app(&tmp).await;
+    let first_prefix = scope_prefix(SCOPE_REPO, SCOPE_REF, DEFAULT_REF);
+    authorized_roundtrip(&app, &first_prefix, TOKEN_A, "slow-hit", b"data").await;
+    authority
+        .register_job(
+            TOKEN_B,
+            JobCapabilityClaims {
+                scope: CacheScope {
+                    repo: "other/repo".into(),
+                    git_ref: SCOPE_REF.into(),
+                    default_ref: DEFAULT_REF.into(),
+                },
+                job_id: "job-b".into(),
+            },
+            Utc::now(),
+        )
+        .await
+        .unwrap();
+    let other_prefix = scope_prefix("other/repo", SCOPE_REF, DEFAULT_REF);
+
+    let persistence = manager.arm_before_lookup_persist();
+    let first_app = app.clone();
+    let first = tokio::spawn(async move {
+        lookup_status(&first_app, &first_prefix, TOKEN_A, "slow-hit", "v1").await
+    });
+    persistence.reached.notified().await;
+
+    let independent = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        lookup_status(&app, &other_prefix, TOKEN_B, "independent-miss", "v1"),
+    )
+    .await;
+    persistence.resume.notify_one();
+    assert_eq!(first.await.unwrap(), StatusCode::OK);
+    assert_eq!(
+        independent.expect("global index lock blocked unrelated lookup"),
+        StatusCode::NO_CONTENT,
+    );
+}
+
+#[tokio::test]
+async fn aborted_commit_keeps_permit_until_blocking_io_and_publication_finish() {
+    let tmp = TempDir::new().unwrap();
+    let (app, manager, authority) = make_test_app(&tmp).await;
+    let prefix = scope_prefix(SCOPE_REPO, SCOPE_REF, DEFAULT_REF);
+    let cache_id = reserve(&app, &prefix, TOKEN_A, "cancelled-waiter", "v1").await;
+    assert_eq!(
+        upload(&app, &prefix, TOKEN_A, cache_id, b"data").await,
+        StatusCode::NO_CONTENT,
+    );
+    let handle = authority
+        .authenticate(TOKEN_A)
+        .await
+        .unwrap()
+        .lifecycle_handle();
+    let blocking_io = manager.arm_before_blob_store_io();
+    let request = bearer(
+        Request::builder()
+            .method("POST")
+            .uri(format!("{prefix}/_apis/artifactcache/caches/{cache_id}"))
+            .header("content-type", "application/json"),
+        TOKEN_A,
+    )
+    .body(Body::from(r#"{"size":4}"#))
+    .unwrap();
+    let response = tokio::spawn(async move { app.oneshot(request).await });
+    blocking_io.reached.notified().await;
+
+    response.abort();
+    assert!(response.await.unwrap_err().is_cancelled());
+    let mut revoke = Box::pin(authority.revoke(&handle));
+    let revoke_pending = futures::poll!(&mut revoke).is_pending();
+    blocking_io.resume();
+    if revoke_pending {
+        revoke.await;
+    }
+
+    assert!(
+        revoke_pending,
+        "handler cancellation released the permit while blocking I/O was still running",
+    );
+    assert!(
+        manager
+            .lookup(
+                &["cancelled-waiter".into()],
+                "v1",
+                SCOPE_REPO,
+                SCOPE_REF,
+                DEFAULT_REF,
+            )
+            .await
+            .is_some(),
+        "the admitted commit did not finish publication before revoke returned",
+    );
 }
 
 #[tokio::test]
@@ -323,7 +594,11 @@ async fn queued_patch_rechecks_authority_after_waiting_for_its_session() {
     session_wait.resume.notify_one();
     assert!(futures::poll!(&mut second_response).is_pending());
 
-    let capability_id = CapabilityId::from_token(TOKEN_A);
+    let capability_id = authority
+        .authenticate(TOKEN_A)
+        .await
+        .unwrap()
+        .lifecycle_handle();
     let mut revoke = Box::pin(authority.revoke(&capability_id));
     let revoke_pending = futures::poll!(&mut revoke).is_pending();
     pause.resume.notify_one();
@@ -366,7 +641,11 @@ async fn revoke_waits_for_admitted_commit_publication() {
     let response = tokio::spawn(async move { app.oneshot(request).await });
     pause.reached.notified().await;
 
-    let capability_id = CapabilityId::from_token(TOKEN_A);
+    let capability_id = authority
+        .authenticate(TOKEN_A)
+        .await
+        .unwrap()
+        .lifecycle_handle();
     let mut revoke = Box::pin(authority.revoke(&capability_id));
     let revoke_pending = futures::poll!(&mut revoke).is_pending();
     pause.resume.notify_one();
@@ -1249,9 +1528,13 @@ async fn revoke_invalidates_previously_issued_download_grant() {
     let tmp = TempDir::new().unwrap();
     let (app, _, authority) = make_test_app(&tmp).await;
     let prefix = scope_prefix(SCOPE_REPO, SCOPE_REF, DEFAULT_REF);
-    let (capability_id, archive_location) =
-        authorized_roundtrip(&app, &prefix, TOKEN_A, "k", b"secret").await;
-    authority.revoke(&capability_id).await;
+    let (_, archive_location) = authorized_roundtrip(&app, &prefix, TOKEN_A, "k", b"secret").await;
+    let handle = authority
+        .authenticate(TOKEN_A)
+        .await
+        .unwrap()
+        .lifecycle_handle();
+    authority.revoke(&handle).await;
     assert_all_cache_handlers_reject(&app, TOKEN_A, StatusCode::UNAUTHORIZED).await;
     let path = archive_location
         .strip_prefix("http://localhost:9999")
@@ -1487,7 +1770,7 @@ async fn concurrent_http_clients() {
             b"feature-b".as_slice(),
         ),
     ] {
-        let owner = CapabilityId::from_token(token);
+        let owner = CapabilityEpoch::for_test(token);
         let id = manager
             .reserve_upload(
                 owner.clone(),

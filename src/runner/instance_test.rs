@@ -246,7 +246,7 @@ async fn register_job_cache_capability_uses_manifest_runtime_token_and_job_id() 
         .unwrap();
 
     let authorized = authority.authorize("job-token-xyz", &scope).await.unwrap();
-    assert_eq!(authorized.capability_id(), &id);
+    assert_eq!(authorized.capability_id(), id.capability_id());
     assert_eq!(authorized.job_id(), "job-001");
 }
 
@@ -294,7 +294,7 @@ async fn registration_failure_cleans_docker_config_without_revoking_existing_cap
         .authorize("synthetic", &scope)
         .await
         .unwrap();
-    assert_eq!(existing.capability_id(), &existing_id);
+    assert_eq!(existing.capability_id(), existing_id.capability_id());
 }
 
 #[tokio::test]
