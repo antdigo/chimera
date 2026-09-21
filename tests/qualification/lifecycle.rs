@@ -249,8 +249,9 @@ pub struct LifecycleFacts {
     pub remaining_writable_roots: u64,
     pub remaining_docker_objects: u64,
     pub owned_enumeration_complete: bool,
-    pub next_tenant_scanned: Vec<String>,
-    pub scanned_attempts: Vec<Uuid>,
+    pub seeded_canaries: Vec<TenantCanaries>,
+    pub scan_manifest: Vec<TenantCanaries>,
+    pub tenant_scans: Vec<TenantScan>,
     pub next_tenant_canaries: Vec<String>,
     pub peer_unchanged: bool,
     pub cross_capability_rejected: bool,
@@ -261,6 +262,33 @@ pub struct LifecycleFacts {
     pub cache_variant: String,
     restart: Option<RestartFacts>,
 }
+
+/// A source row acknowledges the seven exact synthetic marker contents seeded
+/// in one attempt. S-14 uses these source rows as its shared scan manifest.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TenantCanaries {
+    pub attempt: Uuid,
+    pub canaries: Vec<String>,
+}
+
+/// Fixture-only compact destination × source × category evidence. Each element
+/// corresponds to the same-index source in scan_manifest. Bits 0..6 represent
+/// filesystem/process/environment/Docker/cache/artifact/credential, respectively.
+/// Every element must equal 0x7f. This preserves the full matrix within the
+/// protocol's 64 KiB observation cap; it is not live/native proof.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TenantScan {
+    pub attempt: Uuid,
+    pub categories: Vec<u8>,
+}
+
+fn duplicate_canary_rows(rows: &[TenantCanaries]) -> bool {
+    duplicates(&rows.iter().map(|row| row.attempt).collect::<Vec<_>>())
+        || rows.iter().any(|row| duplicates(&row.canaries))
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RestartFacts {
@@ -354,7 +382,17 @@ fn evaluate_facts(
         || duplicates(&f.state_ids)
         || duplicates(&f.simultaneous_ids)
         || duplicates(&f.completed_ids)
-        || duplicates(&f.scanned_attempts)
+        || duplicate_canary_rows(&f.seeded_canaries)
+        || duplicate_canary_rows(&f.scan_manifest)
+        || duplicates(
+            &f.tenant_scans
+                .iter()
+                .map(|row| row.attempt)
+                .collect::<Vec<_>>(),
+        )
+        || f.tenant_scans
+            .iter()
+            .any(|row| row.categories.iter().any(|mask| mask & !0x7f != 0))
         || !rollback_matches(&f.provisioned, &f.rolled_back)
         || f.cache_variant != cache_variant(key)
         || f.restart.as_ref().is_some_and(|r| {
@@ -381,6 +419,21 @@ fn evaluate_facts(
     // Empty collections are missing; nonempty foreign identities are stale.
     let foreign =
         |actual: &[Uuid], expected: &[Uuid]| actual.iter().any(|id| !expected.contains(id));
+    let seed_attempts = if key.scenario == ScenarioId::S13 {
+        input.attempts.as_slice()
+    } else {
+        &[]
+    };
+    let scan_attempts = if key.scenario == ScenarioId::S14 {
+        input.attempts.as_slice()
+    } else {
+        &[]
+    };
+    let previous_attempts = if key.scenario == ScenarioId::S14 {
+        input.previous_attempts.as_slice()
+    } else {
+        &[]
+    };
     let cancel = if key.scenario == ScenarioId::S10 {
         Some(
             input
@@ -396,7 +449,32 @@ fn evaluate_facts(
         || foreign(&f.previous_attempt_ids, &input.previous_attempts)
         || foreign(&f.simultaneous_ids, &input.attempts)
         || foreign(&f.completed_ids, &input.attempts)
-        || foreign(&f.scanned_attempts, &input.attempts)
+        || f.seeded_canaries.iter().any(|row| {
+            !seed_attempts.contains(&row.attempt)
+                || row
+                    .canaries
+                    .iter()
+                    .any(|marker| !tenant_canaries(&[row.attempt]).contains(marker))
+        })
+        || f.tenant_scans
+            .iter()
+            .any(|row| !scan_attempts.contains(&row.attempt))
+        || f.scan_manifest
+            .iter()
+            .zip(previous_attempts)
+            .any(|(row, expected)| row.attempt != *expected)
+        || f.scan_manifest.iter().any(|row| {
+            !previous_attempts.contains(&row.attempt)
+                || row
+                    .canaries
+                    .iter()
+                    .any(|marker| !tenant_canaries(&[row.attempt]).contains(marker))
+                || row
+                    .canaries
+                    .iter()
+                    .zip(tenant_canaries(&[row.attempt]))
+                    .any(|(marker, expected)| marker != &expected)
+        })
         || f.endpoint_ids
             .iter()
             .any(|id| !expected_endpoints.contains(id))
@@ -441,13 +519,18 @@ fn evaluate_facts(
         || f.completed_ids != input.attempts
         || f.barrier != barrier
         || f.wave_trigger != key.wave.as_str()
+        // Membership and uniqueness were checked above. Cardinalities finish
+        // seed coverage; scan masks cover canonical source/category positions.
+        || f.seeded_canaries.len() != seed_attempts.len()
+        || f.seeded_canaries.iter().any(|row| row.canaries.len() != tenant_canaries(&[row.attempt]).len())
+        || f.tenant_scans.len() != scan_attempts.len()
+        || f.scan_manifest.len() != previous_attempts.len()
+        || f.scan_manifest.iter().any(|row|row.canaries.len()!=7)
+        || f.tenant_scans.iter().any(|row| row.categories.len() != previous_attempts.len() || row.categories.iter().any(|&mask|mask!=0x7f))
         || (key.scenario == ScenarioId::S13
             && (f.active_peak != key.concurrency || f.simultaneous_ids != input.attempts))
         || f.provisioned.iter().map(String::as_str).collect::<Vec<_>>() != created_at(&key.case)
-        || (key.scenario == ScenarioId::S14
-            && (!f.artifact_checked
-                || f.scanned_attempts != input.attempts
-                || f.next_tenant_scanned != tenant_canaries(&input.previous_attempts)))
+        || (key.scenario == ScenarioId::S14 && !f.artifact_checked)
     {
         return Err(Reason::MissingEvidence);
     }
@@ -464,9 +547,18 @@ pub struct FixtureSequence {
     halted: bool,
     identity: Option<RunIdentity>,
     driver_digest: Option<String>,
-    pending: Option<(CaseKey, LifecycleInput)>,
+    pending: Option<PendingWave>,
     used: BTreeSet<Uuid>,
 }
+
+struct PendingWave {
+    key: CaseKey,
+    input: LifecycleInput,
+    // Accepted source observations, not a regenerated expectation. Only an
+    // S-13 Passed result can populate this manifest for the next tenant wave.
+    seeded_canaries: Vec<TenantCanaries>,
+}
+
 impl FixtureSequence {
     pub fn results(&self) -> &[CaseResult] {
         &self.results
@@ -505,13 +597,24 @@ impl FixtureSequence {
         {
             return Err(Reason::StaleEvidence);
         }
+        let facts = decode(key, input, response)?;
         match key.scenario {
             ScenarioId::S14 | ScenarioId::S15 => {
-                let (previous, expected) = self.pending.as_ref().ok_or(Reason::MissingEvidence)?;
+                let pending = self.pending.as_ref().ok_or(Reason::MissingEvidence)?;
+                let (previous, expected) = (&pending.key, &pending.input);
                 let valid = if key.scenario == ScenarioId::S14 {
                     previous.scenario == ScenarioId::S13
                         && key.case == format!("next-tenant-clean-after-{}", previous.wave.as_str())
                         && input.previous_attempts == expected.attempts
+                        && !pending.seeded_canaries.is_empty()
+                        && facts.scan_manifest.len() == pending.seeded_canaries.len()
+                        && facts
+                            .scan_manifest
+                            .iter()
+                            .zip(&pending.seeded_canaries)
+                            .all(|(scan, seed)| {
+                                scan.attempt == seed.attempt && scan.canaries == seed.canaries
+                            })
                 } else {
                     previous.scenario == ScenarioId::S14
                         && key.case
@@ -546,13 +649,25 @@ impl FixtureSequence {
                 .chain(input.extra_attempt.iter())
                 .copied(),
         );
+        // Canonicalize the validated observed seeds, preserving their actual
+        // content. S-14 must supply this retained manifest in exactly this order.
+        let mut seeded_canaries = facts.seeded_canaries;
+        seeded_canaries.sort_by_key(|row| input.attempts.iter().position(|id| id == &row.attempt));
+        for row in &mut seeded_canaries {
+            let expected = tenant_canaries(&[row.attempt]);
+            row.canaries
+                .sort_by_key(|marker| expected.iter().position(|item| item == marker));
+        }
         self.pending = if matches!(key.scenario, ScenarioId::S13 | ScenarioId::S14) {
-            Some((key.clone(), input.clone()))
+            Some(PendingWave {
+                key: key.clone(),
+                input: input.clone(),
+                seeded_canaries,
+            })
         } else {
             None
         };
-        let duration = decode(key, input, response)?.elapsed_ms;
-        self.record(key, response, evaluated.clone(), duration);
+        self.record(key, response, evaluated.clone(), facts.elapsed_ms);
         evaluated
     }
     fn record(

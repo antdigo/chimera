@@ -85,8 +85,10 @@ fn good(key: &CaseKey, input: &LifecycleInput, identity: &RunIdentity) -> Value 
         "revoked_before_destroy":true,"destroy_before_completion":true,"elapsed_ms":10,"deadline_ms":input.deadline_ms,
         "remaining_processes":0,"remaining_mounts":0,"remaining_sockets":0,"remaining_writable_roots":0,"remaining_docker_objects":0});
     let rest = json!({
-        "owned_enumeration_complete":true,"next_tenant_scanned":if key.scenario == ScenarioId::S14 {canaries(&input.previous_attempts)} else {vec![]},
-        "scanned_attempts":if key.scenario == ScenarioId::S14 {input.attempts.clone()} else {vec![]},
+        "owned_enumeration_complete":true,
+        "seeded_canaries":if key.scenario == ScenarioId::S13 {seed_rows(&input.attempts)} else {json!([])},
+        "scan_manifest":if key.scenario == ScenarioId::S14 {seed_rows(&input.previous_attempts)} else {json!([])},
+        "tenant_scans":if key.scenario == ScenarioId::S14 {scan_rows(input)} else {json!([])},
         "next_tenant_canaries":[],"peer_unchanged":true,"cross_capability_rejected":true,"artifact_checked":true,
         "cancel_target":if key.case == "stale-cancel" {Some(input.previous_attempts[0])} else if key.scenario == ScenarioId::S10 {Some(input.attempts[0])} else {None},
         "root_poisoned":false,"cleanup_confirmed":true,
@@ -104,6 +106,11 @@ fn good(key: &CaseKey, input: &LifecycleInput, identity: &RunIdentity) -> Value 
 
 // Inert transport fixture: authenticates through the real pinned-driver protocol.
 // No lifecycle operations, daemon signals or native recovery are performed.
+// Bound host-side transport subprocesses independently of the 20/40 logical
+// attempt cardinality in each recipe. Unbounded parallel table tests can starve
+// the existing short-deadline protocol tests during a default full-suite run.
+static FIXTURE_TRANSPORTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+
 async fn response(
     key: &CaseKey,
     input: &LifecycleInput,
@@ -119,6 +126,7 @@ async fn response_variant(
     facts: Value,
     different_driver: bool,
 ) -> AuthenticatedResponse {
+    let _permit = FIXTURE_TRANSPORTS.acquire().await.unwrap();
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("driver");
     let payload = serde_json::to_string(&json!([{"name":"lifecycle","value":facts}])).unwrap();
@@ -422,7 +430,7 @@ async fn lifecycle_next_tenant_scans_all_previous_canaries_and_idle_has_no_owned
     let key = key("next-tenant-clean-after-cold");
     let input = input(&key);
     for (field, value, reason) in [
-        ("next_tenant_scanned", json!([]), Reason::MissingEvidence),
+        ("tenant_scans", json!([]), Reason::MissingEvidence),
         (
             "next_tenant_canaries",
             json!([format!(
@@ -548,11 +556,7 @@ async fn lifecycle_schema_is_closed() {
 async fn lifecycle_requires_wave_trigger_and_each_next_tenant_scan() {
     for (name, field, value) in [
         ("capacity-and-distinct-state", "wave_trigger", json!("")),
-        (
-            "next-tenant-clean-after-cold",
-            "scanned_attempts",
-            json!([]),
-        ),
+        ("next-tenant-clean-after-cold", "tenant_scans", json!([])),
     ] {
         let key = key(name);
         let input = input(&key);
@@ -723,4 +727,239 @@ async fn lifecycle_fixture_sequence_enforces_wave_dependencies_and_poison_stops_
         Err(Reason::UnfinishedRun)
     );
     assert_eq!(sequence.results().len(), 1);
+}
+
+fn seed_rows(ids: &[Uuid]) -> Value {
+    json!(
+        ids.iter()
+            .map(|id| json!({"attempt":id,"canaries":canaries(&[*id])}))
+            .collect::<Vec<_>>()
+    )
+}
+fn scan_rows(input: &LifecycleInput) -> Value {
+    json!(
+        input
+            .attempts
+            .iter()
+            .map(|id| json!({"attempt":id,"categories":vec![127u8;input.previous_attempts.len()]}))
+            .collect::<Vec<_>>()
+    )
+}
+
+#[tokio::test]
+async fn lifecycle_sequence_requires_seeded_source_manifest() {
+    let source = key("capacity-and-distinct-state");
+    let input = input(&source);
+    let identity = super::report_test::identity();
+    for mutation in 0..7 {
+        let mut facts = good(&source, &input, &identity);
+        facts["seeded_canaries"] = seed_rows(&input.attempts);
+        let reason = match mutation {
+            0 => {
+                facts.as_object_mut().unwrap().remove("seeded_canaries");
+                Reason::ProtocolViolation
+            }
+            1 => {
+                facts["seeded_canaries"] = json!([]);
+                Reason::MissingEvidence
+            }
+            2 => {
+                facts["seeded_canaries"].as_array_mut().unwrap().pop();
+                Reason::MissingEvidence
+            }
+            3 => {
+                facts["seeded_canaries"][0]["canaries"]
+                    .as_array_mut()
+                    .unwrap()
+                    .pop();
+                Reason::MissingEvidence
+            }
+            4 => {
+                facts["seeded_canaries"][0]["canaries"][0] = json!("wrong-seed-content");
+                Reason::StaleEvidence
+            }
+            5 => {
+                facts["seeded_canaries"][0] = facts["seeded_canaries"][1].clone();
+                Reason::BoundaryViolation
+            }
+            _ => {
+                facts["seeded_canaries"][0]["canaries"][0] =
+                    facts["seeded_canaries"][0]["canaries"][1].clone();
+                Reason::BoundaryViolation
+            }
+        };
+        let observed = response(&source, &input, identity.clone(), facts).await;
+        let mut sequence = FixtureSequence::default();
+        assert_eq!(
+            sequence.accept(&source, &input, &observed),
+            Err(reason),
+            "mutation {mutation}"
+        );
+        let next = key("next-tenant-clean-after-cold");
+        let mut next_input = super::lifecycle_test::input(&next);
+        next_input.previous_attempts = input.attempts.clone();
+        let fabricated = response(
+            &next,
+            &next_input,
+            identity.clone(),
+            good(&next, &next_input, &identity),
+        )
+        .await;
+        assert_eq!(
+            sequence.accept(&next, &next_input, &fabricated),
+            Err(Reason::UnfinishedRun)
+        );
+    }
+}
+
+#[tokio::test]
+async fn lifecycle_sequence_requires_every_destination_source_category_pair() {
+    let source = key("capacity-and-distinct-state");
+    let source_input = input(&source);
+    let identity = super::report_test::identity();
+    let next = key("next-tenant-clean-after-cold");
+    let mut input = input(&next);
+    input.previous_attempts = source_input.attempts.clone();
+    for mutation in 0..12 {
+        let mut sequence = FixtureSequence::default();
+        let seeded = response(
+            &source,
+            &source_input,
+            identity.clone(),
+            good(&source, &source_input, &identity),
+        )
+        .await;
+        sequence.accept(&source, &source_input, &seeded).unwrap();
+        let mut facts = good(&next, &input, &identity);
+        facts["tenant_scans"] = scan_rows(&input);
+        let reason = match mutation {
+            0 => {
+                facts.as_object_mut().unwrap().remove("tenant_scans");
+                Reason::ProtocolViolation
+            }
+            1 => {
+                facts["tenant_scans"].as_array_mut().unwrap().pop();
+                Reason::MissingEvidence
+            }
+            2 => {
+                facts["tenant_scans"][0]["categories"][0] = json!(126);
+                Reason::MissingEvidence
+            }
+            3 => {
+                facts["tenant_scans"][0]["categories"][0] = json!(0);
+                Reason::MissingEvidence
+            }
+            4 => {
+                facts["tenant_scans"][0] = facts["tenant_scans"][1].clone();
+                Reason::BoundaryViolation
+            }
+            5 => {
+                facts["tenant_scans"][0]["categories"][0] = json!(255);
+                Reason::BoundaryViolation
+            }
+            6 => {
+                facts["scan_manifest"][0]["canaries"][0] = json!("unseeded-canary");
+                Reason::StaleEvidence
+            }
+            7 => {
+                facts["scan_manifest"].as_array_mut().unwrap().reverse();
+                Reason::StaleEvidence
+            }
+            8 => {
+                facts["scan_manifest"].as_array_mut().unwrap().pop();
+                Reason::MissingEvidence
+            }
+            9 => {
+                facts["tenant_scans"][0]["categories"]
+                    .as_array_mut()
+                    .unwrap()
+                    .pop();
+                Reason::MissingEvidence
+            }
+            10 => {
+                facts["tenant_scans"][0]["categories"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(json!(127));
+                Reason::MissingEvidence
+            }
+            _ => {
+                // The union still has every destination and marker, but the
+                // first two destinations each searched only half the manifest.
+                let count = input.previous_attempts.len();
+                facts["tenant_scans"][0]["categories"] = json!(
+                    (0..count)
+                        .map(|i| if i < count / 2 { 127 } else { 0 })
+                        .collect::<Vec<_>>()
+                );
+                facts["tenant_scans"][1]["categories"] = json!(
+                    (0..count)
+                        .map(|i| if i >= count / 2 { 127 } else { 0 })
+                        .collect::<Vec<_>>()
+                );
+                Reason::MissingEvidence
+            }
+        };
+        let observed = response(&next, &input, identity.clone(), facts).await;
+        assert_eq!(
+            sequence.accept(&next, &input, &observed),
+            Err(reason),
+            "mutation {mutation}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn lifecycle_canonicalizes_seed_rows_and_preserves_destination_association() {
+    let source = key("capacity-and-distinct-state");
+    let source_input = input(&source);
+    let identity = super::report_test::identity();
+    let mut facts = good(&source, &source_input, &identity);
+    facts["seeded_canaries"] = seed_rows(&source_input.attempts);
+    facts["seeded_canaries"].as_array_mut().unwrap().reverse();
+    for row in facts["seeded_canaries"].as_array_mut().unwrap() {
+        row["canaries"].as_array_mut().unwrap().reverse();
+    }
+    let observed = response(&source, &source_input, identity.clone(), facts).await;
+    let mut sequence = FixtureSequence::default();
+    sequence.accept(&source, &source_input, &observed).unwrap();
+    let next = key("next-tenant-clean-after-cold");
+    let mut input = input(&next);
+    input.previous_attempts = source_input.attempts;
+    let mut facts = good(&next, &input, &identity);
+    facts["tenant_scans"] = scan_rows(&input);
+    facts["tenant_scans"].as_array_mut().unwrap().reverse();
+    let observed = response(&next, &input, identity, facts).await;
+    sequence.accept(&next, &input, &observed).unwrap();
+}
+
+#[tokio::test]
+async fn lifecycle_manifest_failures_preserve_cleanup_boundary_stale_missing_priority() {
+    for name in [
+        "capacity-and-distinct-state",
+        "next-tenant-clean-after-cold",
+    ] {
+        let key = key(name);
+        let input = input(&key);
+        for (cleanup, peer, reason) in [
+            (true, true, Reason::StaleEvidence),
+            (true, false, Reason::BoundaryViolation),
+            (false, false, Reason::CleanupUnconfirmed),
+        ] {
+            let mut facts = good(&key, &input, &super::report_test::identity());
+            let field = if key.scenario == ScenarioId::S13 {
+                "seeded_canaries"
+            } else {
+                "scan_manifest"
+            };
+            facts[field][0]["canaries"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!("foreign-extra-marker"));
+            facts["completed_ids"] = json!([]);
+            facts["cleanup_confirmed"] = json!(cleanup);
+            facts["peer_unchanged"] = json!(peer);
+            assert_eq!(result(&key, &input, facts).await, Err(reason));
+        }
+    }
 }
