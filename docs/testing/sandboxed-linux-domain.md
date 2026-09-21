@@ -77,14 +77,21 @@ The B12b1 case starts a TERM-ignoring `setsid` descendant without waiting for
 command completion. Its command leader remains TERM-ignoring and active, so
 PID 1 cannot exit before shutdown begins. Before destroy it requires, within a
 bounded interval, at least two additional exact cgroup members over the idle
-baseline; a start acknowledgement alone cannot satisfy this control. It then
-requires the exact production destroy path to finish within its bounded deadline
-and the exact zero-resource inventory. `DestroyReport::forced_kill` is retained
-as truthful evidence but is not asserted here: PID-namespace shutdown may kill
-the descendant before outer cgroup KILL, which is a correct bounded destroy.
-The lower-level destroy test covers the cgroup-KILL fallback. Native
-resistant-cgroup fallback remains a release-gate debt. This is implementation
-evidence only until the ignored case runs on the dedicated native Debian host.
+baseline; a start acknowledgement alone cannot satisfy this control. The
+detached child alone appends a heartbeat in the fresh
+`/work/native-detached-heartbeat` file;
+the fixture reads it through the exact bound `active/<attempt>/work` directory
+with no-follow resolution and requires observed growth shortly before destroy.
+It then calls the exact production destroy path and requires the exact
+zero-resource inventory. The local elapsed-time check detects a late return; it
+cannot interrupt a blocking synchronous cleanup without abandoning the sole
+cleanup authority. The external qualification watchdog is responsible for hang
+enforcement. `DestroyReport::forced_kill` is retained as truthful evidence but
+is not asserted here: PID-namespace shutdown may kill the descendant before
+outer cgroup KILL, which is a correct bounded destroy. The lower-level destroy
+test covers the cgroup-KILL fallback. Native resistant-cgroup fallback remains a
+release-gate debt. This is implementation evidence only until the ignored case
+runs on the dedicated native Debian host.
 
 ## Native operator gate (pending)
 

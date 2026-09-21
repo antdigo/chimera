@@ -84,13 +84,20 @@ async fn native_detached_term_ignoring_descendant_is_destroyed() {
     let started = fixture
         .run_until_started(
             "trap '' TERM\n\
-             setsid sh -c 'trap \"\" TERM; while :; do sleep 1; done' >/dev/null 2>&1 &\n\
+             setsid sh -c 'trap \"\" TERM; while :; do printf x >> /work/native-detached-heartbeat; sleep 0.1; done' >/dev/null 2>&1 &\n\
              while :; do wait || true; done",
         )
         .await;
     let descendant_is_live = if started.is_ok() {
         fixture
             .wait_for_live_processes(baseline + 2, std::time::Duration::from_secs(2))
+            .await
+    } else {
+        Ok(false)
+    };
+    let descendant_heartbeat_grows = if descendant_is_live.as_ref().is_ok_and(|live| *live) {
+        fixture
+            .wait_for_heartbeat_growth(std::time::Duration::from_secs(2))
             .await
     } else {
         Ok(false)
@@ -107,6 +114,10 @@ async fn native_detached_term_ignoring_descendant_is_destroyed() {
     assert!(
         descendant_is_live.unwrap_or(false),
         "the detached descendant must be live before teardown"
+    );
+    assert!(
+        descendant_heartbeat_grows.unwrap_or(false),
+        "the detached TERM-ignoring descendant heartbeat must grow before teardown"
     );
     assert!(
         destroy.is_ok(),

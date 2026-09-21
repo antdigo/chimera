@@ -335,6 +335,36 @@ impl NativeDomainFixture {
         }
     }
 
+    pub(super) async fn wait_for_heartbeat_growth(
+        &self,
+        timeout: Duration,
+    ) -> Result<bool, ExecutionDomainError> {
+        let deadline = Instant::now() + timeout;
+        let mut previous = self.heartbeat_size()?;
+        loop {
+            if Instant::now() >= deadline {
+                return Ok(false);
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            let current = self.heartbeat_size()?;
+            if current > previous {
+                return Ok(true);
+            }
+            previous = current;
+        }
+    }
+
+    fn heartbeat_size(&self) -> Result<usize, ExecutionDomainError> {
+        let work = self.active.child(&self.attempt_name)?.child(c"work")?;
+        match dirfd::stat_at(work.fd(), c"native-detached-heartbeat") {
+            Ok(_) => Ok(work
+                .read_regular(c"native-detached-heartbeat", 64 * 1024)?
+                .len()),
+            Err(error) if error.raw_os_error() == Some(libc::ENOENT) => Ok(0),
+            Err(error) => Err(io_error(error)),
+        }
+    }
+
     fn shell_spec(script: &str) -> CommandSpec {
         CommandSpec {
             target: CommandTarget::Sandboxed {
