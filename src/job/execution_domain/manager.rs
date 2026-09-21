@@ -66,8 +66,9 @@ enum Backend {
 
 #[cfg(target_os = "linux")]
 struct LinuxBackend {
-    kernel: super::linux::launcher::KernelDomain,
-    cleanup: Option<super::linux::StrictCleanupAuthority>,
+    cleanup: Option<super::linux::StrictCleanupRecord>,
+    #[cfg(test)]
+    test_kernel: Option<super::linux::launcher::KernelDomain>,
     path_mappings: Vec<(std::path::PathBuf, super::DomainPath)>,
     next_command_id: u64,
     control_broken: bool,
@@ -144,6 +145,14 @@ impl Drop for ManagerPermitGuard {
     }
 }
 
+fn release_destroyed_backend(backend_slot: &mut Option<Backend>, guard: &mut ManagerPermitGuard) {
+    // Closing retained BoundDir/cgroup/socket authority is part of terminal
+    // cleanup. A capacity waiter must not wake while the old backend still
+    // owns any descriptor capability.
+    drop(backend_slot.take());
+    guard.confirmed_destroyed();
+}
+
 pub(super) struct DomainManager;
 
 impl DomainManager {
@@ -205,11 +214,17 @@ impl DomainManager {
                     #[cfg(target_os = "linux")]
                     BackendBuilder::Sandboxed(builder) => builder
                         .build()
-                        .inspect_err(|_| provision_state.poison())
+                        .map_err(|failure| {
+                            if failure.quarantine() {
+                                provision_state.poison();
+                            }
+                            failure.into_error()
+                        })
                         .map(|parts| {
                             Backend::Linux(LinuxBackend {
-                                kernel: parts.kernel,
                                 cleanup: Some(parts.cleanup),
+                                #[cfg(test)]
+                                test_kernel: None,
                                 path_mappings: parts.path_mappings,
                                 next_command_id: 1,
                                 control_broken: false,
@@ -251,9 +266,9 @@ impl DomainManager {
                     Ok(handle) => handle,
                     Err(error) => {
                         let cleanup =
-                            with_backend_blocking(&mut backend_slot, Backend::destroy).await;
+                            destroy_managed(&mut backend_slot, reader.clone(), attempt).await;
                         if cleanup.is_ok() {
-                            guard.confirmed_destroyed();
+                            release_destroyed_backend(&mut backend_slot, &mut guard);
                         }
                         let _ = ready_tx.take().expect("ready sender").send(Err(error));
                         return;
@@ -266,12 +281,11 @@ impl DomainManager {
                         handle.explicit_destroy = true;
                         handle.request.take();
                     }
-                    revoke_reader(reader.clone()).await;
-                    if with_backend_blocking(&mut backend_slot, Backend::destroy)
+                    if destroy_managed(&mut backend_slot, reader.clone(), attempt)
                         .await
                         .is_ok()
                     {
-                        guard.confirmed_destroyed();
+                        release_destroyed_backend(&mut backend_slot, &mut guard);
                     }
                     return;
                 }
@@ -291,13 +305,12 @@ impl DomainManager {
                 // The guard remains outside the unwind boundary, so cleanup
                 // authority and the permit survive a panic in the request loop.
                 state.poison();
-                revoke_reader(reader.clone()).await;
                 if backend_slot.is_some()
-                    && with_backend_blocking(&mut backend_slot, Backend::destroy)
+                    && destroy_managed(&mut backend_slot, reader.clone(), attempt)
                         .await
                         .is_ok()
                 {
-                    guard.confirmed_destroyed();
+                    release_destroyed_backend(&mut backend_slot, &mut guard);
                 }
             }
         };
@@ -371,8 +384,38 @@ where
     }
 }
 
-async fn revoke_reader(reader: DomainWorkspaceReader) {
-    run_blocking(move || reader.revoke_and_wait()).await;
+async fn revoke_reader(reader: DomainWorkspaceReader) -> Result<(), ExecutionDomainError> {
+    run_blocking(move || {
+        reader.revoke_until(std::time::Instant::now() + std::time::Duration::from_secs(2))
+    })
+    .await
+}
+
+async fn destroy_managed(
+    backend_slot: &mut Option<Backend>,
+    reader: DomainWorkspaceReader,
+    attempt: AttemptIdentity,
+) -> Result<DestroyReport, ExecutionDomainError> {
+    let reader_result = revoke_reader(reader).await;
+    if reader_result.is_ok() {
+        with_backend_blocking(backend_slot, Backend::authorize_external_revocation).await;
+    } else if !backend_slot
+        .as_ref()
+        .is_some_and(Backend::needs_revocation_failure_neutralization)
+    {
+        // Trusted cleanup has no separate kill-only phase. Preserve its files
+        // while a reader still holds authority; the guard poisons capacity.
+        return match reader_result {
+            Err(error) => Err(error),
+            Ok(()) => unreachable!("branch requires a reader revocation error"),
+        };
+    }
+    let destroy =
+        with_backend_blocking(backend_slot, move |backend| backend.destroy(attempt)).await;
+    match (reader_result, destroy) {
+        (Err(error), _) => Err(error),
+        (Ok(()), result) => result,
+    }
 }
 
 #[cfg_attr(
@@ -474,6 +517,8 @@ async fn manager_loop(
                                 }
                                 Some(ManagerRequest::Destroy { reply }) => {
                                     if destroy_reply.is_none() {
+                                        receiver.close();
+                                        channel_closed = true;
                                         manager_cancelled.cancel(CancelReason::Shutdown);
                                         destroy_reply = Some(reply);
                                     } else {
@@ -501,23 +546,17 @@ async fn manager_loop(
                 }
                 let _ = reply.send(result);
                 if let Some(reply) = destroy_reply {
-                    revoke_reader(reader.clone()).await;
-                    let result = with_backend_blocking(backend_slot, Backend::destroy).await;
+                    let result = destroy_managed(backend_slot, reader.clone(), attempt).await;
                     if result.is_ok() {
-                        guard.confirmed_destroyed();
+                        release_destroyed_backend(backend_slot, guard);
                     }
-                    let report = result.map(|()| DestroyReport {
-                        attempt,
-                        forced_kill: true,
-                    });
-                    let _ = reply.send(report);
+                    let _ = reply.send(result);
                     return;
                 }
                 if control_broken {
-                    revoke_reader(reader.clone()).await;
-                    let result = with_backend_blocking(backend_slot, Backend::destroy).await;
+                    let result = destroy_managed(backend_slot, reader.clone(), attempt).await;
                     if result.is_ok() {
-                        guard.confirmed_destroyed();
+                        release_destroyed_backend(backend_slot, guard);
                     }
                     return;
                 }
@@ -541,17 +580,13 @@ async fn manager_loop(
                 let _ = reply.send(result);
             }
             ManagerRequest::Destroy { reply } => {
-                revoke_reader(reader.clone()).await;
-                let result = with_backend_blocking(backend_slot, Backend::destroy).await;
+                receiver.close();
+                let result = destroy_managed(backend_slot, reader.clone(), attempt).await;
                 if result.is_ok() {
-                    guard.confirmed_destroyed();
+                    release_destroyed_backend(backend_slot, guard);
                 }
-                let report = result.map(|()| DestroyReport {
-                    attempt,
-                    forced_kill: false,
-                });
                 // Cleanup is already terminal; a dropped reply cannot cancel it.
-                let _ = reply.send(report);
+                let _ = reply.send(result);
                 return;
             }
             #[cfg(test)]
@@ -575,8 +610,7 @@ async fn manager_loop(
     // Conservative dropped-handle policy: poison admission synchronously, then
     // revoke all read leases and perform idempotent cleanup before permit drop.
     guard.root_state.poison();
-    revoke_reader(reader.clone()).await;
-    let _ = with_backend_blocking(backend_slot, Backend::destroy).await;
+    let _ = destroy_managed(backend_slot, reader.clone(), attempt).await;
 }
 
 fn reject_while_running(request: ManagerRequest) {
@@ -612,6 +646,26 @@ fn reject_while_running(request: ManagerRequest) {
 }
 
 impl Backend {
+    fn needs_revocation_failure_neutralization(&self) -> bool {
+        match self {
+            Self::Trusted(_) => false,
+            #[cfg(target_os = "linux")]
+            Self::Linux(_) => true,
+        }
+    }
+
+    fn authorize_external_revocation(&mut self) {
+        match self {
+            Self::Trusted(_) => {}
+            #[cfg(target_os = "linux")]
+            Self::Linux(backend) => {
+                if let Some(cleanup) = &mut backend.cleanup {
+                    cleanup.authorize_external_revocation();
+                }
+            }
+        }
+    }
+
     fn control_broken(&self) -> bool {
         match self {
             Self::Trusted(_) => false,
@@ -678,7 +732,10 @@ impl Backend {
         match self {
             Self::Trusted(backend) => backend.mark_running(),
             #[cfg(target_os = "linux")]
-            Self::Linux(_) => Ok(()),
+            Self::Linux(backend) => backend
+                .cleanup
+                .as_mut()
+                .map_or(Ok(()), super::linux::StrictCleanupRecord::mark_running),
         }
     }
 
@@ -686,7 +743,10 @@ impl Backend {
         match self {
             Self::Trusted(backend) => backend.mark_cleaning(),
             #[cfg(target_os = "linux")]
-            Self::Linux(_) => Ok(()),
+            Self::Linux(backend) => backend
+                .cleanup
+                .as_mut()
+                .map_or(Ok(()), super::linux::StrictCleanupRecord::mark_cleaning),
         }
     }
 
@@ -736,11 +796,14 @@ impl Backend {
         Ok(())
     }
 
-    fn destroy(&mut self) -> Result<(), ExecutionDomainError> {
+    fn destroy(&mut self, attempt: AttemptIdentity) -> Result<DestroyReport, ExecutionDomainError> {
         match self {
-            Self::Trusted(backend) => backend.destroy_in_place(),
+            Self::Trusted(backend) => backend.destroy_in_place().map(|()| DestroyReport {
+                attempt,
+                forced_kill: false,
+            }),
             #[cfg(target_os = "linux")]
-            Self::Linux(backend) => backend.destroy(),
+            Self::Linux(backend) => backend.destroy(attempt),
         }
     }
 }
@@ -756,8 +819,31 @@ fn backend_failure(category: super::FailureCategory) -> ExecutionDomainError {
 
 #[cfg(target_os = "linux")]
 impl LinuxBackend {
+    #[cfg(test)]
+    fn kernel(&self) -> &super::linux::launcher::KernelDomain {
+        if let Some(cleanup) = &self.cleanup {
+            return cleanup.kernel();
+        }
+        #[cfg(test)]
+        if let Some(kernel) = &self.test_kernel {
+            return kernel;
+        }
+        unreachable!("production Linux backend always owns a cleanup record")
+    }
+
+    fn kernel_mut(&mut self) -> &mut super::linux::launcher::KernelDomain {
+        if let Some(cleanup) = &mut self.cleanup {
+            return cleanup.kernel_mut();
+        }
+        #[cfg(test)]
+        if let Some(kernel) = &mut self.test_kernel {
+            return kernel;
+        }
+        unreachable!("production Linux backend always owns a cleanup record")
+    }
+
     fn fail_control(&mut self, error: ExecutionDomainError) -> ExecutionDomainError {
-        self.kernel.control.abort();
+        self.kernel_mut().control.abort();
         self.control_broken = true;
         error
     }
@@ -800,7 +886,7 @@ impl LinuxBackend {
             .checked_add(spec.timeout + std::time::Duration::from_secs(5))
             .ok_or_else(|| backend_failure(super::FailureCategory::InvalidInput))?;
         if let Err(error) = self
-            .kernel
+            .kernel_mut()
             .control
             .start_send(Message::Request(Request::Run { command_id, spec }))
         {
@@ -866,7 +952,7 @@ impl LinuxBackend {
                 );
             }
             let flushed = if pending_send.is_some() {
-                match self.kernel.control.try_flush() {
+                match self.kernel_mut().control.try_flush() {
                     Ok(flushed) => flushed,
                     Err(error) => return Err(self.fail_control(error)),
                 }
@@ -892,7 +978,7 @@ impl LinuxBackend {
                 && let Some(reason) = cancel_reason.clone()
             {
                 if let Err(error) =
-                    self.kernel
+                    self.kernel_mut()
                         .control
                         .start_send(Message::Request(Request::CancelCommand {
                             command_id,
@@ -914,7 +1000,7 @@ impl LinuxBackend {
                 tokio::time::sleep(std::time::Duration::from_millis(5)).await;
                 continue;
             }
-            let message = match self.kernel.control.try_receive() {
+            let message = match self.kernel_mut().control.try_receive() {
                 Ok(message) => message,
                 Err(error) => return Err(self.fail_control(error)),
             };
@@ -1014,7 +1100,7 @@ impl LinuxBackend {
     fn prepare_step(&mut self, event: &[u8]) -> Result<StepFilesId, ExecutionDomainError> {
         use super::protocol::{Request, Response};
         let id = StepFilesId::new();
-        match self.kernel.control.request(Request::PrepareStep {
+        match self.kernel_mut().control.request(Request::PrepareStep {
             id: id.clone(),
             event: event.to_vec(),
         })? {
@@ -1027,7 +1113,7 @@ impl LinuxBackend {
     fn read_step(&mut self, id: StepFilesId) -> Result<StepStateSnapshot, ExecutionDomainError> {
         use super::protocol::{Request, Response};
         match self
-            .kernel
+            .kernel_mut()
             .control
             .request(Request::ReadStep { id: id.clone() })?
         {
@@ -1040,9 +1126,10 @@ impl LinuxBackend {
         }
     }
 
+    #[cfg(test)]
     fn shutdown(&mut self) -> Result<(), ExecutionDomainError> {
         use super::protocol::{Request, Response};
-        match self.kernel.control.request(Request::Shutdown {
+        match self.kernel_mut().control.request(Request::Shutdown {
             reason: CancelReason::Shutdown,
         })? {
             Response::ShuttingDown => Ok(()),
@@ -1051,47 +1138,54 @@ impl LinuxBackend {
         }
     }
 
-    fn destroy(&mut self) -> Result<(), ExecutionDomainError> {
-        let _ = self.shutdown();
-        if self
-            .kernel
-            .launcher
-            .try_wait()
-            .map_err(|error| ExecutionDomainError::Backend {
-                attempt: None,
-                stage: super::Stage::Destroy,
-                category: super::FailureCategory::Io,
-                errno: error.raw_os_error(),
-            })?
-            .is_none()
+    fn destroy(
+        &mut self,
+        _attempt: AttemptIdentity,
+    ) -> Result<DestroyReport, ExecutionDomainError> {
+        if let Some(cleanup) = &mut self.cleanup {
+            return cleanup.destroy();
+        }
+        #[cfg(not(test))]
+        unreachable!("production Linux backend always owns a cleanup record");
+        #[cfg(test)]
         {
-            self.kernel
+            let _ = self.shutdown();
+            let mut forced_kill = false;
+            if self
+                .kernel_mut()
                 .launcher
-                .kill()
+                .try_wait()
                 .map_err(|error| ExecutionDomainError::Backend {
                     attempt: None,
                     stage: super::Stage::Destroy,
                     category: super::FailureCategory::Io,
                     errno: error.raw_os_error(),
+                })?
+                .is_none()
+            {
+                forced_kill = true;
+                self.kernel_mut().launcher.kill().map_err(|error| {
+                    ExecutionDomainError::Backend {
+                        attempt: None,
+                        stage: super::Stage::Destroy,
+                        category: super::FailureCategory::Io,
+                        errno: error.raw_os_error(),
+                    }
                 })?;
-            self.kernel
-                .launcher
-                .wait()
-                .map_err(|error| ExecutionDomainError::Backend {
-                    attempt: None,
-                    stage: super::Stage::Destroy,
-                    category: super::FailureCategory::Io,
-                    errno: error.raw_os_error(),
+                self.kernel_mut().launcher.wait().map_err(|error| {
+                    ExecutionDomainError::Backend {
+                        attempt: None,
+                        stage: super::Stage::Destroy,
+                        category: super::FailureCategory::Io,
+                        errno: error.raw_os_error(),
+                    }
                 })?;
+            }
+            Ok(DestroyReport {
+                attempt: _attempt,
+                forced_kill,
+            })
         }
-        if let Some(cleanup) = &self.cleanup {
-            cleanup.verify()?;
-            // Task 10 must kill/prove-empty/unmount/remove before this cleanup
-            // authority can be released. Never report a private strict backend
-            // as destroyed while that proof is unavailable.
-            return Err(backend_failure(super::FailureCategory::NotReady));
-        }
-        Ok(())
     }
 }
 

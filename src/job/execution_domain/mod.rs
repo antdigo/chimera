@@ -40,13 +40,17 @@ pub(crate) use trusted::validate_host_docker_capabilities;
 pub fn internal_entry() -> Option<i32> {
     #[cfg(target_os = "linux")]
     {
-        linux::launcher::internal_entry()
+        linux::internal_entry()
     }
     #[cfg(not(target_os = "linux"))]
     {
         std::env::args_os()
             .nth(1)
-            .filter(|arg| arg == "--internal-domain-launch" || arg == "--internal-domain-bootstrap")
+            .filter(|arg| {
+                arg == "--internal-domain-launch"
+                    || arg == "--internal-domain-bootstrap"
+                    || arg == "--internal-mapped-cleanup"
+            })
             .map(|_| 78)
     }
 }

@@ -39,13 +39,13 @@ fn linux_backend_for_test() -> (
     assert!(raw >= 0);
     let pidfd = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) };
     let backend = super::Backend::Linux(super::LinuxBackend {
-        kernel: super::super::linux::launcher::KernelDomain {
+        cleanup: None,
+        test_kernel: Some(super::super::linux::launcher::KernelDomain {
             control: super::super::protocol::ControlConnection::new(manager, attempt).unwrap(),
             launcher: child,
             pidfd,
             deadline: std::time::Instant::now() + std::time::Duration::from_secs(2),
-        },
-        cleanup: None,
+        }),
         path_mappings: Vec::new(),
         next_command_id: 1,
         control_broken: false,
@@ -67,7 +67,7 @@ fn constrain_control_send_buffer(backend: &super::LinuxBackend) {
     assert_eq!(
         unsafe {
             libc::setsockopt(
-                backend.kernel.control.control_fd().as_raw_fd(),
+                backend.kernel().control.control_fd().as_raw_fd(),
                 libc::SOL_SOCKET,
                 libc::SO_SNDBUF,
                 (&raw const send_buffer).cast(),
@@ -874,8 +874,8 @@ fn private_linux_layout_is_strict_but_handle_publication_stays_not_ready() {
     let super::Backend::Linux(mut linux) = backend else {
         unreachable!()
     };
-    linux.kernel.launcher.kill().unwrap();
-    linux.kernel.launcher.wait().unwrap();
+    linux.kernel_mut().launcher.kill().unwrap();
+    linux.kernel_mut().launcher.wait().unwrap();
 }
 
 #[cfg(target_os = "linux")]
@@ -975,7 +975,7 @@ async fn linux_backend_uses_monotonic_ids_and_correlates_rejection() {
     ));
     assert!(backend.prepare_step(b"{}").is_ok());
     responder.join().unwrap();
-    backend.destroy().unwrap();
+    backend.destroy(AttemptIdentity::new()).unwrap();
 }
 
 #[cfg(target_os = "linux")]
@@ -1034,7 +1034,7 @@ async fn linux_backend_receiver_close_sends_handle_dropped_and_drains_finish() {
         CommandOutcome::Cancelled
     );
     responder.join().unwrap();
-    backend.destroy().unwrap();
+    backend.destroy(AttemptIdentity::new()).unwrap();
 }
 
 #[cfg(target_os = "linux")]
@@ -1094,7 +1094,7 @@ async fn linux_backend_manager_cancel_sends_correlated_shutdown_reason() {
         CommandOutcome::Cancelled
     );
     responder.join().unwrap();
-    backend.destroy().unwrap();
+    backend.destroy(AttemptIdentity::new()).unwrap();
 }
 
 #[cfg(target_os = "linux")]
@@ -1106,7 +1106,7 @@ async fn linux_backend_drains_late_cancel_acknowledgement_before_next_request() 
     // Keep the cancel frame partially sent while the peer publishes the
     // natural terminal result, exercising the exact race that used to leave
     // the late cancel acknowledgement queued for the next request.
-    backend.kernel.control.limit_flush_chunk_for_test(4);
+    backend.kernel_mut().control.limit_flush_chunk_for_test(4);
     let responder = std::thread::spawn(move || {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         let Message::Request(Request::Run { command_id, .. }) = peer.receive(deadline).unwrap()
@@ -1170,7 +1170,7 @@ async fn linux_backend_drains_late_cancel_acknowledgement_before_next_request() 
     assert!(!prepared.uuid().is_nil());
 
     responder.join().unwrap();
-    backend.destroy().unwrap();
+    backend.destroy(AttemptIdentity::new()).unwrap();
 }
 
 #[cfg(target_os = "linux")]
@@ -1240,8 +1240,8 @@ async fn linux_backend_drains_cancel_after_independent_init_timeout() {
     let prepared = backend.prepare_step(b"{}");
 
     responder.join().unwrap();
-    backend.kernel.launcher.kill().unwrap();
-    backend.kernel.launcher.wait().unwrap();
+    backend.kernel_mut().launcher.kill().unwrap();
+    backend.kernel_mut().launcher.wait().unwrap();
     assert!(prepared.is_ok());
 }
 
@@ -1307,8 +1307,8 @@ async fn linux_backend_breaks_control_on_ambiguous_late_cancel_rejection() {
     assert!(backend.control_broken);
 
     responder.join().unwrap();
-    backend.kernel.launcher.kill().unwrap();
-    backend.kernel.launcher.wait().unwrap();
+    backend.kernel_mut().launcher.kill().unwrap();
+    backend.kernel_mut().launcher.wait().unwrap();
 }
 
 #[cfg(target_os = "linux")]
@@ -1340,8 +1340,8 @@ async fn linux_backend_marks_a_closed_control_transport_broken() {
     assert!(backend.control_broken);
 
     responder.join().unwrap();
-    backend.kernel.launcher.kill().unwrap();
-    backend.kernel.launcher.wait().unwrap();
+    backend.kernel_mut().launcher.kill().unwrap();
+    backend.kernel_mut().launcher.wait().unwrap();
 }
 
 #[cfg(target_os = "linux")]
@@ -1421,8 +1421,8 @@ async fn stalled_linux_control_send_does_not_block_a_trusted_domain() {
     let (mut linux, stalled_result) = stalled.await.unwrap();
     responder.join().unwrap();
     assert_eq!(stalled_result.unwrap(), CommandOutcome::Exited(0));
-    linux.kernel.launcher.kill().unwrap();
-    linux.kernel.launcher.wait().unwrap();
+    linux.kernel_mut().launcher.kill().unwrap();
+    linux.kernel_mut().launcher.wait().unwrap();
 
     let (outcome, event) = healthy.expect("stalled Linux control blocked the manager runtime");
     assert_eq!(outcome, CommandOutcome::Exited(0));
@@ -1528,8 +1528,8 @@ async fn cancel_converges_when_a_large_run_frame_remains_backpressured() {
         Err(_) => stalled.await.unwrap(),
     };
     responder.join().unwrap();
-    linux.kernel.launcher.kill().unwrap();
-    linux.kernel.launcher.wait().unwrap();
+    linux.kernel_mut().launcher.kill().unwrap();
+    linux.kernel_mut().launcher.wait().unwrap();
 
     assert!(
         converged,
@@ -1582,6 +1582,6 @@ fn idle_linux_command_cancel_never_sends_domain_shutdown() {
     let super::Backend::Linux(mut linux) = backend else {
         unreachable!()
     };
-    linux.kernel.launcher.kill().unwrap();
-    linux.kernel.launcher.wait().unwrap();
+    linux.kernel_mut().launcher.kill().unwrap();
+    linux.kernel_mut().launcher.wait().unwrap();
 }

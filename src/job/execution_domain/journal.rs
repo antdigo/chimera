@@ -10,7 +10,7 @@ use super::ExecutionDomainError;
 use super::filesystem::{
     DirectoryIdentity, directory_identity, io_error, validate_bound_directory,
 };
-#[cfg(all(target_os = "linux", test))]
+#[cfg(target_os = "linux")]
 use super::linux::dirfd::BoundDir;
 
 const JOURNAL_VERSION: u32 = 1;
@@ -40,7 +40,7 @@ struct JournalRecord {
 #[derive(Debug)]
 enum JournalDirectory {
     Trusted(DirectoryIdentity),
-    #[cfg(all(target_os = "linux", test))]
+    #[cfg(target_os = "linux")]
     Strict(BoundDir),
 }
 
@@ -66,9 +66,7 @@ impl DomainLifecycle {
         Ok(lifecycle)
     }
 
-    // Task 9 must select this storage for real sandbox domains before activation.
-    // Today's production lifecycle is exclusively trusted-host on every platform.
-    #[cfg(all(target_os = "linux", test))]
+    #[cfg(target_os = "linux")]
     pub(super) fn create_strict(
         attempt_dir: &Path,
         attempt_id: Uuid,
@@ -182,13 +180,13 @@ impl DomainLifecycle {
                 })?;
                 validate_bound_directory(&self.attempt_dir, *identity, &metadata)
             }
-            #[cfg(all(target_os = "linux", test))]
+            #[cfg(target_os = "linux")]
             JournalDirectory::Strict(directory) => directory.verify_binding(),
         }
     }
 
     fn refuse_next(&self) -> Result<(), ExecutionDomainError> {
-        #[cfg(all(target_os = "linux", test))]
+        #[cfg(target_os = "linux")]
         if let JournalDirectory::Strict(directory) = &self.directory {
             return directory.refuse_entry(c"journal.json.next");
         }
@@ -219,7 +217,7 @@ impl DomainLifecycle {
     }
 
     fn read_bytes(&self, path: &Path) -> Result<Vec<u8>, ExecutionDomainError> {
-        #[cfg(all(target_os = "linux", test))]
+        #[cfg(target_os = "linux")]
         if let JournalDirectory::Strict(directory) = &self.directory {
             return directory.read_regular(c"journal.json", 4096);
         }
@@ -245,7 +243,7 @@ impl DomainLifecycle {
     }
 
     fn write_next(&self, state: DomainState) -> Result<(), ExecutionDomainError> {
-        #[cfg(all(target_os = "linux", test))]
+        #[cfg(target_os = "linux")]
         if let JournalDirectory::Strict(directory) = &self.directory {
             return directory.write_atomic(c"journal.json", &self.record_bytes(state)?);
         }
@@ -258,7 +256,7 @@ impl DomainLifecycle {
         self.sync_directory()
     }
 
-    #[cfg(all(target_os = "linux", test))]
+    #[cfg(target_os = "linux")]
     fn record_bytes(&self, state: DomainState) -> Result<Vec<u8>, ExecutionDomainError> {
         serde_json::to_vec(&JournalRecord {
             version: JOURNAL_VERSION,
@@ -287,6 +285,10 @@ impl DomainLifecycle {
     }
 
     fn sync_directory(&self) -> Result<(), ExecutionDomainError> {
+        #[cfg(target_os = "linux")]
+        if let JournalDirectory::Strict(directory) = &self.directory {
+            return directory.sync_directory();
+        }
         let dir = OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)

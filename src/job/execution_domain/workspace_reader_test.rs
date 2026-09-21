@@ -67,6 +67,24 @@ fn refuses_escape_symlink_and_revoked_reader() {
 }
 
 #[test]
+fn reader_revocation_is_bounded_and_remains_closed_after_timeout() {
+    let temp = tempfile::tempdir().unwrap();
+    let reader = DomainWorkspaceReader::new(temp.path().to_path_buf()).unwrap();
+    let lease = reader.hold_lease_for_test();
+
+    let error = reader
+        .revoke_until(std::time::Instant::now() + Duration::from_millis(10))
+        .unwrap_err();
+    assert_category(error, FailureCategory::Timeout);
+    assert!(reader.hash_files(&["*".into()]).is_err());
+
+    drop(lease);
+    reader
+        .revoke_until(std::time::Instant::now() + Duration::from_secs(1))
+        .unwrap();
+}
+
+#[test]
 fn stays_bound_to_original_directory_after_path_replacement() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("work");

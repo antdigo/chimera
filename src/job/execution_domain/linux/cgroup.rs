@@ -147,6 +147,15 @@ pub(in crate::job::execution_domain) struct AttemptCgroup<F = KernelCgroupFs> {
     limits: ValidatedLimits,
 }
 
+pub(super) struct CleanupCgroup<F = KernelCgroupFs> {
+    directory: Arc<CgroupDir<F>>,
+}
+
+struct BoundPidfd {
+    pid: i32,
+    fd: OwnedFd,
+}
+
 struct CgroupDir<F> {
     bound: BoundDir,
     fs: Arc<F>,
@@ -242,32 +251,50 @@ impl<F: CgroupFilesystem> CgroupRoot<F> {
         let mut directory = None;
         let mut domain = None;
         let mut membership = None;
-        for operation in creation_operations(&limits.writes()) {
-            match operation {
-                CgroupOperation::CreateAttempt => directory = Some(self.directory.create(&name)?),
-                CgroupOperation::WriteLimit(name, value) => {
-                    let name =
-                        CString::new(name).map_err(|_| failure(FailureCategory::InvalidInput))?;
-                    required(&directory)?.write(&name, &value)?;
-                }
-                CgroupOperation::VerifyLimits => verify_limits(required(&directory)?, limits)?,
-                CgroupOperation::EnableControllers => required(&directory)?.enable_controllers()?,
-                CgroupOperation::CreateDomain => {
-                    let created = required(&directory)?.create(c"domain")?;
-                    for (name, _) in limits.writes() {
+        let creation = (|| {
+            for operation in creation_operations(&limits.writes()) {
+                match operation {
+                    CgroupOperation::CreateAttempt => {
+                        directory = Some(self.directory.create(&name)?)
+                    }
+                    CgroupOperation::WriteLimit(name, value) => {
                         let name = CString::new(name)
                             .map_err(|_| failure(FailureCategory::InvalidInput))?;
-                        created.open_control(&name, libc::O_WRONLY)?;
+                        required(&directory)?.write(&name, &value)?;
                     }
-                    domain = Some(created);
-                }
-                CgroupOperation::OpenMembership => {
-                    // No launcher descriptor exists until every limit has been
-                    // read back and the complete delegation layout is bound.
-                    membership =
-                        Some(required(&domain)?.open_control(c"cgroup.procs", libc::O_WRONLY)?);
+                    CgroupOperation::VerifyLimits => verify_limits(required(&directory)?, limits)?,
+                    CgroupOperation::EnableControllers => {
+                        required(&directory)?.enable_controllers()?
+                    }
+                    CgroupOperation::CreateDomain => {
+                        let created = required(&directory)?.create(c"domain")?;
+                        for (name, _) in limits.writes() {
+                            let name = CString::new(name)
+                                .map_err(|_| failure(FailureCategory::InvalidInput))?;
+                            created.open_control(&name, libc::O_WRONLY)?;
+                        }
+                        domain = Some(created);
+                    }
+                    CgroupOperation::OpenMembership => {
+                        // No launcher descriptor exists until every limit has been
+                        // read back and the complete delegation layout is bound.
+                        membership =
+                            Some(required(&domain)?.open_control(c"cgroup.procs", libc::O_WRONLY)?);
+                    }
                 }
             }
+            Ok::<(), ExecutionDomainError>(())
+        })();
+        if let Err(error) = creation {
+            if let Some(directory) = &directory
+                && let Err(cleanup) = remove_unlaunched(directory)
+            {
+                return Err(ExecutionDomainError::LifecycleAndDestroyFailed {
+                    lifecycle: Box::new(error),
+                    destroy: Box::new(cleanup),
+                });
+            }
+            return Err(error);
         }
         Ok(AttemptCgroup {
             directory: directory.ok_or_else(|| failure(FailureCategory::NotReady))?,
@@ -276,6 +303,31 @@ impl<F: CgroupFilesystem> CgroupRoot<F> {
             limits: limits.clone(),
         })
     }
+}
+
+fn remove_unlaunched<F: CgroupFilesystem>(
+    directory: &Arc<CgroupDir<F>>,
+) -> Result<(), ExecutionDomainError> {
+    let groups = directory.tree()?;
+    for group in &groups {
+        if group.populated()? || !group.members()?.is_empty() {
+            return Err(failure(FailureCategory::Unavailable));
+        }
+    }
+    for group in groups.into_iter().rev() {
+        let (parent, name) = group
+            .parent
+            .as_ref()
+            .ok_or_else(|| failure(FailureCategory::IdentityMismatch))?;
+        group.verify()?;
+        parent.verify()?;
+        group
+            .fs
+            .remove(parent.bound.fd(), name, group.bound.fd())
+            .map_err(io_failure)?;
+        parent.verify()?;
+    }
+    Ok(())
 }
 
 impl<F: CgroupFilesystem> AttemptCgroup<F> {
@@ -309,6 +361,79 @@ impl<F: CgroupFilesystem> AttemptCgroup<F> {
         }
     }
 
+    pub(super) fn term(&self) -> Result<(), ExecutionDomainError> {
+        let mut members = Vec::new();
+        for group in self.directory.tree()? {
+            members.extend(group.capture_members()?);
+        }
+        members.sort_by_key(|member| member.pid);
+        members.dedup_by_key(|member| member.pid);
+        for member in members {
+            member.signal(libc::SIGTERM)?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn attach_cleanup_worker(
+        &self,
+        attempt: AttemptIdentity,
+        pid: u32,
+    ) -> Result<CleanupCgroup<F>, ExecutionDomainError> {
+        let (root, _) = self
+            .directory
+            .parent
+            .as_ref()
+            .ok_or_else(|| failure(FailureCategory::IdentityMismatch))?;
+        let name = CString::new(format!("cleanup-{}", attempt.component()))
+            .map_err(|_| failure(FailureCategory::InvalidInput))?;
+        let directory = root.create(&name)?;
+        if let Err(error) = directory.write(c"cgroup.procs", &pid.to_string()) {
+            return match remove_unlaunched(&directory) {
+                Ok(()) => Err(error),
+                Err(cleanup) => Err(ExecutionDomainError::LifecycleAndDestroyFailed {
+                    lifecycle: Box::new(error),
+                    destroy: Box::new(cleanup),
+                }),
+            };
+        }
+        let members = directory.members();
+        if !matches!(&members, Ok(members) if members == &vec![pid as i32]) {
+            let error = members
+                .map(|_| failure(FailureCategory::IdentityMismatch))
+                .unwrap_or_else(|error| error);
+            let cleanup = CleanupCgroup {
+                directory: Arc::clone(&directory),
+            }
+            .kill_wait_remove(std::time::Instant::now() + Duration::from_secs(2));
+            return match cleanup {
+                Ok(()) => Err(error),
+                Err(cleanup) => Err(ExecutionDomainError::LifecycleAndDestroyFailed {
+                    lifecycle: Box::new(error),
+                    destroy: Box::new(cleanup),
+                }),
+            };
+        }
+        Ok(CleanupCgroup { directory })
+    }
+
+    pub(super) fn recursively_empty_until(
+        &self,
+        deadline: std::time::Instant,
+    ) -> Result<bool, ExecutionDomainError> {
+        loop {
+            if self.directory.recursively_empty()? {
+                return Ok(true);
+            }
+            if std::time::Instant::now() >= deadline {
+                return Ok(false);
+            }
+            std::thread::sleep(
+                Duration::from_millis(10)
+                    .min(deadline.saturating_duration_since(std::time::Instant::now())),
+            );
+        }
+    }
+
     fn kill_members_best_effort(&self) {
         let groups = match self.directory.tree() {
             Ok(groups) => groups,
@@ -318,29 +443,34 @@ impl<F: CgroupFilesystem> AttemptCgroup<F> {
             }
         };
         for group in groups {
-            if let Err(error) = group.kill_members() {
+            if let Err(error) = group.signal_members(libc::SIGKILL) {
                 tracing::warn!(%error, "cgroup pidfd fallback incomplete");
             }
         }
     }
 
     pub(super) async fn wait_empty(&self, timeout: Duration) -> Result<(), ExecutionDomainError> {
-        let deadline = tokio::time::Instant::now() + timeout;
+        let deadline = std::time::Instant::now()
+            .checked_add(timeout)
+            .ok_or_else(|| failure(FailureCategory::InvalidInput))?;
         loop {
+            // Always join the bounded scan before observing its deadline. This
+            // keeps blocking cgroupfs I/O off the async executor without the
+            // timeout(detached-spawn_blocking) ownership hole.
             let directory = Arc::clone(&self.directory);
-            let scan = tokio::task::spawn_blocking(move || directory.recursively_empty());
-            let empty = tokio::time::timeout_at(deadline, scan)
+            let scan = tokio::task::spawn_blocking(move || directory.recursively_empty())
                 .await
-                .map_err(|_| failure(FailureCategory::Timeout))?
-                .map_err(|_| failure(FailureCategory::Unavailable))??;
+                .map_err(|_| failure(FailureCategory::Unavailable))?;
+            if std::time::Instant::now() >= deadline {
+                return Err(failure(FailureCategory::Timeout));
+            }
+            let empty = scan?;
             if empty {
                 return Ok(());
             }
-            if tokio::time::Instant::now() >= deadline {
-                return Err(failure(FailureCategory::Timeout));
-            }
-            tokio::time::sleep_until(
-                (tokio::time::Instant::now() + Duration::from_millis(10)).min(deadline),
+            tokio::time::sleep(
+                Duration::from_millis(10)
+                    .min(deadline.saturating_duration_since(std::time::Instant::now())),
             )
             .await;
         }
@@ -371,6 +501,35 @@ impl<F: CgroupFilesystem> AttemptCgroup<F> {
     }
 }
 
+impl<F: CgroupFilesystem> CleanupCgroup<F> {
+    pub(super) fn kill_wait_remove(
+        &self,
+        deadline: std::time::Instant,
+    ) -> Result<(), ExecutionDomainError> {
+        if !self.directory.recursively_empty()? {
+            self.directory.write(c"cgroup.kill", "1")?;
+        }
+        while !self.directory.recursively_empty()? {
+            if std::time::Instant::now() >= deadline {
+                return Err(failure(FailureCategory::Timeout));
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let (parent, name) = self
+            .directory
+            .parent
+            .as_ref()
+            .ok_or_else(|| failure(FailureCategory::IdentityMismatch))?;
+        self.directory.verify()?;
+        parent.verify()?;
+        self.directory
+            .fs
+            .remove(parent.bound.fd(), name, self.directory.bound.fd())
+            .map_err(io_failure)?;
+        parent.verify()
+    }
+}
+
 impl<F: CgroupFilesystem> CgroupDir<F> {
     fn verify(&self) -> Result<(), ExecutionDomainError> {
         self.bound.verify_binding()?;
@@ -394,8 +553,28 @@ impl<F: CgroupFilesystem> CgroupDir<F> {
         self.verify()?;
         self.bound.refuse_entry(name)?;
         self.fs.create(self.bound.fd(), name).map_err(io_failure)?;
-        let child = self.child(name)?;
-        child.open_control(c"cgroup.kill", libc::O_WRONLY)?;
+        let child = match self.child(name) {
+            Ok(child) => child,
+            Err(error) => {
+                // mkdir succeeded but no exact child capability could be
+                // retained. Preserve the deterministic entry and surface a
+                // cleanup failure so callers quarantine rather than claiming
+                // rollback success by pathname.
+                return Err(ExecutionDomainError::LifecycleAndDestroyFailed {
+                    lifecycle: Box::new(error),
+                    destroy: Box::new(failure(FailureCategory::Unavailable)),
+                });
+            }
+        };
+        if let Err(error) = child.open_control(c"cgroup.kill", libc::O_WRONLY) {
+            return match remove_unlaunched(&child) {
+                Ok(()) => Err(error),
+                Err(cleanup) => Err(ExecutionDomainError::LifecycleAndDestroyFailed {
+                    lifecycle: Box::new(error),
+                    destroy: Box::new(cleanup),
+                }),
+            };
+        }
         Ok(child)
     }
 
@@ -559,7 +738,15 @@ impl<F: CgroupFilesystem> CgroupDir<F> {
         Ok(!self.populated()? && self.members()?.is_empty())
     }
 
-    fn kill_members(&self) -> Result<(), ExecutionDomainError> {
+    fn signal_members(&self, signal: i32) -> Result<(), ExecutionDomainError> {
+        for member in self.capture_members()? {
+            member.signal(signal)?;
+        }
+        Ok(())
+    }
+
+    fn capture_members(&self) -> Result<Vec<BoundPidfd>, ExecutionDomainError> {
+        let mut captured = Vec::new();
         for pid in self.members()? {
             let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) } as i32;
             if fd < 0 {
@@ -574,20 +761,27 @@ impl<F: CgroupFilesystem> CgroupDir<F> {
             if !self.members()?.contains(&pid) {
                 continue;
             }
-            let result = unsafe {
-                libc::syscall(
-                    libc::SYS_pidfd_send_signal,
-                    fd.as_raw_fd(),
-                    libc::SIGKILL,
-                    std::ptr::null::<libc::siginfo_t>(),
-                    0,
-                )
-            };
-            if result < 0 {
-                let error = io::Error::last_os_error();
-                if error.raw_os_error() != Some(libc::ESRCH) {
-                    return Err(io_failure(error));
-                }
+            captured.push(BoundPidfd { pid, fd });
+        }
+        Ok(captured)
+    }
+}
+
+impl BoundPidfd {
+    fn signal(&self, signal: i32) -> Result<(), ExecutionDomainError> {
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                self.fd.as_raw_fd(),
+                signal,
+                std::ptr::null::<libc::siginfo_t>(),
+                0,
+            )
+        };
+        if result < 0 {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::ESRCH) {
+                return Err(io_failure(error));
             }
         }
         Ok(())

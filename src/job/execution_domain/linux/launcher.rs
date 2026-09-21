@@ -33,6 +33,7 @@ pub(super) fn rootlesskit_arguments(
     state_arg.push(state);
     Ok(vec![
         state_arg,
+        "--subid-source=static".into(),
         "--net=none".into(),
         "--port-driver=none".into(),
         "--pidns".into(),
@@ -316,7 +317,14 @@ impl KernelDomain {
             .control
             .request_until(Request::Bootstrap { spec }, self.deadline)?
         {
-            Response::Bootstrapped => Ok(()),
+            Response::Bootstrapped => {}
+            _ => return Err(failure(FailureCategory::Protocol)),
+        }
+        // Bootstrapped acknowledges only receipt of the plan. Strict backend
+        // ownership is not publishable until init has assembled/pivoted the
+        // rootfs, installed hardening and returned the kernel-ready proof.
+        match self.control.request_until(Request::Hello, self.deadline)? {
+            Response::KernelReady => Ok(()),
             _ => Err(failure(FailureCategory::Protocol)),
         }
     }

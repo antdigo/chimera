@@ -13,6 +13,7 @@ fn launcher_never_selects_host_network_or_outer_ports() {
         NetworkLaunch::Disconnected,
     )
     .unwrap();
+    assert!(args.contains(&"--subid-source=static".into()));
     assert!(args.contains(&"--net=none".into()));
     assert!(args.contains(&"--port-driver=none".into()));
     assert!(args.contains(&"--evacuate-cgroup2=init".into()));
@@ -213,6 +214,18 @@ fn kernel_handle_retains_deadline_and_detects_failed_launcher() {
         control
             .send(
                 Message::Response(Response::Bootstrapped),
+                Instant::now() + Duration::from_secs(2),
+            )
+            .unwrap();
+        assert!(matches!(
+            control
+                .receive(Instant::now() + Duration::from_secs(2))
+                .unwrap(),
+            Message::Request(Request::Hello)
+        ));
+        control
+            .send(
+                Message::Response(Response::KernelReady),
                 Instant::now() + Duration::from_secs(2),
             )
             .unwrap();

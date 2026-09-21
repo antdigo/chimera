@@ -91,7 +91,7 @@ pub struct DomainWorkspaceReader {
     shared: Arc<SharedReader>,
 }
 
-struct ReadLease {
+pub(super) struct ReadLease {
     shared: Arc<SharedReader>,
 }
 
@@ -247,18 +247,40 @@ impl DomainWorkspaceReader {
         Ok(())
     }
 
-    pub(super) fn revoke_and_wait(&self) {
-        let Ok(mut state) = self.shared.state.lock() else {
-            return;
-        };
+    pub(super) fn revoke_until(&self, deadline: Instant) -> Result<(), ExecutionDomainError> {
+        let mut state = self
+            .shared
+            .state
+            .lock()
+            .map_err(|_| failure(FailureCategory::Io))?;
         state.revoked = true;
         while state.active != 0 {
-            let Ok(next) = self.shared.idle.wait(state) else {
-                return;
-            };
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(failure(FailureCategory::Timeout));
+            }
+            let (next, timeout) = self
+                .shared
+                .idle
+                .wait_timeout(state, remaining)
+                .map_err(|_| failure(FailureCategory::Io))?;
             state = next;
+            if timeout.timed_out() && state.active != 0 {
+                return Err(failure(FailureCategory::Timeout));
+            }
         }
         state.root.take();
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(super) fn revoke_and_wait(&self) {
+        let _ = self.revoke_until(Instant::now() + Duration::from_secs(30));
+    }
+
+    #[cfg(test)]
+    pub(super) fn hold_lease_for_test(&self) -> ReadLease {
+        self.acquire().expect("bound test reader").0
     }
 }
 

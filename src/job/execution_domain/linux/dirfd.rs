@@ -50,6 +50,14 @@ pub(super) enum SyncKind {
 }
 
 impl BoundDir {
+    pub(super) fn clone_bound(&self) -> Self {
+        Self {
+            binding: Arc::clone(&self.binding),
+            poisoned: Arc::clone(&self.poisoned),
+            root_path: Arc::clone(&self.root_path),
+        }
+    }
+
     pub(in super::super) fn open_root(path: &Path) -> Result<Self, ExecutionDomainError> {
         if !path.is_absolute() {
             return Err(failure(FailureCategory::InvalidInput));
@@ -157,7 +165,6 @@ impl BoundDir {
         Ok(())
     }
 
-    #[cfg(test)]
     pub(in super::super) fn read_regular(
         &self,
         name: &CStr,
@@ -178,7 +185,6 @@ impl BoundDir {
         })
     }
 
-    #[cfg(test)]
     pub(super) fn read_regular_with<F>(
         &self,
         name: &CStr,
@@ -234,7 +240,6 @@ impl BoundDir {
         Ok(bytes)
     }
 
-    #[cfg(test)]
     pub(in super::super) fn write_atomic(
         &self,
         name: &CStr,
@@ -251,7 +256,6 @@ impl BoundDir {
         self.write_with_sync(name, bytes, true, sync)
     }
 
-    #[cfg(test)]
     pub(super) fn write_atomic_with_sync<F>(
         &self,
         name: &CStr,
@@ -330,6 +334,17 @@ impl BoundDir {
 
     pub(super) fn fd(&self) -> RawFd {
         self.binding.fd.as_raw_fd()
+    }
+
+    pub(super) fn root_path(&self) -> &Path {
+        self.root_path.as_path()
+    }
+
+    pub(in crate::job::execution_domain) fn sync_directory(
+        &self,
+    ) -> Result<(), ExecutionDomainError> {
+        self.verify_binding()?;
+        sync(self.fd(), SyncKind::Directory).map_err(io_failure)
     }
 
     /// Roll back only a just-created transaction with a complete descriptor inventory.
@@ -442,7 +457,6 @@ impl BoundDir {
     }
 
     /// Only the cgroup-empty teardown driver may enable this in production (Task 10).
-    #[cfg(test)]
     pub(super) fn remove_tree(&self, name: &CStr) -> Result<(), ExecutionDomainError> {
         component(name)?;
         let result = (|| {
@@ -458,7 +472,6 @@ impl BoundDir {
         result.inspect_err(|_| self.poison())
     }
 
-    #[cfg(test)]
     fn inventory(&self, policy: RemovalPolicy) -> Result<Vec<RemovalEntry>, ExecutionDomainError> {
         self.verify_binding()?;
         let mut entries = Vec::new();
@@ -531,7 +544,6 @@ impl BoundDir {
         Ok(entries)
     }
 
-    #[cfg(test)]
     fn remove_inventory(&self, entries: Vec<RemovalEntry>) -> Result<(), ExecutionDomainError> {
         for entry in entries {
             match entry {
@@ -559,7 +571,6 @@ impl BoundDir {
     }
 }
 
-#[cfg(test)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum RemovalPolicy {
     Attempt,
@@ -567,7 +578,6 @@ enum RemovalPolicy {
     Writable,
 }
 
-#[cfg(test)]
 enum RemovalEntry {
     Directory(CString, BoundDir, Vec<RemovalEntry>),
     Leaf {
@@ -577,7 +587,6 @@ enum RemovalEntry {
     },
 }
 
-#[cfg(test)]
 pub(super) fn directory_entries(fd: RawFd) -> Result<Vec<CString>, ExecutionDomainError> {
     directory_entries_stream(fd)?.collect()
 }

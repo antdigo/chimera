@@ -230,10 +230,14 @@ fn owned_attempt_and_domain_controls_must_still_be_writable() {
                 *fixture.fs.readonly_child_control.lock().unwrap() =
                     Some((group.into(), control.into()));
                 *fixture.fs.omit_child_control.lock().unwrap() = missing;
+                let attempt = AttemptIdentity::new();
                 assert!(
-                    root.create_attempt(AttemptIdentity::new(), &limits())
-                        .is_err(),
+                    root.create_attempt(attempt, &limits()).is_err(),
                     "{group}/{control}, missing={missing}"
+                );
+                assert!(
+                    !fixture.attempt_path(attempt).exists(),
+                    "partial cgroup survived: {group}/{control}, missing={missing}"
                 );
             }
         }
@@ -280,7 +284,7 @@ async fn deep_inventory_stops_before_opening_over_depth_children() {
 }
 
 #[tokio::test]
-async fn timed_out_inventory_continuation_is_still_hard_bounded() {
+async fn timed_out_inventory_is_joined_and_hard_bounded() {
     let fixture = Fixture::new();
     let root = fixture.ready();
     let id = AttemptIdentity::new();
@@ -297,8 +301,13 @@ async fn timed_out_inventory_continuation_is_still_hard_bounded() {
         release: release.clone(),
     });
     let references = Arc::strong_count(&fixture.fs);
-    let result = attempt.wait_empty(Duration::from_millis(30)).await;
-    release.store(true, Ordering::Release);
+    let (result, ()) = tokio::join!(attempt.wait_empty(Duration::from_millis(30)), async {
+        while !started.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        release.store(true, Ordering::Release);
+    });
     assert!(started.load(Ordering::Acquire));
     assert!(matches!(
         result,
@@ -307,19 +316,13 @@ async fn timed_out_inventory_continuation_is_still_hard_bounded() {
             ..
         })
     ));
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    loop {
-        let visited = fixture.fs.visited_directories.lock().unwrap().len();
-        if visited >= 4096 && Arc::strong_count(&fixture.fs) == references {
-            assert!(visited <= 4096, "timed-out worker opened {visited} groups");
-            break;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "bounded worker did not finish"
-        );
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
+    let visited = fixture.fs.visited_directories.lock().unwrap().len();
+    assert!(visited <= 4096, "timed-out worker opened {visited} groups");
+    assert_eq!(
+        Arc::strong_count(&fixture.fs),
+        references,
+        "wait_empty returned while a proof worker still retained authority"
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -608,7 +611,10 @@ fn every_limit_write_and_read_error_refuses_launcher() {
                 "{operation} {name}"
             );
             assert!(!fixture.attempt_path(id).join("domain").exists());
-            assert!(fixture.attempt_path(id).exists());
+            assert!(
+                !fixture.attempt_path(id).exists(),
+                "partial cgroup must roll back before returning: {operation} {name}"
+            );
             if operation == "read" {
                 assert!(
                     fixture
