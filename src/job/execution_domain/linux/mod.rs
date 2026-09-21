@@ -449,6 +449,10 @@ impl StrictCleanupRecord {
 
 #[cfg(target_os = "linux")]
 impl destroy::DestroyOps for StrictCleanupRecord {
+    fn kernel_neutralization_required(&self) -> bool {
+        self.created_stages.contains(CreatedStage::AttemptCgroup)
+    }
+
     fn close_admission(&mut self) -> Result<(), super::ExecutionDomainError> {
         self.admission_closed = true;
         if self.external_revocation.cleanup_allowed() {

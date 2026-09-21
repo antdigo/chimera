@@ -288,8 +288,8 @@ pub(in crate::job::execution_domain) struct NamespaceHandles {
 impl NamespaceHandles {
     pub(super) fn open_current() -> Result<Self, ExecutionDomainError> {
         Ok(Self {
-            mount: open_namespace(c"/proc/self/ns/mnt")?,
-            pid: open_namespace(c"/proc/self/ns/pid")?,
+            mount: open_namespace(c"/proc/self/ns/mnt", libc::CLONE_NEWNS)?,
+            pid: open_namespace(c"/proc/self/ns/pid", libc::CLONE_NEWPID)?,
         })
     }
 
@@ -308,21 +308,35 @@ impl NamespaceHandles {
     }
 }
 
-fn open_namespace(path: &std::ffi::CStr) -> Result<OwnedFd, ExecutionDomainError> {
+fn open_namespace(
+    path: &std::ffi::CStr,
+    expected_type: i32,
+) -> Result<OwnedFd, ExecutionDomainError> {
     let raw = unsafe { libc::open(path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
     if raw < 0 {
         return Err(io_failure(io::Error::last_os_error()));
     }
     let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+    validate_namespace_fd(&fd, expected_type)?;
+    Ok(fd)
+}
+
+fn validate_namespace_fd(fd: &OwnedFd, expected_type: i32) -> Result<(), ExecutionDomainError> {
     let mut filesystem = std::mem::MaybeUninit::<libc::statfs>::uninit();
-    if unsafe { libc::fstatfs(raw, filesystem.as_mut_ptr()) } < 0 {
+    if unsafe { libc::fstatfs(fd.as_raw_fd(), filesystem.as_mut_ptr()) } < 0 {
         return Err(io_failure(io::Error::last_os_error()));
     }
-    const NSFS_MAGIC: libc::c_long = 0x6e736673;
-    if unsafe { filesystem.assume_init() }.f_type != NSFS_MAGIC {
+    if unsafe { filesystem.assume_init() }.f_type as u64 != libc::NSFS_MAGIC as u64 {
         return Err(failure(FailureCategory::IdentityMismatch));
     }
-    Ok(fd)
+    let namespace_type = unsafe { libc::ioctl(fd.as_raw_fd(), libc::NS_GET_NSTYPE) };
+    if namespace_type < 0 {
+        return Err(io_failure(io::Error::last_os_error()));
+    }
+    if namespace_type != expected_type {
+        return Err(failure(FailureCategory::IdentityMismatch));
+    }
+    Ok(())
 }
 
 fn fd_identity(fd: &OwnedFd) -> Result<(u64, u64), ExecutionDomainError> {
@@ -442,7 +456,12 @@ fn receive_namespace_handles(
         mount: received_fds.remove(0),
         pid: received_fds.remove(0),
     };
+    validate_namespace_fd(&handles.mount, libc::CLONE_NEWNS)?;
+    validate_namespace_fd(&handles.pid, libc::CLONE_NEWPID)?;
     let identities = handles.identities()?;
+    if identities[0] == identities[1] {
+        return Err(failure(FailureCategory::IdentityMismatch));
+    }
     if require_foreign {
         let supervisor = NamespaceHandles::open_current()?.identities()?;
         if identities[0] == supervisor[0] || identities[1] == supervisor[1] {

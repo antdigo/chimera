@@ -2,7 +2,7 @@ use std::ffi::{CStr, CString};
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::process::{Command, Stdio};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use super::super::{ExecutionDomainError, FailureCategory, Stage};
@@ -12,6 +12,8 @@ const MAX_ENTRIES: usize = 524_288;
 const MAX_DEPTH: usize = 64;
 const MAX_PATH_BYTES: usize = 1 << 20;
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+const REAP_GRACE: Duration = Duration::from_millis(250);
+const CLEANUP_CGROUP_GRACE: Duration = Duration::from_secs(2);
 #[cfg(test)]
 const MIN_SUBORDINATE_IDS: u32 = 65_536;
 
@@ -86,6 +88,14 @@ pub(in crate::job::execution_domain) struct CleanupWorkerConfig {
     executable: Arc<VerifiedExecutable>,
     newuidmap: Arc<VerifiedExecutable>,
     newgidmap: Arc<VerifiedExecutable>,
+    pending: Arc<Mutex<PendingCleanup>>,
+}
+
+#[derive(Default)]
+struct PendingCleanup {
+    children: Vec<std::process::Child>,
+    cgroup: Option<super::cgroup::CleanupCgroup>,
+    bootstrap: Option<(CString, dirfd::BoundDir)>,
 }
 
 struct VerifiedExecutable {
@@ -109,6 +119,100 @@ impl std::fmt::Debug for CleanupWorkerConfig {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("CleanupWorkerConfig")
     }
+}
+
+fn retain_pending_cleanup(
+    worker: &CleanupWorkerConfig,
+    child: Option<std::process::Child>,
+    cgroup: Option<super::cgroup::CleanupCgroup>,
+    bootstrap: Option<(CString, dirfd::BoundDir)>,
+) -> Result<(), ExecutionDomainError> {
+    let mut pending = worker
+        .pending
+        .lock()
+        .map_err(|_| failure(FailureCategory::Unavailable))?;
+    if pending.cgroup.is_some() && cgroup.is_some()
+        || pending.bootstrap.is_some() && bootstrap.is_some()
+    {
+        return Err(failure(FailureCategory::IdentityMismatch));
+    }
+    if let Some(child) = child {
+        pending.children.push(child);
+    }
+    if cgroup.is_some() {
+        pending.cgroup = cgroup;
+    }
+    if bootstrap.is_some() {
+        pending.bootstrap = bootstrap;
+    }
+    Ok(())
+}
+
+fn retry_pending_cleanup(
+    worker: &CleanupWorkerConfig,
+    bootstrap_root: &dirfd::BoundDir,
+) -> Result<(), ExecutionDomainError> {
+    let mut pending = {
+        let mut slot = worker
+            .pending
+            .lock()
+            .map_err(|_| failure(FailureCategory::Unavailable))?;
+        std::mem::take(&mut *slot)
+    };
+    if pending.children.is_empty() && pending.cgroup.is_none() && pending.bootstrap.is_none() {
+        return Ok(());
+    }
+
+    let cleanup_deadline = Instant::now()
+        .checked_add(CLEANUP_CGROUP_GRACE)
+        .ok_or_else(|| failure(FailureCategory::InvalidInput))?;
+    let mut first_error = None;
+    if let Some(cgroup) = pending.cgroup.take()
+        && let Err(error) = cgroup.kill_wait_remove(cleanup_deadline)
+    {
+        first_error = Some(error);
+        pending.cgroup = Some(cgroup);
+    }
+
+    let mut unreaped = Vec::new();
+    for mut child in pending.children.drain(..) {
+        let wait = wait_child_status(&mut child, cleanup_deadline);
+        let still_running = child.try_wait().map_err(io_failure)?.is_none();
+        if still_running {
+            if first_error.is_none() {
+                first_error = Some(
+                    wait.err()
+                        .unwrap_or_else(|| failure(FailureCategory::Timeout)),
+                );
+            }
+            unreaped.push(child);
+        }
+    }
+    pending.children = unreaped;
+
+    if pending.children.is_empty()
+        && pending.cgroup.is_none()
+        && let Some((name, bootstrap)) = pending.bootstrap.take()
+        && let Err(error) = bootstrap_root.remove_created_child(&name, &bootstrap, &[])
+    {
+        if first_error.is_none() {
+            first_error = Some(error);
+        }
+        pending.bootstrap = Some((name, bootstrap));
+    }
+
+    if !pending.children.is_empty() || pending.cgroup.is_some() || pending.bootstrap.is_some() {
+        let mut slot = worker
+            .pending
+            .lock()
+            .map_err(|_| failure(FailureCategory::Unavailable))?;
+        if !slot.children.is_empty() || slot.cgroup.is_some() || slot.bootstrap.is_some() {
+            return Err(failure(FailureCategory::IdentityMismatch));
+        }
+        *slot = pending;
+        return Err(first_error.unwrap_or_else(|| failure(FailureCategory::Unavailable)));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -486,6 +590,7 @@ fn run_worker(
     attempt_cgroup: &super::cgroup::AttemptCgroup,
     bootstrap_root: &dirfd::BoundDir,
 ) -> Result<(), ExecutionDomainError> {
+    retry_pending_cleanup(worker, bootstrap_root)?;
     let bootstrap_name = CString::new(format!("cleanup-{}", attempt.component()))
         .map_err(|_| failure(FailureCategory::InvalidInput))?;
     let bootstrap = bootstrap_root.create_child(&bootstrap_name, 0o700)?;
@@ -523,24 +628,37 @@ fn run_worker(
         Ok(cgroup) => cgroup,
         Err(error) => {
             let _ = child.kill();
-            let _ = child.wait();
-            // attach_cleanup_worker reports whether its own cgroup rollback
-            // failed, but does not expose a reusable empty proof. Preserve the
-            // deterministic bootstrap directory for reconciliation.
-            return Err(error);
+            let reap_deadline = Instant::now()
+                .checked_add(REAP_GRACE)
+                .ok_or_else(|| failure(FailureCategory::InvalidInput))?;
+            let reap = wait_child_status(&mut child, reap_deadline);
+            if child.try_wait().map_err(io_failure)?.is_none() {
+                retain_pending_cleanup(
+                    worker,
+                    Some(child),
+                    None,
+                    Some((bootstrap_name, bootstrap)),
+                )?;
+                return Err(combine_cleanup(
+                    error,
+                    Err(reap
+                        .err()
+                        .unwrap_or_else(|| failure(FailureCategory::Timeout))),
+                ));
+            }
+            let bootstrap_cleanup =
+                bootstrap_root.remove_created_child(&bootstrap_name, &bootstrap, &[]);
+            if bootstrap_cleanup.is_err() {
+                retain_pending_cleanup(worker, None, None, Some((bootstrap_name, bootstrap)))?;
+            }
+            return Err(combine_cleanup(error, bootstrap_cleanup));
         }
     };
     let result = (|| {
         expect_packet(parent.as_raw_fd(), b"U", deadline, Some(child.id() as i32))?;
-        install_map(&worker.newuidmap, child.id(), true, authority.map, deadline)?;
+        install_map(worker, child.id(), true, authority.map, deadline)?;
         deny_setgroups(child.id())?;
-        install_map(
-            &worker.newgidmap,
-            child.id(),
-            false,
-            authority.map,
-            deadline,
-        )?;
+        install_map(worker, child.id(), false, authority.map, deadline)?;
         verify_proc_map(child.id(), true, authority.map)?;
         verify_proc_map(child.id(), false, authority.map)?;
         send_packet(parent.as_raw_fd(), b"M", deadline)?;
@@ -582,7 +700,11 @@ fn run_worker(
         let _ = child.kill();
     }
     let wait = wait_child(&mut child, deadline);
-    let cgroup_result = cleanup_cgroup.kill_wait_remove(deadline);
+    let cleanup_deadline = Instant::now()
+        .checked_add(CLEANUP_CGROUP_GRACE)
+        .ok_or_else(|| failure(FailureCategory::InvalidInput))?;
+    let cgroup_result = cleanup_cgroup.kill_wait_remove(cleanup_deadline);
+    let child_pending = child.try_wait().map_err(io_failure)?.is_none();
     let bootstrap_result = if cgroup_result.is_ok() {
         bootstrap_root.remove_created_child(&bootstrap_name, &bootstrap, &[])
     } else {
@@ -590,6 +712,15 @@ fn run_worker(
         // exact recursive-empty/removal proof.
         Ok(())
     };
+    if child_pending || cgroup_result.is_err() || bootstrap_result.is_err() {
+        retain_pending_cleanup(
+            worker,
+            child_pending.then_some(child),
+            cgroup_result.is_err().then_some(cleanup_cgroup),
+            (cgroup_result.is_err() || bootstrap_result.is_err())
+                .then_some((bootstrap_name, bootstrap)),
+        )?;
+    }
     result.and(wait).and(cgroup_result).and(bootstrap_result)?;
     for root in &authority.roots {
         root.verify()?;
@@ -733,18 +864,23 @@ pub(super) fn verify_rootlesskit_map(
 }
 
 fn install_map(
-    helper: &VerifiedExecutable,
+    worker: &CleanupWorkerConfig,
     pid: u32,
     uid: bool,
     map: MappedIdRange,
     deadline: Instant,
 ) -> Result<(), ExecutionDomainError> {
+    let executable = if uid {
+        &worker.newuidmap
+    } else {
+        &worker.newgidmap
+    };
     let (service, start, count) = if uid {
         (map.service_uid, map.subuid_start, map.subuid_count)
     } else {
         (map.service_gid, map.subgid_start, map.subgid_count)
     };
-    let mut command = helper.command()?;
+    let mut command = executable.command()?;
     command
         .args([
             pid.to_string(),
@@ -757,7 +893,15 @@ fn install_map(
         ])
         .env_clear();
     let mut helper = command.spawn().map_err(io_failure)?;
-    let status = wait_child_status(&mut helper, deadline)?;
+    let status = match wait_child_status(&mut helper, deadline) {
+        Ok(status) => status,
+        Err(error) => {
+            if helper.try_wait().map_err(io_failure)?.is_none() {
+                retain_pending_cleanup(worker, Some(helper), None, None)?;
+            }
+            return Err(error);
+        }
+    };
     if status.success() {
         Ok(())
     } else {
@@ -1344,14 +1488,17 @@ fn wait_child(
 }
 
 fn wait_child_status(
-    child: &mut std::process::Child,
+    child: &mut impl ReapableChild,
     deadline: Instant,
 ) -> Result<std::process::ExitStatus, ExecutionDomainError> {
     const REAP_RESERVE: Duration = Duration::from_millis(25);
     let kill_at = deadline.checked_sub(REAP_RESERVE).unwrap_or(deadline);
+    let reap_deadline = deadline
+        .checked_add(REAP_GRACE)
+        .ok_or_else(|| failure(FailureCategory::InvalidInput))?;
     let mut killed = false;
     loop {
-        if let Some(status) = child.try_wait().map_err(io_failure)? {
+        if let Some(status) = child.try_wait_status().map_err(io_failure)? {
             return if killed {
                 Err(failure(FailureCategory::Timeout))
             } else {
@@ -1360,16 +1507,34 @@ fn wait_child_status(
         }
         let now = Instant::now();
         if !killed && now >= kill_at {
-            match child.kill() {
+            match child.kill_process() {
                 Ok(()) => killed = true,
                 Err(error) if error.kind() == io::ErrorKind::InvalidInput => killed = true,
                 Err(error) => return Err(io_failure(error)),
             }
         }
-        if now >= deadline {
+        let active_deadline = if killed { reap_deadline } else { deadline };
+        if now >= active_deadline {
             return Err(failure(FailureCategory::Timeout));
         }
-        std::thread::sleep(Duration::from_millis(5).min(deadline.saturating_duration_since(now)));
+        std::thread::sleep(
+            Duration::from_millis(5).min(active_deadline.saturating_duration_since(now)),
+        );
+    }
+}
+
+pub(super) trait ReapableChild {
+    fn try_wait_status(&mut self) -> io::Result<Option<std::process::ExitStatus>>;
+    fn kill_process(&mut self) -> io::Result<()>;
+}
+
+impl ReapableChild for std::process::Child {
+    fn try_wait_status(&mut self) -> io::Result<Option<std::process::ExitStatus>> {
+        self.try_wait()
+    }
+
+    fn kill_process(&mut self) -> io::Result<()> {
+        self.kill()
     }
 }
 
@@ -1379,6 +1544,14 @@ pub(super) fn wait_child_for_test(
     deadline: Instant,
 ) -> Result<(), ExecutionDomainError> {
     wait_child(child, deadline)
+}
+
+#[cfg(test)]
+pub(super) fn wait_reapable_child_for_test(
+    child: &mut impl ReapableChild,
+    deadline: Instant,
+) -> Result<(), ExecutionDomainError> {
+    wait_child_status(child, deadline).map(|_| ())
 }
 
 fn root_kind_byte(kind: CleanupRootKind) -> u8 {

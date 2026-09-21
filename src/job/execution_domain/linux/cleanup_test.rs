@@ -1,5 +1,6 @@
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, symlink};
+use std::os::unix::process::ExitStatusExt;
 
 use tempfile::TempDir;
 
@@ -21,6 +22,46 @@ fn timed_out_child_is_killed_and_reaped_within_the_same_deadline() {
 
     assert!(child.try_wait().unwrap().is_some());
     assert!(std::time::Instant::now() <= deadline + std::time::Duration::from_millis(50));
+}
+
+struct DelayedReap {
+    killed: bool,
+    remaining_polls: usize,
+    reaped: bool,
+}
+
+impl super::cleanup::ReapableChild for DelayedReap {
+    fn try_wait_status(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        if !self.killed {
+            return Ok(None);
+        }
+        if self.remaining_polls > 0 {
+            self.remaining_polls -= 1;
+            return Ok(None);
+        }
+        self.reaped = true;
+        Ok(Some(std::process::ExitStatus::from_raw(libc::SIGKILL)))
+    }
+
+    fn kill_process(&mut self) -> std::io::Result<()> {
+        self.killed = true;
+        Ok(())
+    }
+}
+
+#[test]
+fn timeout_uses_a_separate_bounded_window_to_prove_reap() {
+    let mut child = DelayedReap {
+        killed: false,
+        remaining_polls: 8,
+        reaped: false,
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(5);
+
+    assert!(super::cleanup::wait_reapable_child_for_test(&mut child, deadline).is_err());
+
+    assert!(child.killed);
+    assert!(child.reaped);
 }
 
 fn fixture() -> (TempDir, MappedIdRange, PinnedCleanupRoot) {

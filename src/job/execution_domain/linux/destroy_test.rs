@@ -14,6 +14,7 @@ struct Harness {
     term_error: bool,
     fail_at: Option<&'static str>,
     empty_calls: usize,
+    cgroup_present: bool,
 }
 
 impl Harness {
@@ -26,6 +27,7 @@ impl Harness {
             term_error: false,
             fail_at: None,
             empty_calls: 0,
+            cgroup_present: true,
         }
     }
 
@@ -40,6 +42,9 @@ impl Harness {
 }
 
 impl DestroyOps for Harness {
+    fn kernel_neutralization_required(&self) -> bool {
+        self.cgroup_present
+    }
     fn close_admission(&mut self) -> Result<(), ExecutionDomainError> {
         self.event("close-admission")
     }
@@ -98,7 +103,9 @@ impl DestroyOps for Harness {
         self.event("unlink-state")
     }
     fn remove_cgroup(&mut self) -> Result<(), ExecutionDomainError> {
-        self.event("remove-cgroup")
+        self.event("remove-cgroup")?;
+        self.cgroup_present = false;
+        Ok(())
     }
     fn fsync_root(&mut self) -> Result<(), ExecutionDomainError> {
         self.event("fsync-root")
@@ -106,6 +113,32 @@ impl DestroyOps for Harness {
     fn mark_destroyed(&mut self) -> Result<(), ExecutionDomainError> {
         self.event("destroyed")
     }
+}
+
+#[test]
+fn retry_after_late_fsync_failure_skips_removed_kernel_domain() {
+    let mut harness = Harness::new(true, true);
+    harness.fail_at = Some("fsync-root");
+
+    assert!(destroy_kernel(&mut harness, attempt(), ShutdownBounds::default()).is_err());
+    let first_pass_len = harness.events.len();
+    assert!(!harness.cgroup_present);
+
+    harness.fail_at = None;
+    destroy_kernel(&mut harness, attempt(), ShutdownBounds::default()).unwrap();
+
+    assert_eq!(
+        &harness.events[first_pass_len..],
+        [
+            "close-admission",
+            "persist-destroying",
+            "socket",
+            "unlink-state",
+            "remove-cgroup",
+            "fsync-root",
+            "destroyed"
+        ]
+    );
 }
 
 fn attempt() -> AttemptIdentity {

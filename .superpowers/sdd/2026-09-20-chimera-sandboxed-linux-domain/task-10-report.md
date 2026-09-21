@@ -18,6 +18,7 @@
 - Independent pre-audit findings were closed for lost first errors, pre-recursion directory swaps, missing Docker writable root, partial cgroup ownership, mutable helper paths, unbounded helper waits, bootstrap capability leakage, socket absence retry, protocol-error kill escalation, external-revocation authorization, and backend-FD release ordering.
 - Independent post-commit review findings were all accepted and closed: external revocation now has explicit `Unpublished`/`Required`/`Proven` states; failed teardown retains retry authority and permit; namespace capabilities are retained and identity-checked; `KernelReady` leaves the durable journal in `Provisioning`; every traversal/helper wait uses the original absolute deadline; and unused future-C1 production seams were removed or deferred to tests.
 - Retry tests cover `Quarantined` teardown continuation, exact record retention, no fabricated external revocation proof, stage-ledger idempotence, namespace-handle transfer/closure, and absolute traversal/helper deadlines.
+- Second re-review closed three narrower retry/authentication gaps. A real two-pass destroy regression fails after cgroup/filesystem discharge, then proves retry skips the absent kernel domain and completes fsync/mark. Helper and mapped-worker timeouts get a separate bounded reap/cleanup window; any unreaped child, cleanup cgroup, or bootstrap capability remains attached to the per-attempt worker configuration for the next retry. Received namespace descriptors now require `NSFS_MAGIC`, exact `NS_GET_NSTYPE` (`CLONE_NEWNS`/`CLONE_NEWPID`), distinct identities, and reject swapped, duplicated, or ordinary descriptors.
 
 ## Verification
 
@@ -29,6 +30,15 @@
 - `cargo test --all-targets --all-features -- --test-threads=1` outside the restricted sandbox: library **1085 passed, 23 ignored**; every integration target passed.
 - Native arm64 Linux container: the new namespace-handle transfer, synchronous cgroup-deadline, bounded child kill/reap, and launcher-handshake regressions passed; `cargo check --offline --lib` exited 0 without warnings. The broader Linux filter passed **103** tests, ignored **16**, and classified five environment-only failures: two require a non-root UID, two require the native rootfs fixture, and the launcher fake was corrected then rerun green.
 - `git diff --check`: exit 0.
+
+### Re-review round 2 verification
+
+- Host destroy regression suite: **10 passed**.
+- Native Linux namespace capability positive/negative tests: **2 passed**, including swapped/duplicate/non-namespace rejection.
+- Native Linux bounded delayed-reap regression: **1 passed**; the existing real-child kill/reap regression also remains green.
+- Native Linux `cargo check --offline --lib`: exit 0.
+- Elevated `cargo test --all-targets --all-features -- --test-threads=1`: library **1086 passed, 23 ignored**; every integration target passed. The restricted-sandbox attempt produced the expected fixture permission cascade and was replaced by this unchanged elevated run.
+- The amd64-on-arm Docker cleanup sweep reached all touched tests successfully; seven unrelated dirfd fixtures report the environment's known `ENOSYS` for the required filesystem syscall under emulation, so they are not claimed as native qualification. Task 12 retains the real Debian gate.
 
 ## Qualification boundary
 

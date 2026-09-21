@@ -54,6 +54,8 @@ Task 10: complete (commit recorded by the implementation handoff). One retained 
 
 Task 10: fix round 1/5 (6 addressed, 0 open — no fabricated external revocation, retained teardown authority and idempotent retry, retained namespace capabilities, non-Ready durable KernelReady state, absolute teardown bounds, and removal/deferment of unused future-C1 seams; review-fix commit recorded by this handoff). Host fmt/clippy/diff-check and full serial suite are green: 1085 passed, 23 ignored, every integration target passed. Native arm64 Linux focused namespace-transfer, cgroup-deadline, helper-reap, and launcher-handshake regressions are green; Task 12 retains the real Debian RootlessKit/userns/cgroup qualification boundary.
 
+Task 10: fix round 2/5 (3 addressed, 0 open — late destructive retry skips discharged kernel/cgroup work, timed-out helper/worker authority is bounded and retained for retry, and received namespace FDs require exact nsfs/type/identity proof). Focused host destroy suite 10/10 and native Linux namespace/reap regressions are green; native Linux lib check is clean. Elevated full serial gate: 1086 passed, 23 ignored, every integration target green. Task 12 remains the only real Debian RootlessKit/userns/cgroup qualification boundary.
+
 Plan C consumer note: managed dockerd needs a separate policy and explicit retained-capability lifetime; never reuse the workflow child policy.
 
 Deferred contract for Task 10/C: rootless Docker may leave subordinate-UID files and non-traversable directories. Cleanup must define an owned user-namespace/idmapped cleanup capability; do not solve this by globally weakening owner checks.

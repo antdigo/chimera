@@ -22,6 +22,32 @@ fn kernel_ready_transfers_exact_mount_and_pid_namespace_handles() {
 }
 
 #[test]
+fn kernel_ready_rejects_swapped_duplicate_and_non_namespace_handles() {
+    fn rejected(handles: NamespaceHandles) {
+        let (sender, receiver) = UnixStream::pair().unwrap();
+        send_namespace_handles_for_test(&sender, &handles).unwrap();
+        assert!(
+            receive_namespace_handles_for_test(&receiver, Instant::now() + Duration::from_secs(1),)
+                .is_err()
+        );
+    }
+
+    let current = NamespaceHandles::open_current_for_test().unwrap();
+    rejected(NamespaceHandles {
+        mount: current.pid.try_clone().unwrap(),
+        pid: current.mount.try_clone().unwrap(),
+    });
+    rejected(NamespaceHandles {
+        mount: current.mount.try_clone().unwrap(),
+        pid: current.mount.try_clone().unwrap(),
+    });
+    rejected(NamespaceHandles {
+        mount: std::fs::File::open("/dev/null").unwrap().into(),
+        pid: current.pid.try_clone().unwrap(),
+    });
+}
+
+#[test]
 fn launcher_never_selects_host_network_or_outer_ports() {
     let args = rootlesskit_arguments(
         &AttemptIdentity::from_uuid(uuid::Uuid::from_u128(7)).unwrap(),
