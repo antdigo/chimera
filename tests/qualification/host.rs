@@ -687,7 +687,7 @@ fn entry_matches(parent: &File, name: &CString, file: &File) -> bool {
     let stat = unsafe { stat.assume_init() };
     file.metadata().is_ok_and(|metadata| {
         metadata.dev() == stat.st_dev as u64
-            && metadata.ino() == stat.st_ino as u64
+            && metadata.ino() == stat.st_ino
             && metadata.mode() == stat.st_mode as u32
     })
 }
