@@ -16,3 +16,40 @@ fn report_cannot_turn_diagnostics_into_activation() {
     assert_eq!(json["activation_available"], false);
     assert_eq!(json["schema_version"], 1);
 }
+
+#[test]
+fn cgroup_v1_cannot_satisfy_linux_platform() {
+    let (check, in_service) = classify_linux_platform(
+        true,
+        Some("11:memory:/system.slice/chimera.service\n10:cpu:/system.slice/chimera.service\n"),
+        true,
+        false,
+        true,
+    );
+    assert_eq!(check.status, CheckStatus::Failed);
+    assert_eq!(check.category, "cgroup_v2_unavailable");
+    assert!(!in_service);
+}
+
+#[test]
+fn cgroup_v2_requires_unified_mount_before_platform_satisfaction() {
+    let (check, in_service) = classify_linux_platform(
+        true,
+        Some("0::/system.slice/chimera.service\n"),
+        true,
+        false,
+        false,
+    );
+    assert_eq!(check.status, CheckStatus::Failed);
+    assert_eq!(check.category, "cgroup_v2_unavailable");
+    assert!(!in_service);
+}
+
+#[test]
+fn known_storage_mismatch_is_failed_not_unverified() {
+    let check = classify_storage_probe_error(PolicyError::StorageBoundMismatch);
+    assert_eq!(check.status, CheckStatus::Failed);
+    assert_eq!(check.category, "storage_bound_mismatch");
+    let inconclusive = classify_storage_probe_error(PolicyError::StorageProbeInconclusive);
+    assert_eq!(inconclusive.status, CheckStatus::Unverified);
+}

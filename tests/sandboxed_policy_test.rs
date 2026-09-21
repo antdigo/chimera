@@ -1,4 +1,5 @@
 use std::fs;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::process::Command;
@@ -15,27 +16,59 @@ fn command(root: &Path, args: &[&str]) -> std::process::Output {
 }
 
 fn snapshot(root: &Path) -> Vec<(String, u64, u64, Vec<u8>)> {
-    let mut entries = fs::read_dir(root)
-        .unwrap()
-        .map(|entry| {
+    fn visit(root: &Path, directory: &Path, entries: &mut Vec<(String, u64, u64, Vec<u8>)>) {
+        for entry in fs::read_dir(directory).unwrap() {
             let entry = entry.unwrap();
-            let name = entry.file_name().to_string_lossy().into_owned();
-            let metadata = entry.metadata().unwrap();
+            let path = entry.path();
+            let name = path
+                .strip_prefix(root)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned();
+            let metadata = fs::symlink_metadata(&path).unwrap();
             let bytes = if metadata.is_file() {
-                fs::read(entry.path()).unwrap()
+                fs::read(&path).unwrap()
+            } else if metadata.file_type().is_symlink() {
+                fs::read_link(&path)
+                    .unwrap()
+                    .as_os_str()
+                    .as_bytes()
+                    .to_vec()
             } else {
                 Vec::new()
             };
-            (name, metadata.dev(), metadata.ino(), bytes)
-        })
-        .collect::<Vec<_>>();
+            entries.push((name, metadata.dev(), metadata.ino(), bytes));
+            if metadata.is_dir() {
+                visit(root, &path, entries);
+            }
+        }
+    }
+    let mut entries = Vec::new();
+    visit(root, root, &mut entries);
     entries.sort_by(|a, b| a.0.cmp(&b.0));
     entries
+}
+
+fn seed_nested_state(root: &Path) {
+    fs::create_dir_all(root.join("cache/entries")).unwrap();
+    fs::write(root.join("cache/entries/marker"), b"preserve me").unwrap();
+}
+
+#[test]
+fn snapshot_includes_nested_entries() {
+    let root = TempDir::new().unwrap();
+    seed_nested_state(root.path());
+    assert!(
+        snapshot(root.path())
+            .iter()
+            .any(|entry| entry.0 == "cache/entries/marker")
+    );
 }
 
 #[test]
 fn doctor_missing_config_is_error_and_does_not_create_it() {
     let root = TempDir::new().unwrap();
+    seed_nested_state(root.path());
     let before = snapshot(root.path());
     let output = command(root.path(), &["doctor", "--json"]);
     assert!(!output.status.success());
@@ -46,7 +79,8 @@ fn doctor_missing_config_is_error_and_does_not_create_it() {
 #[test]
 fn doctor_json_is_read_only_and_never_claims_activation() {
     let root = TempDir::new().unwrap();
-    fs::write(root.path().join("config.toml"), "").unwrap();
+    seed_nested_state(root.path());
+    fs::write(root.path().join("config.toml"), "[execution.network]\nproduction_cidrs = []\n[execution.storage]\nmechanism = 'dedicated-filesystem'\nmax_bytes = '1GiB'\n").unwrap();
     let before = snapshot(root.path());
     let output = command(root.path(), &["doctor", "--json"]);
     assert!(!output.status.success());
@@ -56,12 +90,20 @@ fn doctor_json_is_read_only_and_never_claims_activation() {
     assert_eq!(report["checks"].as_array().unwrap().len(), 7);
     assert_eq!(report["checks"][6]["id"], "activation");
     assert_eq!(report["checks"][6]["status"], "failed");
+    assert_eq!(report["checks"][6]["category"], "sandboxed_unavailable");
+    assert_eq!(report["checks"][1]["id"], "network_config");
+    assert_eq!(report["checks"][1]["status"], "satisfied");
+    assert_eq!(report["checks"][2]["id"], "network_effective");
+    assert_eq!(report["checks"][2]["status"], "unverified");
+    assert_eq!(report["checks"][3]["id"], "network_negative_probes");
+    assert_eq!(report["checks"][3]["status"], "unverified");
     assert_eq!(snapshot(root.path()), before);
 }
 
 #[test]
 fn install_policy_only_renders_and_does_not_write_root() {
     let root = TempDir::new().unwrap();
+    seed_nested_state(root.path());
     fs::write(
         root.path().join("config.toml"),
         "[execution.network]\nproduction_cidrs = []\n",
@@ -83,6 +125,7 @@ fn install_policy_only_renders_and_does_not_write_root() {
 #[test]
 fn install_policy_rejects_unrequested_apply_modes() {
     let root = TempDir::new().unwrap();
+    seed_nested_state(root.path());
     fs::write(
         root.path().join("config.toml"),
         "[execution.network]\nproduction_cidrs = []\n",

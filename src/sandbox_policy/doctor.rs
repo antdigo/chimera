@@ -89,6 +89,33 @@ fn host_addresses() -> Result<HostAddresses, PolicyError> {
     Ok(HostAddresses { addresses })
 }
 
+#[cfg(any(target_os = "linux", test))]
+fn classify_linux_platform(
+    boot_ok: bool,
+    cgroup: Option<&str>,
+    systemd: bool,
+    container: bool,
+    unified_mount: bool,
+) -> (DoctorCheck, bool) {
+    let unified_membership = cgroup.is_some_and(|value| {
+        let mut lines = value.lines();
+        lines.next().is_some_and(|line| line.starts_with("0::/")) && lines.next().is_none()
+    });
+    let in_service = unified_mount
+        && unified_membership
+        && cgroup.is_some_and(|value| value.trim_end() == "0::/system.slice/chimera.service");
+    let (status, category) = if !boot_ok || cgroup.is_none() || !systemd {
+        (CheckStatus::Failed, "linux_prerequisites_missing")
+    } else if !unified_mount || !unified_membership {
+        (CheckStatus::Failed, "cgroup_v2_unavailable")
+    } else if container {
+        (CheckStatus::Failed, "container_environment")
+    } else {
+        (CheckStatus::Satisfied, "linux_prerequisites_observed")
+    };
+    (check("platform", status, category), in_service)
+}
+
 #[cfg(target_os = "linux")]
 fn platform() -> (DoctorCheck, bool) {
     let boot_ok = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
@@ -96,11 +123,6 @@ fn platform() -> (DoctorCheck, bool) {
         .and_then(|value| uuid::Uuid::parse_str(value.trim()).ok())
         .is_some_and(|id| !id.is_nil());
     let cgroup = std::fs::read_to_string("/proc/self/cgroup").ok();
-    let in_service = cgroup.as_deref().is_some_and(|value| {
-        value
-            .lines()
-            .any(|line| line == "0::/system.slice/chimera.service")
-    });
     let container = Path::new("/.dockerenv").exists()
         || Path::new("/run/.containerenv").exists()
         || cgroup.as_deref().is_some_and(|value| {
@@ -108,15 +130,13 @@ fn platform() -> (DoctorCheck, bool) {
                 .iter()
                 .any(|needle| value.contains(needle))
         });
-    let systemd = Path::new("/run/systemd/system").is_dir();
-    let (status, category) = if !boot_ok || cgroup.is_none() || !systemd {
-        (CheckStatus::Failed, "linux_prerequisites_missing")
-    } else if container {
-        (CheckStatus::Failed, "container_environment")
-    } else {
-        (CheckStatus::Satisfied, "linux_prerequisites_observed")
-    };
-    (check("platform", status, category), in_service)
+    classify_linux_platform(
+        boot_ok,
+        cgroup.as_deref(),
+        Path::new("/run/systemd/system").is_dir(),
+        container,
+        Path::new("/sys/fs/cgroup/cgroup.controllers").is_file(),
+    )
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -192,11 +212,7 @@ pub fn inspect_policy(root: &Path) -> Result<DoctorReport, PolicyError> {
                 CheckStatus::Failed,
                 "storage_bound_mismatch",
             ),
-            Err(_) => check(
-                "storage_bound",
-                CheckStatus::Unverified,
-                "storage_probe_unavailable",
-            ),
+            Err(error) => classify_storage_probe_error(error),
         },
     };
     checks.push(storage_check);
@@ -216,6 +232,21 @@ pub fn inspect_policy(root: &Path) -> Result<DoctorReport, PolicyError> {
         checks,
         policy_digest,
     })
+}
+
+fn classify_storage_probe_error(error: PolicyError) -> DoctorCheck {
+    match error {
+        PolicyError::StorageBoundMismatch => check(
+            "storage_bound",
+            CheckStatus::Failed,
+            "storage_bound_mismatch",
+        ),
+        _ => check(
+            "storage_bound",
+            CheckStatus::Unverified,
+            "storage_probe_unavailable",
+        ),
+    }
 }
 
 pub fn inspect_install_plan(root: &Path) -> Result<InstallPlan, PolicyError> {
