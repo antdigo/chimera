@@ -1,7 +1,6 @@
 use std::ffi::{CStr, CString};
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
-use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -13,6 +12,7 @@ const MAX_ENTRIES: usize = 524_288;
 const MAX_DEPTH: usize = 64;
 const MAX_PATH_BYTES: usize = 1 << 20;
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(test)]
 const MIN_SUBORDINATE_IDS: u32 = 65_536;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -75,6 +75,7 @@ impl MappedIdRange {
     }
 }
 
+#[cfg(test)]
 pub(in crate::job::execution_domain) struct IdMapSpec {
     service_user: String,
     range: MappedIdRange,
@@ -104,38 +105,15 @@ impl VerifiedExecutable {
     }
 }
 
-impl CleanupWorkerConfig {
-    #[expect(
-        dead_code,
-        reason = "Plan C preflight retains the verified worker binaries"
-    )]
-    pub(in crate::job::execution_domain) fn new(
-        executable: &Path,
-        newuidmap: &Path,
-        newgidmap: &Path,
-    ) -> Result<Self, ExecutionDomainError> {
-        Ok(Self {
-            executable: Arc::new(verify_executable(executable, false)?),
-            newuidmap: Arc::new(verify_executable(newuidmap, true)?),
-            newgidmap: Arc::new(verify_executable(newgidmap, true)?),
-        })
-    }
-}
-
 impl std::fmt::Debug for CleanupWorkerConfig {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("CleanupWorkerConfig")
     }
 }
 
+#[cfg(test)]
 impl IdMapSpec {
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "Plan C preflight consumes this before enabling the private runtime"
-        )
-    )]
+    #[cfg(test)]
     pub(in crate::job::execution_domain) fn parse(
         service_user: &str,
         service_uid: u32,
@@ -169,16 +147,13 @@ impl IdMapSpec {
         })
     }
 
-    pub(in crate::job::execution_domain) fn range(&self) -> MappedIdRange {
-        self.range
-    }
-
     #[cfg(test)]
     pub(super) fn subuid_start(&self) -> u32 {
         self.range.subuid_start
     }
 }
 
+#[cfg(test)]
 impl std::fmt::Debug for IdMapSpec {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -188,6 +163,7 @@ impl std::fmt::Debug for IdMapSpec {
     }
 }
 
+#[cfg(test)]
 fn parse_single_range(user: &str, contents: &str) -> Result<(u32, u32), ExecutionDomainError> {
     let mut found = None;
     for line in contents.lines() {
@@ -294,11 +270,6 @@ pub(in crate::job::execution_domain) struct RuntimeSocketCapability {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(in crate::job::execution_domain) enum RuntimeSocketRootKind {
     RootlessKitState,
-    #[expect(
-        dead_code,
-        reason = "Plan C supplies the future private Docker socket capability"
-    )]
-    DockerRun,
 }
 
 impl RuntimeSocketCapability {
@@ -309,7 +280,6 @@ impl RuntimeSocketCapability {
     ) -> Result<Self, ExecutionDomainError> {
         let expected_name = match scope {
             RuntimeSocketRootKind::RootlessKitState => c"api.sock",
-            RuntimeSocketRootKind::DockerRun => c"docker.sock",
         };
         if name != expected_name {
             return Err(failure(FailureCategory::InvalidInput));
@@ -335,7 +305,6 @@ impl RuntimeSocketCapability {
     pub(in crate::job::execution_domain) fn remove(&self) -> Result<(), ExecutionDomainError> {
         let expected_name = match self.scope {
             RuntimeSocketRootKind::RootlessKitState => c"api.sock",
-            RuntimeSocketRootKind::DockerRun => c"docker.sock",
         };
         if self.name != expected_name {
             return Err(failure(FailureCategory::IdentityMismatch));
@@ -788,19 +757,7 @@ fn install_map(
         ])
         .env_clear();
     let mut helper = command.spawn().map_err(io_failure)?;
-    let status = loop {
-        if let Some(status) = helper.try_wait().map_err(io_failure)? {
-            break status;
-        }
-        if Instant::now() >= deadline {
-            let _ = helper.kill();
-            let _ = helper.wait();
-            return Err(failure(FailureCategory::Timeout));
-        }
-        std::thread::sleep(
-            Duration::from_millis(5).min(deadline.saturating_duration_since(Instant::now())),
-        );
-    };
+    let status = wait_child_status(&mut helper, deadline)?;
     if status.success() {
         Ok(())
     } else {
@@ -1378,56 +1335,50 @@ fn wait_child(
     child: &mut std::process::Child,
     deadline: Instant,
 ) -> Result<(), ExecutionDomainError> {
-    loop {
-        if let Some(status) = child.try_wait().map_err(io_failure)? {
-            return if status.success() {
-                Ok(())
-            } else {
-                Err(failure(FailureCategory::Unavailable))
-            };
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(failure(FailureCategory::Timeout));
-        }
-        std::thread::sleep(Duration::from_millis(10));
+    let status = wait_child_status(child, deadline)?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(failure(FailureCategory::Unavailable))
     }
 }
 
-fn verify_executable(
-    path: &Path,
-    root_owned: bool,
-) -> Result<VerifiedExecutable, ExecutionDomainError> {
-    use std::os::unix::ffi::OsStrExt;
-    if !path.is_absolute() {
-        return Err(failure(FailureCategory::InvalidInput));
+fn wait_child_status(
+    child: &mut std::process::Child,
+    deadline: Instant,
+) -> Result<std::process::ExitStatus, ExecutionDomainError> {
+    const REAP_RESERVE: Duration = Duration::from_millis(25);
+    let kill_at = deadline.checked_sub(REAP_RESERVE).unwrap_or(deadline);
+    let mut killed = false;
+    loop {
+        if let Some(status) = child.try_wait().map_err(io_failure)? {
+            return if killed {
+                Err(failure(FailureCategory::Timeout))
+            } else {
+                Ok(status)
+            };
+        }
+        let now = Instant::now();
+        if !killed && now >= kill_at {
+            match child.kill() {
+                Ok(()) => killed = true,
+                Err(error) if error.kind() == io::ErrorKind::InvalidInput => killed = true,
+                Err(error) => return Err(io_failure(error)),
+            }
+        }
+        if now >= deadline {
+            return Err(failure(FailureCategory::Timeout));
+        }
+        std::thread::sleep(Duration::from_millis(5).min(deadline.saturating_duration_since(now)));
     }
-    let canonical = path.canonicalize().map_err(io_failure)?;
-    if canonical != path {
-        return Err(failure(FailureCategory::IdentityMismatch));
-    }
-    let path = CString::new(path.as_os_str().as_bytes())
-        .map_err(|_| failure(FailureCategory::InvalidInput))?;
-    let raw = unsafe {
-        libc::open(
-            path.as_ptr(),
-            libc::O_PATH | libc::O_CLOEXEC | libc::O_NOFOLLOW,
-        )
-    };
-    if raw < 0 {
-        return Err(io_failure(io::Error::last_os_error()));
-    }
-    let fd = unsafe { OwnedFd::from_raw_fd(raw) };
-    let identity = identity(&dirfd::metadata(fd.as_raw_fd())?);
-    if u32::from(identity.mode) & libc::S_IFMT != libc::S_IFREG
-        || u32::from(identity.mode) & 0o022 != 0
-        || u32::from(identity.mode) & 0o111 == 0
-        || root_owned && identity.uid != 0
-    {
-        return Err(failure(FailureCategory::IdentityMismatch));
-    }
-    Ok(VerifiedExecutable { fd, identity })
+}
+
+#[cfg(test)]
+pub(super) fn wait_child_for_test(
+    child: &mut std::process::Child,
+    deadline: Instant,
+) -> Result<(), ExecutionDomainError> {
+    wait_child(child, deadline)
 }
 
 fn root_kind_byte(kind: CleanupRootKind) -> u8 {

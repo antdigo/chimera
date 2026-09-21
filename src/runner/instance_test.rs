@@ -253,7 +253,7 @@ fn runner_creates_workspace_inside_the_current_attempt() {
 #[tokio::test(flavor = "current_thread")]
 async fn lifecycle_transition_does_not_block_tokio_tasks_or_timers() {
     let (_temp, runner) = make_runner();
-    let domain = runner
+    let mut domain = runner
         .execution_domains
         .reserve()
         .await
@@ -605,7 +605,7 @@ async fn cancelled_job_removes_attempt_workspace_and_temp_canaries() {
 
     let (_temp, runner) = make_runner();
     cache_node_runtimes(&runner);
-    let domain = runner
+    let mut domain = runner
         .execution_domains
         .reserve()
         .await
@@ -675,7 +675,7 @@ async fn cancelled_job_removes_attempt_workspace_and_temp_canaries() {
 
     let first_attempt = domain.attempt_dir().to_path_buf();
     domain.destroy().await.unwrap();
-    let next_attempt = runner
+    let mut next_attempt = runner
         .execution_domains
         .reserve()
         .await
@@ -998,7 +998,7 @@ async fn poll_loop_stops_when_job_resource_root_is_poisoned() {
     let poll = tokio::spawn(async move { runner.poll_loop(&broker, &mut rx).await });
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    let config = root
+    let mut config = root
         .reserve()
         .await
         .unwrap()
@@ -1102,7 +1102,7 @@ async fn poisoned_runner_refuses_job_before_acknowledgement() {
     )
     .unwrap();
     let permit = runner.execution_domains.reserve().await.unwrap();
-    let resources = runner
+    let mut resources = runner
         .execution_domains
         .reserve()
         .await

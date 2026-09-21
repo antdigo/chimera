@@ -667,7 +667,7 @@ async fn cancel_token_cancels_job() {
         &env.mock_server.uri(),
     );
 
-    let domain = env
+    let mut domain = env
         .execution_domains
         .reserve()
         .await

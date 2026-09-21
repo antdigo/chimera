@@ -45,6 +45,8 @@ fn linux_backend_for_test() -> (
             launcher: child,
             pidfd,
             deadline: std::time::Instant::now() + std::time::Duration::from_secs(2),
+            namespaces: None,
+            require_foreign_namespaces: false,
         }),
         path_mappings: Vec::new(),
         next_command_id: 1,
@@ -102,13 +104,74 @@ async fn explicit_destroy_releases_manager_owned_permit() {
     let root_path = temp.path().join("domains");
     let root = ExecutionDomainRoot::prepare(&root_path, NonZeroUsize::new(1).unwrap()).unwrap();
     let permit = root.reserve().await.unwrap();
-    let domain = permit.provision(AttemptIdentity::new()).await.unwrap();
+    let mut domain = permit.provision(AttemptIdentity::new()).await.unwrap();
     assert_eq!(root.admission.available_permits(), 0);
 
     domain.destroy().await.unwrap();
 
     assert_eq!(root.admission.available_permits(), 1);
     assert!(root.reserve().await.is_ok());
+}
+
+#[tokio::test]
+async fn failed_destroy_retains_backend_and_can_be_retried() {
+    let temp = tempfile::tempdir().unwrap();
+    let root_path = temp.path().join("domains");
+    let root = ExecutionDomainRoot::prepare(&root_path, NonZeroUsize::new(1).unwrap()).unwrap();
+    let mut domain = root
+        .reserve()
+        .await
+        .unwrap()
+        .provision(AttemptIdentity::new())
+        .await
+        .unwrap();
+    let attempt = domain.attempt_dir().to_path_buf();
+    let original = attempt.with_extension("original");
+    std::fs::rename(&attempt, &original).unwrap();
+    std::fs::create_dir(&attempt).unwrap();
+
+    assert!(domain.destroy().await.is_err());
+    assert_eq!(root.admission.available_permits(), 0);
+    std::fs::remove_dir(&attempt).unwrap();
+    std::fs::rename(&original, &attempt).unwrap();
+
+    domain.destroy().await.unwrap();
+    assert!(!attempt.exists());
+    assert_eq!(root.admission.available_permits(), 1);
+}
+
+#[tokio::test]
+async fn dropping_handle_after_failed_destroy_retains_cleanup_authority() {
+    let temp = tempfile::tempdir().unwrap();
+    let root_path = temp.path().join("domains");
+    let root = ExecutionDomainRoot::prepare(&root_path, NonZeroUsize::new(1).unwrap()).unwrap();
+    let mut domain = root
+        .reserve()
+        .await
+        .unwrap()
+        .provision(AttemptIdentity::new())
+        .await
+        .unwrap();
+    let attempt = domain.attempt_dir().to_path_buf();
+    let original = attempt.with_extension("original");
+    std::fs::rename(&attempt, &original).unwrap();
+    std::fs::create_dir(&attempt).unwrap();
+
+    assert!(domain.destroy().await.is_err());
+    drop(domain);
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            if root.retained_cleanup_count_for_test() == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(root.admission.available_permits(), 0);
+    assert!(*root.state.poisoned.borrow());
 }
 
 #[tokio::test]
@@ -365,7 +428,7 @@ async fn trusted_backend_delivers_non_utf8_argument_byte_for_byte() {
     let root =
         ExecutionDomainRoot::prepare(&temp.path().join("domains"), NonZeroUsize::new(1).unwrap())
             .unwrap();
-    let domain = root
+    let mut domain = root
         .reserve()
         .await
         .unwrap()
@@ -430,7 +493,7 @@ async fn domain_cancel_interrupts_in_flight_trusted_command_but_allows_post_comm
     let root =
         ExecutionDomainRoot::prepare(&temp.path().join("domains"), NonZeroUsize::new(1).unwrap())
             .unwrap();
-    let domain = root
+    let mut domain = root
         .reserve()
         .await
         .unwrap()
@@ -475,14 +538,14 @@ async fn blocking_state_work_in_one_domain_does_not_stall_another_domain() {
     let root =
         ExecutionDomainRoot::prepare(&temp.path().join("domains"), NonZeroUsize::new(2).unwrap())
             .unwrap();
-    let blocked = root
+    let mut blocked = root
         .reserve()
         .await
         .unwrap()
         .provision(AttemptIdentity::new())
         .await
         .unwrap();
-    let responsive = root
+    let mut responsive = root
         .reserve()
         .await
         .unwrap()
@@ -527,7 +590,7 @@ async fn cancel_racing_with_command_finish_is_command_scoped_and_idempotent() {
     let root =
         ExecutionDomainRoot::prepare(&temp.path().join("domains"), NonZeroUsize::new(1).unwrap())
             .unwrap();
-    let domain = root
+    let mut domain = root
         .reserve()
         .await
         .unwrap()
@@ -630,7 +693,7 @@ async fn trusted_normal_exit_has_a_bounded_drain_when_descendant_holds_pipes() {
     let root =
         ExecutionDomainRoot::prepare(&temp.path().join("domains"), NonZeroUsize::new(1).unwrap())
             .unwrap();
-    let domain = root
+    let mut domain = root
         .reserve()
         .await
         .unwrap()
@@ -1353,7 +1416,7 @@ async fn stalled_linux_control_send_does_not_block_a_trusted_domain() {
     let root =
         ExecutionDomainRoot::prepare(&temp.path().join("domains"), NonZeroUsize::new(1).unwrap())
             .unwrap();
-    let trusted = root
+    let mut trusted = root
         .reserve()
         .await
         .unwrap()
@@ -1441,7 +1504,7 @@ async fn cancel_converges_when_a_large_run_frame_remains_backpressured() {
     let root =
         ExecutionDomainRoot::prepare(&temp.path().join("domains"), NonZeroUsize::new(1).unwrap())
             .unwrap();
-    let trusted = root
+    let mut trusted = root
         .reserve()
         .await
         .unwrap()

@@ -658,7 +658,7 @@ impl Runner {
         permit: DomainPermit,
     ) -> Result<()> {
         let cache_scope = cache_scope_for_job(manifest, repo);
-        let domain = permit
+        let mut domain = permit
             .provision(AttemptIdentity::new())
             .await
             .context("provisioning execution domain")?;
@@ -675,6 +675,10 @@ impl Runner {
         {
             Ok(capability_id) => capability_id,
             Err(registration_error) => {
+                domain
+                    .authorize_external_revocation()
+                    .await
+                    .context("authorizing unpublished execution-domain cleanup")?;
                 let cleanup_result = domain.destroy().await.map(|_| ());
                 match &cleanup_result {
                     Ok(()) => info!(%attempt_id, "cleaned job Docker config"),
@@ -729,6 +733,7 @@ impl Runner {
             Ok(())
         };
         let destroy = async move {
+            domain.authorize_external_revocation().await?;
             let cleanup_result = domain.destroy().await.map(|_| ());
             match &cleanup_result {
                 Ok(()) => info!(%attempt_id, "cleaned job Docker config"),

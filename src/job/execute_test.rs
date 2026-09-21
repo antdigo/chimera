@@ -1894,7 +1894,7 @@ async fn concurrent_webhook_flows_get_private_absolute_tmp() {
         .into_iter()
         .map(Result::unwrap)
         .collect::<Vec<_>>();
-    for (index, (result, outputs, config)) in completed.into_iter().enumerate() {
+    for (index, (result, outputs, mut config)) in completed.into_iter().enumerate() {
         assert_eq!(
             result.as_ref().unwrap().conclusion,
             StepConclusion::Succeeded
@@ -1949,7 +1949,7 @@ async fn host_command_fails_closed_when_private_tmp_is_missing() {
         NonZeroUsize::new(1).unwrap(),
     )
     .unwrap();
-    let config = provision_test_domain(&root);
+    let mut config = provision_test_domain(&root);
     let sentinel = temp.path().join("command-ran");
     let script = format!("touch '{}'", sentinel.display());
     let env = host_base_env(&config);
@@ -2004,7 +2004,7 @@ async fn private_tmp_mount_precedes_working_directory_lookup() {
         NonZeroUsize::new(1).unwrap(),
     )
     .unwrap();
-    let config = root
+    let mut config = root
         .reserve()
         .await
         .unwrap()
@@ -2073,7 +2073,7 @@ async fn working_directory_tmp_does_not_write_to_host_tmp() {
         NonZeroUsize::new(1).unwrap(),
     )
     .unwrap();
-    let config = root
+    let mut config = root
         .reserve()
         .await
         .unwrap()

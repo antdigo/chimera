@@ -66,12 +66,11 @@ pub(in crate::job::execution_domain) struct StrictCleanupRecord {
     lifecycle: Option<super::journal::DomainLifecycle>,
     admission_closed: bool,
     handles_closed: bool,
-    external_revocation_proven: bool,
+    external_revocation: ExternalRevocationState,
     destroy_report: Option<super::DestroyReport>,
-    created_stages: Vec<CreatedStage>,
+    created_stages: CreatedStageStack,
 }
 
-#[cfg(target_os = "linux")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CreatedStage {
     AttemptCgroup,
@@ -81,7 +80,61 @@ enum CreatedStage {
     KernelDomain,
     RootlessKitSocket,
     Evacuated,
-    Ready,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ExternalRevocationState {
+    Unpublished,
+    Required,
+    Proven,
+}
+
+impl ExternalRevocationState {
+    fn publish(&mut self) {
+        if *self == Self::Unpublished {
+            *self = Self::Required;
+        }
+    }
+
+    fn prove(&mut self) {
+        *self = Self::Proven;
+    }
+
+    fn cleanup_allowed(self) -> bool {
+        matches!(self, Self::Unpublished | Self::Proven)
+    }
+}
+
+#[derive(Debug)]
+struct CreatedStageStack(Vec<CreatedStage>);
+
+impl CreatedStageStack {
+    fn new(stages: impl IntoIterator<Item = CreatedStage>) -> Self {
+        Self(stages.into_iter().collect())
+    }
+
+    fn push(&mut self, stage: CreatedStage) {
+        self.0.push(stage);
+    }
+
+    fn contains(&self, stage: CreatedStage) -> bool {
+        self.0.contains(&stage)
+    }
+
+    fn discharge(&mut self, expected: CreatedStage) -> Result<(), super::ExecutionDomainError> {
+        if !self.contains(expected) {
+            return Ok(());
+        }
+        if self.0.last() != Some(&expected) {
+            return Err(destroy::failure(super::FailureCategory::IdentityMismatch));
+        }
+        self.0.pop();
+        Ok(())
+    }
+
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -94,6 +147,25 @@ pub(in crate::job::execution_domain) struct StrictBackendParts {
 pub(in crate::job::execution_domain) struct StrictProvisionFailure {
     error: super::ExecutionDomainError,
     quarantine: bool,
+    cleanup: Option<StrictPartialCleanup>,
+}
+
+#[cfg(target_os = "linux")]
+pub(in crate::job::execution_domain) enum StrictPartialCleanup {
+    Record(Box<StrictCleanupRecord>),
+    Cgroup(cgroup::AttemptCgroup),
+}
+
+#[cfg(target_os = "linux")]
+impl StrictPartialCleanup {
+    pub(in crate::job::execution_domain) fn retry(
+        &mut self,
+    ) -> Result<(), super::ExecutionDomainError> {
+        match self {
+            Self::Record(record) => record.destroy().map(|_| ()),
+            Self::Cgroup(cgroup) => cgroup.remove(),
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -102,8 +174,10 @@ impl StrictProvisionFailure {
         self.quarantine
     }
 
-    pub(in crate::job::execution_domain) fn into_error(self) -> super::ExecutionDomainError {
-        self.error
+    pub(in crate::job::execution_domain) fn into_parts(
+        self,
+    ) -> (super::ExecutionDomainError, Option<StrictPartialCleanup>) {
+        (self.error, self.cleanup)
     }
 }
 
@@ -113,64 +187,39 @@ impl From<super::ExecutionDomainError> for StrictProvisionFailure {
         Self {
             error,
             quarantine: true,
+            cleanup: None,
         }
     }
 }
 
 #[cfg(target_os = "linux")]
 fn rollback_partial_cgroup(
-    cgroup: &cgroup::AttemptCgroup,
+    cgroup: cgroup::AttemptCgroup,
     source: super::ExecutionDomainError,
 ) -> StrictProvisionFailure {
     // Before the attempt/rootfs bindings are proven there is deliberately no
     // pathname fallback. We can still discharge the exact retained cgroup
     // capability, but the attempt is quarantined because filesystem absence
     // could not be proven.
-    let error = match cgroup.remove() {
-        Ok(()) => source,
-        Err(cleanup) => super::ExecutionDomainError::LifecycleAndDestroyFailed {
-            lifecycle: Box::new(source),
-            destroy: Box::new(cleanup),
-        },
+    let (error, cleanup) = match cgroup.remove() {
+        Ok(()) => (source, None),
+        Err(cleanup) => (
+            super::ExecutionDomainError::LifecycleAndDestroyFailed {
+                lifecycle: Box::new(source),
+                destroy: Box::new(cleanup),
+            },
+            Some(StrictPartialCleanup::Cgroup(cgroup)),
+        ),
     };
     StrictProvisionFailure {
         error,
         quarantine: true,
+        cleanup,
     }
 }
 
 #[cfg(target_os = "linux")]
 impl StrictBackendBuilder {
-    #[expect(
-        dead_code,
-        reason = "constructed by the private C1 activation seam after endpoint installation"
-    )]
-    pub(in crate::job::execution_domain) fn new(
-        cgroup: cgroup::AttemptCgroup,
-        launch: launcher::LaunchSpec,
-        mapped_ids: cleanup::IdMapSpec,
-        worker: cleanup::CleanupWorkerConfig,
-    ) -> Self {
-        Self {
-            cgroup,
-            launch,
-            mapped_cleanup: Some((mapped_ids.range(), worker)),
-            runtime_socket: None,
-        }
-    }
-
-    #[expect(
-        dead_code,
-        reason = "Plan C supplies the retained socket identity at its private activation seam"
-    )]
-    pub(in crate::job::execution_domain) fn with_runtime_socket(
-        mut self,
-        runtime_socket: cleanup::RuntimeSocketCapability,
-    ) -> Self {
-        self.runtime_socket = Some(runtime_socket);
-        self
-    }
-
     pub(in crate::job::execution_domain) fn build(
         self,
     ) -> Result<StrictBackendParts, StrictProvisionFailure> {
@@ -214,7 +263,7 @@ impl StrictBackendBuilder {
         let (attempt_path, attempt_name, active_root, attempt_root, rootlesskit_state) =
             match pre_record {
                 Ok(prepared) => prepared,
-                Err(error) => return Err(rollback_partial_cgroup(&cgroup, error)),
+                Err(error) => return Err(rollback_partial_cgroup(cgroup, error)),
             };
         let mut record = StrictCleanupRecord {
             attempt: launch.attempt,
@@ -232,9 +281,12 @@ impl StrictBackendBuilder {
             lifecycle: None,
             admission_closed: false,
             handles_closed: false,
-            external_revocation_proven: true,
+            external_revocation: ExternalRevocationState::Unpublished,
             destroy_report: None,
-            created_stages: vec![CreatedStage::AttemptCgroup, CreatedStage::AttemptFilesystem],
+            created_stages: CreatedStageStack::new([
+                CreatedStage::AttemptCgroup,
+                CreatedStage::AttemptFilesystem,
+            ]),
         };
         record.lifecycle = match super::journal::DomainLifecycle::create_strict(
             &attempt_path,
@@ -291,13 +343,9 @@ impl StrictBackendBuilder {
         // publish these two dependent capabilities in their teardown order.
         record.created_stages.push(CreatedStage::RootlessKitSocket);
         record.created_stages.push(CreatedStage::KernelDomain);
-        let map = record
-            .mapped_cleanup
-            .as_ref()
-            .map(|(map, _)| *map)
-            .ok_or_else(|| {
-                StrictProvisionFailure::from(destroy::failure(super::FailureCategory::NotReady))
-            })?;
+        let Some(map) = record.mapped_cleanup.as_ref().map(|(map, _)| *map) else {
+            return Err(record.rollback(destroy::failure(super::FailureCategory::NotReady)));
+        };
         if let Err(error) = cleanup::verify_rootlesskit_map(&record.rootlesskit_state, map) {
             return Err(record.rollback(error));
         }
@@ -305,19 +353,6 @@ impl StrictBackendBuilder {
             return Err(record.rollback(error));
         }
         record.created_stages.push(CreatedStage::Evacuated);
-        if let Err(error) = record
-            .lifecycle
-            .as_mut()
-            .ok_or_else(|| destroy::failure(super::FailureCategory::NotReady))
-            .and_then(|lifecycle| lifecycle.transition(super::journal::DomainState::Ready))
-        {
-            return Err(record.rollback(error));
-        }
-        record.created_stages.push(CreatedStage::Ready);
-        // Unpublished rollback is internally authorized. Once a handle may be
-        // published, manager-side reader/capability revocation must explicitly
-        // re-authorize destructive cleanup.
-        record.external_revocation_proven = false;
         Ok(StrictBackendParts {
             cleanup: record,
             path_mappings,
@@ -331,22 +366,15 @@ impl StrictCleanupRecord {
         &mut self,
         expected: CreatedStage,
     ) -> Result<(), super::ExecutionDomainError> {
-        if !self.created_stages.contains(&expected) {
-            // Retried destroy after a later stage failed.
-            return Ok(());
-        }
-        if self.created_stages.last() != Some(&expected) {
-            return Err(destroy::failure(super::FailureCategory::IdentityMismatch));
-        }
-        self.created_stages.pop();
-        Ok(())
+        self.created_stages.discharge(expected)
     }
 
-    fn rollback(&mut self, source: super::ExecutionDomainError) -> StrictProvisionFailure {
+    fn rollback(mut self, source: super::ExecutionDomainError) -> StrictProvisionFailure {
         match self.destroy() {
             Ok(_) => StrictProvisionFailure {
                 error: source,
                 quarantine: false,
+                cleanup: None,
             },
             Err(destroy) => StrictProvisionFailure {
                 error: super::ExecutionDomainError::LifecycleAndDestroyFailed {
@@ -354,6 +382,7 @@ impl StrictCleanupRecord {
                     destroy: Box::new(destroy),
                 },
                 quarantine: true,
+                cleanup: Some(StrictPartialCleanup::Record(Box::new(self))),
             },
         }
     }
@@ -372,7 +401,11 @@ impl StrictCleanupRecord {
     }
 
     pub(in crate::job::execution_domain) fn authorize_external_revocation(&mut self) {
-        self.external_revocation_proven = true;
+        self.external_revocation.prove();
+    }
+
+    pub(in crate::job::execution_domain) fn mark_published(&mut self) {
+        self.external_revocation.publish();
     }
 
     pub(in crate::job::execution_domain) fn mark_running(
@@ -418,7 +451,7 @@ impl StrictCleanupRecord {
 impl destroy::DestroyOps for StrictCleanupRecord {
     fn close_admission(&mut self) -> Result<(), super::ExecutionDomainError> {
         self.admission_closed = true;
-        if self.external_revocation_proven {
+        if self.external_revocation.cleanup_allowed() {
             Ok(())
         } else {
             Err(destroy::failure(super::FailureCategory::Unavailable))
@@ -426,16 +459,16 @@ impl destroy::DestroyOps for StrictCleanupRecord {
     }
 
     fn persist_destroying(&mut self) -> Result<(), super::ExecutionDomainError> {
-        let lifecycle = self
-            .lifecycle
-            .as_mut()
-            .ok_or_else(|| destroy::failure(super::FailureCategory::NotReady))?;
+        let Some(lifecycle) = self.lifecycle.as_mut() else {
+            return self.discharge_stage(CreatedStage::Evacuated);
+        };
         match lifecycle.state() {
             super::journal::DomainState::Destroying => Ok(()),
-            super::journal::DomainState::Destroyed => Ok(()),
+            super::journal::DomainState::Destroyed | super::journal::DomainState::Quarantined => {
+                Ok(())
+            }
             _ => lifecycle.transition(super::journal::DomainState::Destroying),
         }?;
-        self.discharge_stage(CreatedStage::Ready)?;
         self.discharge_stage(CreatedStage::Evacuated)
     }
 
@@ -461,9 +494,9 @@ impl destroy::DestroyOps for StrictCleanupRecord {
 
     fn term_members(
         &mut self,
-        _deadline: std::time::Instant,
+        deadline: std::time::Instant,
     ) -> Result<(), super::ExecutionDomainError> {
-        self.cgroup.term()
+        self.cgroup.term(deadline)
     }
 
     fn recursively_empty_until(
@@ -473,8 +506,11 @@ impl destroy::DestroyOps for StrictCleanupRecord {
         self.cgroup.recursively_empty_until(deadline)
     }
 
-    fn kill_all(&mut self) -> Result<(), super::ExecutionDomainError> {
-        self.cgroup.kill()
+    fn kill_all(
+        &mut self,
+        deadline: std::time::Instant,
+    ) -> Result<(), super::ExecutionDomainError> {
+        self.cgroup.kill_until(deadline)
     }
 
     fn reap_launcher(
@@ -513,6 +549,10 @@ impl destroy::DestroyOps for StrictCleanupRecord {
     }
 
     fn close_handles(&mut self) -> Result<(), super::ExecutionDomainError> {
+        if !self.created_stages.contains(CreatedStage::KernelDomain) {
+            self.handles_closed = true;
+            return Ok(());
+        }
         if let Some(mut kernel) = self.kernel.take() {
             kernel.control.abort();
             if kernel
@@ -534,12 +574,24 @@ impl destroy::DestroyOps for StrictCleanupRecord {
             return Err(destroy::failure(super::FailureCategory::Unavailable));
         }
         self.active_root.verify_binding()?;
-        self.attempt_root.verify_binding()?;
-        self.rootfs.verify_binding()?;
+        if self
+            .created_stages
+            .contains(CreatedStage::AttemptFilesystem)
+        {
+            self.attempt_root.verify_binding()?;
+            self.rootfs.verify_binding()?;
+        }
         prove_no_mount_below(self.attempt_root.root_path())
     }
 
     fn remove_runtime_socket(&mut self) -> Result<(), super::ExecutionDomainError> {
+        if !self
+            .created_stages
+            .contains(CreatedStage::RootlessKitSocket)
+            && !self.created_stages.contains(CreatedStage::RuntimeSocket)
+        {
+            return Ok(());
+        }
         if let Some(socket) = self.rootlesskit_socket.as_ref() {
             socket.remove()?;
             self.rootlesskit_socket = None;
@@ -563,6 +615,12 @@ impl destroy::DestroyOps for StrictCleanupRecord {
     }
 
     fn remove_filesystem(&mut self) -> Result<(), super::ExecutionDomainError> {
+        if !self
+            .created_stages
+            .contains(CreatedStage::AttemptFilesystem)
+        {
+            return Ok(());
+        }
         if let Some((map, worker)) = self.mapped_cleanup.as_ref() {
             let roots = self
                 .writable_roots
@@ -579,6 +637,9 @@ impl destroy::DestroyOps for StrictCleanupRecord {
     }
 
     fn remove_cgroup(&mut self) -> Result<(), super::ExecutionDomainError> {
+        if !self.created_stages.contains(CreatedStage::AttemptCgroup) {
+            return Ok(());
+        }
         self.cgroup.remove()?;
         self.discharge_stage(CreatedStage::AttemptCgroup)
     }
@@ -588,10 +649,9 @@ impl destroy::DestroyOps for StrictCleanupRecord {
     }
 
     fn mark_destroyed(&mut self) -> Result<(), super::ExecutionDomainError> {
-        self.lifecycle
-            .as_mut()
-            .ok_or_else(|| destroy::failure(super::FailureCategory::NotReady))?
-            .complete_destroyed()?;
+        if let Some(lifecycle) = self.lifecycle.as_mut() {
+            lifecycle.complete_destroyed()?;
+        }
         if !self.created_stages.is_empty() {
             return Err(destroy::failure(super::FailureCategory::IdentityMismatch));
         }

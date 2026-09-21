@@ -131,6 +131,7 @@ pub struct ExecutionDomainRoot {
     state: Arc<ExecutionDomainState>,
     admission: Arc<Semaphore>,
     manager_tasks: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+    retained_cleanups: Arc<manager::RetainedCleanupRegistry>,
     #[cfg(test)]
     provision_pause: Arc<Mutex<Option<ProvisionPause>>>,
 }
@@ -427,6 +428,7 @@ impl ExecutionDomainRoot {
             state: Arc::new(ExecutionDomainState::new()),
             admission: Arc::new(Semaphore::new(capacity.get())),
             manager_tasks: Arc::new(Mutex::new(Vec::new())),
+            retained_cleanups: Arc::new(manager::RetainedCleanupRegistry::default()),
             #[cfg(test)]
             provision_pause: Arc::new(Mutex::new(None)),
         })
@@ -464,6 +466,12 @@ impl ExecutionDomainRoot {
         for handle in handles {
             let _ = handle.await;
         }
+        self.retained_cleanups.retry_all();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retained_cleanup_count_for_test(&self) -> usize {
+        self.retained_cleanups.len()
     }
 
     #[cfg(test)]
@@ -953,6 +961,21 @@ impl ExecutionDomain {
             })?
     }
 
+    pub(crate) async fn authorize_external_revocation(&self) -> Result<(), ExecutionDomainError> {
+        let (reply, response) = tokio::sync::oneshot::channel();
+        self.sender()?
+            .send(manager::ManagerRequest::AuthorizeExternalRevocation { reply })
+            .await
+            .map_err(|_| ExecutionDomainError::PoisonedRoot {
+                path: self.root.clone(),
+            })?;
+        response
+            .await
+            .map_err(|_| ExecutionDomainError::PoisonedRoot {
+                path: self.root.clone(),
+            })?
+    }
+
     #[cfg(test)]
     async fn panic_manager_for_test(&self) -> Result<(), ExecutionDomainError> {
         self.sender()?
@@ -963,27 +986,29 @@ impl ExecutionDomain {
             })
     }
 
-    pub async fn destroy(mut self) -> Result<DestroyReport, ExecutionDomainError> {
+    pub async fn destroy(&mut self) -> Result<DestroyReport, ExecutionDomainError> {
         let (reply, response) = tokio::sync::oneshot::channel();
-        let sender = self
-            .request
-            .take()
-            .ok_or_else(|| ExecutionDomainError::AdmissionClosed {
+        let sender = self.request.as_ref().cloned().ok_or_else(|| {
+            ExecutionDomainError::AdmissionClosed {
                 path: self.root.clone(),
-            })?;
-        self.explicit_destroy = true;
+            }
+        })?;
         sender
             .send(manager::ManagerRequest::Destroy { reply })
             .await
             .map_err(|_| ExecutionDomainError::PoisonedRoot {
                 path: self.root.clone(),
             })?;
-        drop(sender);
-        response
+        let result = response
             .await
             .map_err(|_| ExecutionDomainError::PoisonedRoot {
                 path: self.root.clone(),
-            })?
+            })?;
+        if result.is_ok() {
+            self.explicit_destroy = true;
+            self.request.take();
+        }
+        result
     }
 
     pub fn paths(&self) -> &DomainPaths {

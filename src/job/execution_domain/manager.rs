@@ -43,6 +43,9 @@ pub(super) enum ManagerRequest {
         reason: CancelReason,
         reply: oneshot::Sender<Result<(), ExecutionDomainError>>,
     },
+    AuthorizeExternalRevocation {
+        reply: oneshot::Sender<Result<(), ExecutionDomainError>>,
+    },
     Destroy {
         reply: oneshot::Sender<Result<DestroyReport, ExecutionDomainError>>,
     },
@@ -64,6 +67,88 @@ enum Backend {
     Linux(LinuxBackend),
 }
 
+#[derive(Default)]
+pub(super) struct RetainedCleanupRegistry {
+    entries: Mutex<Vec<RetainedCleanup>>,
+}
+
+struct RetainedCleanup {
+    authority: RetainedAuthority,
+    guard: ManagerPermitGuard,
+    attempt: AttemptIdentity,
+}
+
+enum RetainedAuthority {
+    Backend(Backend),
+    #[cfg(target_os = "linux")]
+    Partial(super::linux::StrictPartialCleanup),
+}
+
+struct ProvisionFailure {
+    error: ExecutionDomainError,
+    #[cfg(target_os = "linux")]
+    partial: Option<super::linux::StrictPartialCleanup>,
+}
+
+impl std::fmt::Debug for RetainedCleanupRegistry {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RetainedCleanupRegistry")
+            .field("entries", &self.len())
+            .finish()
+    }
+}
+
+impl RetainedCleanupRegistry {
+    fn retain(&self, backend: Backend, guard: ManagerPermitGuard, attempt: AttemptIdentity) {
+        self.retain_authority(RetainedAuthority::Backend(backend), guard, attempt);
+    }
+
+    fn retain_authority(
+        &self,
+        authority: RetainedAuthority,
+        guard: ManagerPermitGuard,
+        attempt: AttemptIdentity,
+    ) {
+        self.entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(RetainedCleanup {
+                authority,
+                guard,
+                attempt,
+            });
+    }
+
+    pub(super) fn len(&self) -> usize {
+        self.entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
+    }
+
+    pub(super) fn retry_all(&self) {
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut retained = Vec::new();
+        for mut entry in std::mem::take(&mut *entries) {
+            let result = match &mut entry.authority {
+                RetainedAuthority::Backend(backend) => backend.destroy(entry.attempt).map(|_| ()),
+                #[cfg(target_os = "linux")]
+                RetainedAuthority::Partial(partial) => partial.retry(),
+            };
+            if result.is_ok() {
+                entry.guard.confirmed_destroyed();
+            } else {
+                retained.push(entry);
+            }
+        }
+        *entries = retained;
+    }
+}
+
 #[cfg(target_os = "linux")]
 struct LinuxBackend {
     cleanup: Option<super::linux::StrictCleanupRecord>,
@@ -77,10 +162,18 @@ struct LinuxBackend {
 #[cfg(target_os = "linux")]
 const CONTROL_CANCEL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 
-enum BackendBuilder {
-    Trusted,
+struct BackendBuilder {
     #[cfg(target_os = "linux")]
-    Sandboxed(super::linux::StrictBackendBuilder),
+    sandboxed: Option<super::linux::StrictBackendBuilder>,
+}
+
+impl BackendBuilder {
+    fn trusted() -> Self {
+        Self {
+            #[cfg(target_os = "linux")]
+            sandboxed: None,
+        }
+    }
 }
 
 struct ManagerPermitGuard {
@@ -161,28 +254,14 @@ impl DomainManager {
         permit: OwnedSemaphorePermit,
         attempt: AttemptIdentity,
     ) -> Result<ExecutionDomain, ExecutionDomainError> {
-        Self::spawn_selected(root, permit, attempt, BackendBuilder::Trusted).await
-    }
-
-    #[cfg(target_os = "linux")]
-    #[expect(
-        dead_code,
-        reason = "private strict selector is called by C1 only after endpoint installation"
-    )]
-    pub(in crate::job::execution_domain) async fn spawn_sandboxed(
-        root: ExecutionDomainRoot,
-        permit: OwnedSemaphorePermit,
-        attempt: AttemptIdentity,
-        builder: super::linux::StrictBackendBuilder,
-    ) -> Result<ExecutionDomain, ExecutionDomainError> {
-        Self::spawn_selected(root, permit, attempt, BackendBuilder::Sandboxed(builder)).await
+        Self::spawn_selected(root, permit, attempt, BackendBuilder::trusted()).await
     }
 
     async fn spawn_selected(
         root: ExecutionDomainRoot,
         permit: OwnedSemaphorePermit,
         attempt: AttemptIdentity,
-        builder: BackendBuilder,
+        _builder: BackendBuilder,
     ) -> Result<ExecutionDomain, ExecutionDomainError> {
         let (request, mut receiver) = mpsc::channel(32);
         let (ready_tx, ready_rx) = oneshot::channel();
@@ -201,44 +280,72 @@ impl DomainManager {
             let mut guard = guard;
             let reader = DomainWorkspaceReader::unbound();
             let mut backend_slot: Option<Backend> = None;
+            #[cfg(target_os = "linux")]
+            let mut partial_slot: Option<super::linux::StrictPartialCleanup> = None;
             let mut ready_tx = Some(ready_tx);
 
             let managed = AssertUnwindSafe(async {
                 let provision_root = root.clone();
                 #[cfg(target_os = "linux")]
                 let provision_state = Arc::clone(&state);
-                let provision = tokio::task::spawn_blocking(move || match builder {
-                    BackendBuilder::Trusted => provision_root
-                        .create_domain_with_id(attempt.uuid())
-                        .map(|backend| Backend::Trusted(Box::new(backend))),
+                let provision = tokio::task::spawn_blocking(move || {
+                    #[cfg(not(target_os = "linux"))]
+                    {
+                        provision_root
+                            .create_domain_with_id(attempt.uuid())
+                            .map(|backend| Backend::Trusted(Box::new(backend)))
+                            .map_err(|error| ProvisionFailure { error })
+                    }
                     #[cfg(target_os = "linux")]
-                    BackendBuilder::Sandboxed(builder) => builder
-                        .build()
-                        .map_err(|failure| {
-                            if failure.quarantine() {
-                                provision_state.poison();
-                            }
-                            failure.into_error()
-                        })
-                        .map(|parts| {
-                            Backend::Linux(LinuxBackend {
+                    if let Some(builder) = _builder.sandboxed {
+                        match builder.build() {
+                            Ok(parts) => Ok(Backend::Linux(LinuxBackend {
                                 cleanup: Some(parts.cleanup),
                                 #[cfg(test)]
                                 test_kernel: None,
                                 path_mappings: parts.path_mappings,
                                 next_command_id: 1,
                                 control_broken: false,
+                            })),
+                            Err(failure) => {
+                                if failure.quarantine() {
+                                    provision_state.poison();
+                                }
+                                let (error, partial) = failure.into_parts();
+                                Err(ProvisionFailure { error, partial })
+                            }
+                        }
+                    } else {
+                        provision_root
+                            .create_domain_with_id(attempt.uuid())
+                            .map(|backend| Backend::Trusted(Box::new(backend)))
+                            .map_err(|error| ProvisionFailure {
+                                error,
+                                partial: None,
                             })
-                        }),
+                    }
                 })
                 .await;
                 let backend = match provision {
                     Ok(Ok(backend)) => backend,
-                    Ok(Err(error)) => {
+                    Ok(Err(failure)) => {
+                        #[cfg(target_os = "linux")]
+                        if let Some(partial) = failure.partial {
+                            state.poison();
+                            partial_slot = Some(partial);
+                            let _ = ready_tx
+                                .take()
+                                .expect("ready sender")
+                                .send(Err(failure.error));
+                            return;
+                        }
                         if !*state.poisoned.borrow() {
                             guard.release_without_resources();
                         }
-                        let _ = ready_tx.take().expect("ready sender").send(Err(error));
+                        let _ = ready_tx
+                            .take()
+                            .expect("ready sender")
+                            .send(Err(failure.error));
                         return;
                     }
                     Err(_) => {
@@ -289,6 +396,7 @@ impl DomainManager {
                     }
                     return;
                 }
+                with_backend_blocking(&mut backend_slot, Backend::mark_published).await;
                 manager_loop(
                     &mut backend_slot,
                     &mut receiver,
@@ -312,6 +420,19 @@ impl DomainManager {
                 {
                     release_destroyed_backend(&mut backend_slot, &mut guard);
                 }
+            }
+            #[cfg(target_os = "linux")]
+            if let Some(partial) = partial_slot.take() {
+                root.retained_cleanups.retain_authority(
+                    RetainedAuthority::Partial(partial),
+                    guard,
+                    attempt,
+                );
+                return;
+            }
+            if let Some(backend) = backend_slot.take() {
+                state.poison();
+                root.retained_cleanups.retain(backend, guard, attempt);
             }
         };
         let handle = manager_runtime()
@@ -397,11 +518,10 @@ async fn destroy_managed(
     attempt: AttemptIdentity,
 ) -> Result<DestroyReport, ExecutionDomainError> {
     let reader_result = revoke_reader(reader).await;
-    if reader_result.is_ok() {
-        with_backend_blocking(backend_slot, Backend::authorize_external_revocation).await;
-    } else if !backend_slot
-        .as_ref()
-        .is_some_and(Backend::needs_revocation_failure_neutralization)
+    if reader_result.is_err()
+        && !backend_slot
+            .as_ref()
+            .is_some_and(Backend::needs_revocation_failure_neutralization)
     {
         // Trusted cleanup has no separate kill-only phase. Preserve its files
         // while a reader still holds authority; the guard poisons capacity.
@@ -579,15 +699,23 @@ async fn manager_loop(
                         .await;
                 let _ = reply.send(result);
             }
+            ManagerRequest::AuthorizeExternalRevocation { reply } => {
+                with_backend_blocking(backend_slot, Backend::authorize_external_revocation).await;
+                let _ = reply.send(Ok(()));
+            }
             ManagerRequest::Destroy { reply } => {
-                receiver.close();
                 let result = destroy_managed(backend_slot, reader.clone(), attempt).await;
                 if result.is_ok() {
+                    receiver.close();
                     release_destroyed_backend(backend_slot, guard);
                 }
                 // Cleanup is already terminal; a dropped reply cannot cancel it.
+                let success = result.is_ok();
                 let _ = reply.send(result);
-                return;
+                if success {
+                    return;
+                }
+                guard.root_state.poison();
             }
             #[cfg(test)]
             ManagerRequest::BlockStateForTest {
@@ -633,6 +761,9 @@ fn reject_while_running(request: ManagerRequest) {
         ManagerRequest::Cancel { reply, .. } => {
             let _ = reply.send(Err(error()));
         }
+        ManagerRequest::AuthorizeExternalRevocation { reply } => {
+            let _ = reply.send(Err(error()));
+        }
         ManagerRequest::Destroy { reply } => {
             let _ = reply.send(Err(error()));
         }
@@ -646,6 +777,18 @@ fn reject_while_running(request: ManagerRequest) {
 }
 
 impl Backend {
+    fn mark_published(&mut self) {
+        match self {
+            Self::Trusted(_) => {}
+            #[cfg(target_os = "linux")]
+            Self::Linux(backend) => {
+                if let Some(cleanup) = &mut backend.cleanup {
+                    cleanup.mark_published();
+                }
+            }
+        }
+    }
+
     fn needs_revocation_failure_neutralization(&self) -> bool {
         match self {
             Self::Trusted(_) => false,

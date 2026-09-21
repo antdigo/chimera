@@ -5,6 +5,23 @@ use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
 
 #[test]
+fn kernel_ready_transfers_exact_mount_and_pid_namespace_handles() {
+    let (sender, receiver) = UnixStream::pair().unwrap();
+    let expected = NamespaceHandles::open_current_for_test().unwrap();
+    let identities = expected.identities_for_test();
+    send_namespace_handles_for_test(&sender, &expected).unwrap();
+
+    let received =
+        receive_namespace_handles_for_test(&receiver, Instant::now() + Duration::from_secs(1))
+            .unwrap();
+
+    assert_eq!(received.identities_for_test(), identities);
+    for fd in [received.mount.as_raw_fd(), received.pid.as_raw_fd()] {
+        assert!(fd >= 0);
+    }
+}
+
+#[test]
 fn launcher_never_selects_host_network_or_outer_ports() {
     let args = rootlesskit_arguments(
         &AttemptIdentity::from_uuid(uuid::Uuid::from_u128(7)).unwrap(),
@@ -229,6 +246,8 @@ fn kernel_handle_retains_deadline_and_detects_failed_launcher() {
                 Instant::now() + Duration::from_secs(2),
             )
             .unwrap();
+        let namespaces = NamespaceHandles::open_current_for_test().unwrap();
+        send_namespace_handles(control.control_fd(), &namespaces).unwrap();
     });
     let spec = BootstrapSpec {
         attempt,
@@ -243,6 +262,8 @@ fn kernel_handle_retains_deadline_and_detects_failed_launcher() {
         launcher: child,
         pidfd,
         deadline: Instant::now() + Duration::from_secs(2),
+        namespaces: None,
+        require_foreign_namespaces: false,
     };
     handle.bootstrap(spec.clone()).unwrap();
     peer.join().unwrap();

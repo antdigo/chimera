@@ -976,7 +976,7 @@ async fn docker_cli_atomic_rewrite_stays_private() {
         NonZeroUsize::new(1).unwrap(),
     )
     .unwrap();
-    let config = root
+    let mut config = root
         .reserve()
         .await
         .unwrap()

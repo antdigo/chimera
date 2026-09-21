@@ -9,6 +9,20 @@ use super::cleanup::{
     RuntimeSocketCapability, RuntimeSocketRootKind,
 };
 
+#[test]
+fn timed_out_child_is_killed_and_reaped_within_the_same_deadline() {
+    let mut child = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(100);
+
+    assert!(super::cleanup::wait_child_for_test(&mut child, deadline).is_err());
+
+    assert!(child.try_wait().unwrap().is_some());
+    assert!(std::time::Instant::now() <= deadline + std::time::Duration::from_millis(50));
+}
+
 fn fixture() -> (TempDir, MappedIdRange, PinnedCleanupRoot) {
     let temporary = TempDir::new().unwrap();
     let root = temporary.path().join("work");

@@ -37,7 +37,7 @@ pub(super) fn install_signal_handlers() -> Result<(), ExecutionDomainError> {
     SHUTDOWN.store(false, Ordering::Relaxed);
     for signal in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP, libc::SIGCHLD] {
         let mut action = unsafe { std::mem::zeroed::<libc::sigaction>() };
-        action.sa_sigaction = signal_received as usize;
+        action.sa_sigaction = signal_received as *const () as usize;
         unsafe { libc::sigemptyset(&mut action.sa_mask) };
         if unsafe { libc::sigaction(signal, &action, std::ptr::null_mut()) } < 0 {
             return Err(io_failure());
@@ -105,6 +105,11 @@ pub(super) fn serve(
                             connection.send(
                                 Message::Response(Response::KernelReady),
                                 Instant::now() + super::launcher::STARTUP_TIMEOUT,
+                            )?;
+                            let namespaces = super::launcher::NamespaceHandles::open_current()?;
+                            super::launcher::send_namespace_handles(
+                                connection.control_fd(),
+                                &namespaces,
                             )?;
                             return InitRuntime {
                                 connection,

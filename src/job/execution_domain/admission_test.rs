@@ -15,7 +15,7 @@ fn prepared_root_with_capacity(temp: &tempfile::TempDir, capacity: usize) -> Exe
 async fn second_reservation_waits_until_first_domain_is_destroyed() {
     let temp = tempfile::tempdir().unwrap();
     let root = prepared_root_with_capacity(&temp, 1);
-    let first = root
+    let mut first = root
         .reserve()
         .await
         .unwrap()

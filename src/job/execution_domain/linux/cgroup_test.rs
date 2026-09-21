@@ -325,6 +325,42 @@ async fn timed_out_inventory_is_joined_and_hard_bounded() {
     );
 }
 
+#[test]
+fn synchronous_term_and_kill_fallback_stop_at_the_absolute_deadline() {
+    let fixture = Fixture::new();
+    let root = fixture.ready();
+    let attempt = root
+        .create_attempt(AttemptIdentity::new(), &limits())
+        .unwrap();
+    let started = Arc::new(AtomicBool::new(false));
+    let release = Arc::new(AtomicBool::new(false));
+    *fixture.fs.scan_gate.lock().unwrap() = Some(ScanGate {
+        started: started.clone(),
+        release: release.clone(),
+    });
+    let release_thread = std::thread::spawn(move || {
+        while !started.load(Ordering::Acquire) {
+            std::thread::yield_now();
+        }
+        std::thread::sleep(Duration::from_millis(20));
+        release.store(true, Ordering::Release);
+    });
+
+    let deadline = std::time::Instant::now() + Duration::from_millis(5);
+    assert!(matches!(
+        attempt.term(deadline),
+        Err(ExecutionDomainError::Backend {
+            category: FailureCategory::Timeout,
+            ..
+        })
+    ));
+    release_thread.join().unwrap();
+
+    fixture.fail("write", "cgroup.kill");
+    let deadline = std::time::Instant::now() + Duration::from_millis(5);
+    assert!(attempt.kill_until(deadline).is_err());
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn emptiness_scan_does_not_block_the_async_executor() {
     let fixture = Fixture::new();
@@ -680,7 +716,11 @@ async fn filesystem_change_refuses_kill_wait_and_remove() {
     let id = AttemptIdentity::new();
     let attempt = root.create_attempt(id, &limits()).unwrap();
     *fixture.fs.wrong_filesystem.lock().unwrap() = true;
-    assert!(attempt.kill().is_err());
+    assert!(
+        attempt
+            .kill_until(std::time::Instant::now() + Duration::from_secs(1))
+            .is_err()
+    );
     assert!(
         attempt
             .wait_empty(Duration::from_millis(100))
@@ -762,7 +802,7 @@ fn failed_kill_uses_pidfd_for_only_the_owned_fixture_child() {
     )
     .unwrap();
     fixture.fail("write", "cgroup.kill");
-    let result = attempt.kill();
+    let result = attempt.kill_until(std::time::Instant::now() + Duration::from_secs(1));
     let deadline = std::time::Instant::now() + Duration::from_secs(2);
     let terminated = loop {
         if child.try_wait().unwrap().is_some() {
@@ -926,13 +966,19 @@ async fn kill_failure_is_not_success_even_when_fallback_has_no_members() {
     let root = fixture.ready();
     let id = AttemptIdentity::new();
     let attempt = root.create_attempt(id, &limits()).unwrap();
-    attempt.kill().unwrap();
+    attempt
+        .kill_until(std::time::Instant::now() + Duration::from_secs(1))
+        .unwrap();
     assert_eq!(
         fs::read_to_string(fixture.attempt_path(id).join("cgroup.kill")).unwrap(),
         "1\n"
     );
     fixture.fail("write", "cgroup.kill");
-    assert!(attempt.kill().is_err());
+    assert!(
+        attempt
+            .kill_until(std::time::Instant::now() + Duration::from_secs(1))
+            .is_err()
+    );
     attempt
         .wait_empty(Duration::from_millis(100))
         .await
@@ -973,7 +1019,11 @@ async fn replaced_directory_and_symlink_controls_are_refused() {
     fs::write(&canary, "safe").unwrap();
     fs::remove_file(fixture.attempt_path(id).join("cgroup.kill")).unwrap();
     symlink(&canary, fixture.attempt_path(id).join("cgroup.kill")).unwrap();
-    assert!(attempt.kill().is_err());
+    assert!(
+        attempt
+            .kill_until(std::time::Instant::now() + Duration::from_secs(1))
+            .is_err()
+    );
     assert!(
         attempt
             .wait_empty(Duration::from_millis(100))

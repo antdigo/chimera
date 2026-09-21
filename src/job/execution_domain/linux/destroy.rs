@@ -25,7 +25,7 @@ pub(super) trait DestroyOps {
     fn graceful_shutdown(&mut self, deadline: Instant) -> Result<(), ExecutionDomainError>;
     fn term_members(&mut self, deadline: Instant) -> Result<(), ExecutionDomainError>;
     fn recursively_empty_until(&mut self, deadline: Instant) -> Result<bool, ExecutionDomainError>;
-    fn kill_all(&mut self) -> Result<(), ExecutionDomainError>;
+    fn kill_all(&mut self, deadline: Instant) -> Result<(), ExecutionDomainError>;
     fn reap_launcher(&mut self, deadline: Instant) -> Result<(), ExecutionDomainError>;
     fn drain_diagnostics(&mut self, deadline: Instant) -> Result<(), ExecutionDomainError>;
     fn close_handles(&mut self) -> Result<(), ExecutionDomainError>;
@@ -77,7 +77,7 @@ pub(super) fn destroy_kernel<O: DestroyOps>(
     let forced_kill = !graceful_empty || first_error.is_some();
     let mut empty_proven = graceful_empty;
     if forced_kill {
-        retain_first(&mut first_error, operations.kill_all());
+        retain_first(&mut first_error, operations.kill_all(kill_deadline));
         match operations.recursively_empty_until(kill_deadline) {
             Ok(true) => empty_proven = true,
             Ok(false) => retain_first(&mut first_error, Err(failure(FailureCategory::Timeout))),

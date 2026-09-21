@@ -6,6 +6,18 @@ use uuid::Uuid;
 use super::ExecutionDomainError;
 use super::journal::{DomainLifecycle, DomainState};
 
+#[test]
+fn quarantined_destroy_can_complete_in_memory_on_retry() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut lifecycle = DomainLifecycle::create(temp.path(), Uuid::new_v4()).unwrap();
+    lifecycle.transition(DomainState::Destroying).unwrap();
+    lifecycle.transition(DomainState::Quarantined).unwrap();
+
+    lifecycle.complete_destroyed().unwrap();
+
+    assert_eq!(lifecycle.state(), DomainState::Destroyed);
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn trusted_journal_does_not_require_strict_linux_syscalls() {
@@ -370,6 +382,7 @@ fn enforces_every_lifecycle_edge() {
         (Running, Destroying),
         (Cleaning, Destroying),
         (Destroying, Quarantined),
+        (Quarantined, Destroying),
     ];
     for (from, name) in states.into_iter().zip(names) {
         for to in states {

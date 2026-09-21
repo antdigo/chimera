@@ -4,6 +4,7 @@ use uuid::Uuid;
 
 use super::super::{AttemptIdentity, ExecutionDomainError, FailureCategory};
 use super::destroy::{DestroyOps, ShutdownBounds, destroy_kernel, failure};
+use super::{CreatedStage, CreatedStageStack, ExternalRevocationState};
 
 struct Harness {
     events: Vec<&'static str>,
@@ -73,7 +74,7 @@ impl DestroyOps for Harness {
             self.empty_before_kill
         })
     }
-    fn kill_all(&mut self) -> Result<(), ExecutionDomainError> {
+    fn kill_all(&mut self, _: Instant) -> Result<(), ExecutionDomainError> {
         self.event("kill")?;
         self.killed = true;
         Ok(())
@@ -109,6 +110,43 @@ impl DestroyOps for Harness {
 
 fn attempt() -> AttemptIdentity {
     AttemptIdentity::from_uuid(Uuid::from_u128(10)).unwrap()
+}
+
+#[test]
+fn published_cleanup_needs_an_explicit_external_revocation_proof() {
+    let mut state = ExternalRevocationState::Unpublished;
+    assert!(state.cleanup_allowed());
+
+    state.publish();
+    assert!(!state.cleanup_allowed());
+
+    state.prove();
+    assert!(state.cleanup_allowed());
+}
+
+#[test]
+fn created_stage_stack_retries_only_the_remaining_reverse_order() {
+    let mut stages = CreatedStageStack::new([CreatedStage::AttemptCgroup]);
+    for stage in [
+        CreatedStage::AttemptFilesystem,
+        CreatedStage::LifecycleJournal,
+        CreatedStage::RuntimeSocket,
+        CreatedStage::RootlessKitSocket,
+        CreatedStage::KernelDomain,
+        CreatedStage::Evacuated,
+    ] {
+        stages.push(stage);
+    }
+
+    assert!(stages.discharge(CreatedStage::AttemptFilesystem).is_err());
+    stages.discharge(CreatedStage::Evacuated).unwrap();
+    stages.discharge(CreatedStage::KernelDomain).unwrap();
+    stages.discharge(CreatedStage::RootlessKitSocket).unwrap();
+    stages.discharge(CreatedStage::RuntimeSocket).unwrap();
+    stages.discharge(CreatedStage::LifecycleJournal).unwrap();
+    stages.discharge(CreatedStage::AttemptFilesystem).unwrap();
+    stages.discharge(CreatedStage::AttemptCgroup).unwrap();
+    assert!(stages.is_empty());
 }
 
 #[test]

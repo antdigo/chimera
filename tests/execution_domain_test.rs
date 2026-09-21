@@ -405,7 +405,7 @@ async fn cleanup_runs_for_all_job_outcomes() {
         NonZeroUsize::new(2).unwrap(),
     )
     .unwrap();
-    let neighbor = execution_domains
+    let mut neighbor = execution_domains
         .reserve()
         .await
         .unwrap()

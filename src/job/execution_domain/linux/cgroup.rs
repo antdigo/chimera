@@ -1,16 +1,9 @@
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "private B3/B4 construction and Task 10 teardown are not daemon-activated yet"
-    )
-)]
-
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{CStr, CString};
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
+#[cfg(test)]
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -59,6 +52,7 @@ impl TraversalBudget {
     }
 }
 
+#[cfg(test)]
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum CgroupOperation {
     CreateAttempt,
@@ -69,6 +63,7 @@ pub(super) enum CgroupOperation {
     OpenMembership,
 }
 
+#[cfg(test)]
 pub(super) fn creation_operations(writes: &[(&str, String)]) -> Vec<CgroupOperation> {
     let mut operations = vec![CgroupOperation::CreateAttempt];
     operations.extend(
@@ -135,6 +130,7 @@ pub(in crate::job::execution_domain) trait CgroupFilesystem:
 pub(in crate::job::execution_domain) struct KernelCgroupFs;
 impl CgroupFilesystem for KernelCgroupFs {}
 
+#[cfg(test)]
 pub(super) struct CgroupRoot<F = KernelCgroupFs> {
     directory: Arc<CgroupDir<F>>,
     global: Option<ValidatedLimits>,
@@ -162,12 +158,14 @@ struct CgroupDir<F> {
     parent: Option<(Arc<CgroupDir<F>>, CString)>,
 }
 
+#[cfg(test)]
 impl CgroupRoot {
     pub(super) fn open_delegated(path: &Path) -> Result<Self, ExecutionDomainError> {
         Self::open_with_filesystem(path, Arc::new(KernelCgroupFs))
     }
 }
 
+#[cfg(test)]
 impl<F: CgroupFilesystem> CgroupRoot<F> {
     pub(super) fn open_with_filesystem(
         path: &Path,
@@ -348,27 +346,33 @@ impl<F: CgroupFilesystem> AttemptCgroup<F> {
         self.domain.enable_controllers()
     }
 
-    pub(super) fn kill(&self) -> Result<(), ExecutionDomainError> {
+    pub(super) fn kill_until(
+        &self,
+        deadline: std::time::Instant,
+    ) -> Result<(), ExecutionDomainError> {
+        deadline_check(deadline)?;
         match self.directory.write(c"cgroup.kill", "1") {
-            Ok(()) => Ok(()),
+            Ok(()) => deadline_check(deadline),
             Err(error) => {
                 // A pidfd targets only the process observed in bound membership.
                 // Failure still reaches the caller; only wait_empty can prove
                 // destruction, regardless of best-effort fallback progress.
-                self.kill_members_best_effort();
+                let _ = self.kill_members_best_effort(deadline);
                 Err(error)
             }
         }
     }
 
-    pub(super) fn term(&self) -> Result<(), ExecutionDomainError> {
+    pub(super) fn term(&self, deadline: std::time::Instant) -> Result<(), ExecutionDomainError> {
         let mut members = Vec::new();
-        for group in self.directory.tree()? {
-            members.extend(group.capture_members()?);
+        for group in self.directory.tree_until(deadline)? {
+            deadline_check(deadline)?;
+            members.extend(group.capture_members_until(deadline)?);
         }
         members.sort_by_key(|member| member.pid);
         members.dedup_by_key(|member| member.pid);
         for member in members {
+            deadline_check(deadline)?;
             member.signal(libc::SIGTERM)?;
         }
         Ok(())
@@ -421,7 +425,8 @@ impl<F: CgroupFilesystem> AttemptCgroup<F> {
         deadline: std::time::Instant,
     ) -> Result<bool, ExecutionDomainError> {
         loop {
-            if self.directory.recursively_empty()? {
+            deadline_check(deadline)?;
+            if self.directory.recursively_empty_until(deadline)? {
                 return Ok(true);
             }
             if std::time::Instant::now() >= deadline {
@@ -434,21 +439,28 @@ impl<F: CgroupFilesystem> AttemptCgroup<F> {
         }
     }
 
-    fn kill_members_best_effort(&self) {
-        let groups = match self.directory.tree() {
+    fn kill_members_best_effort(
+        &self,
+        deadline: std::time::Instant,
+    ) -> Result<(), ExecutionDomainError> {
+        let groups = match self.directory.tree_until(deadline) {
             Ok(groups) => groups,
             Err(error) => {
                 tracing::warn!(%error, "cannot inventory cgroup for pidfd fallback");
-                return;
+                return Err(error);
             }
         };
         for group in groups {
-            if let Err(error) = group.signal_members(libc::SIGKILL) {
+            deadline_check(deadline)?;
+            if let Err(error) = group.signal_members_until(libc::SIGKILL, deadline) {
                 tracing::warn!(%error, "cgroup pidfd fallback incomplete");
+                return Err(error);
             }
         }
+        Ok(())
     }
 
+    #[cfg(test)]
     pub(super) async fn wait_empty(&self, timeout: Duration) -> Result<(), ExecutionDomainError> {
         let deadline = std::time::Instant::now()
             .checked_add(timeout)
@@ -458,9 +470,10 @@ impl<F: CgroupFilesystem> AttemptCgroup<F> {
             // keeps blocking cgroupfs I/O off the async executor without the
             // timeout(detached-spawn_blocking) ownership hole.
             let directory = Arc::clone(&self.directory);
-            let scan = tokio::task::spawn_blocking(move || directory.recursively_empty())
-                .await
-                .map_err(|_| failure(FailureCategory::Unavailable))?;
+            let scan =
+                tokio::task::spawn_blocking(move || directory.recursively_empty_until(deadline))
+                    .await
+                    .map_err(|_| failure(FailureCategory::Unavailable))?;
             if std::time::Instant::now() >= deadline {
                 return Err(failure(FailureCategory::Timeout));
             }
@@ -506,10 +519,10 @@ impl<F: CgroupFilesystem> CleanupCgroup<F> {
         &self,
         deadline: std::time::Instant,
     ) -> Result<(), ExecutionDomainError> {
-        if !self.directory.recursively_empty()? {
+        if !self.directory.recursively_empty_until(deadline)? {
             self.directory.write(c"cgroup.kill", "1")?;
         }
-        while !self.directory.recursively_empty()? {
+        while !self.directory.recursively_empty_until(deadline)? {
             if std::time::Instant::now() >= deadline {
                 return Err(failure(FailureCategory::Timeout));
             }
@@ -661,6 +674,7 @@ impl<F: CgroupFilesystem> CgroupDir<F> {
         value.ok_or_else(|| failure(FailureCategory::IdentityMismatch))
     }
 
+    #[cfg(test)]
     fn has_children(&self) -> Result<bool, ExecutionDomainError> {
         self.verify()?;
         let mut budget = TraversalBudget::new();
@@ -698,6 +712,44 @@ impl<F: CgroupFilesystem> CgroupDir<F> {
         let mut groups = Vec::new();
         self.collect_tree(0, &mut TraversalBudget::new(), &mut groups)?;
         Ok(groups)
+    }
+
+    fn tree_until(
+        self: &Arc<Self>,
+        deadline: std::time::Instant,
+    ) -> Result<Vec<Arc<Self>>, ExecutionDomainError> {
+        let mut groups = Vec::new();
+        self.collect_tree_until(0, &mut TraversalBudget::new(), &mut groups, deadline)?;
+        Ok(groups)
+    }
+
+    fn collect_tree_until(
+        self: &Arc<Self>,
+        depth: usize,
+        budget: &mut TraversalBudget,
+        groups: &mut Vec<Arc<Self>>,
+        deadline: std::time::Instant,
+    ) -> Result<(), ExecutionDomainError> {
+        deadline_check(deadline)?;
+        self.verify()?;
+        deadline_check(deadline)?;
+        groups.push(Arc::clone(self));
+        let mut entries = dirfd::directory_entries_stream(self.bound.fd())?;
+        loop {
+            deadline_check(deadline)?;
+            budget.entry()?;
+            let Some(name) = entries.next() else {
+                break;
+            };
+            let name = name?;
+            if self.entry_is_directory(&name)? {
+                budget.child(depth + 1)?;
+                let child = self.child(&name)?;
+                child.collect_tree_until(depth + 1, budget, groups, deadline)?;
+            }
+        }
+        deadline_check(deadline)?;
+        self.verify()
     }
 
     fn collect_tree(
@@ -738,16 +790,45 @@ impl<F: CgroupFilesystem> CgroupDir<F> {
         Ok(!self.populated()? && self.members()?.is_empty())
     }
 
-    fn signal_members(&self, signal: i32) -> Result<(), ExecutionDomainError> {
-        for member in self.capture_members()? {
+    fn recursively_empty_until(
+        self: &Arc<Self>,
+        deadline: std::time::Instant,
+    ) -> Result<bool, ExecutionDomainError> {
+        for group in self.tree_until(deadline)? {
+            deadline_check(deadline)?;
+            if group.populated()? || !group.members()?.is_empty() {
+                deadline_check(deadline)?;
+                return Ok(false);
+            }
+        }
+        deadline_check(deadline)?;
+        let empty = !self.populated()? && self.members()?.is_empty();
+        deadline_check(deadline)?;
+        Ok(empty)
+    }
+
+    fn signal_members_until(
+        &self,
+        signal: i32,
+        deadline: std::time::Instant,
+    ) -> Result<(), ExecutionDomainError> {
+        for member in self.capture_members_until(deadline)? {
+            deadline_check(deadline)?;
             member.signal(signal)?;
         }
         Ok(())
     }
 
-    fn capture_members(&self) -> Result<Vec<BoundPidfd>, ExecutionDomainError> {
+    fn capture_members_until(
+        &self,
+        deadline: std::time::Instant,
+    ) -> Result<Vec<BoundPidfd>, ExecutionDomainError> {
+        deadline_check(deadline)?;
+        let pids = self.members()?;
+        deadline_check(deadline)?;
         let mut captured = Vec::new();
-        for pid in self.members()? {
+        for pid in pids {
+            deadline_check(deadline)?;
             let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) } as i32;
             if fd < 0 {
                 let error = io::Error::last_os_error();
@@ -757,13 +838,21 @@ impl<F: CgroupFilesystem> CgroupDir<F> {
                 return Err(io_failure(error));
             }
             let fd = unsafe { OwnedFd::from_raw_fd(fd) };
-            // A recycled PID outside the exact cgroup must not be signalled.
             if !self.members()?.contains(&pid) {
                 continue;
             }
+            deadline_check(deadline)?;
             captured.push(BoundPidfd { pid, fd });
         }
         Ok(captured)
+    }
+}
+
+fn deadline_check(deadline: std::time::Instant) -> Result<(), ExecutionDomainError> {
+    if std::time::Instant::now() >= deadline {
+        Err(failure(FailureCategory::Timeout))
+    } else {
+        Ok(())
     }
 }
 
@@ -788,6 +877,7 @@ impl BoundPidfd {
     }
 }
 
+#[cfg(test)]
 fn required<T>(value: &Option<T>) -> Result<&T, ExecutionDomainError> {
     value
         .as_ref()

@@ -162,7 +162,10 @@ impl DomainLifecycle {
     }
 
     pub(super) fn complete_destroyed(&mut self) -> Result<(), ExecutionDomainError> {
-        if self.state != DomainState::Destroying {
+        if !matches!(
+            self.state,
+            DomainState::Destroying | DomainState::Quarantined
+        ) {
             return Err(ExecutionDomainError::InvalidTransition {
                 from: self.state,
                 to: DomainState::Destroyed,
@@ -341,5 +344,6 @@ fn transition_allowed(from: DomainState, to: DomainState) -> bool {
             DomainState::Cleaning | DomainState::Destroying
         ) | (DomainState::Cleaning, DomainState::Destroying)
             | (DomainState::Destroying, DomainState::Quarantined)
+            | (DomainState::Quarantined, DomainState::Destroying)
     )
 }

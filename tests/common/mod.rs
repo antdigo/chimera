@@ -132,7 +132,7 @@ impl TestEnv {
         access_token: &str,
         registry_auth: Option<&RegistryAuth>,
     ) -> anyhow::Result<ObservedRun> {
-        let domain = self
+        let mut domain = self
             .execution_domains
             .reserve()
             .await?
@@ -297,7 +297,7 @@ impl TestEnv {
         manifest: &JobManifest,
         docker_resources: &JobDockerResources,
     ) -> anyhow::Result<(JobConclusion, HashMap<String, String>)> {
-        let domain = self
+        let mut domain = self
             .execution_domains
             .reserve()
             .await?

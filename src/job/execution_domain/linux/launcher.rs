@@ -275,6 +275,197 @@ pub(in crate::job::execution_domain) struct KernelDomain {
     pub launcher: std::process::Child,
     pub pidfd: OwnedFd,
     pub deadline: std::time::Instant,
+    pub(in crate::job::execution_domain) namespaces: Option<NamespaceHandles>,
+    #[cfg(test)]
+    pub(in crate::job::execution_domain) require_foreign_namespaces: bool,
+}
+
+pub(in crate::job::execution_domain) struct NamespaceHandles {
+    pub(super) mount: OwnedFd,
+    pub(super) pid: OwnedFd,
+}
+
+impl NamespaceHandles {
+    pub(super) fn open_current() -> Result<Self, ExecutionDomainError> {
+        Ok(Self {
+            mount: open_namespace(c"/proc/self/ns/mnt")?,
+            pid: open_namespace(c"/proc/self/ns/pid")?,
+        })
+    }
+
+    fn identities(&self) -> Result<[(u64, u64); 2], ExecutionDomainError> {
+        Ok([fd_identity(&self.mount)?, fd_identity(&self.pid)?])
+    }
+
+    #[cfg(test)]
+    pub(super) fn open_current_for_test() -> Result<Self, ExecutionDomainError> {
+        Self::open_current()
+    }
+
+    #[cfg(test)]
+    pub(super) fn identities_for_test(&self) -> [(u64, u64); 2] {
+        self.identities().expect("namespace fd identity")
+    }
+}
+
+fn open_namespace(path: &std::ffi::CStr) -> Result<OwnedFd, ExecutionDomainError> {
+    let raw = unsafe { libc::open(path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+    if raw < 0 {
+        return Err(io_failure(io::Error::last_os_error()));
+    }
+    let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+    let mut filesystem = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    if unsafe { libc::fstatfs(raw, filesystem.as_mut_ptr()) } < 0 {
+        return Err(io_failure(io::Error::last_os_error()));
+    }
+    const NSFS_MAGIC: libc::c_long = 0x6e736673;
+    if unsafe { filesystem.assume_init() }.f_type != NSFS_MAGIC {
+        return Err(failure(FailureCategory::IdentityMismatch));
+    }
+    Ok(fd)
+}
+
+fn fd_identity(fd: &OwnedFd) -> Result<(u64, u64), ExecutionDomainError> {
+    let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
+    if unsafe { libc::fstat(fd.as_raw_fd(), metadata.as_mut_ptr()) } < 0 {
+        return Err(io_failure(io::Error::last_os_error()));
+    }
+    let metadata = unsafe { metadata.assume_init() };
+    Ok((metadata.st_dev, metadata.st_ino))
+}
+
+pub(super) fn send_namespace_handles(
+    socket: BorrowedFd<'_>,
+    handles: &NamespaceHandles,
+) -> Result<(), ExecutionDomainError> {
+    let byte = [b'N'];
+    let mut io = libc::iovec {
+        iov_base: byte.as_ptr().cast_mut().cast(),
+        iov_len: byte.len(),
+    };
+    let fds = [handles.mount.as_raw_fd(), handles.pid.as_raw_fd()];
+    let space = unsafe { libc::CMSG_SPACE(std::mem::size_of_val(&fds) as _) } as usize;
+    let mut control = vec![0u8; space];
+    let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
+    message.msg_iov = &mut io;
+    message.msg_iovlen = 1;
+    message.msg_control = control.as_mut_ptr().cast();
+    message.msg_controllen = control.len();
+    unsafe {
+        let header = libc::CMSG_FIRSTHDR(&message);
+        if header.is_null() {
+            return Err(failure(FailureCategory::Protocol));
+        }
+        (*header).cmsg_level = libc::SOL_SOCKET;
+        (*header).cmsg_type = libc::SCM_RIGHTS;
+        (*header).cmsg_len = libc::CMSG_LEN(std::mem::size_of_val(&fds) as _) as usize;
+        std::ptr::copy_nonoverlapping(fds.as_ptr(), libc::CMSG_DATA(header).cast(), fds.len());
+        message.msg_controllen = (*header).cmsg_len;
+        if libc::sendmsg(socket.as_raw_fd(), &message, libc::MSG_NOSIGNAL) != 1 {
+            return Err(io_failure(io::Error::last_os_error()));
+        }
+    }
+    Ok(())
+}
+
+fn receive_namespace_handles(
+    socket: BorrowedFd<'_>,
+    deadline: std::time::Instant,
+    require_foreign: bool,
+) -> Result<NamespaceHandles, ExecutionDomainError> {
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(failure(FailureCategory::Timeout));
+        }
+        let mut poll = libc::pollfd {
+            fd: socket.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let millis = remaining.as_millis().min(i32::MAX as u128) as i32;
+        let ready = unsafe { libc::poll(&mut poll, 1, millis.max(1)) };
+        if ready < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+            continue;
+        }
+        if ready < 0 {
+            return Err(io_failure(io::Error::last_os_error()));
+        }
+        if ready == 0 {
+            continue;
+        }
+        break;
+    }
+    let mut byte = [0u8; 1];
+    let mut io = libc::iovec {
+        iov_base: byte.as_mut_ptr().cast(),
+        iov_len: byte.len(),
+    };
+    let space = unsafe { libc::CMSG_SPACE((2 * std::mem::size_of::<i32>()) as _) } as usize;
+    let mut control = vec![0u8; space];
+    let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
+    message.msg_iov = &mut io;
+    message.msg_iovlen = 1;
+    message.msg_control = control.as_mut_ptr().cast();
+    message.msg_controllen = control.len();
+    let received =
+        unsafe { libc::recvmsg(socket.as_raw_fd(), &mut message, libc::MSG_CMSG_CLOEXEC) };
+    if received != 1
+        || byte != [b'N']
+        || message.msg_flags & (libc::MSG_CTRUNC | libc::MSG_TRUNC) != 0
+    {
+        return Err(failure(FailureCategory::Protocol));
+    }
+    let header = unsafe { libc::CMSG_FIRSTHDR(&message) };
+    if header.is_null()
+        || unsafe { (*header).cmsg_level } != libc::SOL_SOCKET
+        || unsafe { (*header).cmsg_type } != libc::SCM_RIGHTS
+    {
+        return Err(failure(FailureCategory::Protocol));
+    }
+    let empty = unsafe { libc::CMSG_LEN(0) } as usize;
+    let length = unsafe { (*header).cmsg_len };
+    if length < empty || !(length - empty).is_multiple_of(std::mem::size_of::<i32>()) {
+        return Err(failure(FailureCategory::Protocol));
+    }
+    let count = (length - empty) / std::mem::size_of::<i32>();
+    let raw = unsafe { std::slice::from_raw_parts(libc::CMSG_DATA(header).cast::<i32>(), count) };
+    let mut received_fds: Vec<OwnedFd> = raw
+        .iter()
+        .copied()
+        .map(|fd| unsafe { OwnedFd::from_raw_fd(fd) })
+        .collect();
+    if received_fds.len() != 2 || !unsafe { libc::CMSG_NXTHDR(&message, header) }.is_null() {
+        return Err(failure(FailureCategory::Protocol));
+    }
+    let handles = NamespaceHandles {
+        mount: received_fds.remove(0),
+        pid: received_fds.remove(0),
+    };
+    let identities = handles.identities()?;
+    if require_foreign {
+        let supervisor = NamespaceHandles::open_current()?.identities()?;
+        if identities[0] == supervisor[0] || identities[1] == supervisor[1] {
+            return Err(failure(FailureCategory::IdentityMismatch));
+        }
+    }
+    Ok(handles)
+}
+
+#[cfg(test)]
+pub(super) fn send_namespace_handles_for_test(
+    socket: &UnixStream,
+    handles: &NamespaceHandles,
+) -> Result<(), ExecutionDomainError> {
+    send_namespace_handles(std::os::fd::AsFd::as_fd(socket), handles)
+}
+
+#[cfg(test)]
+pub(super) fn receive_namespace_handles_for_test(
+    socket: &UnixStream,
+    deadline: std::time::Instant,
+) -> Result<NamespaceHandles, ExecutionDomainError> {
+    receive_namespace_handles(std::os::fd::AsFd::as_fd(socket), deadline, false)
 }
 
 pub(super) fn launch<F: super::cgroup::CgroupFilesystem>(
@@ -324,7 +515,18 @@ impl KernelDomain {
         // ownership is not publishable until init has assembled/pivoted the
         // rootfs, installed hardening and returned the kernel-ready proof.
         match self.control.request_until(Request::Hello, self.deadline)? {
-            Response::KernelReady => Ok(()),
+            Response::KernelReady => {
+                #[cfg(test)]
+                let require_foreign = self.require_foreign_namespaces;
+                #[cfg(not(test))]
+                let require_foreign = true;
+                self.namespaces = Some(receive_namespace_handles(
+                    self.control.control_fd(),
+                    self.deadline,
+                    require_foreign,
+                )?);
+                Ok(())
+            }
             _ => Err(failure(FailureCategory::Protocol)),
         }
     }
@@ -404,6 +606,9 @@ fn spawn_launcher(
         launcher: child,
         pidfd,
         deadline,
+        namespaces: None,
+        #[cfg(test)]
+        require_foreign_namespaces: true,
     };
     let bootstrap = domain.bootstrap(BootstrapSpec {
         attempt: spec.attempt,
