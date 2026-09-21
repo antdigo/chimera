@@ -1,5 +1,5 @@
 #[cfg(target_os = "linux")]
-mod cgroup;
+pub(super) mod cgroup;
 #[cfg(target_os = "linux")]
 mod cleanup;
 #[cfg(all(target_os = "linux", test))]
@@ -20,6 +20,10 @@ pub(super) mod launcher;
 #[cfg(all(target_os = "linux", test))]
 #[path = "launcher_test.rs"]
 mod launcher_test;
+pub(super) mod reconcile;
+#[cfg(test)]
+#[path = "reconcile_test.rs"]
+mod reconcile_test;
 pub(super) mod rootfs;
 #[cfg(target_os = "linux")]
 mod step_files;
@@ -681,7 +685,9 @@ fn destroy_io_failure(error: std::io::Error) -> super::ExecutionDomainError {
 }
 
 #[cfg(target_os = "linux")]
-fn prove_no_mount_below(path: &std::path::Path) -> Result<(), super::ExecutionDomainError> {
+pub(super) fn prove_no_mount_below(
+    path: &std::path::Path,
+) -> Result<(), super::ExecutionDomainError> {
     use std::os::unix::ffi::OsStrExt;
     let expected = path.as_os_str().as_bytes();
     let mountinfo = std::fs::read("/proc/self/mountinfo").map_err(destroy_io_failure)?;

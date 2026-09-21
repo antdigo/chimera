@@ -37,6 +37,8 @@ async fn sandboxed_run_rejects_before_daemon_owned_side_effects() {
     let root = TempDir::new().unwrap();
     let paths = ChimeraPaths::new(root.path().to_path_buf());
     let root_lock = RootLock::acquire(root.path()).unwrap();
+    #[cfg(target_os = "linux")]
+    let root_lock_proof = root_lock.reconciliation_proof().unwrap();
     let daemon = Daemon {
         paths: paths.clone(),
         config: ChimeraConfig {
@@ -48,6 +50,8 @@ async fn sandboxed_run_rejects_before_daemon_owned_side_effects() {
             ..Default::default()
         },
         _root_lock: root_lock,
+        #[cfg(target_os = "linux")]
+        _root_lock_proof: root_lock_proof,
     };
     let before = std::fs::read_dir(root.path())
         .unwrap()
@@ -149,6 +153,48 @@ fn daemon_holds_root_lock_for_its_lifetime() {
             Err(error) => panic!("root lock not acquirable after daemon drop: {error:?}"),
         }
     }
+}
+
+#[test]
+fn reconciliation_proof_keeps_the_exclusive_root_lock_live() {
+    let root = TempDir::new().unwrap();
+    let lock = RootLock::acquire(root.path()).unwrap();
+    let proof = lock.reconciliation_proof().unwrap();
+    let _pinned_root = proof.try_clone_root().unwrap();
+    assert_eq!(proof.root_path(), root.path());
+    drop(proof.lock_reconciliation());
+    drop(lock);
+
+    assert!(matches!(
+        RootLock::acquire(root.path()),
+        Err(RootLockError::Busy)
+    ));
+    drop(proof);
+    assert!(RootLock::acquire(root.path()).is_ok());
+}
+
+#[test]
+fn reconciliation_proof_serializes_same_process_recovery() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let root = TempDir::new().unwrap();
+    let lock = RootLock::acquire(root.path()).unwrap();
+    let first = lock.reconciliation_proof().unwrap();
+    let second = lock.reconciliation_proof().unwrap();
+    let entered = Arc::new(AtomicBool::new(false));
+    let held = first.lock_reconciliation();
+
+    std::thread::scope(|scope| {
+        let thread_entered = Arc::clone(&entered);
+        scope.spawn(move || {
+            let _guard = second.lock_reconciliation();
+            thread_entered.store(true, Ordering::Release);
+        });
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(!entered.load(Ordering::Acquire));
+        drop(held);
+    });
+    assert!(entered.load(Ordering::Acquire));
 }
 
 const LOCK_TEST_TIMEOUT: Duration = Duration::from_secs(5);

@@ -21,6 +21,8 @@ use crate::job::execution_domain::{
 };
 use crate::runner::Runner;
 use crate::storage::RootLock;
+#[cfg(target_os = "linux")]
+use crate::storage::RootLockProof;
 
 // --- PID Lock ---
 
@@ -445,6 +447,8 @@ pub struct Daemon {
     paths: ChimeraPaths,
     config: ChimeraConfig,
     _root_lock: RootLock,
+    #[cfg(target_os = "linux")]
+    _root_lock_proof: RootLockProof,
 }
 
 impl Daemon {
@@ -453,6 +457,13 @@ impl Daemon {
             let context = format!("acquiring root storage lock: {error}");
             anyhow::Error::new(error).context(context)
         })?;
+        #[cfg(target_os = "linux")]
+        let root_lock_proof = root_lock.reconciliation_proof().map_err(|error| {
+            anyhow::Error::new(error).context("retaining root reconciliation proof")
+        })?;
+        #[cfg(target_os = "linux")]
+        ExecutionDomainRoot::validate_reconciliation_proof(&root_lock_proof)
+            .context("validating root reconciliation proof")?;
         paths.root = paths
             .root
             .canonicalize()
@@ -463,6 +474,8 @@ impl Daemon {
             paths,
             config,
             _root_lock: root_lock,
+            #[cfg(target_os = "linux")]
+            _root_lock_proof: root_lock_proof,
         })
     }
 

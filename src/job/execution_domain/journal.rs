@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+#[cfg(target_os = "linux")]
+use super::AttemptIdentity;
 use super::ExecutionDomainError;
 use super::filesystem::{
     DirectoryIdentity, directory_identity, io_error, validate_bound_directory,
@@ -13,7 +15,11 @@ use super::filesystem::{
 #[cfg(target_os = "linux")]
 use super::linux::dirfd::BoundDir;
 
-const JOURNAL_VERSION: u32 = 1;
+const TRUSTED_JOURNAL_VERSION: u32 = 1;
+#[cfg(target_os = "linux")]
+const LINUX_JOURNAL_VERSION: u32 = 2;
+#[cfg(target_os = "linux")]
+const LINUX_LAYOUT_VERSION: u32 = 1;
 const JOURNAL_FILE: &str = "journal.json";
 const NEXT_JOURNAL_FILE: &str = "journal.json.next";
 
@@ -31,10 +37,35 @@ pub(crate) enum DomainState {
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct JournalRecord {
+struct TrustedJournalRecord {
     version: u32,
     attempt_id: Uuid,
     state: DomainState,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LinuxJournalRecord {
+    version: u32,
+    backend: String,
+    attempt_id: Uuid,
+    state: DomainState,
+    layout_version: u32,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Deserialize)]
+struct JournalVersion {
+    version: u32,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum LinuxJournalEvidence {
+    Missing,
+    TrustedV1Diagnostic,
+    Recoverable(DomainState),
 }
 
 #[derive(Debug)]
@@ -205,18 +236,21 @@ impl DomainLifecycle {
         }
     }
 
-    fn read_record(&self) -> Result<JournalRecord, ExecutionDomainError> {
+    fn read_record(&self) -> Result<TrustedJournalRecord, ExecutionDomainError> {
         let path = self.attempt_dir.join(JOURNAL_FILE);
         let bytes = self.read_bytes(&path)?;
-        let record: JournalRecord =
-            serde_json::from_slice(&bytes).map_err(|source| invalid_journal(&path, source))?;
-        if record.version != JOURNAL_VERSION {
-            return Err(ExecutionDomainError::UnsupportedJournalVersion {
-                path,
-                version: record.version,
-            });
+        match &self.directory {
+            JournalDirectory::Trusted(_) => parse_trusted_record(&path, &bytes),
+            #[cfg(target_os = "linux")]
+            JournalDirectory::Strict(_) => {
+                let record = parse_linux_record(&path, &bytes)?;
+                Ok(TrustedJournalRecord {
+                    version: record.version,
+                    attempt_id: record.attempt_id,
+                    state: record.state,
+                })
+            }
         }
-        Ok(record)
     }
 
     fn read_bytes(&self, path: &Path) -> Result<Vec<u8>, ExecutionDomainError> {
@@ -261,10 +295,12 @@ impl DomainLifecycle {
 
     #[cfg(target_os = "linux")]
     fn record_bytes(&self, state: DomainState) -> Result<Vec<u8>, ExecutionDomainError> {
-        serde_json::to_vec(&JournalRecord {
-            version: JOURNAL_VERSION,
+        serde_json::to_vec(&LinuxJournalRecord {
+            version: LINUX_JOURNAL_VERSION,
+            backend: "linux".to_owned(),
             attempt_id: self.attempt_id,
             state,
+            layout_version: LINUX_LAYOUT_VERSION,
         })
         .map_err(|source| invalid_journal(&self.attempt_dir.join(JOURNAL_FILE), source))
     }
@@ -275,8 +311,8 @@ impl DomainLifecycle {
         path: &Path,
         state: DomainState,
     ) -> Result<(), ExecutionDomainError> {
-        let record = JournalRecord {
-            version: JOURNAL_VERSION,
+        let record = TrustedJournalRecord {
+            version: TRUSTED_JOURNAL_VERSION,
             attempt_id: self.attempt_id,
             state,
         };
@@ -300,6 +336,84 @@ impl DomainLifecycle {
         dir.sync_all()
             .map_err(|source| io_error("syncing journal directory", &self.attempt_dir, source))
     }
+}
+
+#[cfg(target_os = "linux")]
+pub(super) fn inspect_linux_journal(
+    directory: &BoundDir,
+    attempt: AttemptIdentity,
+) -> Result<LinuxJournalEvidence, ExecutionDomainError> {
+    directory.refuse_entry(c"journal.json.next")?;
+    let bytes = match directory.read_regular(c"journal.json", 4096) {
+        Ok(bytes) => bytes,
+        Err(ExecutionDomainError::Backend {
+            errno: Some(libc::ENOENT),
+            ..
+        }) => return Ok(LinuxJournalEvidence::Missing),
+        Err(error) => return Err(error),
+    };
+    let path = directory.root_path().join(JOURNAL_FILE);
+    let version = parse_version(&path, &bytes)?;
+    match version {
+        TRUSTED_JOURNAL_VERSION => {
+            let record = parse_trusted_record(&path, &bytes)?;
+            if record.attempt_id != attempt.uuid() {
+                return Err(ExecutionDomainError::UnsafeEntry { path });
+            }
+            Ok(LinuxJournalEvidence::TrustedV1Diagnostic)
+        }
+        LINUX_JOURNAL_VERSION => {
+            let record = parse_linux_record(&path, &bytes)?;
+            if record.attempt_id != attempt.uuid() || record.state == DomainState::Destroyed {
+                return Err(ExecutionDomainError::UnsafeEntry { path });
+            }
+            Ok(LinuxJournalEvidence::Recoverable(record.state))
+        }
+        version => Err(ExecutionDomainError::UnsupportedJournalVersion { path, version }),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn parse_version(path: &Path, bytes: &[u8]) -> Result<u32, ExecutionDomainError> {
+    serde_json::from_slice::<JournalVersion>(bytes)
+        .map(|record| record.version)
+        .map_err(|source| invalid_journal(path, source))
+}
+
+fn parse_trusted_record(
+    path: &Path,
+    bytes: &[u8],
+) -> Result<TrustedJournalRecord, ExecutionDomainError> {
+    let record: TrustedJournalRecord =
+        serde_json::from_slice(bytes).map_err(|source| invalid_journal(path, source))?;
+    if record.version != TRUSTED_JOURNAL_VERSION {
+        return Err(ExecutionDomainError::UnsupportedJournalVersion {
+            path: path.to_owned(),
+            version: record.version,
+        });
+    }
+    Ok(record)
+}
+
+#[cfg(target_os = "linux")]
+fn parse_linux_record(
+    path: &Path,
+    bytes: &[u8],
+) -> Result<LinuxJournalRecord, ExecutionDomainError> {
+    let record: LinuxJournalRecord =
+        serde_json::from_slice(bytes).map_err(|source| invalid_journal(path, source))?;
+    if record.version != LINUX_JOURNAL_VERSION {
+        return Err(ExecutionDomainError::UnsupportedJournalVersion {
+            path: path.to_owned(),
+            version: record.version,
+        });
+    }
+    if record.backend != "linux" || record.layout_version != LINUX_LAYOUT_VERSION {
+        return Err(ExecutionDomainError::UnsafeEntry {
+            path: path.to_owned(),
+        });
+    }
+    Ok(record)
 }
 
 fn new_journal(path: &Path) -> Result<File, ExecutionDomainError> {

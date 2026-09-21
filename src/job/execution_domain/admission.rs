@@ -25,6 +25,7 @@ impl ExecutionDomainRoot {
         // the initial check and registration of a blocked waiter.
         let mut poisoned = self.poisoned_receiver();
         self.ensure_healthy()?;
+        self.ensure_reconciled()?;
         let permit = tokio::select! {
             _ = poisoned.changed() => {
                 return Err(ExecutionDomainError::PoisonedRoot {
@@ -40,6 +41,7 @@ impl ExecutionDomainRoot {
         // Poison and capacity may become ready together. Never hand that
         // capacity to a caller after the root has failed.
         self.ensure_healthy()?;
+        self.ensure_reconciled()?;
         Ok(DomainPermit {
             root: self.clone(),
             permit,

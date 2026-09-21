@@ -99,6 +99,25 @@ impl BoundDir {
         Ok(directory)
     }
 
+    pub(in crate::job::execution_domain) fn from_pinned_root(
+        file: File,
+        path: PathBuf,
+    ) -> Result<Self, ExecutionDomainError> {
+        let fd: OwnedFd = file.into();
+        let binding = Arc::new(Binding {
+            identity: identity(&metadata(fd.as_raw_fd())?),
+            fd,
+            parent: None,
+        });
+        let directory = Self {
+            binding,
+            poisoned: Arc::new(AtomicBool::new(false)),
+            root_path: Arc::new(path),
+        };
+        directory.verify_binding()?;
+        Ok(directory)
+    }
+
     pub(in super::super) fn verify_binding(&self) -> Result<(), ExecutionDomainError> {
         if self.poisoned.load(Ordering::Acquire) {
             return Err(ExecutionDomainError::PoisonedRoot {
@@ -106,6 +125,32 @@ impl BoundDir {
             });
         }
         verify_chain(&self.binding).inspect_err(|_| self.poison())
+    }
+
+    pub(in crate::job::execution_domain) fn verify_private_directory(
+        &self,
+    ) -> Result<(), ExecutionDomainError> {
+        self.verify_binding()?;
+        let metadata = metadata(self.fd())?;
+        if u32::from(metadata.stx_mode) & libc::S_IFMT != libc::S_IFDIR
+            || u32::from(metadata.stx_mode) & 0o777 != 0o700
+            || metadata.stx_uid != unsafe { libc::geteuid() }
+        {
+            return Err(failure(FailureCategory::IdentityMismatch));
+        }
+        Ok(())
+    }
+
+    pub(super) fn verify_attempt_removal_tree(&self) -> Result<(), ExecutionDomainError> {
+        self.inventory(RemovalPolicy::Attempt).map(drop)
+    }
+
+    pub(super) fn verify_empty_partial_attempt(&self) -> Result<(), ExecutionDomainError> {
+        self.verify_binding()?;
+        if directory_entries_stream(self.fd())?.next().is_some() {
+            return Err(failure(FailureCategory::IdentityMismatch));
+        }
+        self.verify_binding()
     }
 
     // Creation is also used inside init for private workflow command files.
@@ -336,7 +381,7 @@ impl BoundDir {
         self.binding.fd.as_raw_fd()
     }
 
-    pub(super) fn root_path(&self) -> &Path {
+    pub(in crate::job::execution_domain) fn root_path(&self) -> &Path {
         self.root_path.as_path()
     }
 

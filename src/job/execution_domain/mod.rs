@@ -5,6 +5,8 @@ use std::io::{self, Write};
 use std::num::NonZeroUsize;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+#[cfg(target_os = "linux")]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use tokio::sync::{Semaphore, watch};
@@ -132,6 +134,10 @@ pub struct ExecutionDomainRoot {
     admission: Arc<Semaphore>,
     manager_tasks: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
     retained_cleanups: Arc<manager::RetainedCleanupRegistry>,
+    #[cfg(target_os = "linux")]
+    linux_reconcile: Option<Arc<linux::reconcile::LinuxReconcileContext>>,
+    #[cfg(target_os = "linux")]
+    reconciled: Arc<AtomicBool>,
     #[cfg(test)]
     provision_pause: Arc<Mutex<Option<ProvisionPause>>>,
 }
@@ -390,6 +396,24 @@ impl std::fmt::Debug for ExecutionDomain {
 }
 
 impl ExecutionDomainRoot {
+    #[cfg(target_os = "linux")]
+    pub(crate) fn validate_reconciliation_proof(
+        proof: &crate::storage::RootLockProof,
+    ) -> Result<(), ExecutionDomainError> {
+        linux::dirfd::BoundDir::from_pinned_root(
+            proof
+                .try_clone_root()
+                .map_err(|error| ExecutionDomainError::Backend {
+                    attempt: None,
+                    stage: Stage::Filesystem,
+                    category: FailureCategory::Io,
+                    errno: error.raw_os_error(),
+                })?,
+            proof.root_path().to_owned(),
+        )?
+        .verify_binding()
+    }
+
     pub fn prepare(path: &Path, capacity: NonZeroUsize) -> Result<Self, ExecutionDomainError> {
         // Reject before any mutation: creating the directory first would leave
         // behind a non-UTF-8 path that fails every later start until removed
@@ -429,6 +453,10 @@ impl ExecutionDomainRoot {
             admission: Arc::new(Semaphore::new(capacity.get())),
             manager_tasks: Arc::new(Mutex::new(Vec::new())),
             retained_cleanups: Arc::new(manager::RetainedCleanupRegistry::default()),
+            #[cfg(target_os = "linux")]
+            linux_reconcile: None,
+            #[cfg(target_os = "linux")]
+            reconciled: Arc::new(AtomicBool::new(true)),
             #[cfg(test)]
             provision_pause: Arc::new(Mutex::new(None)),
         })
@@ -440,6 +468,72 @@ impl ExecutionDomainRoot {
 
     pub(crate) fn ensure_healthy(&self) -> Result<(), ExecutionDomainError> {
         self.state.ensure_healthy(&self.canonical_path)
+    }
+
+    pub(crate) fn ensure_reconciled(&self) -> Result<(), ExecutionDomainError> {
+        #[cfg(target_os = "linux")]
+        if !self.reconciled.load(Ordering::Acquire) {
+            return Err(ExecutionDomainError::AdmissionClosed {
+                path: self.canonical_path.clone(),
+            });
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    pub async fn reconcile(&self) -> Result<(), ExecutionDomainError> {
+        let context = self.linux_reconcile.as_ref().cloned().ok_or_else(|| {
+            ExecutionDomainError::Backend {
+                attempt: None,
+                stage: Stage::Filesystem,
+                category: FailureCategory::NotReady,
+                errno: None,
+            }
+        })?;
+        let result = tokio::task::spawn_blocking(move || context.reconcile())
+            .await
+            .map_err(|_| ExecutionDomainError::Backend {
+                attempt: None,
+                stage: Stage::Filesystem,
+                category: FailureCategory::Unavailable,
+                errno: None,
+            })?;
+        match result {
+            Ok(()) => {
+                self.reconciled.store(true, Ordering::Release);
+                Ok(())
+            }
+            Err(error) => {
+                self.state.poison();
+                Err(error)
+            }
+        }
+    }
+
+    #[cfg(all(target_os = "linux", test))]
+    pub(in crate::job::execution_domain) fn prepare_linux_recovery_for_test<
+        F: linux::cgroup::CgroupFilesystem,
+    >(
+        lock: crate::storage::RootLockProof,
+        cgroups: linux::cgroup::CgroupRoot<F>,
+        capacity: NonZeroUsize,
+    ) -> Result<Self, ExecutionDomainError> {
+        let context = Arc::new(linux::reconcile::LinuxReconcileContext::from_root_lock(
+            lock, cgroups,
+        )?);
+        let canonical_path = context.active_path();
+        let identity = directory_identity(&canonical_path, "reading job resource root identity")?;
+        Ok(Self {
+            canonical_path,
+            identity,
+            state: Arc::new(ExecutionDomainState::new()),
+            admission: Arc::new(Semaphore::new(capacity.get())),
+            manager_tasks: Arc::new(Mutex::new(Vec::new())),
+            retained_cleanups: Arc::new(manager::RetainedCleanupRegistry::default()),
+            linux_reconcile: Some(context),
+            reconciled: Arc::new(AtomicBool::new(false)),
+            provision_pause: Arc::new(Mutex::new(None)),
+        })
     }
 
     pub(crate) fn poisoned_receiver(&self) -> watch::Receiver<bool> {

@@ -130,9 +130,9 @@ pub(in crate::job::execution_domain) trait CgroupFilesystem:
 pub(in crate::job::execution_domain) struct KernelCgroupFs;
 impl CgroupFilesystem for KernelCgroupFs {}
 
-#[cfg(test)]
-pub(super) struct CgroupRoot<F = KernelCgroupFs> {
+pub(in crate::job::execution_domain) struct CgroupRoot<F = KernelCgroupFs> {
     directory: Arc<CgroupDir<F>>,
+    #[cfg(test)]
     global: Option<ValidatedLimits>,
 }
 
@@ -147,6 +147,18 @@ pub(super) struct CleanupCgroup<F = KernelCgroupFs> {
     directory: Arc<CgroupDir<F>>,
 }
 
+pub(super) struct RecoveredCgroup<F = KernelCgroupFs> {
+    pub attempt: AttemptIdentity,
+    pub kind: super::reconcile::OwnedKind,
+    directory: Arc<CgroupDir<F>>,
+    empty_proven: bool,
+}
+
+pub(super) struct RecoveryCgroupInventory<F = KernelCgroupFs> {
+    pub entries: Vec<RecoveredCgroup<F>>,
+    pub first_error: Option<ExecutionDomainError>,
+}
+
 struct BoundPidfd {
     pid: i32,
     fd: OwnedFd,
@@ -158,15 +170,15 @@ struct CgroupDir<F> {
     parent: Option<(Arc<CgroupDir<F>>, CString)>,
 }
 
-#[cfg(test)]
 impl CgroupRoot {
+    #[cfg(test)]
     pub(super) fn open_delegated(path: &Path) -> Result<Self, ExecutionDomainError> {
         Self::open_with_filesystem(path, Arc::new(KernelCgroupFs))
     }
 }
 
-#[cfg(test)]
 impl<F: CgroupFilesystem> CgroupRoot<F> {
+    #[cfg(test)]
     pub(super) fn open_with_filesystem(
         path: &Path,
         fs: Arc<F>,
@@ -192,12 +204,67 @@ impl<F: CgroupFilesystem> CgroupRoot<F> {
         directory.read(c"memory.swap.max")?;
         Ok(Self {
             directory,
+            #[cfg(test)]
             global: None,
         })
     }
 
+    pub(super) fn recovery_inventory(
+        &self,
+    ) -> Result<RecoveryCgroupInventory<F>, ExecutionDomainError> {
+        self.directory.verify()?;
+        let mut inventory = RecoveryCgroupInventory {
+            entries: Vec::new(),
+            first_error: None,
+        };
+        for name in dirfd::directory_entries(self.directory.bound.fd())? {
+            let is_directory = match self.directory.entry_is_directory(&name) {
+                Ok(is_directory) => is_directory,
+                Err(error) => {
+                    retain_first(&mut inventory.first_error, error);
+                    continue;
+                }
+            };
+            if !is_directory {
+                continue;
+            }
+            let value = match name.to_str() {
+                Ok(value) => value,
+                Err(_) => {
+                    retain_first(
+                        &mut inventory.first_error,
+                        failure(FailureCategory::IdentityMismatch),
+                    );
+                    continue;
+                }
+            };
+            if value == "supervisor" {
+                continue;
+            }
+            let (kind, attempt) = match super::reconcile::parse_owned_name(value, false) {
+                Ok(owned) => owned,
+                Err(error) => {
+                    retain_first(&mut inventory.first_error, error);
+                    continue;
+                }
+            };
+            match self.directory.child(&name) {
+                Ok(directory) => inventory.entries.push(RecoveredCgroup {
+                    attempt,
+                    kind,
+                    directory,
+                    empty_proven: false,
+                }),
+                Err(error) => retain_first(&mut inventory.first_error, error),
+            }
+        }
+        self.directory.verify()?;
+        Ok(inventory)
+    }
+
     /// Called synchronously before spawning children, while the manager holds
     /// the exclusive service-root lock. A failed startup is not retried in place.
+    #[cfg(test)]
     pub(super) fn prepare_supervisor(
         &mut self,
         limits: &ValidatedLimits,
@@ -230,6 +297,7 @@ impl<F: CgroupFilesystem> CgroupRoot<F> {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(super) fn create_attempt(
         &self,
         attempt: AttemptIdentity,
@@ -300,6 +368,77 @@ impl<F: CgroupFilesystem> CgroupRoot<F> {
             membership: membership.ok_or_else(|| failure(FailureCategory::NotReady))?,
             limits: limits.clone(),
         })
+    }
+}
+
+impl<F: CgroupFilesystem> RecoveredCgroup<F> {
+    pub(super) fn neutralize_until(
+        &mut self,
+        deadline: std::time::Instant,
+    ) -> Result<(), ExecutionDomainError> {
+        deadline_check(deadline)?;
+        let mut first_error = None;
+        let graceful_empty = match self.directory.recursively_empty_until(deadline) {
+            Ok(empty) => empty,
+            Err(error) => {
+                retain_first(&mut first_error, error);
+                false
+            }
+        };
+        let mut empty_proven = graceful_empty;
+        if !graceful_empty || first_error.is_some() {
+            if let Err(error) = self.directory.write(c"cgroup.kill", "1") {
+                retain_first(&mut first_error, error);
+            }
+            loop {
+                match self.directory.recursively_empty_until(deadline) {
+                    Ok(true) => {
+                        empty_proven = true;
+                        break;
+                    }
+                    Ok(false) => {
+                        if let Err(error) = deadline_check(deadline) {
+                            retain_first(&mut first_error, error);
+                            break;
+                        }
+                        std::thread::sleep(
+                            Duration::from_millis(10)
+                                .min(deadline.saturating_duration_since(std::time::Instant::now())),
+                        );
+                    }
+                    Err(error) => {
+                        retain_first(&mut first_error, error);
+                        break;
+                    }
+                }
+            }
+        }
+        if !empty_proven && first_error.is_none() {
+            first_error = Some(failure(FailureCategory::Timeout));
+        }
+        if let Some(error) = first_error {
+            return Err(error);
+        }
+        self.empty_proven = true;
+        Ok(())
+    }
+
+    pub(super) fn remove(&mut self) -> Result<(), ExecutionDomainError> {
+        if !self.empty_proven || self.directory.has_children()? {
+            return Err(failure(FailureCategory::Unavailable));
+        }
+        let (parent, name) = self
+            .directory
+            .parent
+            .as_ref()
+            .ok_or_else(|| failure(FailureCategory::IdentityMismatch))?;
+        self.directory.verify()?;
+        parent.verify()?;
+        self.directory
+            .fs
+            .remove(parent.bound.fd(), name, self.directory.bound.fd())
+            .map_err(io_failure)?;
+        parent.verify()
     }
 }
 
@@ -674,7 +813,6 @@ impl<F: CgroupFilesystem> CgroupDir<F> {
         value.ok_or_else(|| failure(FailureCategory::IdentityMismatch))
     }
 
-    #[cfg(test)]
     fn has_children(&self) -> Result<bool, ExecutionDomainError> {
         self.verify()?;
         let mut budget = TraversalBudget::new();
@@ -882,6 +1020,12 @@ fn required<T>(value: &Option<T>) -> Result<&T, ExecutionDomainError> {
     value
         .as_ref()
         .ok_or_else(|| failure(FailureCategory::NotReady))
+}
+
+fn retain_first(first: &mut Option<ExecutionDomainError>, error: ExecutionDomainError) {
+    if first.is_none() {
+        *first = Some(error);
+    }
 }
 
 fn verify_limits<F: CgroupFilesystem>(

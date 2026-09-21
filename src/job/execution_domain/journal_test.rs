@@ -5,6 +5,8 @@ use uuid::Uuid;
 
 use super::ExecutionDomainError;
 use super::journal::{DomainLifecycle, DomainState};
+#[cfg(target_os = "linux")]
+use super::journal::{LinuxJournalEvidence, inspect_linux_journal};
 
 #[test]
 fn quarantined_destroy_can_complete_in_memory_on_retry() {
@@ -172,6 +174,140 @@ fn strict_journal_uses_bound_storage_and_preserves_invalid_records() {
         assert_eq!(fs::read(temp.path().join("journal.json")).unwrap(), body);
         assert_eq!(fs::read(outside.path().join("canary")).unwrap(), b"keep");
     }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn strict_linux_journal_is_minimal_v2_and_authoritative_for_its_attempt() {
+    let temp = tempfile::tempdir().unwrap();
+    let attempt = super::AttemptIdentity::from_uuid(Uuid::from_u128(19)).unwrap();
+    DomainLifecycle::create_strict(temp.path(), attempt.uuid()).unwrap();
+
+    let value: serde_json::Value =
+        serde_json::from_slice(&fs::read(temp.path().join("journal.json")).unwrap()).unwrap();
+    assert_eq!(
+        value,
+        serde_json::json!({
+            "version": 2,
+            "backend": "linux",
+            "attempt_id": "00000000-0000-0000-0000-000000000013",
+            "state": "provisioning",
+            "layout_version": 1
+        })
+    );
+    let bound = super::linux::dirfd::BoundDir::open_root(temp.path()).unwrap();
+    assert_eq!(
+        inspect_linux_journal(&bound, attempt).unwrap(),
+        LinuxJournalEvidence::Recoverable(DomainState::Provisioning)
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn trusted_v1_journal_is_diagnostic_but_never_linux_cleanup_authority() {
+    let temp = tempfile::tempdir().unwrap();
+    let attempt = super::AttemptIdentity::from_uuid(Uuid::from_u128(20)).unwrap();
+    DomainLifecycle::create(temp.path(), attempt.uuid()).unwrap();
+    let bound = super::linux::dirfd::BoundDir::open_root(temp.path()).unwrap();
+
+    assert_eq!(
+        inspect_linux_journal(&bound, attempt).unwrap(),
+        LinuxJournalEvidence::TrustedV1Diagnostic
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn persisted_destroyed_linux_journal_is_inconsistent() {
+    let temp = tempfile::tempdir().unwrap();
+    let attempt = super::AttemptIdentity::from_uuid(Uuid::from_u128(21)).unwrap();
+    fs::write(
+        temp.path().join("journal.json"),
+        br#"{"version":2,"backend":"linux","attempt_id":"00000000-0000-0000-0000-000000000015","state":"destroyed","layout_version":1}"#,
+    )
+    .unwrap();
+    let bound = super::linux::dirfd::BoundDir::open_root(temp.path()).unwrap();
+
+    assert!(inspect_linux_journal(&bound, attempt).is_err());
+    assert!(temp.path().join("journal.json").exists());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn every_non_destroyed_linux_v2_state_is_recoverable() {
+    let states = [
+        ("provisioning", DomainState::Provisioning),
+        ("ready", DomainState::Ready),
+        ("running", DomainState::Running),
+        ("cleaning", DomainState::Cleaning),
+        ("destroying", DomainState::Destroying),
+        ("quarantined", DomainState::Quarantined),
+    ];
+    for (name, expected) in states {
+        let temp = tempfile::tempdir().unwrap();
+        let attempt = super::AttemptIdentity::from_uuid(Uuid::from_u128(22)).unwrap();
+        fs::write(
+            temp.path().join("journal.json"),
+            format!(
+                r#"{{"version":2,"backend":"linux","attempt_id":"00000000-0000-0000-0000-000000000016","state":"{name}","layout_version":1}}"#
+            ),
+        )
+        .unwrap();
+        let bound = super::linux::dirfd::BoundDir::open_root(temp.path()).unwrap();
+        assert_eq!(
+            inspect_linux_journal(&bound, attempt).unwrap(),
+            LinuxJournalEvidence::Recoverable(expected)
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_journal_distinguishes_missing_from_present_invalid_evidence() {
+    let attempt = super::AttemptIdentity::from_uuid(Uuid::from_u128(23)).unwrap();
+    let missing = tempfile::tempdir().unwrap();
+    let bound = super::linux::dirfd::BoundDir::open_root(missing.path()).unwrap();
+    assert_eq!(
+        inspect_linux_journal(&bound, attempt).unwrap(),
+        LinuxJournalEvidence::Missing
+    );
+
+    for body in [
+        br#"{"version":2,"backend":"other","attempt_id":"00000000-0000-0000-0000-000000000017","state":"running","layout_version":1}"#.as_slice(),
+        br#"{"version":2,"backend":"linux","attempt_id":"00000000-0000-0000-0000-000000000017","state":"running","layout_version":2}"#.as_slice(),
+        b"{".as_slice(),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("journal.json"), body).unwrap();
+        let bound = super::linux::dirfd::BoundDir::open_root(temp.path()).unwrap();
+        assert!(inspect_linux_journal(&bound, attempt).is_err());
+        assert_eq!(fs::read(temp.path().join("journal.json")).unwrap(), body);
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn diagnostic_pid_is_rejected_and_never_used_as_recovery_authority() {
+    let mut sentinel = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let attempt = super::AttemptIdentity::from_uuid(Uuid::from_u128(24)).unwrap();
+    fs::write(
+        temp.path().join("journal.json"),
+        format!(
+            r#"{{"version":2,"backend":"linux","attempt_id":"00000000-0000-0000-0000-000000000018","state":"running","layout_version":1,"pid":{}}}"#,
+            sentinel.id()
+        ),
+    )
+    .unwrap();
+    let bound = super::linux::dirfd::BoundDir::open_root(temp.path()).unwrap();
+
+    assert!(inspect_linux_journal(&bound, attempt).is_err());
+    assert!(sentinel.try_wait().unwrap().is_none());
+    sentinel.kill().unwrap();
+    sentinel.wait().unwrap();
 }
 
 #[cfg(target_os = "linux")]
