@@ -17,6 +17,27 @@ pub fn make_canaries(run_id: uuid::Uuid) -> CanarySet {
     }
 }
 
+/// Closed previous-tenant manifest, generated from the harness's expected UUIDs.
+/// E1 must seed and search every category in every next-wave attempt; artifact
+/// integration being absent is missing evidence, never an empty successful scan.
+pub fn tenant_canaries(attempts: &[uuid::Uuid]) -> Vec<String> {
+    attempts
+        .iter()
+        .flat_map(|attempt| {
+            [
+                "filesystem",
+                "process",
+                "environment",
+                "docker",
+                "cache",
+                "artifact",
+                "credential",
+            ]
+            .map(|kind| format!("chimera-qualification:{attempt}:{kind}"))
+        })
+        .collect()
+}
+
 /// E1 must start this registry inside `attempt`, on a Docker network reachable
 /// by that attempt's BuildKit. This is an intention, not a running registry.
 /// It creates `network`, injects QUALIFICATION_NETWORK, arranges attempt-local
