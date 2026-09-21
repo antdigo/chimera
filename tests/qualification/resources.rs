@@ -389,27 +389,27 @@ fn enforce_scope(
         .filter(|s| s.phase == SamplePhase::Active)
         .collect();
     if let (Some(first), Some(last)) = (active.first(), active.last()) {
-        if let (Some(elapsed), Some(usage), Some(periods)) = (
+        if let (Some(elapsed), Some(usage)) = (
             last.elapsed_ms.checked_sub(first.elapsed_ms),
             last.cpu_usage_usec.checked_sub(first.cpu_usage_usec),
-            last.cpu_nr_periods.checked_sub(first.cpu_nr_periods),
-        ) {
-            if u128::from(elapsed) * 1000 >= u128::from(expected.cpu_period_usec) * 10
-                && u128::from(usage) * u128::from(expected.cpu_period_usec) * 10
-                    > u128::from(expected.cpu_quota_usec)
-                        .saturating_mul(u128::from(elapsed))
-                        .saturating_mul(11000)
-            {
-                note(error, Reason::BoundaryViolation);
-            }
-            if key.case == "cpu"
-                && (periods < 10
-                    || (attempt
-                        && (last.cpu_nr_throttled <= first.cpu_nr_throttled
-                            || last.cpu_throttled_usec <= first.cpu_throttled_usec)))
-            {
-                note(error, Reason::MissingEvidence);
-            }
+        ) && u128::from(elapsed) * 1000 >= u128::from(expected.cpu_period_usec) * 10
+            && u128::from(usage) * u128::from(expected.cpu_period_usec) * 10
+                > u128::from(expected.cpu_quota_usec)
+                    .saturating_mul(u128::from(elapsed))
+                    .saturating_mul(11000)
+        {
+            note(error, Reason::BoundaryViolation);
+        }
+        if key.case == "cpu"
+            && (last
+                .cpu_nr_periods
+                .checked_sub(first.cpu_nr_periods)
+                .is_none_or(|periods| periods < 10)
+                || (attempt
+                    && (last.cpu_nr_throttled <= first.cpu_nr_throttled
+                        || last.cpu_throttled_usec <= first.cpu_throttled_usec)))
+        {
+            note(error, Reason::MissingEvidence);
         }
         let sustained: Vec<_> = active
             .iter()

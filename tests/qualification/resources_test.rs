@@ -495,6 +495,30 @@ fn resources_missing_periods_cannot_hide_affirmative_cpu_overuse_or_oom_escape()
 }
 
 #[test]
+fn resources_regressing_periods_cannot_hide_cpu_overuse_and_cleanup_has_priority() {
+    for name in ["cpu", "native-storage"] {
+        for cleanup_confirmed in [true, false] {
+            assert_eq!(
+                evaluate(name, |facts| {
+                    for (index, sample) in facts.attempts[0].samples.iter_mut().enumerate() {
+                        sample.cpu_usage_usec = index as u64 * 200000;
+                    }
+                    facts.attempts[0].samples[1].cpu_nr_periods = 1000;
+                    facts.expected_work_completed = false;
+                    facts.cleanup_confirmed = cleanup_confirmed;
+                }),
+                Err(if cleanup_confirmed {
+                    Reason::BoundaryViolation
+                } else {
+                    Reason::CleanupUnconfirmed
+                }),
+                "{name}, cleanup_confirmed={cleanup_confirmed}"
+            );
+        }
+    }
+}
+
+#[test]
 fn resources_every_configured_device_needs_matching_counters_and_limits() {
     let key = key("io");
     let (mut config, input, mut facts) = fixture(&key);
