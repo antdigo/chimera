@@ -70,6 +70,11 @@ jobs:
           mkdir -p "$RUNNER_TEMP/chimera-tests"
           TMPDIR="$RUNNER_TEMP/chimera-tests" cargo test --lib
 
+      - name: Compile native acceptance fixture and run its preflight unit tests
+        # Never execute the ignored native cases on this GitHub-hosted VM.
+        run: |
+          cargo test --lib --features acceptance-tests job::execution_domain::linux::native_test -- --nocapture
+
   host-integ:
     name: Host integration (${{ matrix.name }})
     runs-on: ubuntu-latest

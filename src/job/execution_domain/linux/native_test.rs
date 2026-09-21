@@ -1,4 +1,47 @@
-use super::native_fixture::{NativeDomainFixture, NativePrerequisites, installed_rootlesskit_235};
+use super::super::{CommandOutcome, CommandTarget};
+use super::native_fixture::{
+    NativeDomainFixture, NativePrerequisites, control_fd_probe_spec, installed_rootlesskit_235,
+};
+
+#[test]
+fn native_fd_probe_is_the_direct_workflow_executable() {
+    let command = control_fd_probe_spec().unwrap();
+    let CommandTarget::Sandboxed { program, args, cwd } = command.target else {
+        panic!("probe must use production sandbox command execution");
+    };
+    assert_eq!(program.as_str(), "/work/native-fd-probe");
+    assert!(
+        args.is_empty(),
+        "probe must not be a shell command argument"
+    );
+    assert_eq!(cwd.as_str(), "/work");
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated native Debian systemd delegation"]
+async fn native_pid_one_private_root_and_control_fd() {
+    let mut fixture = NativeDomainFixture::prepare().await.unwrap();
+    assert!(fixture.kernel().namespaces.is_some());
+    let result = fixture
+        .run(concat!(
+            "test \"$(cat /proc/1/comm)\" = chimera-domain\n",
+            "test ! -e /.oldroot\n",
+            "test ! -e /run/docker.sock\n",
+            "test ! -e /root/.ssh\n",
+            "test ! -e /proc/1/fd/3\n",
+        ))
+        .await;
+    // Check set -eu too: an early failed assertion must never be hidden.
+    let early_failure = fixture.run("false; true").await;
+    let probe = fixture.probe_control_fds().await;
+    let report = fixture.destroy().await.unwrap();
+    assert_eq!(fixture.destroy().await.unwrap(), report);
+    fixture.assert_no_resources().await.unwrap();
+    assert_eq!(fixture.snapshot().live_processes, 0);
+    assert_eq!(result, CommandOutcome::Exited(0));
+    assert_ne!(early_failure, CommandOutcome::Exited(0));
+    assert_eq!(probe, CommandOutcome::Exited(0));
+}
 
 #[test]
 fn native_preflight_requires_all_three_paths() {
@@ -25,7 +68,6 @@ macro_rules! native_case {
         #[tokio::test]
         #[ignore = "requires dedicated native Debian systemd delegation"]
         async fn $name() {
-            let _fixture = NativeDomainFixture::prepare().await.unwrap();
             panic!(
                 "{} has no qualified production-path assertion; native gate remains blocked",
                 stringify!($name)
@@ -34,7 +76,6 @@ macro_rules! native_case {
     };
 }
 
-native_case!(native_pid_one_private_root_and_control_fd);
 native_case!(native_detached_term_ignoring_descendant_is_destroyed);
 native_case!(native_namespace_identity_matrix);
 native_case!(native_old_root_is_unreachable);

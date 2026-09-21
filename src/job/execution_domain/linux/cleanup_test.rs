@@ -6,9 +6,32 @@ use tempfile::TempDir;
 
 use super::cleanup::IdMapSpec;
 use super::cleanup::{
-    CleanupRootKind, MappedCleanupAuthority, MappedIdRange, PinnedCleanupRoot,
+    CleanupRootKind, CleanupWorkerConfig, MappedCleanupAuthority, MappedIdRange, PinnedCleanupRoot,
     RuntimeSocketCapability, RuntimeSocketRootKind,
 };
+
+#[test]
+fn cleanup_worker_constructor_rejects_symlink_and_non_setuid_helpers() {
+    let temporary = TempDir::new().unwrap();
+    let alias = temporary.path().join("executable");
+    symlink("/usr/bin/true", &alias).unwrap();
+    assert!(
+        CleanupWorkerConfig::verified(
+            &alias,
+            std::path::Path::new("/usr/bin/true"),
+            std::path::Path::new("/usr/bin/true"),
+        )
+        .is_err()
+    );
+    assert!(
+        CleanupWorkerConfig::verified(
+            std::path::Path::new("/usr/bin/true"),
+            std::path::Path::new("/usr/bin/true"),
+            std::path::Path::new("/usr/bin/true"),
+        )
+        .is_err()
+    );
+}
 
 #[test]
 fn timed_out_child_is_killed_and_reaped_within_the_same_deadline() {

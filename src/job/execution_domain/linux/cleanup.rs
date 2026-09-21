@@ -101,17 +101,101 @@ struct PendingCleanup {
 struct VerifiedExecutable {
     fd: OwnedFd,
     identity: Identity,
+    size: u64,
+    changed: (i64, u32),
 }
 
 impl VerifiedExecutable {
+    fn open(path: &std::path::Path, setuid: bool) -> Result<Self, ExecutionDomainError> {
+        if !path.is_absolute() || path.canonicalize().map_err(io_failure)? != path {
+            return Err(failure(FailureCategory::InvalidInput));
+        }
+        for ancestor in path.ancestors().skip(1) {
+            let directory = dirfd::BoundDir::open_root(ancestor)?;
+            let metadata = dirfd::metadata(directory.fd())?;
+            if metadata.stx_uid != 0 || metadata.stx_mode & 0o022 != 0 {
+                return Err(failure(FailureCategory::IdentityMismatch));
+            }
+        }
+        let path = CString::new(path.as_os_str().as_encoded_bytes())
+            .map_err(|_| failure(FailureCategory::InvalidInput))?;
+        let fd = dirfd::open_at(
+            libc::AT_FDCWD,
+            &path,
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+            0,
+            libc::RESOLVE_NO_SYMLINKS | libc::RESOLVE_NO_MAGICLINKS,
+        )?;
+        let metadata = dirfd::metadata(fd.as_raw_fd())?;
+        validate_executable_metadata(&metadata, setuid)?;
+        // CLOEXEC descriptors can execute ELF files through /proc/self/fd;
+        // scripts would require passing the authority descriptor to an interpreter.
+        let mut magic = [0u8; 4];
+        if unsafe { libc::pread(fd.as_raw_fd(), magic.as_mut_ptr().cast(), 4, 0) } != 4
+            || magic != *b"\x7fELF"
+        {
+            return Err(failure(FailureCategory::Unsupported));
+        }
+        let executable = Self {
+            fd,
+            identity: identity(&metadata),
+            size: metadata.stx_size,
+            changed: (metadata.stx_ctime.tv_sec, metadata.stx_ctime.tv_nsec),
+        };
+        executable.command()?;
+        Ok(executable)
+    }
+
     fn command(&self) -> Result<Command, ExecutionDomainError> {
-        if identity(&dirfd::metadata(self.fd.as_raw_fd())?) != self.identity {
+        let metadata = dirfd::metadata(self.fd.as_raw_fd())?;
+        if identity(&metadata) != self.identity
+            || metadata.stx_nlink != 1
+            || metadata.stx_size != self.size
+            || (metadata.stx_ctime.tv_sec, metadata.stx_ctime.tv_nsec) != self.changed
+        {
             return Err(failure(FailureCategory::IdentityMismatch));
         }
         Ok(Command::new(format!(
             "/proc/self/fd/{}",
             self.fd.as_raw_fd()
         )))
+    }
+}
+
+fn validate_executable_metadata(
+    metadata: &libc::statx,
+    setuid: bool,
+) -> Result<(), ExecutionDomainError> {
+    let mode = u32::from(metadata.stx_mode);
+    if mode & libc::S_IFMT != libc::S_IFREG
+        || metadata.stx_uid != 0
+        || metadata.stx_gid != 0
+        || metadata.stx_nlink != 1
+        || mode & 0o022 != 0
+        || mode & 0o111 == 0
+        || mode & 0o6000 != if setuid { 0o4000 } else { 0 }
+    {
+        return Err(failure(FailureCategory::IdentityMismatch));
+    }
+    Ok(())
+}
+
+impl CleanupWorkerConfig {
+    /// Retain the exact operator-installed executables for the whole cleanup
+    /// lifetime. Neither PATH lookup nor later pathname replacement selects code.
+    // The production activation seam remains closed until Plans C–E qualify.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(in crate::job::execution_domain) fn verified(
+        executable: &std::path::Path,
+        newuidmap: &std::path::Path,
+        newgidmap: &std::path::Path,
+    ) -> Result<Self, ExecutionDomainError> {
+        Ok(Self {
+            executable: Arc::new(VerifiedExecutable::open(executable, false)?),
+            newuidmap: Arc::new(VerifiedExecutable::open(newuidmap, true)?),
+            newgidmap: Arc::new(VerifiedExecutable::open(newgidmap, true)?),
+            pending: Arc::new(Mutex::new(PendingCleanup::default())),
+        })
     }
 }
 
@@ -279,6 +363,11 @@ impl IdMapSpec {
     #[cfg(test)]
     pub(super) fn subuid_start(&self) -> u32 {
         self.range.subuid_start
+    }
+
+    #[cfg(all(test, feature = "acceptance-tests"))]
+    pub(super) fn range(&self) -> MappedIdRange {
+        self.range
     }
 }
 
@@ -1671,3 +1760,7 @@ fn failure(category: FailureCategory) -> ExecutionDomainError {
         errno: None,
     }
 }
+
+#[cfg(test)]
+#[path = "cleanup_executable_test.rs"]
+mod executable_test;
