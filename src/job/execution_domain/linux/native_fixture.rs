@@ -304,7 +304,39 @@ impl NativeDomainFixture {
     }
 
     pub(super) async fn run(&mut self, script: &str) -> CommandOutcome {
-        let spec = CommandSpec {
+        self.run_checked(Self::shell_spec(script))
+            .unwrap_or_else(|error| panic!("native command protocol failed: {error:?}"))
+    }
+
+    // Native teardown tests use this only for a command that must remain
+    // active through Shutdown, preventing PID 1 from exiting before cgroup
+    // escalation is observed.
+    pub(super) async fn run_until_started(
+        &mut self,
+        script: &str,
+    ) -> Result<(), ExecutionDomainError> {
+        self.start_checked(Self::shell_spec(script)).map(|_| ())
+    }
+
+    pub(super) async fn wait_for_live_processes(
+        &self,
+        minimum: usize,
+        timeout: Duration,
+    ) -> Result<bool, ExecutionDomainError> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if self.inventory()?.live_processes >= minimum {
+                return Ok(true);
+            }
+            if Instant::now() >= deadline {
+                return Ok(false);
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    fn shell_spec(script: &str) -> CommandSpec {
+        CommandSpec {
             target: CommandTarget::Sandboxed {
                 program: DomainPath::parse("/usr/bin/dash").expect("fixed shell path"),
                 args: vec!["-c".into(), format!("set -eu\n{script}")],
@@ -313,12 +345,33 @@ impl NativeDomainFixture {
             env: Default::default(),
             timeout: Duration::from_secs(30),
             state: None,
-        };
-        self.run_checked(spec)
-            .unwrap_or_else(|error| panic!("native command protocol failed: {error:?}"))
+        }
     }
 
     fn run_checked(&mut self, spec: CommandSpec) -> Result<CommandOutcome, ExecutionDomainError> {
+        let (command_id, deadline) = self.start_checked(spec)?;
+        loop {
+            match self
+                .cleanup
+                .as_mut()
+                .ok_or_else(not_ready)?
+                .kernel_mut()
+                .control
+                .receive(deadline)?
+            {
+                Message::Response(Response::Output {
+                    command_id: actual, ..
+                }) if actual == command_id => {}
+                Message::Response(Response::CommandFinished {
+                    command_id: actual,
+                    outcome,
+                }) if actual == command_id => return Ok(outcome),
+                _ => return Err(unavailable()),
+            }
+        }
+    }
+
+    fn start_checked(&mut self, spec: CommandSpec) -> Result<(u64, Instant), ExecutionDomainError> {
         self.command_id += 1;
         let command_id = self.command_id;
         let kernel = self.cleanup.as_mut().ok_or_else(not_ready)?.kernel_mut();
@@ -330,18 +383,7 @@ impl NativeDomainFixture {
             Response::CommandStarted { command_id: actual } if actual == command_id => {}
             _ => return Err(unavailable()),
         }
-        loop {
-            match kernel.control.receive(deadline)? {
-                Message::Response(Response::Output {
-                    command_id: actual, ..
-                }) if actual == command_id => {}
-                Message::Response(Response::CommandFinished {
-                    command_id: actual,
-                    outcome,
-                }) if actual == command_id => return Ok(outcome),
-                _ => return Err(unavailable()),
-            }
-        }
+        Ok((command_id, deadline))
     }
 
     pub(super) async fn probe_control_fds(&mut self) -> CommandOutcome {

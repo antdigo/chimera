@@ -17,8 +17,9 @@ RootlessKit 2.3.5. The package check is not native execution evidence.
 Only test code reads these environment variables; daemon startup does not.
 
 The 15 Task 12 native cases remain `#[ignore]` to prevent accidental execution
-without a dedicated host. B12a implements only
-`native_pid_one_private_root_and_control_fd`. The other 14 cases explicitly
+without a dedicated host. B12a implements
+`native_pid_one_private_root_and_control_fd`; B12b1 implements
+`native_detached_term_ignoring_descendant_is_destroyed`. The remaining 13 cases explicitly
 fail when selected, before allocating a fixture. The full matrix is not green.
 
 ## B12a fixture implementation (native execution pending)
@@ -72,6 +73,19 @@ empty, and no supervisor mount below the recorded attempt path. Production
 destroy additionally proves empty cgroups, reaps the launcher and releases
 namespace handles before filesystem deletion. No process-name kills are used.
 
+The B12b1 case starts a TERM-ignoring `setsid` descendant without waiting for
+command completion. Its command leader remains TERM-ignoring and active, so
+PID 1 cannot exit before shutdown begins. Before destroy it requires, within a
+bounded interval, at least two additional exact cgroup members over the idle
+baseline; a start acknowledgement alone cannot satisfy this control. It then
+requires the exact production destroy path to finish within its bounded deadline
+and the exact zero-resource inventory. `DestroyReport::forced_kill` is retained
+as truthful evidence but is not asserted here: PID-namespace shutdown may kill
+the descendant before outer cgroup KILL, which is a correct bounded destroy.
+The lower-level destroy test covers the cgroup-KILL fallback. Native
+resistant-cgroup fallback remains a release-gate debt. This is implementation
+evidence only until the ignored case runs on the dedicated native Debian host.
+
 ## Native operator gate (pending)
 
 Use one dedicated non-root service account and systemd-delegated cgroup v2 on
@@ -107,7 +121,7 @@ cargo test --features acceptance-tests job::execution_domain::linux::native_test
 
 For the B12a slice, pass the already-built test executable this exact filter:
 `job::execution_domain::linux::native_test::native_pid_one_private_root_and_control_fd --exact --ignored --test-threads=1 --nocapture`.
-The full command above intentionally still fails the 14 unfinished cases.
+The full command above intentionally still fails the 13 unfinished cases.
 
 Before marking this gate qualified, retain the exact Debian/kernel/systemd/
 RootlessKit versions, delegated controllers, subordinate mappings, nonzero
