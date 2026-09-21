@@ -72,6 +72,7 @@ fn fixture_report(config: &NativeConfig, boot: uuid::Uuid, run: uuid::Uuid) -> Q
         activation_available: false,
         results,
         cleanup_confirmed: true,
+        resource_summaries: vec![],
     }
 }
 

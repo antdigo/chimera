@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use super::catalog::{
     CaseKey, CheckId, Reason, ScenarioId, required_cases, required_checks, validate_coverage,
 };
+use super::resources::{CaseMetrics, valid_summary};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -58,7 +59,7 @@ pub struct CaseResult {
     pub duration_ms: u64,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct QualificationReport {
     pub schema_version: u32,
@@ -67,6 +68,7 @@ pub struct QualificationReport {
     pub activation_available: bool,
     pub results: Vec<CaseResult>,
     pub cleanup_confirmed: bool,
+    pub resource_summaries: Vec<CaseMetrics>,
 }
 
 pub(super) fn valid_hex(value: &str, length: usize) -> bool {
@@ -113,7 +115,29 @@ pub fn validate_report_structure(report: &QualificationReport) -> Result<(), Rea
             return Err(Reason::MissingEvidence);
         }
     }
+    if !valid_metrics(report, report.identity.mode == EvidenceMode::NativeDebian) {
+        return Err(Reason::MissingEvidence);
+    }
     Ok(())
+}
+
+fn valid_metrics(report: &QualificationReport, complete: bool) -> bool {
+    let expected: std::collections::BTreeSet<_> = required_cases()
+        .into_iter()
+        .filter(|key| matches!(key.scenario, ScenarioId::S09 | ScenarioId::S16))
+        .collect();
+    let actual: std::collections::BTreeSet<_> = report
+        .resource_summaries
+        .iter()
+        .map(|metrics| metrics.key.clone())
+        .collect();
+    actual.len() == report.resource_summaries.len()
+        && actual.is_subset(&expected)
+        && (!complete || actual == expected)
+        && report.resource_summaries.iter().all(|metrics| {
+            valid_summary(&metrics.summary)
+                && report.results.iter().any(|row| row.key == metrics.key)
+        })
 }
 
 pub fn qualifies(report: &QualificationReport) -> bool {
@@ -122,9 +146,9 @@ pub fn qualifies(report: &QualificationReport) -> bool {
     {
         return false;
     }
-    // Tasks 4–7 provide typed evaluators, independently captured native facts and
-    // bounded S-09/S-16 metric summaries. Raw responses or caller-constructed
-    // all-true checklists must never substitute for that evidence in Task 2.
+    // E0 provides fixture evaluators and typed summaries, but no authenticated
+    // run-owned native sampler. Numeric summaries and all-true checklists do
+    // not establish native provenance; E1 must supply independent collection.
     false
 }
 
@@ -137,6 +161,7 @@ fn safe_to_serialize(report: &QualificationReport) -> bool {
         && valid_identity(&report.identity)
         && (report.driver_digest.is_empty() || valid_hex(&report.driver_digest, 64))
         && report.results.len() <= catalogue.len()
+        && valid_metrics(report, false)
         && report.results.iter().all(|row| {
             catalogue.contains(&row.key)
                 && catalogue.contains(&row.provenance.key)
@@ -190,6 +215,15 @@ fn markdown(report: &QualificationReport) -> String {
             key.concurrency
         )
         .unwrap();
+    }
+    if !report.resource_summaries.is_empty() {
+        text.push_str("\n| Scenario | Case | Wave | Concurrency | PSS (bytes) | Peak PIDs (count) | Sentinel p99 (µs) | Read (ops/s) | Write (ops/s) | Minimum host available (bytes) | CPU (µs) | Throttled periods (count) | Throttled (µs) | Startup (ms) | Cleanup (ms) |\n| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n");
+        for metrics in &report.resource_summaries {
+            let key = &metrics.key;
+            let s = &metrics.summary;
+            let id = serde_json::to_string(&key.scenario).unwrap();
+            writeln!(text,"| {} | {} | {} | {} | {} | {} | {} | {:.3} | {:.3} | {} | {} | {} | {} | {} | {} |",id.trim_matches('"'),key.case,key.wave.as_str(),key.concurrency,s.peak_pss_bytes,s.peak_pids,s.sentinel_p99_us,s.read_iops,s.write_iops,s.minimum_host_mem_available_bytes,s.total_cpu_usage_usec,s.cpu_throttled_periods,s.cpu_throttled_usec,s.startup_ms,s.cleanup_ms).unwrap();
+        }
     }
     text
 }

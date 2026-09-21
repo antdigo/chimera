@@ -43,6 +43,7 @@ fn complete() -> QualificationReport {
         activation_available: false,
         results,
         cleanup_confirmed: true,
+        resource_summaries: vec![],
     }
 }
 
@@ -59,7 +60,7 @@ fn report_fixture_nested_and_caller_labelled_native_never_qualify() {
         for row in &mut report.results {
             row.provenance.identity.mode = mode;
         }
-        assert!(!qualifies(&report)); // No authenticated typed metrics/evaluators exist yet.
+        assert!(!qualifies(&report)); // No authenticated native collector exists in E0.
     }
 }
 
@@ -207,4 +208,73 @@ fn report_rejects_unknown_fields_and_does_not_render_workload_strings() {
     let mut value = serde_json::to_value(complete()).unwrap();
     value["stdout"] = "secret".into();
     assert!(serde_json::from_value::<QualificationReport>(value).is_err());
+}
+
+#[test]
+fn resources_report_requires_exact_native_summaries_and_never_promotes_fixture_data() {
+    use super::resources::{CaseMetrics, summarize_resources};
+    let mut report = complete();
+    for key in required_cases()
+        .into_iter()
+        .filter(|k| matches!(k.scenario, ScenarioId::S09 | ScenarioId::S16))
+    {
+        let (_, _, facts) = super::resources_test::fixture(&key);
+        report.resource_summaries.push(CaseMetrics {
+            key,
+            summary: summarize_resources(&facts).unwrap(),
+        });
+    }
+    assert_eq!(validate_report_structure(&report), Ok(()));
+    assert!(!qualifies(&report));
+    report.identity.mode = EvidenceMode::NativeDebian;
+    for row in &mut report.results {
+        row.provenance.identity.mode = EvidenceMode::NativeDebian;
+    }
+    assert_eq!(validate_report_structure(&report), Ok(()));
+    assert!(!qualifies(&report)); // No native collector exists in E0.
+    let mut variants = vec![];
+    let mut bad = report.clone();
+    bad.resource_summaries.pop();
+    variants.push(bad);
+    let mut bad = report.clone();
+    bad.resource_summaries
+        .push(bad.resource_summaries[0].clone());
+    variants.push(bad);
+    let mut bad = report.clone();
+    bad.resource_summaries[0].key = required_cases()[0].clone();
+    variants.push(bad);
+    for rate in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.0] {
+        let mut bad = report.clone();
+        bad.resource_summaries[0].summary.write_iops = rate;
+        variants.push(bad);
+    }
+    for bad in variants {
+        assert!(validate_report_structure(&bad).is_err());
+        assert!(!qualifies(&bad));
+    }
+    let dir = tempfile::tempdir().unwrap();
+    write_report(dir.path(), &report).unwrap();
+    let json = std::fs::read_to_string(dir.path().join("report.json")).unwrap();
+    let md = std::fs::read_to_string(dir.path().join("report.md")).unwrap();
+    assert!(json.contains("peak_pss_bytes") && json.contains("total_cpu_usage_usec"));
+    for unit in [
+        "PSS (bytes)",
+        "CPU (µs)",
+        "Startup (ms)",
+        "Read (ops/s)",
+        "Cleanup (ms)",
+    ] {
+        assert!(md.contains(unit), "{unit}");
+    }
+    // A failed stress case still retains safe numeric forensic measurements.
+    let metric_key = report.resource_summaries[0].key.clone();
+    let row = report
+        .results
+        .iter_mut()
+        .find(|row| row.key == metric_key)
+        .unwrap();
+    row.verdict = Verdict::Failed;
+    row.reason = Some(Reason::BoundaryViolation);
+    assert!(!qualifies(&report));
+    assert!(write_report(dir.path(), &report).is_ok());
 }

@@ -6,6 +6,7 @@ pub mod host;
 pub mod isolation;
 pub mod lifecycle;
 pub mod report;
+pub mod resources;
 
 #[cfg(test)]
 mod catalog_test;
@@ -23,3 +24,5 @@ mod isolation_test;
 mod lifecycle_test;
 #[cfg(test)]
 mod report_test;
+#[cfg(test)]
+mod resources_test;
