@@ -438,7 +438,27 @@ pub fn evaluate_isolation(
     {
         return Err(Reason::ProtocolViolation);
     }
-    let network = wire
+    let mut facts = IsolationFacts {
+        setup_confirmed: wire.setup_confirmed,
+        outside_control_before: wire.outside_control_before,
+        outside_control_after: wire.outside_control_after,
+        network: None,
+        observations: wire.observations,
+        peer_unchanged: wire.peer_unchanged,
+        polling_started: wire.polling_started,
+        rollback_confirmed: wire.rollback_confirmed,
+        cleanup_confirmed: wire.cleanup_confirmed,
+    };
+    // Once the envelope and schema are trusted, operational stop conditions and
+    // affirmative escapes outrank stale/incomplete supporting evidence. A failed
+    // setup must never hide polling, peer mutation or unconfirmed cleanup.
+    if !facts.cleanup_confirmed || (key.scenario == ScenarioId::S01 && !facts.rollback_confirmed) {
+        return Err(Reason::CleanupUnconfirmed);
+    }
+    if !facts.peer_unchanged || (key.scenario == ScenarioId::S01 && facts.polling_started) {
+        return Err(Reason::BoundaryViolation);
+    }
+    facts.network = wire
         .network
         .map(|n| {
             network_facts(
@@ -449,35 +469,11 @@ pub fn evaluate_isolation(
             )
         })
         .transpose()?;
-    let facts = IsolationFacts {
-        setup_confirmed: wire.setup_confirmed,
-        outside_control_before: wire.outside_control_before,
-        outside_control_after: wire.outside_control_after,
-        network,
-        observations: wire.observations,
-        peer_unchanged: wire.peer_unchanged,
-        polling_started: wire.polling_started,
-        rollback_confirmed: wire.rollback_confirmed,
-        cleanup_confirmed: wire.cleanup_confirmed,
-    };
     if !facts.setup_confirmed {
         return Err(Reason::MissingEvidence);
     }
-    if !facts.cleanup_confirmed {
-        return Err(Reason::CleanupUnconfirmed);
-    }
-    if !facts.peer_unchanged {
-        return Err(Reason::BoundaryViolation);
-    }
     match key.scenario {
-        ScenarioId::S01 => {
-            if facts.polling_started {
-                return Err(Reason::BoundaryViolation);
-            }
-            if !facts.rollback_confirmed {
-                return Err(Reason::CleanupUnconfirmed);
-            }
-        }
+        ScenarioId::S01 => {}
         ScenarioId::S03 | ScenarioId::S04 => {
             evaluate_boundary_observations(key, &facts.observations)?;
         }

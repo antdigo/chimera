@@ -370,6 +370,79 @@ async fn isolation_network_preserves_typed_outcomes_controls_and_binding() {
 }
 
 #[tokio::test]
+async fn isolation_preflight_failure_precedence_covers_combined_facts() {
+    let identity = super::report_test::identity();
+    let key = key(ScenarioId::S01, "no-userns");
+    for setup in [false, true] {
+        for cleanup in [false, true] {
+            for rollback in [false, true] {
+                for polling in [false, true] {
+                    for peer in [false, true] {
+                        let mut facts = good(&key, &identity);
+                        facts["setup_confirmed"] = json!(setup);
+                        facts["cleanup_confirmed"] = json!(cleanup);
+                        facts["rollback_confirmed"] = json!(rollback);
+                        facts["polling_started"] = json!(polling);
+                        facts["peer_unchanged"] = json!(peer);
+                        let want = if !cleanup || !rollback {
+                            Some(Reason::CleanupUnconfirmed)
+                        } else if polling || !peer {
+                            Some(Reason::BoundaryViolation)
+                        } else if !setup {
+                            Some(Reason::MissingEvidence)
+                        } else {
+                            None
+                        };
+                        assert_eq!(
+                            facts_result(&key, &identity, facts).await.err(),
+                            want,
+                            "setup={setup} cleanup={cleanup} rollback={rollback} polling={polling} peer={peer}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn isolation_network_failure_precedence_retains_cleanup_and_peer_failures() {
+    let identity = super::report_test::identity();
+    let key = key(ScenarioId::S05, "loopback");
+    for stale in [false, true] {
+        for setup in [false, true] {
+            for cleanup in [false, true] {
+                for peer in [false, true] {
+                    let mut facts = good(&key, &identity);
+                    facts["setup_confirmed"] = json!(setup);
+                    facts["cleanup_confirmed"] = json!(cleanup);
+                    facts["peer_unchanged"] = json!(peer);
+                    if stale {
+                        facts["network"]["expected_digest"] = json!("c".repeat(64));
+                    } else {
+                        facts["network"] = Value::Null;
+                    }
+                    let want = if !cleanup {
+                        Reason::CleanupUnconfirmed
+                    } else if !peer {
+                        Reason::BoundaryViolation
+                    } else if stale {
+                        Reason::StaleEvidence
+                    } else {
+                        Reason::MissingEvidence
+                    };
+                    assert_eq!(
+                        facts_result(&key, &identity, facts).await.unwrap_err(),
+                        want,
+                        "stale={stale} setup={setup} cleanup={cleanup} peer={peer}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn isolation_preflight_rollback_and_cleanup_cannot_be_omitted() {
     let identity = super::report_test::identity();
     let key = key(ScenarioId::S01, "no-userns");
