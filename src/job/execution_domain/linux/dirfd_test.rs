@@ -150,6 +150,39 @@ fn swapped_ancestor_prevents_mutations_through_retained_descendant() {
 }
 
 #[test]
+fn retained_attempt_swap_never_deletes_replacement() {
+    let fixture = Fixture::new();
+    let original = fixture.root.create_child(c"attempt", 0o700).unwrap();
+    original.write_atomic(c"journal.json", b"{}").unwrap();
+    original.verify_attempt_removal_tree().unwrap();
+    fs::rename(fixture.path("attempt"), fixture.path("moved")).unwrap();
+    fs::create_dir(fixture.path("attempt")).unwrap();
+    fs::write(fixture.path("attempt/canary"), b"replacement").unwrap();
+
+    assert!(
+        fixture
+            .root
+            .remove_bound_tree(c"attempt", &original)
+            .is_err()
+    );
+    assert_eq!(
+        fs::read(fixture.path("attempt/canary")).unwrap(),
+        b"replacement"
+    );
+    assert_eq!(fs::read(fixture.path("moved/journal.json")).unwrap(), b"{}");
+    fixture.assert_canary();
+}
+
+#[test]
+fn pinned_descendant_reports_actual_logical_mount_path() {
+    let fixture = Fixture::new();
+    let active = fixture.root.create_child(c"job-resources", 0o700).unwrap();
+    let attempt = active.create_child(c"attempt", 0o700).unwrap();
+
+    assert_eq!(attempt.bound_path(), fixture.path("job-resources/attempt"));
+}
+
+#[test]
 fn regular_reader_refuses_fifo_without_waiting() {
     let fixture = Fixture::new();
     let path = CString::new(fixture.path("state").as_os_str().as_encoded_bytes()).unwrap();

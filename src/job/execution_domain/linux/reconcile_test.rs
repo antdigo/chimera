@@ -305,7 +305,127 @@ async fn recovery_root_keeps_admission_closed_until_locked_reconcile_succeeds() 
     assert!(root.reserve().await.is_err());
     root.reconcile().await.unwrap();
     assert!(root.reserve().await.is_ok());
+    assert!(root.reconcile().await.is_err());
+    assert!(root.reserve().await.is_ok());
     drop(lock);
+}
+
+#[cfg(target_os = "linux")]
+struct PanickingCgroupFs(std::sync::atomic::AtomicBool);
+
+#[cfg(target_os = "linux")]
+impl CgroupFilesystem for PanickingCgroupFs {
+    fn verify_filesystem(&self, _fd: RawFd) -> io::Result<()> {
+        assert!(
+            !self.0.load(std::sync::atomic::Ordering::Acquire),
+            "injected blocking task panic"
+        );
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct ObservedCgroupFs(std::sync::atomic::AtomicUsize);
+
+#[cfg(target_os = "linux")]
+impl CgroupFilesystem for ObservedCgroupFs {
+    fn verify_filesystem(&self, _fd: RawFd) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn read(&self, file: &mut fs::File, name: &std::ffi::CStr) -> io::Result<String> {
+        if name == c"cgroup.events" {
+            let populated = usize::from(self.0.load(std::sync::atomic::Ordering::Acquire) == 0);
+            return Ok(format!("populated {populated}\n"));
+        }
+        let mut text = String::new();
+        std::io::Read::read_to_string(file, &mut text)?;
+        Ok(text)
+    }
+
+    fn write(&self, _file: &mut fs::File, name: &std::ffi::CStr, _value: &str) -> io::Result<()> {
+        if name == c"cgroup.kill" {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        }
+        Ok(())
+    }
+
+    fn remove(&self, parent: RawFd, name: &std::ffi::CStr, child: RawFd) -> io::Result<()> {
+        FixtureCgroupFs.remove(parent, name, child)
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn invalid_active_root_still_kills_independently_bound_attempt_cgroup() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let temp = tempfile::tempdir().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    create_private(&temp.path().join("job-resources"));
+    create_private(&temp.path().join("cgroup"));
+    seed_cgroup_root(&temp.path().join("cgroup"));
+    let id = attempt(36);
+    let group = temp
+        .path()
+        .join("cgroup")
+        .join(format!("attempt-{}", id.component()));
+    create_private(&group);
+    seed_cgroup_root(&group);
+    let lock = RootLock::acquire(temp.path()).unwrap();
+    let observed = Arc::new(ObservedCgroupFs(AtomicUsize::new(0)));
+    let cgroups =
+        CgroupRoot::open_with_filesystem(&temp.path().join("cgroup"), Arc::clone(&observed))
+            .unwrap();
+    let root = super::super::ExecutionDomainRoot::prepare_linux_recovery_for_test(
+        lock.reconciliation_proof().unwrap(),
+        cgroups,
+        NonZeroUsize::new(1).unwrap(),
+    )
+    .unwrap();
+    fs::set_permissions(
+        temp.path().join("job-resources"),
+        fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+
+    assert!(root.reconcile().await.is_err());
+    assert!(
+        observed.0.load(Ordering::Acquire) > 0,
+        "independent cgroup must be killed"
+    );
+    assert!(
+        group.exists(),
+        "invalid filesystem proof must prevent cgroup removal"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn reconcile_join_failure_poisons_and_never_opens_admission() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let temp = tempfile::tempdir().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    create_private(&temp.path().join("job-resources"));
+    create_private(&temp.path().join("cgroup"));
+    seed_cgroup_root(&temp.path().join("cgroup"));
+    let lock = RootLock::acquire(temp.path()).unwrap();
+    let injected = Arc::new(PanickingCgroupFs(AtomicBool::new(false)));
+    let cgroups =
+        CgroupRoot::open_with_filesystem(&temp.path().join("cgroup"), Arc::clone(&injected))
+            .unwrap();
+    let root = super::super::ExecutionDomainRoot::prepare_linux_recovery_for_test(
+        lock.reconciliation_proof().unwrap(),
+        cgroups,
+        NonZeroUsize::new(1).unwrap(),
+    )
+    .unwrap();
+    injected.0.store(true, Ordering::Release);
+
+    assert!(root.reconcile().await.is_err());
+    assert!(matches!(
+        root.reserve().await,
+        Err(super::super::ExecutionDomainError::PoisonedRoot { .. })
+    ));
 }
 
 #[cfg(target_os = "linux")]
@@ -374,6 +494,82 @@ async fn reconciles_cgroup_only_directory_only_and_exact_partial_orphans() {
                 .path()
                 .join("cgroup")
                 .join(format!("attempt-{}", id.component()))
+                .exists()
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn recovery_removes_normal_domain_and_nested_empty_cgroups_bottom_up() {
+    let id = attempt(33);
+    let (temp, root) = fixture_root(|_, cgroup| {
+        let attempt_group = cgroup.join(format!("attempt-{}", id.component()));
+        create_private(&attempt_group);
+        seed_cgroup_root(&attempt_group);
+        let domain = attempt_group.join("domain");
+        create_private(&domain);
+        seed_cgroup_root(&domain);
+        let nested = domain.join("nested");
+        create_private(&nested);
+        seed_cgroup_root(&nested);
+    });
+
+    root.reconcile().await.unwrap();
+    assert!(
+        !temp
+            .path()
+            .join("cgroup")
+            .join(format!("attempt-{}", id.component()))
+            .exists()
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn recovery_refuses_populated_nested_cgroup_without_removing_parent() {
+    let id = attempt(34);
+    let (temp, root) = fixture_root(|_, cgroup| {
+        let attempt_group = cgroup.join(format!("attempt-{}", id.component()));
+        create_private(&attempt_group);
+        seed_cgroup_root(&attempt_group);
+        let domain = attempt_group.join("domain");
+        create_private(&domain);
+        seed_cgroup_root(&domain);
+        fs::write(domain.join("cgroup.events"), b"populated 1\n").unwrap();
+    });
+
+    assert!(root.reconcile().await.is_err());
+    assert!(
+        temp.path()
+            .join("cgroup")
+            .join(format!("attempt-{}", id.component()))
+            .join("domain")
+            .exists()
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn recovery_refuses_wrong_nested_directory_and_journal_modes() {
+    for entry in ["work", "journal.json"] {
+        let id = attempt(35);
+        let (temp, root) = fixture_root(|active, _| {
+            let directory = active.join(id.component());
+            create_private(&directory);
+            super::super::journal::DomainLifecycle::create_strict(&directory, id.uuid()).unwrap();
+            if entry == "work" {
+                create_private(&directory.join("work"));
+            }
+            fs::set_permissions(directory.join(entry), fs::Permissions::from_mode(0o755)).unwrap();
+        });
+
+        assert!(root.reconcile().await.is_err(), "{entry}");
+        assert!(
+            temp.path()
+                .join("job-resources")
+                .join(id.component())
+                .join(entry)
                 .exists()
         );
     }

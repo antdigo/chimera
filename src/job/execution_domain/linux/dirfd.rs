@@ -2,6 +2,7 @@ use std::ffi::{CStr, CString};
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -33,6 +34,7 @@ struct Binding {
 /// lifetime. Descendant bindings share poison state; failure never rolls back by path.
 pub(in super::super) struct BoundDir {
     binding: Arc<Binding>,
+    path_root: Arc<Binding>,
     poisoned: Arc<AtomicBool>,
     root_path: Arc<PathBuf>,
 }
@@ -53,6 +55,7 @@ impl BoundDir {
     pub(super) fn clone_bound(&self) -> Self {
         Self {
             binding: Arc::clone(&self.binding),
+            path_root: Arc::clone(&self.path_root),
             poisoned: Arc::clone(&self.poisoned),
             root_path: Arc::clone(&self.root_path),
         }
@@ -91,6 +94,7 @@ impl BoundDir {
             });
         }
         let directory = Self {
+            path_root: Arc::clone(&binding),
             binding,
             poisoned: Arc::new(AtomicBool::new(false)),
             root_path: Arc::new(path.to_owned()),
@@ -110,6 +114,7 @@ impl BoundDir {
             parent: None,
         });
         let directory = Self {
+            path_root: Arc::clone(&binding),
             binding,
             poisoned: Arc::new(AtomicBool::new(false)),
             root_path: Arc::new(path),
@@ -165,6 +170,7 @@ impl BoundDir {
                 fd,
                 parent: Some((Arc::clone(&self.binding), name.to_owned())),
             }),
+            path_root: Arc::clone(&self.path_root),
             poisoned: Arc::clone(&self.poisoned),
             root_path: Arc::clone(&self.root_path),
         };
@@ -385,6 +391,23 @@ impl BoundDir {
         self.root_path.as_path()
     }
 
+    pub(in crate::job::execution_domain) fn bound_path(&self) -> PathBuf {
+        let mut names = Vec::new();
+        let mut binding = self.binding.as_ref();
+        while !std::ptr::eq(binding, self.path_root.as_ref()) {
+            let Some((parent, name)) = &binding.parent else {
+                break;
+            };
+            names.push(name.to_owned());
+            binding = parent.as_ref();
+        }
+        let mut path = self.root_path.as_ref().clone();
+        for name in names.into_iter().rev() {
+            path.push(std::ffi::OsStr::from_bytes(name.to_bytes()));
+        }
+        path
+    }
+
     pub(in crate::job::execution_domain) fn sync_directory(
         &self,
     ) -> Result<(), ExecutionDomainError> {
@@ -517,6 +540,37 @@ impl BoundDir {
         result.inspect_err(|_| self.poison())
     }
 
+    pub(super) fn remove_bound_tree(
+        &self,
+        name: &CStr,
+        attempt: &Self,
+    ) -> Result<(), ExecutionDomainError> {
+        component(name)?;
+        let result = (|| {
+            self.verify_binding()?;
+            attempt.verify_binding()?;
+            let (parent, bound_name) = attempt
+                .binding
+                .parent
+                .as_ref()
+                .ok_or_else(|| failure(FailureCategory::IdentityMismatch))?;
+            if !Arc::ptr_eq(parent, &self.binding) || bound_name.as_c_str() != name {
+                return Err(failure(FailureCategory::IdentityMismatch));
+            }
+            let named = stat_at(self.fd(), name).map_err(io_failure)?;
+            if identity(&named) != attempt.binding.identity {
+                return Err(failure(FailureCategory::IdentityMismatch));
+            }
+            let tree = attempt.inventory(RemovalPolicy::Attempt)?;
+            attempt.verify_binding()?;
+            attempt.remove_inventory(tree)?;
+            attempt.verify_binding()?;
+            checked(unsafe { libc::unlinkat(self.fd(), name.as_ptr(), libc::AT_REMOVEDIR) })?;
+            sync(self.fd(), SyncKind::Directory).map_err(io_failure)
+        })();
+        result.inspect_err(|_| self.poison())
+    }
+
     fn inventory(&self, policy: RemovalPolicy) -> Result<Vec<RemovalEntry>, ExecutionDomainError> {
         self.verify_binding()?;
         let mut entries = Vec::new();
@@ -542,9 +596,12 @@ impl BoundDir {
                         | b"docker-data"
                         | b"docker-exec"
                 );
-                if !(expected_directory && mode == libc::S_IFDIR
+                if !(expected_directory
+                    && mode == libc::S_IFDIR
+                    && u32::from(metadata.stx_mode) & 0o777 == 0o700
                     || name.to_bytes() == b"journal.json"
                         && mode == libc::S_IFREG
+                        && u32::from(metadata.stx_mode) & 0o777 == 0o600
                         && metadata.stx_nlink == 1)
                 {
                     return Err(failure(FailureCategory::IdentityMismatch));

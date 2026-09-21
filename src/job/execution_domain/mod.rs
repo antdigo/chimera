@@ -138,6 +138,8 @@ pub struct ExecutionDomainRoot {
     linux_reconcile: Option<Arc<linux::reconcile::LinuxReconcileContext>>,
     #[cfg(target_os = "linux")]
     reconciled: Arc<AtomicBool>,
+    #[cfg(target_os = "linux")]
+    reconcile_started: Arc<AtomicBool>,
     #[cfg(test)]
     provision_pause: Arc<Mutex<Option<ProvisionPause>>>,
 }
@@ -457,6 +459,8 @@ impl ExecutionDomainRoot {
             linux_reconcile: None,
             #[cfg(target_os = "linux")]
             reconciled: Arc::new(AtomicBool::new(true)),
+            #[cfg(target_os = "linux")]
+            reconcile_started: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
             provision_pause: Arc::new(Mutex::new(None)),
         })
@@ -490,13 +494,21 @@ impl ExecutionDomainRoot {
                 errno: None,
             }
         })?;
+        if self.reconcile_started.swap(true, Ordering::AcqRel) {
+            return Err(ExecutionDomainError::AdmissionClosed {
+                path: self.canonical_path.clone(),
+            });
+        }
         let result = tokio::task::spawn_blocking(move || context.reconcile())
             .await
-            .map_err(|_| ExecutionDomainError::Backend {
-                attempt: None,
-                stage: Stage::Filesystem,
-                category: FailureCategory::Unavailable,
-                errno: None,
+            .map_err(|_| {
+                self.state.poison();
+                ExecutionDomainError::Backend {
+                    attempt: None,
+                    stage: Stage::Filesystem,
+                    category: FailureCategory::Unavailable,
+                    errno: None,
+                }
             })?;
         match result {
             Ok(()) => {
@@ -532,6 +544,7 @@ impl ExecutionDomainRoot {
             retained_cleanups: Arc::new(manager::RetainedCleanupRegistry::default()),
             linux_reconcile: Some(context),
             reconciled: Arc::new(AtomicBool::new(false)),
+            reconcile_started: Arc::new(AtomicBool::new(false)),
             provision_pause: Arc::new(Mutex::new(None)),
         })
     }

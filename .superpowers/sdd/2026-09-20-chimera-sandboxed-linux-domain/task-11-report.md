@@ -33,3 +33,16 @@
 ## Qualification boundary
 
 Task 11 proves the recovery state machine, durable provenance rules, descriptor capability flow, and native Linux recovery fixtures without activating the public sandbox. Task 12 still owns qualification on a real Debian host with systemd-delegated cgroup v2, real RootlessKit and subordinate UID/GID mappings, subordinate-owned nonempty writable trees, live/nested descendants, mounts, cleanup-worker crash/timeout, and peer-attempt canaries. No pathname, PID, journal text, trusted-v1 record, or permissive owner fallback was introduced for that missing qualification.
+
+## Independent review closure
+
+The six review findings were independently verified, reproduced, and fixed test-first:
+
+- Normal `attempt/domain` and nested empty cgroups now reuse Task 10's reverse-order recursive empty/remove primitive; residual populated descendants preserve parent evidence. Native recovery regression covers both.
+- Reconciliation deletes the exact retained attempt directory capability, rechecking its parent/name/inode before mutation. A real rename/replacement regression proves neither the substituted directory nor an outside canary is touched.
+- Recovery is single-shot: a repeated call cannot scan while admission is open, and a blocking-task panic poisons the root before returning. Native tests cover both the repeated call and injected `JoinError`.
+- The mount-absence proof now uses the actual pinned descendant path (`<root>/job-resources/<attempt>`), not the root's diagnostic path. A native path regression catches duplicate/missing ancestors.
+- A failed active-root validation or read no longer bypasses independent cgroup inventory. An injected invalid active root with a simulated populated cgroup proves bounded KILL/empty still occurs, while filesystem and cgroup deletion remain blocked.
+- Direct allowlisted attempt subdirectories require mode `0700` and `journal.json` requires `0600`; wrong-mode nested evidence remains. Writable user-controlled content under those roots deliberately retains Task 10's existing policy because arbitrary job-created mode bits are not Linux provenance.
+
+Final review-fix gates: host formatting, Clippy with warnings denied, and diff-check exit 0; native arm64 Linux reconciliation **16 passed**, dirfd **23 passed / 2 privileged ignored**, cgroup suite **32 passed** as UID1000. The initial root-container cgroup run had exactly two fixture failures whose assertions explicitly require UID≠0; unchanged UID1000 rerun was green. Final elevated full serial gate: library **1094 passed, 23 ignored**, all integration targets passed. The expected injected worker panic is caught by `JoinError` and the root is verified poisoned.

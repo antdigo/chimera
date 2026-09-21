@@ -263,7 +263,6 @@ mod native {
         cgroups: &CgroupRoot<F>,
     ) -> Result<(), ExecutionDomainError> {
         let _single_flight = lock.lock_reconciliation();
-        active.verify_private_directory()?;
         let (inventory, mut operations, first_error) = inventory(active, cgroups)?;
         reconcile_inventory_with_error(&inventory, &mut operations, first_error)
     }
@@ -283,7 +282,17 @@ mod native {
         let mut directories = BTreeMap::new();
         let mut cleanup_directories = BTreeMap::new();
         let mut first_error = None;
-        for name in dirfd::directory_entries(active.fd())? {
+        let active_entries = match active
+            .verify_private_directory()
+            .and_then(|()| dirfd::directory_entries(active.fd()))
+        {
+            Ok(entries) => entries,
+            Err(error) => {
+                retain_error(&mut first_error, error);
+                Vec::new()
+            }
+        };
+        for name in active_entries {
             let value = match name.to_str() {
                 Ok(value) => value,
                 Err(_) => {
@@ -321,7 +330,10 @@ mod native {
                 }
             }
         }
-        let cgroup_inventory = cgroups.recovery_inventory()?;
+        let cgroup_inventory = match cgroups.recovery_inventory() {
+            Ok(inventory) => inventory,
+            Err(error) => return Err(first_error.unwrap_or(error)),
+        };
         retain_optional(&mut first_error, cgroup_inventory.first_error);
         let mut attempt_cgroups = BTreeMap::new();
         let mut cleanup_cgroups = BTreeMap::new();
@@ -378,7 +390,7 @@ mod native {
                 LinuxJournalEvidence::TrustedV1Diagnostic => return Err(invalid_inventory()),
             }
             directory.verify_attempt_removal_tree()?;
-            let path = self.active.root_path().join(attempt.component());
+            let path = directory.bound_path();
             super::super::prove_no_mount_below(&path)
         }
 
@@ -402,7 +414,9 @@ mod native {
             &mut self,
             attempt: AttemptIdentity,
         ) -> Result<(), ExecutionDomainError> {
-            self.active.remove_tree(&component("", attempt)?)
+            let directory = required(&self.directories, attempt)?;
+            self.active
+                .remove_bound_tree(&component("", attempt)?, directory)
         }
 
         fn remove_attempt_cgroup(

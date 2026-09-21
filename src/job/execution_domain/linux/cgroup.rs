@@ -424,21 +424,10 @@ impl<F: CgroupFilesystem> RecoveredCgroup<F> {
     }
 
     pub(super) fn remove(&mut self) -> Result<(), ExecutionDomainError> {
-        if !self.empty_proven || self.directory.has_children()? {
+        if !self.empty_proven {
             return Err(failure(FailureCategory::Unavailable));
         }
-        let (parent, name) = self
-            .directory
-            .parent
-            .as_ref()
-            .ok_or_else(|| failure(FailureCategory::IdentityMismatch))?;
-        self.directory.verify()?;
-        parent.verify()?;
-        self.directory
-            .fs
-            .remove(parent.bound.fd(), name, self.directory.bound.fd())
-            .map_err(io_failure)?;
-        parent.verify()
+        self.directory.remove_recursive_empty()
     }
 }
 
@@ -629,10 +618,16 @@ impl<F: CgroupFilesystem> AttemptCgroup<F> {
     }
 
     pub(super) fn remove(&self) -> Result<(), ExecutionDomainError> {
-        if !self.directory.recursively_empty()? {
+        self.directory.remove_recursive_empty()
+    }
+}
+
+impl<F: CgroupFilesystem> CgroupDir<F> {
+    fn remove_recursive_empty(self: &Arc<Self>) -> Result<(), ExecutionDomainError> {
+        if !self.recursively_empty()? {
             return Err(failure(FailureCategory::Unavailable));
         }
-        let groups = self.directory.tree()?;
+        let groups = self.tree()?;
         for group in groups.into_iter().rev() {
             group.verify()?;
             if !group.members()?.is_empty() || group.populated()? {
