@@ -199,18 +199,25 @@ pub fn write_report(
     report: &QualificationReport,
 ) -> std::io::Result<()> {
     use std::fs::OpenOptions;
-    use std::io::{Error, ErrorKind, Write};
-    use std::os::fd::{AsRawFd, FromRawFd};
     use std::os::unix::fs::OpenOptionsExt;
-    if !safe_to_serialize(report) {
-        return Err(Error::new(ErrorKind::InvalidInput, "unsafe report fields"));
-    }
     // Hold the run directory across creation, publication and directory fsync;
     // path replacement cannot redirect subsequent writes.
     let directory = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
         .open(directory)?;
+    write_report_at(&directory, report)
+}
+
+pub(super) fn write_report_at(
+    directory: &std::fs::File,
+    report: &QualificationReport,
+) -> std::io::Result<()> {
+    use std::io::{Error, ErrorKind, Write};
+    use std::os::fd::{AsRawFd, FromRawFd};
+    if !safe_to_serialize(report) {
+        return Err(Error::new(ErrorKind::InvalidInput, "unsafe report fields"));
+    }
     let json = serde_json::to_vec_pretty(report)?;
     let md = markdown(report);
     for (name, contents) in [
