@@ -35,11 +35,75 @@ impl Fixture {
         }
     }
     fn acquire(&self, run: uuid::Uuid) -> Result<NativeLease, Reason> {
-        acquire_fixture(&self.config, run, self.boot, &self.lock, &self.marker)
+        after_transient_host_busy(|| {
+            acquire_fixture(&self.config, run, self.boot, &self.lock, &self.marker)
+        })
     }
     fn report(&self, run: uuid::Uuid) -> QualificationReport {
         fixture_report(&self.config, self.boot, run)
     }
+}
+
+pub(super) fn after_transient_host_busy<T>(
+    operation: impl FnMut() -> Result<T, Reason>,
+) -> Result<T, Reason> {
+    after_transient_host_busy_for(Duration::from_secs(5), operation)
+}
+
+fn after_transient_host_busy_for<T>(
+    timeout: Duration,
+    mut operation: impl FnMut() -> Result<T, Reason>,
+) -> Result<T, Reason> {
+    // Other tests spawn children. Between process creation and exec, a child
+    // can briefly inherit an open-file description holding this flock even
+    // after its owner drops the FD; CLOEXEC closes it only at exec.
+    let deadline = Instant::now() + timeout;
+    loop {
+        match operation() {
+            Err(Reason::HostBusy) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            result => return result,
+        }
+    }
+}
+
+fn recover_fixture(lock: &std::path::Path, marker: &std::path::Path) -> Result<(), Reason> {
+    after_transient_host_busy(|| super::host::recover_fixture(lock, marker))
+}
+
+#[test]
+fn host_fixture_lock_release_retries_only_transient_busy() {
+    let fixture = Fixture::new();
+    let held = lock_exclusive(&fixture.lock).unwrap();
+    let releaser = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(50));
+        drop(held);
+    });
+    let released = after_transient_host_busy_for(Duration::from_secs(1), || {
+        super::host::recover_fixture(&fixture.lock, &fixture.marker)
+    });
+    releaser.join().unwrap();
+    assert_eq!(released, Ok(()));
+
+    let held = lock_exclusive(&fixture.lock).unwrap();
+    assert_eq!(
+        after_transient_host_busy_for(Duration::from_millis(30), || {
+            super::host::recover_fixture(&fixture.lock, &fixture.marker)
+        }),
+        Err(Reason::HostBusy)
+    );
+    drop(held);
+
+    let mut calls = 0;
+    assert_eq!(
+        after_transient_host_busy_for(Duration::from_secs(1), || {
+            calls += 1;
+            Err::<(), _>(Reason::InvalidConfig)
+        }),
+        Err(Reason::InvalidConfig)
+    );
+    assert_eq!(calls, 1);
 }
 fn fixture_report(config: &NativeConfig, boot: uuid::Uuid, run: uuid::Uuid) -> QualificationReport {
     let identity = RunIdentity {
@@ -100,7 +164,7 @@ fn exclusive_lock_cannot_be_bypassed_by_a_second_output_directory() {
         String::from_utf8_lossy(&output.stdout)
     );
     drop(first);
-    assert!(lock_exclusive(&fixture.lock).is_ok());
+    assert!(after_transient_host_busy(|| lock_exclusive(&fixture.lock)).is_ok());
 }
 
 #[test]
@@ -528,7 +592,7 @@ fn host_silent_fixture_readiness_is_bounded_and_child_reaped() {
     assert_eq!(result.err().unwrap().kind(), std::io::ErrorKind::TimedOut);
     assert!(start.elapsed() < Duration::from_millis(1500));
     assert!(fixture.marker.exists()); // Child acquired the lock before becoming silent.
-    assert!(lock_exclusive(&fixture.lock).is_ok()); // Its guard killed and reaped it.
+    assert!(after_transient_host_busy(|| lock_exclusive(&fixture.lock)).is_ok()); // Its guard killed and reaped it.
 }
 
 struct FixtureChild(std::process::Child);

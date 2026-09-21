@@ -66,11 +66,10 @@ fn report_fixture_nested_and_caller_labelled_native_never_qualify() {
 
 #[test]
 fn report_rejects_missing_duplicate_or_unexpected_checks_and_cases() {
-    let mut original = complete();
-    original.identity.mode = EvidenceMode::NativeDebian;
-    for row in &mut original.results {
-        row.provenance.identity.mode = EvidenceMode::NativeDebian;
-    }
+    let original = complete();
+    // Every mutation must be tested against a structurally valid baseline.
+    // The separate resource-report test covers native summary completeness.
+    assert_eq!(validate_report_structure(&original), Ok(()));
     let mut variants = Vec::new();
     let mut r = original.clone();
     r.results.pop();

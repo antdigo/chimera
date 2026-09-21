@@ -34,13 +34,16 @@ impl Fixture {
         self.temp.path().canonicalize().unwrap()
     }
     fn acquire(&self) -> Result<NativeLease, Reason> {
-        acquire_fixture(
-            &self.config,
-            uuid::Uuid::new_v4(),
-            self.boot,
-            &self.base().join("lock"),
-            &self.base().join("active"),
-        )
+        let run = uuid::Uuid::new_v4();
+        super::host_test::after_transient_host_busy(|| {
+            acquire_fixture(
+                &self.config,
+                run,
+                self.boot,
+                &self.base().join("lock"),
+                &self.base().join("active"),
+            )
+        })
     }
     fn driver(&self) {
         fs::write(
