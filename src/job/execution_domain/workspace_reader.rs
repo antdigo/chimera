@@ -297,14 +297,17 @@ fn open_root(path: &Path) -> Result<RootBinding, ExecutionDomainError> {
     }
     Ok(RootBinding {
         fd,
-        device: metadata.st_dev,
+        device: metadata_device(&metadata),
         inode: metadata.st_ino as u64,
     })
 }
 
 fn verify_directory(fd: &OwnedFd, device: u64, inode: u64) -> Result<(), ExecutionDomainError> {
     let current = metadata(fd.as_raw_fd())?;
-    if file_type(&current) != libc::S_IFDIR || current.st_dev != device || current.st_ino != inode {
+    if file_type(&current) != libc::S_IFDIR
+        || metadata_device(&current) != device
+        || current.st_ino != inode
+    {
         return Err(failure(FailureCategory::IdentityMismatch));
     }
     Ok(())
@@ -338,7 +341,7 @@ impl Traversal<'_> {
             check_deadline(self.started, self.limits.max_time)?;
             let before = metadata_at(directory, name)?;
             check_deadline(self.started, self.limits.max_time)?;
-            if before.st_dev != self.root_device {
+            if metadata_device(&before) != self.root_device {
                 return Err(failure(FailureCategory::IdentityMismatch));
             }
             let relative = relative_dir.join(OsString::from_vec(name.to_bytes().to_vec()));
@@ -356,7 +359,9 @@ impl Traversal<'_> {
                         self.limits.max_time,
                     )?;
                     let after = metadata(child.as_raw_fd())?;
-                    if !same_identity(&before, &after) || after.st_dev != self.root_device {
+                    if !same_identity(&before, &after)
+                        || metadata_device(&after) != self.root_device
+                    {
                         return Err(failure(FailureCategory::IdentityMismatch));
                     }
                     self.enumerate(child.as_raw_fd(), &relative, child_depth)?;
@@ -437,7 +442,7 @@ fn open_relative_regular(
             max_time,
         )?;
         let metadata = metadata(next.as_raw_fd())?;
-        if metadata.st_dev != root.device
+        if metadata_device(&metadata) != root.device
             || if last {
                 file_type(&metadata) != libc::S_IFREG
             } else {
@@ -525,6 +530,17 @@ fn clear_errno() {
 #[cfg(target_os = "macos")]
 fn clear_errno() {
     unsafe { *libc::__error() = 0 };
+}
+
+fn metadata_device(metadata: &libc::stat) -> u64 {
+    #[cfg(target_os = "linux")]
+    {
+        metadata.st_dev
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        metadata.st_dev as u64
+    }
 }
 
 fn metadata(fd: RawFd) -> Result<libc::stat, ExecutionDomainError> {
