@@ -62,6 +62,8 @@ Task 11: complete (implementation commit recorded by this handoff). A live unfor
 
 Task 11: fix round 1/5 (review-fix commit recorded by this handoff; 6 addressed, 0 open — recursive normal/nested cgroup removal, retained-FD deletion after swap, single-shot admission and JoinError poison, exact mount path, independent cgroup neutralization on active-root errors, and direct nested/journal mode provenance). Final host fmt/clippy/diff-check and full serial suite are green: 1094 passed, 23 ignored, every integration target passed. Native arm64 Linux reconciliation 16/16, dirfd 23/23 with two privileged fixtures ignored, and cgroup 32/32 under UID1000 are green; real Debian production qualification remains Task 12.
 
+Task 11: fix round 2/5 (review-fix commit recorded by this handoff; 2 addressed, 0 open — active/attempt owner+full-mode revalidation immediately before bound deletion and exact `0o7777` mode checks rejecting special bits). Four native RED cases are GREEN: dirfd 27/27 with two privileged fixtures ignored; recovery 16/16. Host fmt/clippy/diff-check and final elevated full serial suite are green: 1094 passed, 23 ignored, every integration target passed. Task 12 native qualification boundary unchanged.
+
 Plan C consumer note: managed dockerd needs a separate policy and explicit retained-capability lifetime; never reuse the workflow child policy.
 
 Deferred contract for Task 10/C: rootless Docker may leave subordinate-UID files and non-traversable directories. Cleanup must define an owned user-namespace/idmapped cleanup capability; do not solve this by globally weakening owner checks.

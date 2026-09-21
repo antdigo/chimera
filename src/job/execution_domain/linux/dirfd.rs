@@ -138,7 +138,7 @@ impl BoundDir {
         self.verify_binding()?;
         let metadata = metadata(self.fd())?;
         if u32::from(metadata.stx_mode) & libc::S_IFMT != libc::S_IFDIR
-            || u32::from(metadata.stx_mode) & 0o777 != 0o700
+            || u32::from(metadata.stx_mode) & 0o7777 != 0o700
             || metadata.stx_uid != unsafe { libc::geteuid() }
         {
             return Err(failure(FailureCategory::IdentityMismatch));
@@ -547,8 +547,8 @@ impl BoundDir {
     ) -> Result<(), ExecutionDomainError> {
         component(name)?;
         let result = (|| {
-            self.verify_binding()?;
-            attempt.verify_binding()?;
+            self.verify_private_directory()?;
+            attempt.verify_private_directory()?;
             let (parent, bound_name) = attempt
                 .binding
                 .parent
@@ -562,9 +562,11 @@ impl BoundDir {
                 return Err(failure(FailureCategory::IdentityMismatch));
             }
             let tree = attempt.inventory(RemovalPolicy::Attempt)?;
-            attempt.verify_binding()?;
+            self.verify_private_directory()?;
+            attempt.verify_private_directory()?;
             attempt.remove_inventory(tree)?;
-            attempt.verify_binding()?;
+            self.verify_private_directory()?;
+            attempt.verify_private_directory()?;
             checked(unsafe { libc::unlinkat(self.fd(), name.as_ptr(), libc::AT_REMOVEDIR) })?;
             sync(self.fd(), SyncKind::Directory).map_err(io_failure)
         })();
@@ -598,10 +600,10 @@ impl BoundDir {
                 );
                 if !(expected_directory
                     && mode == libc::S_IFDIR
-                    && u32::from(metadata.stx_mode) & 0o777 == 0o700
+                    && u32::from(metadata.stx_mode) & 0o7777 == 0o700
                     || name.to_bytes() == b"journal.json"
                         && mode == libc::S_IFREG
-                        && u32::from(metadata.stx_mode) & 0o777 == 0o600
+                        && u32::from(metadata.stx_mode) & 0o7777 == 0o600
                         && metadata.stx_nlink == 1)
                 {
                     return Err(failure(FailureCategory::IdentityMismatch));

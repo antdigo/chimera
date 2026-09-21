@@ -174,6 +174,98 @@ fn retained_attempt_swap_never_deletes_replacement() {
 }
 
 #[test]
+fn retained_attempt_mode_drift_refuses_mutation_after_inventory() {
+    let fixture = Fixture::new();
+    fs::set_permissions(fixture.path(""), fs::Permissions::from_mode(0o700)).unwrap();
+    let original = fixture.root.create_child(c"attempt", 0o700).unwrap();
+    original.write_atomic(c"journal.json", b"{}").unwrap();
+    fixture.root.verify_private_directory().unwrap();
+    original.verify_private_directory().unwrap();
+    original.verify_attempt_removal_tree().unwrap();
+    fs::set_permissions(fixture.path("attempt"), fs::Permissions::from_mode(0o777)).unwrap();
+
+    assert!(
+        fixture
+            .root
+            .remove_bound_tree(c"attempt", &original)
+            .is_err()
+    );
+    assert_eq!(
+        fs::read(fixture.path("attempt/journal.json")).unwrap(),
+        b"{}"
+    );
+    fixture.assert_canary();
+}
+
+#[test]
+fn retained_active_root_mode_drift_refuses_mutation_after_inventory() {
+    let fixture = Fixture::new();
+    fs::set_permissions(fixture.path(""), fs::Permissions::from_mode(0o700)).unwrap();
+    let original = fixture.root.create_child(c"attempt", 0o700).unwrap();
+    original.write_atomic(c"journal.json", b"{}").unwrap();
+    fixture.root.verify_private_directory().unwrap();
+    original.verify_private_directory().unwrap();
+    original.verify_attempt_removal_tree().unwrap();
+    fs::set_permissions(fixture.path(""), fs::Permissions::from_mode(0o777)).unwrap();
+
+    assert!(
+        fixture
+            .root
+            .remove_bound_tree(c"attempt", &original)
+            .is_err()
+    );
+    assert_eq!(
+        fs::read(fixture.path("attempt/journal.json")).unwrap(),
+        b"{}"
+    );
+    fixture.assert_canary();
+}
+
+#[test]
+fn private_directory_rejects_setuid_and_sticky_bits() {
+    for mode in [0o4700, 0o1700] {
+        let fixture = Fixture::new();
+        fs::set_permissions(fixture.path(""), fs::Permissions::from_mode(mode)).unwrap();
+        assert_eq!(
+            fs::metadata(fixture.path("")).unwrap().permissions().mode() & 0o7777,
+            mode
+        );
+        assert!(fixture.root.verify_private_directory().is_err(), "{mode:o}");
+        fixture.assert_canary();
+    }
+}
+
+#[test]
+fn attempt_inventory_rejects_special_bits_on_owned_subdir_and_journal() {
+    for (name, mode) in [("work", 0o4700), ("journal.json", 0o4600)] {
+        let fixture = Fixture::new();
+        let attempt = fixture.root.create_child(c"attempt", 0o700).unwrap();
+        attempt.create_child(c"work", 0o700).unwrap();
+        attempt.write_atomic(c"journal.json", b"{}").unwrap();
+        fs::set_permissions(
+            fixture.path(&format!("attempt/{name}")),
+            fs::Permissions::from_mode(mode),
+        )
+        .unwrap();
+        assert_eq!(
+            fs::metadata(fixture.path(&format!("attempt/{name}")))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
+            mode
+        );
+
+        assert!(attempt.verify_attempt_removal_tree().is_err(), "{name}");
+        assert_eq!(
+            fs::read(fixture.path("attempt/journal.json")).unwrap(),
+            b"{}"
+        );
+        fixture.assert_canary();
+    }
+}
+
+#[test]
 fn pinned_descendant_reports_actual_logical_mount_path() {
     let fixture = Fixture::new();
     let active = fixture.root.create_child(c"job-resources", 0o700).unwrap();

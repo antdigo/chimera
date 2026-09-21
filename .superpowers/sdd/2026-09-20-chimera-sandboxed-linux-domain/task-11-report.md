@@ -46,3 +46,9 @@ The six review findings were independently verified, reproduced, and fixed test-
 - Direct allowlisted attempt subdirectories require mode `0700` and `journal.json` requires `0600`; wrong-mode nested evidence remains. Writable user-controlled content under those roots deliberately retains Task 10's existing policy because arbitrary job-created mode bits are not Linux provenance.
 
 Final review-fix gates: host formatting, Clippy with warnings denied, and diff-check exit 0; native arm64 Linux reconciliation **16 passed**, dirfd **23 passed / 2 privileged ignored**, cgroup suite **32 passed** as UID1000. The initial root-container cgroup run had exactly two fixture failures whose assertions explicitly require UID≠0; unchanged UID1000 rerun was green. Final elevated full serial gate: library **1094 passed, 23 ignored**, all integration targets passed. The expected injected worker panic is caught by `JoinError` and the root is verified poisoned.
+
+## Final provenance re-review closure
+
+- Four native RED regressions demonstrated that chmod drift on the retained active/attempt directory after inventory still allowed deletion, and that setuid/sticky directory bits (`04700`/`01700`) or a setuid journal (`04600`) passed the masked mode checks.
+- `remove_bound_tree` now revalidates the exact retained active and attempt directory UID and full private mode before inventory, after inventory and immediately before the final unlink. Mode/owner drift refuses deletion and preserves the attempt journal and outside canary. Direct allowlisted roots and journal compare all `0o7777` permission/special bits, not only `0o777`.
+- Final native arm64 Linux dirfd suite: **27 passed, 2 privileged ignored**; recovery suite: **16 passed**. Host Clippy with warnings denied, formatting and diff-check exit 0. Final elevated full serial suite: library **1094 passed, 23 ignored**, all integration targets passed.
