@@ -40,6 +40,14 @@
 - Elevated `cargo test --all-targets --all-features -- --test-threads=1`: library **1086 passed, 23 ignored**; every integration target passed. The restricted-sandbox attempt produced the expected fixture permission cascade and was replaced by this unchanged elevated run.
 - The amd64-on-arm Docker cleanup sweep reached all touched tests successfully; seven unrelated dirfd fixtures report the environment's known `ENOSYS` for the required filesystem syscall under emulation, so they are not claimed as native qualification. Task 12 retains the real Debian gate.
 
+### Final re-review closure
+
+- Pending cleanup retry is failure-atomic for observation errors: ownership-returning child observation never drops the child on `try_wait` failure, retained children/cgroups/bootstrap directories are held in append-only pending vectors, and a poisoned mutex is recovered without discarding authority. Attach-failure, worker teardown, helper teardown, and retry all reinsert exact authority before returning an error.
+- An injected two-error `try_wait` regression traverses the production pending-child retry helper: the first pass returns an error while retaining the exact child, and the second pass proves reap and discharges it.
+- `StrictCleanupRecord` accumulates forced-kill evidence before later destructive stages can fail. The real two-pass late-fsync regression now forces KILL on pass one and asserts the successful retry still reports `forced_kill = true`.
+- Focused host destroy suite: **10 passed**; native Linux injected observation-error retry: **1 passed**; native Linux library check, host formatting, Clippy with warnings denied, and diff-check are green.
+- Final elevated full serial gate: library **1086 passed, 23 ignored**; every integration target passed.
+
 ## Qualification boundary
 
 Task 10 proves the portable destruction state machine and Linux descriptor/map/protocol primitives, but does **not** claim production-native mapped cleanup qualification. A real Debian host fixture with delegated cgroup v2, RootlessKit, `newuidmap`/`newgidmap`, subordinate-owned `0700` trees, original namespace death, worker crash/timeout, and peer-attempt canaries remains an explicit Task 12 gate. No fallback was added for its absence, and public sandbox activation remains blocked.

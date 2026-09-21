@@ -15,6 +15,7 @@ struct Harness {
     fail_at: Option<&'static str>,
     empty_calls: usize,
     cgroup_present: bool,
+    forced_kill_observed: bool,
 }
 
 impl Harness {
@@ -28,6 +29,7 @@ impl Harness {
             fail_at: None,
             empty_calls: 0,
             cgroup_present: true,
+            forced_kill_observed: false,
         }
     }
 
@@ -44,6 +46,10 @@ impl Harness {
 impl DestroyOps for Harness {
     fn kernel_neutralization_required(&self) -> bool {
         self.cgroup_present
+    }
+    fn remember_forced_kill(&mut self, forced_kill: bool) -> bool {
+        self.forced_kill_observed |= forced_kill;
+        self.forced_kill_observed
     }
     fn close_admission(&mut self) -> Result<(), ExecutionDomainError> {
         self.event("close-admission")
@@ -117,7 +123,7 @@ impl DestroyOps for Harness {
 
 #[test]
 fn retry_after_late_fsync_failure_skips_removed_kernel_domain() {
-    let mut harness = Harness::new(true, true);
+    let mut harness = Harness::new(false, true);
     harness.fail_at = Some("fsync-root");
 
     assert!(destroy_kernel(&mut harness, attempt(), ShutdownBounds::default()).is_err());
@@ -125,8 +131,9 @@ fn retry_after_late_fsync_failure_skips_removed_kernel_domain() {
     assert!(!harness.cgroup_present);
 
     harness.fail_at = None;
-    destroy_kernel(&mut harness, attempt(), ShutdownBounds::default()).unwrap();
+    let report = destroy_kernel(&mut harness, attempt(), ShutdownBounds::default()).unwrap();
 
+    assert!(report.forced_kill);
     assert_eq!(
         &harness.events[first_pass_len..],
         [

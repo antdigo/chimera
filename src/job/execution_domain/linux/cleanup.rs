@@ -94,8 +94,8 @@ pub(in crate::job::execution_domain) struct CleanupWorkerConfig {
 #[derive(Default)]
 struct PendingCleanup {
     children: Vec<std::process::Child>,
-    cgroup: Option<super::cgroup::CleanupCgroup>,
-    bootstrap: Option<(CString, dirfd::BoundDir)>,
+    cgroups: Vec<super::cgroup::CleanupCgroup>,
+    bootstraps: Vec<(CString, dirfd::BoundDir)>,
 }
 
 struct VerifiedExecutable {
@@ -126,93 +126,118 @@ fn retain_pending_cleanup(
     child: Option<std::process::Child>,
     cgroup: Option<super::cgroup::CleanupCgroup>,
     bootstrap: Option<(CString, dirfd::BoundDir)>,
-) -> Result<(), ExecutionDomainError> {
+) {
     let mut pending = worker
         .pending
         .lock()
-        .map_err(|_| failure(FailureCategory::Unavailable))?;
-    if pending.cgroup.is_some() && cgroup.is_some()
-        || pending.bootstrap.is_some() && bootstrap.is_some()
-    {
-        return Err(failure(FailureCategory::IdentityMismatch));
-    }
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some(child) = child {
         pending.children.push(child);
     }
-    if cgroup.is_some() {
-        pending.cgroup = cgroup;
+    if let Some(cgroup) = cgroup {
+        pending.cgroups.push(cgroup);
     }
-    if bootstrap.is_some() {
-        pending.bootstrap = bootstrap;
+    if let Some(bootstrap) = bootstrap {
+        pending.bootstraps.push(bootstrap);
     }
-    Ok(())
 }
 
 fn retry_pending_cleanup(
     worker: &CleanupWorkerConfig,
     bootstrap_root: &dirfd::BoundDir,
 ) -> Result<(), ExecutionDomainError> {
+    let cleanup_deadline = Instant::now()
+        .checked_add(CLEANUP_CGROUP_GRACE)
+        .ok_or_else(|| failure(FailureCategory::InvalidInput))?;
     let mut pending = {
         let mut slot = worker
             .pending
             .lock()
-            .map_err(|_| failure(FailureCategory::Unavailable))?;
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         std::mem::take(&mut *slot)
     };
-    if pending.children.is_empty() && pending.cgroup.is_none() && pending.bootstrap.is_none() {
+    if pending.children.is_empty() && pending.cgroups.is_empty() && pending.bootstraps.is_empty() {
         return Ok(());
     }
 
-    let cleanup_deadline = Instant::now()
-        .checked_add(CLEANUP_CGROUP_GRACE)
-        .ok_or_else(|| failure(FailureCategory::InvalidInput))?;
     let mut first_error = None;
-    if let Some(cgroup) = pending.cgroup.take()
-        && let Err(error) = cgroup.kill_wait_remove(cleanup_deadline)
+    let mut retained_cgroups = Vec::new();
+    for cgroup in pending.cgroups.drain(..) {
+        if let Err(error) = cgroup.kill_wait_remove(cleanup_deadline) {
+            if first_error.is_none() {
+                first_error = Some(error);
+            }
+            retained_cgroups.push(cgroup);
+        }
+    }
+    pending.cgroups = retained_cgroups;
+
+    if let Err(error) = retry_pending_children(&mut pending.children, cleanup_deadline)
+        && first_error.is_none()
     {
         first_error = Some(error);
-        pending.cgroup = Some(cgroup);
     }
 
-    let mut unreaped = Vec::new();
-    for mut child in pending.children.drain(..) {
-        let wait = wait_child_status(&mut child, cleanup_deadline);
-        let still_running = child.try_wait().map_err(io_failure)?.is_none();
-        if still_running {
-            if first_error.is_none() {
-                first_error = Some(
-                    wait.err()
-                        .unwrap_or_else(|| failure(FailureCategory::Timeout)),
-                );
+    if pending.children.is_empty() && pending.cgroups.is_empty() {
+        let mut retained_bootstraps = Vec::new();
+        for (name, bootstrap) in pending.bootstraps.drain(..) {
+            if let Err(error) = bootstrap_root.remove_created_child(&name, &bootstrap, &[]) {
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+                retained_bootstraps.push((name, bootstrap));
             }
-            unreaped.push(child);
         }
+        pending.bootstraps = retained_bootstraps;
     }
-    pending.children = unreaped;
 
-    if pending.children.is_empty()
-        && pending.cgroup.is_none()
-        && let Some((name, bootstrap)) = pending.bootstrap.take()
-        && let Err(error) = bootstrap_root.remove_created_child(&name, &bootstrap, &[])
+    if !pending.children.is_empty() || !pending.cgroups.is_empty() || !pending.bootstraps.is_empty()
     {
-        if first_error.is_none() {
-            first_error = Some(error);
-        }
-        pending.bootstrap = Some((name, bootstrap));
-    }
-
-    if !pending.children.is_empty() || pending.cgroup.is_some() || pending.bootstrap.is_some() {
         let mut slot = worker
             .pending
             .lock()
-            .map_err(|_| failure(FailureCategory::Unavailable))?;
-        if !slot.children.is_empty() || slot.cgroup.is_some() || slot.bootstrap.is_some() {
-            return Err(failure(FailureCategory::IdentityMismatch));
-        }
-        *slot = pending;
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        slot.children.append(&mut pending.children);
+        slot.cgroups.append(&mut pending.cgroups);
+        slot.bootstraps.append(&mut pending.bootstraps);
         return Err(first_error.unwrap_or_else(|| failure(FailureCategory::Unavailable)));
     }
     Ok(())
+}
+
+fn retry_pending_children<C: ReapableChild>(
+    children: &mut Vec<C>,
+    deadline: Instant,
+) -> Result<(), ExecutionDomainError> {
+    let mut retained = Vec::new();
+    let mut first_error = None;
+    for mut child in children.drain(..) {
+        let wait = wait_child_status(&mut child, deadline);
+        match observe_child(child) {
+            Ok((false, _child)) => {}
+            Ok((true, child)) => {
+                if first_error.is_none() {
+                    first_error = Some(
+                        wait.err()
+                            .unwrap_or_else(|| failure(FailureCategory::Timeout)),
+                    );
+                }
+                retained.push(child);
+            }
+            Err((error, child)) => {
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+                retained.push(child);
+            }
+        }
+    }
+    *children = retained;
+    if children.is_empty() {
+        Ok(())
+    } else {
+        Err(first_error.unwrap_or_else(|| failure(FailureCategory::Unavailable)))
+    }
 }
 
 #[cfg(test)]
@@ -632,24 +657,36 @@ fn run_worker(
                 .checked_add(REAP_GRACE)
                 .ok_or_else(|| failure(FailureCategory::InvalidInput))?;
             let reap = wait_child_status(&mut child, reap_deadline);
-            if child.try_wait().map_err(io_failure)?.is_none() {
-                retain_pending_cleanup(
-                    worker,
-                    Some(child),
-                    None,
-                    Some((bootstrap_name, bootstrap)),
-                )?;
-                return Err(combine_cleanup(
-                    error,
-                    Err(reap
-                        .err()
-                        .unwrap_or_else(|| failure(FailureCategory::Timeout))),
-                ));
+            match observe_child(child) {
+                Ok((true, child)) => {
+                    retain_pending_cleanup(
+                        worker,
+                        Some(child),
+                        None,
+                        Some((bootstrap_name, bootstrap)),
+                    );
+                    return Err(combine_cleanup(
+                        error,
+                        Err(reap
+                            .err()
+                            .unwrap_or_else(|| failure(FailureCategory::Timeout))),
+                    ));
+                }
+                Err((observation, child)) => {
+                    retain_pending_cleanup(
+                        worker,
+                        Some(child),
+                        None,
+                        Some((bootstrap_name, bootstrap)),
+                    );
+                    return Err(combine_cleanup(error, Err(observation)));
+                }
+                Ok((false, _child)) => {}
             }
             let bootstrap_cleanup =
                 bootstrap_root.remove_created_child(&bootstrap_name, &bootstrap, &[]);
             if bootstrap_cleanup.is_err() {
-                retain_pending_cleanup(worker, None, None, Some((bootstrap_name, bootstrap)))?;
+                retain_pending_cleanup(worker, None, None, Some((bootstrap_name, bootstrap)));
             }
             return Err(combine_cleanup(error, bootstrap_cleanup));
         }
@@ -704,7 +741,11 @@ fn run_worker(
         .checked_add(CLEANUP_CGROUP_GRACE)
         .ok_or_else(|| failure(FailureCategory::InvalidInput))?;
     let cgroup_result = cleanup_cgroup.kill_wait_remove(cleanup_deadline);
-    let child_pending = child.try_wait().map_err(io_failure)?.is_none();
+    let (pending_child, observation_result) = match observe_child(child) {
+        Ok((false, _child)) => (None, Ok(())),
+        Ok((true, child)) => (Some(child), Ok(())),
+        Err((error, child)) => (Some(child), Err(error)),
+    };
     let bootstrap_result = if cgroup_result.is_ok() {
         bootstrap_root.remove_created_child(&bootstrap_name, &bootstrap, &[])
     } else {
@@ -712,16 +753,20 @@ fn run_worker(
         // exact recursive-empty/removal proof.
         Ok(())
     };
-    if child_pending || cgroup_result.is_err() || bootstrap_result.is_err() {
+    if pending_child.is_some() || cgroup_result.is_err() || bootstrap_result.is_err() {
         retain_pending_cleanup(
             worker,
-            child_pending.then_some(child),
+            pending_child,
             cgroup_result.is_err().then_some(cleanup_cgroup),
             (cgroup_result.is_err() || bootstrap_result.is_err())
                 .then_some((bootstrap_name, bootstrap)),
-        )?;
+        );
     }
-    result.and(wait).and(cgroup_result).and(bootstrap_result)?;
+    result
+        .and(wait)
+        .and(observation_result)
+        .and(cgroup_result)
+        .and(bootstrap_result)?;
     for root in &authority.roots {
         root.verify()?;
         if dirfd::directory_entries_stream(root.fd.as_raw_fd())?
@@ -895,12 +940,17 @@ fn install_map(
     let mut helper = command.spawn().map_err(io_failure)?;
     let status = match wait_child_status(&mut helper, deadline) {
         Ok(status) => status,
-        Err(error) => {
-            if helper.try_wait().map_err(io_failure)?.is_none() {
-                retain_pending_cleanup(worker, Some(helper), None, None)?;
+        Err(error) => match observe_child(helper) {
+            Ok((false, _helper)) => return Err(error),
+            Ok((true, helper)) => {
+                retain_pending_cleanup(worker, Some(helper), None, None);
+                return Err(error);
             }
-            return Err(error);
-        }
+            Err((observation, helper)) => {
+                retain_pending_cleanup(worker, Some(helper), None, None);
+                return Err(combine_cleanup(error, Err(observation)));
+            }
+        },
     };
     if status.success() {
         Ok(())
@@ -1538,6 +1588,13 @@ impl ReapableChild for std::process::Child {
     }
 }
 
+fn observe_child<C: ReapableChild>(mut child: C) -> Result<(bool, C), (ExecutionDomainError, C)> {
+    match child.try_wait_status() {
+        Ok(status) => Ok((status.is_none(), child)),
+        Err(error) => Err((io_failure(error), child)),
+    }
+}
+
 #[cfg(test)]
 pub(super) fn wait_child_for_test(
     child: &mut std::process::Child,
@@ -1552,6 +1609,14 @@ pub(super) fn wait_reapable_child_for_test(
     deadline: Instant,
 ) -> Result<(), ExecutionDomainError> {
     wait_child_status(child, deadline).map(|_| ())
+}
+
+#[cfg(test)]
+pub(super) fn retry_pending_children_for_test<C: ReapableChild>(
+    children: &mut Vec<C>,
+    deadline: Instant,
+) -> Result<(), ExecutionDomainError> {
+    retry_pending_children(children, deadline)
 }
 
 fn root_kind_byte(kind: CleanupRootKind) -> u8 {

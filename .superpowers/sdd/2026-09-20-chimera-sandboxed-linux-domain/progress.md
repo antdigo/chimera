@@ -56,6 +56,8 @@ Task 10: fix round 1/5 (6 addressed, 0 open — no fabricated external revocatio
 
 Task 10: fix round 2/5 (3 addressed, 0 open — late destructive retry skips discharged kernel/cgroup work, timed-out helper/worker authority is bounded and retained for retry, and received namespace FDs require exact nsfs/type/identity proof). Focused host destroy suite 10/10 and native Linux namespace/reap regressions are green; native Linux lib check is clean. Elevated full serial gate: 1086 passed, 23 ignored, every integration target green. Task 12 remains the only real Debian RootlessKit/userns/cgroup qualification boundary.
 
+Task 10: fix round 3/5 (2 addressed, 0 open — observation errors atomically reinsert exact pending child/cgroup/bootstrap authority, and forced-kill evidence survives late destructive failure/retry). Injected native `try_wait` failure retry and host two-pass forced-kill report regressions are green. Final elevated full serial gate: 1086 passed, 23 ignored, every integration target green.
+
 Plan C consumer note: managed dockerd needs a separate policy and explicit retained-capability lifetime; never reuse the workflow child policy.
 
 Deferred contract for Task 10/C: rootless Docker may leave subordinate-UID files and non-traversable directories. Cleanup must define an owned user-namespace/idmapped cleanup capability; do not solve this by globally weakening owner checks.

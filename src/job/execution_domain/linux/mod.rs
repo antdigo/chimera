@@ -67,6 +67,7 @@ pub(in crate::job::execution_domain) struct StrictCleanupRecord {
     admission_closed: bool,
     handles_closed: bool,
     external_revocation: ExternalRevocationState,
+    forced_kill_observed: bool,
     destroy_report: Option<super::DestroyReport>,
     created_stages: CreatedStageStack,
 }
@@ -282,6 +283,7 @@ impl StrictBackendBuilder {
             admission_closed: false,
             handles_closed: false,
             external_revocation: ExternalRevocationState::Unpublished,
+            forced_kill_observed: false,
             destroy_report: None,
             created_stages: CreatedStageStack::new([
                 CreatedStage::AttemptCgroup,
@@ -451,6 +453,11 @@ impl StrictCleanupRecord {
 impl destroy::DestroyOps for StrictCleanupRecord {
     fn kernel_neutralization_required(&self) -> bool {
         self.created_stages.contains(CreatedStage::AttemptCgroup)
+    }
+
+    fn remember_forced_kill(&mut self, forced_kill: bool) -> bool {
+        self.forced_kill_observed |= forced_kill;
+        self.forced_kill_observed
     }
 
     fn close_admission(&mut self) -> Result<(), super::ExecutionDomainError> {

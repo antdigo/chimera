@@ -21,6 +21,7 @@ impl Default for ShutdownBounds {
 
 pub(super) trait DestroyOps {
     fn kernel_neutralization_required(&self) -> bool;
+    fn remember_forced_kill(&mut self, forced_kill: bool) -> bool;
     fn close_admission(&mut self) -> Result<(), ExecutionDomainError>;
     fn persist_destroying(&mut self) -> Result<(), ExecutionDomainError>;
     fn graceful_shutdown(&mut self, deadline: Instant) -> Result<(), ExecutionDomainError>;
@@ -100,6 +101,9 @@ pub(super) fn destroy_kernel<O: DestroyOps>(
         retain_first(&mut first_error, operations.close_handles());
         retain_first(&mut first_error, operations.prove_no_mounts());
     }
+    // Persist evidence before any later operation can fail. A retry that
+    // resumes after cgroup removal must still report the earlier escalation.
+    forced_kill = operations.remember_forced_kill(forced_kill);
     // Destructive filesystem cleanup is forbidden unless recursive cgroup
     // emptiness and every preceding ownership proof succeeded.
     if let Some(error) = first_error {

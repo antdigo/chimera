@@ -28,10 +28,15 @@ struct DelayedReap {
     killed: bool,
     remaining_polls: usize,
     reaped: bool,
+    try_wait_errors: usize,
 }
 
 impl super::cleanup::ReapableChild for DelayedReap {
     fn try_wait_status(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        if self.try_wait_errors > 0 {
+            self.try_wait_errors -= 1;
+            return Err(std::io::Error::from_raw_os_error(libc::EIO));
+        }
         if !self.killed {
             return Ok(None);
         }
@@ -55,6 +60,7 @@ fn timeout_uses_a_separate_bounded_window_to_prove_reap() {
         killed: false,
         remaining_polls: 8,
         reaped: false,
+        try_wait_errors: 0,
     };
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(5);
 
@@ -62,6 +68,39 @@ fn timeout_uses_a_separate_bounded_window_to_prove_reap() {
 
     assert!(child.killed);
     assert!(child.reaped);
+}
+
+#[test]
+fn pending_retry_reinserts_child_after_try_wait_observation_error() {
+    let mut pending = vec![DelayedReap {
+        killed: false,
+        remaining_polls: 2,
+        reaped: false,
+        try_wait_errors: 2,
+    }];
+
+    assert!(
+        super::cleanup::retry_pending_children_for_test(
+            &mut pending,
+            std::time::Instant::now() + std::time::Duration::from_millis(5),
+        )
+        .is_err()
+    );
+    assert_eq!(
+        pending.len(),
+        1,
+        "observation error must retain exact child"
+    );
+
+    super::cleanup::retry_pending_children_for_test(
+        &mut pending,
+        std::time::Instant::now() + std::time::Duration::from_millis(20),
+    )
+    .unwrap();
+    assert!(
+        pending.is_empty(),
+        "successful retry discharges child authority"
+    );
 }
 
 fn fixture() -> (TempDir, MappedIdRange, PinnedCleanupRoot) {
