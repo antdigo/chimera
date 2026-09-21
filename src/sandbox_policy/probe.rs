@@ -30,7 +30,7 @@ pub async fn probe_connect(
             _ if matches!(error.raw_os_error(), Some(51 | 65 | 100 | 101 | 113)) => {
                 Ok(ConnectOutcome::Unreachable)
             }
-            _ => Err(PolicyError::Io),
+            _ => Err(PolicyError::Io(error)),
         },
     }
 }

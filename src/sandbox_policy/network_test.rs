@@ -50,10 +50,10 @@ fn evidence() -> (super::NetworkPolicy, AppliedNetworkPolicy, ProbeBatch) {
 #[test]
 fn valid_evidence_requires_real_denial_across_all_classes() {
     let (policy, applied, probes) = evidence();
-    assert_eq!(
+    assert!(matches!(
         validate_network_evidence(&policy, &applied, &probes),
         Ok(())
-    );
+    ));
 }
 
 #[test]
@@ -69,18 +69,20 @@ fn ambiguous_and_allowed_negative_probes_are_rejected() {
         let (policy, applied, mut probes) = evidence();
         probes.negative[0].observed = outcome;
         assert_eq!(
-            validate_network_evidence(&policy, &applied, &probes),
-            Err(expected)
+            std::mem::discriminant(
+                &validate_network_evidence(&policy, &applied, &probes).unwrap_err()
+            ),
+            std::mem::discriminant(&expected)
         );
     }
     for before in [true, false] {
         let (policy, applied, mut probes) = evidence();
         probes.negative[0].control_before = before;
         probes.negative[0].control_after = !before;
-        assert_eq!(
+        assert!(matches!(
             validate_network_evidence(&policy, &applied, &probes),
             Err(PolicyError::ProbeInconclusive)
-        );
+        ));
     }
 }
 
@@ -88,34 +90,34 @@ fn ambiguous_and_allowed_negative_probes_are_rejected() {
 fn stale_or_loose_policy_evidence_is_rejected() {
     let (policy, mut applied, probes) = evidence();
     applied.allowed.push("0.0.0.0/0".parse().unwrap());
-    assert_eq!(
+    assert!(matches!(
         validate_network_evidence(&policy, &applied, &probes),
         Err(PolicyError::PolicyMismatch)
-    );
+    ));
     let (policy, mut applied, probes) = evidence();
     applied.bpf_attached = false;
-    assert_eq!(
+    assert!(matches!(
         validate_network_evidence(&policy, &applied, &probes),
         Err(PolicyError::PolicyMismatch)
-    );
+    ));
     let (policy, mut applied, probes) = evidence();
     applied.generation.boot_id = uuid::Uuid::new_v4();
-    assert_eq!(
+    assert!(matches!(
         validate_network_evidence(&policy, &applied, &probes),
         Err(PolicyError::PolicyMismatch)
-    );
+    ));
     let (policy, mut applied, probes) = evidence();
     applied.generation.invocation_id = "stale".into();
-    assert_eq!(
+    assert!(matches!(
         validate_network_evidence(&policy, &applied, &probes),
         Err(PolicyError::PolicyMismatch)
-    );
+    ));
     let (policy, mut applied, probes) = evidence();
     applied.generation.control_group = "/system.slice/other.service".into();
-    assert_eq!(
+    assert!(matches!(
         validate_network_evidence(&policy, &applied, &probes),
         Err(PolicyError::PolicyMismatch)
-    );
+    ));
 }
 
 #[test]
@@ -123,17 +125,17 @@ fn incomplete_probe_set_is_inconclusive() {
     for index in 0..3 {
         let (policy, applied, mut probes) = evidence();
         probes.negative.remove(index);
-        assert_eq!(
+        assert!(matches!(
             validate_network_evidence(&policy, &applied, &probes),
             Err(PolicyError::ProbeInconclusive)
-        );
+        ));
     }
     let (policy, applied, mut probes) = evidence();
     probes.public_registry_ok = false;
-    assert_eq!(
+    assert!(matches!(
         validate_network_evidence(&policy, &applied, &probes),
         Err(PolicyError::ProbeInconclusive)
-    );
+    ));
 }
 
 #[test]
@@ -154,10 +156,10 @@ fn overlapping_production_prefixes_need_distinct_sentinels() {
     assert_ne!(base_policy.digest(), policy.digest());
     applied.denied = policy.denied().to_vec();
 
-    assert_eq!(
+    assert!(matches!(
         validate_network_evidence(&policy, &applied, &probes),
         Err(PolicyError::ProbeInconclusive)
-    );
+    ));
 
     probes.negative.push(SentinelObservation {
         address: "198.51.100.1:8443".parse().unwrap(),
@@ -165,15 +167,15 @@ fn overlapping_production_prefixes_need_distinct_sentinels() {
         control_after: true,
         observed: ConnectOutcome::Denied,
     });
-    assert_eq!(
+    assert!(matches!(
         validate_network_evidence(&policy, &applied, &probes),
         Err(PolicyError::ProbeInconclusive)
-    );
+    ));
     probes.negative.last_mut().unwrap().address = "198.51.100.200:443".parse().unwrap();
-    assert_eq!(
+    assert!(matches!(
         validate_network_evidence(&policy, &applied, &probes),
         Ok(())
-    );
+    ));
 }
 
 #[test]

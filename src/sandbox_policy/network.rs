@@ -126,7 +126,7 @@ pub fn compile_network(
     host: &HostAddresses,
 ) -> Result<NetworkPolicy, PolicyError> {
     if host.addresses.is_empty() {
-        return Err(PolicyError::EmptyHostInventory);
+        return Err(PolicyError::InvalidObservation("host_addresses"));
     }
 
     let mut denied = BTreeMap::new();

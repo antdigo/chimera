@@ -85,9 +85,98 @@ fn unsupported_quota_collectors_do_not_accept_operator_assertions() {
 #[test]
 fn live_storage_probe_is_explicitly_unsupported_off_linux() {
     let temp = tempfile::tempdir().unwrap();
-    assert_eq!(
+    assert!(matches!(
         probe_storage(temp.path()),
         Err(PolicyError::UnsupportedPlatform)
+    ));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn pinned_root_rejects_escaped_writable_paths() {
+    for relative in [
+        "cache",
+        "work",
+        "tmp",
+        "job-resources",
+        "actions",
+        "externals",
+        "tool-cache",
+        "cache/entries",
+        "cache/data",
+        "cache/tmp",
+        "cache/data/ab",
+        "cache/data/ab/blob",
+        "cache/entries/entry.json",
+        "cache/tmp/upload.tmp",
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        let expected = linux::path_identity(&root).unwrap();
+        assert!(linux::verify_pinned_identity(&root, &expected).is_ok());
+        let escaped = root.join(relative);
+        std::fs::create_dir_all(escaped.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&outside, &escaped).unwrap();
+
+        assert!(
+            matches!(
+                linux::verify_pinned_identity(&root, &expected),
+                Err(PolicyError::StorageUnbounded)
+            ),
+            "accepted escaped writable path {relative}"
+        );
+        let evidence = StorageBoundEvidence {
+            identity: expected,
+            hard_limit_bytes: 64 << 30,
+        };
+        assert!(matches!(
+            revalidate_storage_identity(&root, &evidence),
+            Err(PolicyError::StorageUnbounded)
+        ));
+        assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn pinned_child_rejects_existing_foreign_mount_without_mounting_anything() {
+    let root = std::fs::File::open("/").unwrap();
+    let identity = linux::path_identity(Path::new("/")).unwrap();
+    assert!(matches!(
+        linux::open_bound_child(&root, std::ffi::OsStr::new("proc"), &identity),
+        Err(PolicyError::StorageUnbounded)
+    ));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn overdeep_cache_inspection_is_inconclusive() {
+    let temp = tempfile::tempdir().unwrap();
+    let deep = temp.path().join("cache").join("x/".repeat(17));
+    std::fs::create_dir_all(deep).unwrap();
+    let expected = linux::path_identity(temp.path()).unwrap();
+    assert!(matches!(
+        linux::verify_pinned_identity(temp.path(), &expected),
+        Err(PolicyError::InvalidObservation("storage"))
+    ));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn pinned_root_accepts_missing_and_contained_writable_paths_without_writes() {
+    let temp = tempfile::tempdir().unwrap();
+    let expected = linux::path_identity(temp.path()).unwrap();
+    assert!(linux::verify_pinned_identity(temp.path(), &expected).is_ok());
+    assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 0);
+    std::fs::create_dir_all(temp.path().join("cache/data/ab")).unwrap();
+    std::fs::write(temp.path().join("cache/data/ab/blob"), b"blob").unwrap();
+    assert!(linux::verify_pinned_identity(temp.path(), &expected).is_ok());
+    assert_eq!(
+        std::fs::read(temp.path().join("cache/data/ab/blob")).unwrap(),
+        b"blob"
     );
 }
 
@@ -104,7 +193,10 @@ fn revalidation_rejects_replaced_and_symlink_roots() {
     assert!(linux::verify_pinned_identity(&root, &evidence.identity).is_ok());
     std::fs::rename(&root, temp.path().join("old")).unwrap();
     std::fs::create_dir(&root).unwrap();
-    assert!(linux::verify_pinned_identity(&root, &evidence.identity).is_err());
+    assert!(matches!(
+        linux::verify_pinned_identity(&root, &evidence.identity),
+        Err(PolicyError::StorageIdentityChanged)
+    ));
     assert!(revalidate_storage_identity(&root, &evidence).is_err());
     std::fs::remove_dir(&root).unwrap();
     std::os::unix::fs::symlink(temp.path().join("old"), &root).unwrap();

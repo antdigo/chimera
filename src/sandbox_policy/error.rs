@@ -1,4 +1,4 @@
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[derive(thiserror::Error)]
 pub enum PolicyError {
     #[error("capability descriptor does not match the attempt")]
     CapabilityMismatch,
@@ -6,32 +6,35 @@ pub enum PolicyError {
     InvalidCidr,
     #[error("invalid storage limit")]
     InvalidStorageLimit,
-    #[error("host address inventory is empty")]
-    EmptyHostInventory,
+    #[error("missing sandbox policy: {0}")]
+    MissingPolicy(&'static str),
+    #[error("invalid sandbox policy service")]
+    InvalidService,
+    #[error("invalid sandbox policy observation: {0}")]
+    InvalidObservation(&'static str),
     #[error("network policy evidence does not match")]
     PolicyMismatch,
     #[error("negative probe allowed a forbidden connection")]
     ProbeAllowedForbidden,
     #[error("network probe was inconclusive")]
     ProbeInconclusive,
-    #[error("network probe I/O error")]
-    Io,
+    #[error("sandbox policy I/O error")]
+    Io(std::io::Error),
     #[error("storage probe is unsupported for this mechanism")]
     UnsupportedStorageProbe,
     #[error("sandbox storage probe is unsupported on this platform")]
     UnsupportedPlatform,
-    #[error("storage bound or identity does not match")]
-    StorageBoundMismatch,
-    #[error("storage probe is inconclusive")]
-    StorageProbeInconclusive,
-    #[error("sandbox policy root is not an existing directory")]
-    MissingRoot,
-    #[error("sandbox policy config is missing")]
-    MissingConfig,
-    #[error("sandbox policy config is invalid")]
-    InvalidConfig,
-    #[error("sandbox network config is missing")]
-    MissingNetworkConfig,
-    #[error("host address inventory could not be verified")]
-    HostInventoryUnavailable,
+    #[error("sandbox storage is not bounded")]
+    StorageUnbounded,
+    #[error("sandbox storage identity changed")]
+    StorageIdentityChanged,
+    #[error("sandbox capability is unsupported")]
+    UnsupportedCapability,
+}
+
+// Keep Debug safe for error reporters too; the I/O payload is available by matching.
+impl std::fmt::Debug for PolicyError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, formatter)
+    }
 }

@@ -47,9 +47,27 @@ fn cgroup_v2_requires_unified_mount_before_platform_satisfaction() {
 
 #[test]
 fn known_storage_mismatch_is_failed_not_unverified() {
-    let check = classify_storage_probe_error(PolicyError::StorageBoundMismatch);
-    assert_eq!(check.status, CheckStatus::Failed);
-    assert_eq!(check.category, "storage_bound_mismatch");
-    let inconclusive = classify_storage_probe_error(PolicyError::StorageProbeInconclusive);
+    for error in [
+        PolicyError::StorageUnbounded,
+        PolicyError::StorageIdentityChanged,
+    ] {
+        let check = classify_storage_probe_error(error);
+        assert_eq!(check.status, CheckStatus::Failed);
+        assert_eq!(check.category, "storage_bound_mismatch");
+    }
+    let inconclusive = classify_storage_probe_error(PolicyError::InvalidObservation("storage"));
     assert_eq!(inconclusive.status, CheckStatus::Unverified);
+}
+
+#[test]
+fn policy_io_error_preserves_cause_without_displaying_sensitive_detail() {
+    let error = PolicyError::Io(std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        "synthetic_secret_do_not_echo",
+    ));
+    assert!(!error.to_string().contains("synthetic_secret_do_not_echo"));
+    assert!(!format!("{error:?}").contains("synthetic_secret_do_not_echo"));
+    assert!(
+        matches!(error, PolicyError::Io(cause) if cause.kind() == std::io::ErrorKind::PermissionDenied)
+    );
 }

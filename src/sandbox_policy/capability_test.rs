@@ -31,7 +31,10 @@ fn descriptor_accepts_only_generated_attempt_scoped_socket_metadata() {
         let mut candidate = descriptor(attempt_id, grant_id);
         candidate.service = service;
         candidate.expires_at = now + Duration::minutes(1);
-        assert_eq!(validate_descriptor(&candidate, attempt_id, now), Ok(()));
+        assert!(matches!(
+            validate_descriptor(&candidate, attempt_id, now),
+            Ok(())
+        ));
     }
 }
 
@@ -44,10 +47,10 @@ fn descriptor_rejects_wrong_attempt_and_noncanonical_or_expired_metadata() {
     assert_ne!(grant_id, different_grant_id);
     let valid_descriptor = descriptor(attempt_id, grant_id);
 
-    assert_eq!(
+    assert!(matches!(
         validate_descriptor(&valid_descriptor, Uuid::new_v4(), now),
         Err(PolicyError::CapabilityMismatch)
-    );
+    ));
 
     for local_path in [
         format!("/run/chimera/capabilities/{grant_id}/../escape.sock"),
@@ -60,10 +63,10 @@ fn descriptor_rejects_wrong_attempt_and_noncanonical_or_expired_metadata() {
     ] {
         let mut candidate = descriptor(attempt_id, grant_id);
         candidate.local_path = local_path;
-        assert_eq!(
+        assert!(matches!(
             validate_descriptor(&candidate, attempt_id, now),
             Err(PolicyError::CapabilityMismatch)
-        );
+        ));
     }
 
     for (candidate_attempt, candidate_grant, expiry) in [
@@ -75,10 +78,10 @@ fn descriptor_rejects_wrong_attempt_and_noncanonical_or_expired_metadata() {
         let mut candidate = descriptor(candidate_attempt, candidate_grant);
         candidate.expires_at = expiry;
         candidate.local_path = format!("/run/chimera/capabilities/{candidate_grant}.sock");
-        assert_eq!(
+        assert!(matches!(
             validate_descriptor(&candidate, attempt_id, now),
             Err(PolicyError::CapabilityMismatch)
-        );
+        ));
     }
 }
 

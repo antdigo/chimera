@@ -58,7 +58,7 @@ pub fn validate_storage_bound(
         || !observation.writable_nested_mounts.is_empty()
         || !observation.aliases_outside_root.is_empty()
     {
-        return Err(PolicyError::StorageBoundMismatch);
+        return Err(PolicyError::StorageUnbounded);
     }
     Ok(StorageBoundEvidence {
         identity: observation.root.clone(),
@@ -69,11 +69,12 @@ pub fn validate_storage_bound(
 #[cfg(target_os = "linux")]
 mod linux {
     use super::*;
+    use std::ffi::{CString, OsStr};
     use std::fs::{self, File};
     use std::io::Read;
     use std::mem::MaybeUninit;
-    use std::os::fd::AsRawFd;
-    use std::os::unix::ffi::OsStringExt;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
     use std::os::unix::fs::MetadataExt;
 
     pub(super) const MAX_MOUNTINFO_BYTES: usize = 4 * 1024 * 1024;
@@ -89,10 +90,10 @@ mod linux {
     }
 
     fn inconclusive() -> PolicyError {
-        PolicyError::StorageProbeInconclusive
+        PolicyError::InvalidObservation("storage")
     }
     fn mismatch() -> PolicyError {
-        PolicyError::StorageBoundMismatch
+        PolicyError::StorageUnbounded
     }
 
     pub(super) fn checked_capacity(blocks: u64, fragment_size: u64) -> Result<u64, PolicyError> {
@@ -241,8 +242,115 @@ mod linux {
         root: &Path,
         expected: &StorageIdentity,
     ) -> Result<(), PolicyError> {
+        let file = crate::storage::open_existing_root(root)
+            .map_err(|_| PolicyError::StorageIdentityChanged)?;
+        if &identity(&file)? != expected {
+            return Err(PolicyError::StorageIdentityChanged);
+        }
+        for name in [
+            "work",
+            "tmp",
+            "job-resources",
+            "cache",
+            "actions",
+            "externals",
+            "tool-cache",
+        ] {
+            let Some(child) = open_bound_child(&file, OsStr::new(name), expected)? else {
+                continue;
+            };
+            if !child.metadata().map_err(|_| inconclusive())?.is_dir() {
+                return Err(mismatch());
+            }
+            if name == "cache" {
+                verify_cache_tree(&child, expected, &mut 100_000, 0)?;
+            }
+            verify_child_identity(&file, OsStr::new(name), &child, expected)?;
+        }
         if &path_identity(root)? != expected {
+            return Err(PolicyError::StorageIdentityChanged);
+        }
+        Ok(())
+    }
+
+    pub(super) fn open_bound_child(
+        parent: &File,
+        name: &OsStr,
+        root: &StorageIdentity,
+    ) -> Result<Option<File>, PolicyError> {
+        let name = CString::new(name.as_bytes()).map_err(|_| inconclusive())?;
+        // O_PATH avoids opening devices/FIFOs, and O_NOFOLLOW pins a symlink itself.
+        let fd = unsafe {
+            libc::openat(
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            let error = std::io::Error::last_os_error();
+            return if error.kind() == std::io::ErrorKind::NotFound {
+                Ok(None)
+            } else {
+                Err(inconclusive())
+            };
+        }
+        let file = unsafe { File::from_raw_fd(fd) };
+        let metadata = file.metadata().map_err(|_| inconclusive())?;
+        if !metadata.is_dir() && !metadata.is_file() {
             return Err(mismatch());
+        }
+        let observed = identity(&file)?;
+        if observed.device != root.device || observed.mount_id != root.mount_id {
+            return Err(mismatch());
+        }
+        Ok(Some(file))
+    }
+
+    fn verify_child_identity(
+        parent: &File,
+        name: &OsStr,
+        child: &File,
+        root: &StorageIdentity,
+    ) -> Result<(), PolicyError> {
+        let current =
+            open_bound_child(parent, name, root)?.ok_or(PolicyError::StorageIdentityChanged)?;
+        if identity(&current)? != identity(child)? {
+            return Err(PolicyError::StorageIdentityChanged);
+        }
+        Ok(())
+    }
+
+    fn verify_cache_tree(
+        directory: &File,
+        root: &StorageIdentity,
+        remaining: &mut usize,
+        depth: usize,
+    ) -> Result<(), PolicyError> {
+        if depth > 16 {
+            return Err(inconclusive());
+        }
+        // Enumeration uses the pinned directory, never an untrusted reconstructed path.
+        let entries = fs::read_dir(format!("/proc/self/fd/{}", directory.as_raw_fd()))
+            .map_err(|_| inconclusive())?;
+        for entry in entries {
+            *remaining = remaining.checked_sub(1).ok_or_else(inconclusive)?;
+            let name = entry.map_err(|_| inconclusive())?.file_name();
+            let child = open_bound_child(directory, &name, root)?
+                .ok_or(PolicyError::StorageIdentityChanged)?;
+            let is_directory = child.metadata().map_err(|_| inconclusive())?.is_dir();
+            if depth == 0
+                && ["entries", "data", "tmp"]
+                    .iter()
+                    .any(|required| name == *required)
+                && !is_directory
+            {
+                return Err(mismatch());
+            }
+            if is_directory {
+                verify_cache_tree(&child, root, remaining, depth + 1)?;
+            }
+            verify_child_identity(directory, &name, &child, root)?;
         }
         Ok(())
     }
@@ -305,12 +413,11 @@ mod linux {
         let (writable_nested_mounts, aliases_outside_root) =
             mount_conflicts(&mounts, &point, mount.id, mount.device);
         let last = identity(&file)?;
-        if first != last
-            || verify_pinned_identity(root, &first).is_err()
-            || fs::metadata(parent).map_err(|_| inconclusive())?.dev() != parent_device
+        if first != last || fs::metadata(parent).map_err(|_| inconclusive())?.dev() != parent_device
         {
-            return Err(mismatch());
+            return Err(PolicyError::StorageIdentityChanged);
         }
+        verify_pinned_identity(root, &first)?;
         let observation = StorageObservation {
             root: first,
             mount_point: point,
@@ -339,7 +446,7 @@ mod linux {
         if observation.root != evidence.identity
             || observation.total_bytes != evidence.hard_limit_bytes
         {
-            return Err(mismatch());
+            return Err(PolicyError::StorageIdentityChanged);
         }
         Ok(())
     }

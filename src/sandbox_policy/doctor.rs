@@ -41,13 +41,14 @@ fn check(id: &str, status: CheckStatus, category: &str) -> DoctorCheck {
 }
 
 fn config(root: &Path) -> Result<ChimeraConfig, PolicyError> {
-    let metadata = std::fs::symlink_metadata(root).map_err(|_| PolicyError::MissingRoot)?;
+    let metadata =
+        std::fs::symlink_metadata(root).map_err(|_| PolicyError::InvalidObservation("root"))?;
     if !metadata.file_type().is_dir() {
-        return Err(PolicyError::MissingRoot);
+        return Err(PolicyError::InvalidObservation("root"));
     }
     load_config_if_exists(&ChimeraPaths::new(root.to_path_buf()).config_file())
-        .map_err(|_| PolicyError::InvalidConfig)?
-        .ok_or(PolicyError::MissingConfig)
+        .map_err(|_| PolicyError::InvalidObservation("config"))?
+        .ok_or(PolicyError::MissingPolicy("config"))
 }
 
 struct InterfaceList(*mut libc::ifaddrs);
@@ -60,7 +61,7 @@ impl Drop for InterfaceList {
 fn host_addresses() -> Result<HostAddresses, PolicyError> {
     let mut first = std::ptr::null_mut();
     if unsafe { libc::getifaddrs(&mut first) } != 0 || first.is_null() {
-        return Err(PolicyError::HostInventoryUnavailable);
+        return Err(PolicyError::InvalidObservation("host_addresses"));
     }
     let guard = InterfaceList(first);
     let mut addresses = Vec::new();
@@ -84,7 +85,7 @@ fn host_addresses() -> Result<HostAddresses, PolicyError> {
     addresses.sort_unstable();
     addresses.dedup();
     if addresses.is_empty() {
-        return Err(PolicyError::HostInventoryUnavailable);
+        return Err(PolicyError::InvalidObservation("host_addresses"));
     }
     Ok(HostAddresses { addresses })
 }
@@ -236,7 +237,7 @@ pub fn inspect_policy(root: &Path) -> Result<DoctorReport, PolicyError> {
 
 fn classify_storage_probe_error(error: PolicyError) -> DoctorCheck {
     match error {
-        PolicyError::StorageBoundMismatch => check(
+        PolicyError::StorageUnbounded | PolicyError::StorageIdentityChanged => check(
             "storage_bound",
             CheckStatus::Failed,
             "storage_bound_mismatch",
@@ -255,7 +256,7 @@ pub fn inspect_install_plan(root: &Path) -> Result<InstallPlan, PolicyError> {
         .execution
         .network
         .as_ref()
-        .ok_or(PolicyError::MissingNetworkConfig)?;
+        .ok_or(PolicyError::MissingPolicy("network"))?;
     let host = host_addresses()?;
     let policy = compile_network(network, &host)?;
     Ok(render_install_plan(&policy))

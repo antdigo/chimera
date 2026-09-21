@@ -57,7 +57,6 @@ async fn sandboxed_run_rejects_before_daemon_owned_side_effects() {
                     mechanism: StorageMechanism::DedicatedFilesystem,
                     max_bytes: "1GiB".parse().unwrap(),
                 }),
-                ..ExecutionConfig::default()
             },
             runners: vec!["safety".into()],
             ..Default::default()
