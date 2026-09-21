@@ -1,0 +1,29 @@
+name: synthetic-sandbox-qualification
+on: workflow_dispatch
+jobs:
+  build:
+    runs-on: self-hosted
+    steps:
+      - uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5
+        with:
+          driver: docker-container
+          driver-opts: network=${{ env.QUALIFICATION_NETWORK }}
+      - uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee
+        with:
+          registry: ${{ env.QUALIFICATION_REGISTRY }}
+          username: ${{ env.QUALIFICATION_USER }}
+          password: ${{ secrets.QUALIFICATION_PASSWORD }}
+      - id: build
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf
+        with:
+          context: .
+          push: true
+          tags: ${{ env.QUALIFICATION_REGISTRY }}/synthetic:qualification
+      - name: verify-pull-by-digest
+        env:
+          PUSHED_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -eu
+          image="$QUALIFICATION_REGISTRY/synthetic@$PUSHED_DIGEST"
+          docker pull "$image"
+          test "$(docker image inspect --format '{{index .RepoDigests 0}}' "$image")" = "$image"

@@ -1,0 +1,26 @@
+{
+  "root": "/var/lib/chimera-qualification",
+  "driver": "/usr/local/libexec/chimera-qualification-driver",
+  "report_root": "/var/lib/chimera-qualification/reports",
+  "lock_file": "/run/lock/chimera-qualification.lock",
+  "active_marker": "/run/lock/chimera-qualification.active",
+  "max_case_ms": 10000,
+  "cleanup_deadline_ms": 1000,
+  "production_sentinel": "192.0.2.10:9000",
+  "negative_sentinels": [
+    {"role": "loopback", "address": "127.0.0.1:9001", "denied_prefix": "127.0.0.0/8"},
+    {"role": "host", "address": "192.0.2.1:9001", "denied_prefix": "192.0.2.1/32"},
+    {"role": "lan", "address": "198.51.100.1:9001", "denied_prefix": "198.51.100.0/24"},
+    {"role": "production", "address": "192.0.2.10:9001", "denied_prefix": "192.0.2.10/32"}
+  ],
+  "public_registry_url": "https://registry.example.com/v2/",
+  "sentinel_p99_ms": 100,
+  "execution_resources": {
+    "global": {"memory_high": "1 MiB", "memory_max": "2 MiB", "memory_swap_max": "0", "cpu_quota": "100%", "cpu_weight": 100, "pids_max": "20", "io_weight": 100},
+    "attempt": {"memory_high": "512 KiB", "memory_max": "1 MiB", "memory_swap_max": "0", "cpu_quota": "50%", "cpu_weight": 100, "pids_max": "10", "io_weight": 100}
+  },
+  "minimum_production_memory_bytes": 1048576,
+  "maximum_chimera_memory_bytes": 2097152,
+  "maximum_chimera_pids": 20,
+  "max_parallel_builds": 1
+}

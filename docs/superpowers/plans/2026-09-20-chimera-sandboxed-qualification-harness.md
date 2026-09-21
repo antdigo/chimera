@@ -26,7 +26,7 @@
 ## Review Focus
 
 - A truncated report, duplicate ID, missing wave or fabricated fixture pass must fail overall qualification (Task 1 and Task 2).
-- Two native invocations, including different checkout paths, must not run destructive tests together (Task 3).
+- Two native invocations, including different checkout paths, must not run destructive tests together; an interrupted run with unproven cleanup blocks the next invocation (Task 3).
 - A sentinel that was never listening must not produce a successful isolation test (Task 4).
 - Crash/cancel/timeout must preserve forensic evidence and prove cleanup before starting the next case; stale IDs must not target a subsequent tenant (Task 6).
 - Missing PSS/I/O/SLO samples and an early terminated 40-attempt wave must be reported as incomplete, not zero-cost success (Task 7 and Task 8).
@@ -44,7 +44,7 @@ The existing tests exercise trusted-host execution. `tests/execution_domain_dock
 | `tests/qualification/catalog.rs`, `catalog_test.rs` | Fixed scenario/subcase/wave coverage |
 | `tests/qualification/report.rs`, `report_test.rs` | Typed results, strict verdict, atomic JSON/Markdown output |
 | `tests/qualification/driver.rs`, `driver_test.rs` | Bounded versioned request/observation protocol |
-| `tests/qualification/host.rs`, `host_test.rs` | Global lock, native identity, safe qualification workspace |
+| `tests/qualification/host.rs`, `host_test.rs` | Global lock, durable fail-closed marker, native identity and safe qualification workspace; E1 adds exact-resource recovery |
 | `tests/qualification/fixtures.rs`, `fixtures_test.rs` | Owned canaries, recipes and pinned action manifest |
 | `tests/qualification/isolation.rs`, `isolation_test.rs` | S-01/S-03/S-04/S-05/S-12 observations and assertions |
 | `tests/qualification/docker.rs`, `docker_test.rs` | S-06/S-07/S-08 command and action recipes |
@@ -55,7 +55,7 @@ The existing tests exercise trusted-host execution. `tests/execution_domain_dock
 | `scripts/qualification/native.sh` | Serialized invocation and artifact path checks |
 | `docs/testing-sandboxed-native.md` | Single-host runbook and report interpretation |
 
-All support modules are reached via `#[path = "qualification/mod.rs"] mod qualification;` in the one integration target, so Cargo does not discover them as independent test binaries. Sibling `_test.rs` modules follow repository conventions. No production source file is changed by E0. The future runtime driver is a qualification binary linked to B–D implementation, built separately from the shipped CLI; creating that adapter belongs to E1. E0 defines its exact wire protocol now and tests it with deterministic fixture observations. If no driver exists, the native report contains 16 blocked scenarios and exits unsuccessfully.
+All support modules are reached via `#[path = "qualification/mod.rs"] mod qualification;` in the one integration target, so Cargo does not discover them as independent test binaries. Sibling `_test.rs` modules follow repository conventions. No production source file is changed by E0. The future runtime driver is a qualification binary linked to B–D implementation, built separately from the shipped CLI; creating that adapter belongs to E1. E0 defines its exact wire protocol now and tests it with deterministic fixture observations. If no driver exists, the native report contains 16 blocked scenarios and exits unsuccessfully. E0 has no authenticated run-owned cgroup/process authority after supervisor death, so it must not perform PID/PGID-only automatic recovery or start destructive native scenarios. E1 adds a pinned run-cgroup/driver identity, an unprivileged watchdog and authenticated recovery before those scenarios can execute. Until then a durable unfinished marker blocks later native runs, even if a crash releases the advisory lock.
 
 ### Common types and testing commands
 
@@ -78,7 +78,8 @@ pub enum CheckId {
     OutsideControlAvailable, PublicRegistryReachable, DockerApiCompatible,
     BuildxCompatible, ChangedHostSemanticsContained, ResourceLimitEnforced,
     ProductionReservePreserved, CancellationBounded, RestartReconciled,
-    CapacityBounded, NextTenantClean, IdleZero, NativeMetricsComplete,
+    CapacityBounded, DistinctStateConfirmed, ExtraAdmissionBlocked,
+    NextTenantClean, IdleZero, NativeMetricsComplete,
     CleanupConfirmed,
 }
 pub struct Check { pub id: CheckId, pub passed: bool }
@@ -242,20 +243,24 @@ pub enum SentinelRole { Loopback, Host, Lan, Production }
 pub struct NegativeSentinel { pub role: SentinelRole,
     pub address: std::net::SocketAddr, pub denied_prefix: String }
 pub struct NativeLease { lock: std::fs::File, run_directory: std::path::PathBuf,
-    watchdog: std::process::Child }
+    marker: std::fs::File }
 pub fn acquire_native(config: &NativeConfig, run_id: uuid::Uuid)
     -> Result<NativeLease, Reason>;
 pub fn recover_unfinished(config: &NativeConfig) -> Result<(), Reason>;
-impl NativeLease { pub fn run_directory(&self) -> &std::path::Path; }
+impl NativeLease {
+    pub fn run_directory(&self) -> &std::path::Path;
+    pub fn publish_blocked_and_release(self, report: &QualificationReport)
+        -> Result<(), Reason>;
+}
 pub struct HostSnapshot { pub boot_id: uuid::Uuid, pub kernel: String,
     pub systemd_version: String, pub cgroup_v2: bool, pub container: bool,
     pub service_uid: u32, pub service_name: String }
 pub fn inspect_host() -> Result<HostSnapshot, Reason>;
 ```
 
-Native config must be provided, not synthesized from these test fixture limits. Native config and its nested types derive serde with `deny_unknown_fields`. `execution_resources` uses B's production parser and validation and its canonical bytes are included in `RunIdentity.config_digest`; the harness compares them with live cgroup readback rather than trusting duplicate test-only limits. All durations/limits must be positive, cleanup deadline <= case deadline, `max_parallel_builds` between 1 and 40. `negative_sentinels` must cover all four roles and every configured host/production prefix; the public-registry URL must use HTTPS and contain no userinfo or query credentials. The production SLO listener and negative isolation listeners serve separate roles even when hosted on the same physical machine. Resource budget provenance comes from an operator-approved native benchmark; a large machine is not permission to invent reserve values. `active_marker` is fixed to `/run/lock/chimera-qualification.active` and records only run UUID, boot ID, supervisor start identity, run-owned cgroup and report directory identity; no command, secret or workload path is stored.
+Native config must be provided, not synthesized from these test fixture limits. Native config and its nested types derive serde with `deny_unknown_fields`. `execution_resources` uses B's production parser and validation and its canonical bytes are included in `RunIdentity.config_digest`; Task 7/E1 later compare them with live cgroup readback rather than trusting duplicate test-only limits. All durations/limits must be positive, cleanup deadline <= case deadline, `max_parallel_builds` between 1 and 40. `negative_sentinels` must cover all four roles; the public-registry URL must use HTTPS and contain no userinfo or query credentials. The production SLO listener and negative isolation listeners serve separate roles even when hosted on the same physical machine. Numeric resource limits in E0 are fixture inputs, not operator-approved benchmark provenance. E1 must add an authenticated operator manifest for actual production roots, CIDR inventory, bounded storage and approved reserve/SLO before any native case can qualify. `active_marker` is fixed to `/run/lock/chimera-qualification.active` and records only run UUID, boot ID, supervisor start identity, optional run-owned cgroup identity and report-directory identity; no command, secret or workload path is stored. E0 writes no cgroup identity and never invokes a native driver.
 
-- [ ] **Step 1: Add tests.** Two processes using different run directories and the same lock file: the second receives HostBusy. Reject symlink lock/root/report directory, unowned/shared writable root, `/`, `/tmp`, home directory, report root outside designated qualification storage, and driver under writable attempt storage. Refuse a preexisting run UUID directory. Spawn a fixture harness plus long-lived fixture driver, wait until the durable active marker is synced, kill only the harness, and assert a second invocation cannot begin any scenario: it sees HostBusy while the watchdog owns the lock or UnfinishedRun if cleanup could not be confirmed. After the watchdog proves the run-owned driver/cgroup dead and atomically marks recovery complete, `recover_unfinished` permits a new run. A stale marker with changed boot/process/cgroup identity is never heuristically deleted.
+- [ ] **Step 1: Add tests.** Two processes using different run directories and the same test lock file: the second receives HostBusy. Reject symlink lock/root/report directory, unowned/shared writable root, `/`, `/tmp`, home directory, report root outside designated qualification storage, and driver under writable attempt storage. Refuse a preexisting run UUID directory. Spawn a portable fixture harness which fsyncs an active marker, kill only that harness, and assert a second invocation cannot start: the marker yields UnfinishedRun even though process exit released the advisory lock. `recover_unfinished` never deletes or heuristically clears a stale, changed-boot, or changed-process marker in E0. A clean blocked preflight with no driver/cgroup ever started writes and syncs a complete blocked report, removes only its own exact marker, and allows a subsequent run; a failed report write leaves the marker. No test touches `/run/lock` or real cgroups.
 
 ```rust
 #[test]
@@ -270,9 +275,13 @@ fn exclusive_lock_cannot_be_bypassed_by_a_second_output_directory() {
 }
 ```
 
-Define `fn lock_exclusive(path: &Path) -> Result<File, Reason>` in `host.rs`; implementation takes an owned safe parent directory and opens filename with `O_NOFOLLOW|O_CLOEXEC|O_CREAT` mode 0600, validates identity and uses `LOCK_EX|LOCK_NB`. The test-only custom path is not exposed as a native CLI override.
+Define `fn lock_exclusive(path: &Path) -> Result<File, Reason>` in `host.rs` for portable fixture paths; it takes an owned non-shared-writable parent directory and opens the filename with `O_NOFOLLOW|O_CLOEXEC|O_CREAT` mode 0600, validates identity and uses `LOCK_EX|LOCK_NB`. Native acquisition uses the fixed `/run/lock/chimera-qualification.lock` without `O_CREAT`: the operator preprovisions a service-owned 0600 regular file with link count one. Accept a root-owned sticky `/run/lock` only when its descriptor proves directory identity, root ownership, sticky bit, no symlink and no group/other write except that protected sticky directory; reject all other writable parents. This rule does not change permissions on the global directory. The test-only custom path is not exposed as a native CLI override.
 - [ ] **Step 2: RED.** `cargo test --test sandboxed_qualification_test host > /tmp/chimera-e0-host.log 2>&1`.
-- [ ] **Step 3: Implement ownership and observations.** Require native `lock_file` exactly `/run/lock/chimera-qualification.lock` and `active_marker` exactly `/run/lock/chimera-qualification.active`; install-time operator setup gives the one service account access. Before a fresh run, fail closed on any active marker until `recover_unfinished` uses the authenticated driver plus deterministic run-owned cgroup/process identities to kill/reconcile and prove zero descendants/resources; an unverifiable marker remains and returns UnfinishedRun. After taking the lock, create+fsync the marker before starting a driver. Spawn a tiny test-harness watchdog before native scenarios, explicitly passing only a duplicate qualification lock FD, pinned marker FD and run-owned cgroup identity; every other inherited FD is closed and driver/stress children receive none. The watchdog observes a parent-death pipe: on clean completion it verifies the signed cleanup acknowledgement, removes+syncs the marker and releases the lock; on harness death it kills only the exact run-owned cgroup/process group, invokes bounded driver reconciliation, writes a partial cleanup report, and retains the lock indefinitely if cleanup cannot be proved. It is an unprivileged test companion, not a production helper or system service. The same lease is held across all native scenarios and report publication; it is separate from the target daemon's root lock, which is released/reacquired during restart tests. Verify Debian `/etc/os-release`, systemd PID 1, unified cgroup v2 and no container environment through mount/cgroup/runtime indicators; inability to establish bare-metal provenance is Inconclusive, not native success. Check report root and qualification root are explicit dedicated paths, disjoint from actual deployed project storage. Do not infer root-owned arbitrary paths as safe. Use pinned directory handles for canary/report operations and UUID run ownership markers. `NativeLease::Drop` only signals clean shutdown after a synced report; otherwise the watchdog applies the crash path.
+- [ ] **Step 3: Implement fail-closed ownership and observations.** Require native `lock_file` exactly `/run/lock/chimera-qualification.lock` and `active_marker` exactly `/run/lock/chimera-qualification.active`; do not create or chmod the native lock file. After taking the lock, reject any existing marker as UnfinishedRun, create+fsync a 0600 marker with run UUID, boot ID, supervisor PID/start identity, no cgroup, and pinned report-directory identity before any external driver activity. E0 never starts a native driver or destructive scenario. `NativeLease::Drop` leaves the marker in place. Only `publish_blocked_and_release` may write and sync an all-Blocked report and remove+sync the exact same marker while the original process still holds the lock and no driver/cgroup was started. A failed write or changed marker leaves it and returns CleanupUnconfirmed. `recover_unfinished` returns UnfinishedRun for any marker; E1 replaces this with authenticated exact-resource recovery and a watchdog once it owns real driver/cgroup identities. Verify Debian `/etc/os-release`, systemd PID 1, unified cgroup v2 and no container environment through mount/cgroup/runtime indicators; inability to establish bare-metal provenance is Inconclusive, not native success. Check configured root/report/driver paths for no-follow identity, normalization, ownership and disjointness, but do not infer actual production-root or bounded-storage approval from path checks. Use pinned directory handles and UUID ownership markers. These E0 checks cannot qualify a native release without the E1 operator manifest and runtime adapter.
+Publication must retain and revalidate every directory edge from `/` through the configured report root and UUID directory, immediately before and after report fsync and before claiming the active name. Reject untrusted writable ancestry; only trusted root/service-owned non-shared-writable directories and root-owned sticky edges protecting the owned child are acceptable. POSIX does not provide an atomic multi-directory identity transaction: root and same-service-UID operators must honor the held qualification lock and refrain from concurrent ancestry mutation. These E0 checks do not protect against a malicious root or the same service UID.
+
+To avoid check-then-unlink races, create and fsync `/run/lock/chimera-qualification.active.claim` as a private 0700 guard, then atomically move the active entry into it. Verify the claimed inode and bytes only after the move; preserve any unexpected entry intact for quarantine. Both acquisition and recovery treat any unfinished guard as `UnfinishedRun`, including a crash after the active name moved. For an exact own marker and intact synced report, atomically rename the guard without replacement to `chimera-qualification.active.completed.<run_uuid>` using Linux `RENAME_NOREPLACE` (portable macOS fixtures use `RENAME_EXCL`). Unsupported atomic rename fails closed; no precheck-plus-rename fallback is permitted. Completed claims remain small audit artifacts and do not block later runs. E0 never deletes these records; E1 must add managed garbage collection and an accumulation bound. Fixture subprocess readiness must be bounded, and every child must be killed/reaped on timeout or assertion unwinding.
+
 - [ ] **Step 4: GREEN.** Repeat host command. Ensure the tests use temporary lock paths and cannot touch `/run/lock` in the portable run.
 - [ ] **Step 5: Commit.** `git add tests/qualification tests/fixtures/qualification/config.json && git commit -m "test: serialize native sandbox qualification on one host"`
 
@@ -442,9 +451,13 @@ Define `fn rollback_matches(created: &[String], removed: &[String]) -> bool` in 
 - [ ] **Step 4: GREEN.** Repeat lifecycle command. Native failure handling records partial report, attempts exact owned reconciliation under the retained lease, and refuses subsequent cases when cleanup is unconfirmed. Test this orchestrator branch with fixture driver observations; no real daemon signals in portable tests.
 - [ ] **Step 5: Commit.** `git add tests/qualification && git commit -m "test: cover sandbox teardown and successive tenant waves"`
 
-### Task 7: Bounded resource stress and native PSS/storage measurements
+### Task 7: Fixture resource evaluation and native PSS/storage measurement contract
 
 **Files:** Create `resources.rs`, `resources_test.rs`; extend report with typed metric summaries.
+
+**Approved E0 scope:** Implement bounded pure parsers and deterministic fixture evaluators only. E0 has no authenticated run-owned cgroup/process authority, live sampler, native stress launcher, or outside watchdog. Those remain E1 obligations. Resource series are local harness inputs, never workload-driver observations; NativeDebian and NestedSmoke evaluation returns `BackendUnavailable`, and even complete numeric summaries cannot make `qualifies` return true. No production activation changes or native host operations are authorized by this task.
+
+The illustrative types below are expanded in the implementation with trusted `ResourceInput` global/attempt identities, deadline and I/O warm-up; explicit baseline/Before/Active/After phases; one scoped series for the global cgroup and every exact expected attempt; and counters/readbacks for every configured I/O device. Global summaries do not double-count descendant series. This local fixture representation does not change the driver's 64 KiB observation cap.
 
 **Interfaces:**
 
@@ -478,7 +491,7 @@ pub fn evaluate_resources(key: &CaseKey, config: &NativeConfig,
     facts: &ResourceFacts) -> Result<Vec<Check>, Reason>;
 ```
 
-Add `pub resource_summaries: Vec<CaseMetrics>` to `QualificationReport` in this task and update all earlier report literals with an empty vector. Native `qualifies` additionally requires one validated summary for each S-09/S-16 case, rejects duplicate/unexpected metric keys, and serializes their measurement units explicitly in JSON/Markdown. Fixture reports remain disqualified even with complete synthetic summaries.
+Add `pub resource_summaries: Vec<CaseMetrics>` to `QualificationReport` in this task and update all earlier report literals with an empty vector. Native-labelled report structural validation additionally requires one valid summary for each S-09/S-16 case and rejects duplicate/unexpected metric keys; JSON/Markdown serialize measurement units explicitly. Structural validity is insufficient for qualification: `qualifies` remains false in E0 because independent native collection is absent. Fixture reports remain disqualified even with complete synthetic summaries.
 
 - [ ] **Step 1: Add tests.** Empty, one-sample, nonmonotonic time, missing PSS, counter regression, NaN/nonfinite derived rates, no completed work and SLO violation all reject. PSS zero is valid only for a documented empty idle interval, never during active workload. Quantile uses nearest-rank `ceil(0.99*n)-1`, with checked indexing. Given three samples at 0, 1000, 2000 ms and write-op counters 10, 20, 30, write IOPS equals 10; a single aggregate RSS observation is not accepted by the schema. Reject a missing/mismatched global or attempt `LimitReadback`, zero CPU throttling during the saturated CPU fixture, observed CPU usage above configured quota tolerance, absent `io.max` for the configured device, saturated I/O throughput above its configured ceiling tolerance, and any sample whose host `MemAvailable` drops below `minimum_production_memory_bytes`. Each negative test keeps sentinel latency healthy so a fast machine cannot mask disabled enforcement.
 
@@ -492,9 +505,13 @@ fn p99_uses_nearest_rank_without_hiding_tail_latency() {
 
 Define `fn nearest_rank_p99(values: &[u64]) -> Result<u64, Reason>` in `resources.rs`; sort a copied vector and use integer arithmetic for the rank.
 - [ ] **Step 2: RED.** `cargo test --test sandboxed_qualification_test resources > /tmp/chimera-e0-resources.log 2>&1`.
-- [ ] **Step 3: Implement metrics and recipes.** The harness, not the workload driver, reads both global and exact attempt cgroups. It compares `memory.high/max`, `memory.swap.max`, `pids.max`, `cpu.max`, `cpu.weight`, and device-qualified `io.max` with canonical `ValidatedLimits::writes()` produced from `NativeConfig.execution_resources`; a missing controller/file, `max` where a bound is required, wrong device, or changed value is MissingEvidence/Failed. The sampler sums process PSS from `/proc/<pid>/smaps_rollup` while guarding PID start time, reads `cpu.stat`, `io.stat`, memory/pids events, samples host `/proc/meminfo` `MemAvailable`, and samples production sentinel from outside Chimera cgroup on the same host. Sample at 250 ms with monotonic timestamps before/during/after each workload; require at least ten active samples for benchmark/stress intervals. Permission-denied/missing samples mark evidence incomplete. Stress fixture durations are capped by config and an independent outside watchdog; tests never remove configured global limits. Memory fixture allocates within the attempt until cgroup OOM event and requires host `MemAvailable` to remain at or above the configured production reserve; PID fixture uses a bounded child loop until pids.max denial, never an unbounded shell fork bomb. CPU fixture has finite worker count and deadline, must increase `nr_throttled/throttled_usec`, and verifies usage over at least ten periods does not exceed the configured quota by more than 10%. I/O fixture writes/fsyncs only owned bounded storage, stops before its configured byte budget, requires the configured `io.max` device counters to advance, and checks sustained BPS/IOPS do not exceed the applicable ceiling by more than 10% after warm-up. If the production device cannot expose the configured I/O controller evidence, the case is nonqualifying rather than silently skipped. Record production sentinel baseline for 10 s before each stress and compare in absolute configured SLO terms. S-16 records Cold/Warm startup, total CPU, PSS, IOPS, minimum host available memory and cleanup for 1/20/40 attempts; do not derive sizing from nested VFS measurements.
+- [ ] **Step 3: Implement pure fixture metrics and evaluators.** Parse supplied readback contents without opening caller-named paths, and compare every global/attempt limit and every configured I/O device with canonical `ValidatedLimits::writes()`. Validate exact scoped coverage, monotonic timestamps/counters, PSS, a 10 s sentinel baseline, 250 ms Before/Active/After samples with at least ten active samples, bounded durations, completed work, CPU throttling/quota and sustained I/O ceilings with 10% tolerance, configured production reserve, and absolute p99 SLO. Compute summaries from the global series. Preserve cleanup failure > affirmative violations > stale identity > missing evidence when defects combine. These fixtures exercise the measurement contract; they do not acquire native evidence or execute stress recipes.
+
+**E1 live measurement obligation, excluded from E0 Task 7:** After E1 provides authenticated run-owned cgroup/process identity, an operator-approved storage/benchmark inventory and an independent outside watchdog, the harness (not the workload driver) must read both global and exact attempt cgroups. Compare `memory.high/max`, `memory.swap.max`, `pids.max`, `cpu.max`, `cpu.weight`, `io.weight`, and every device-qualified `io.max` with canonical `ValidatedLimits::writes()`; missing controllers/files, unbounded values, wrong devices or changed values are nonqualifying. Sum PSS from `/proc/<pid>/smaps_rollup` with PID-start guards; read `cpu.stat`, `io.stat`, memory/pids events and host `MemAvailable`; sample the production sentinel outside Chimera's cgroup. Collect before/during/after samples at 250 ms with at least ten active samples, defining live scheduling jitter/gap handling explicitly. Permission-denied/missing samples are incomplete. Cap stress duration and storage bytes under the independent watchdog without removing global limits. Bound memory allocation until contained OOM, child creation until PID denial, CPU worker count/deadline and throttling evidence, and owned-storage I/O/fsync after warm-up; enforce CPU and sustained BPS/IOPS ceilings with 10% tolerance. Preserve production reserve at every sample and a 10 s sentinel baseline with absolute configured SLO. If configured I/O device evidence is unavailable, the case cannot qualify. Record S-16 Cold/Warm startup, total CPU, PSS, IOPS, minimum available host memory and cleanup at 1/20/40 concurrency; nested VFS measurements cannot establish sizing.
 - [ ] **Step 4: GREEN.** Repeat resource command. Synthetic fixture thresholds are only parser/evaluator test data; native config has no default reserve or SLO.
 - [ ] **Step 5: Commit.** `git add tests/qualification && git commit -m "test: measure sandbox resource limits with native evidence"`
+
+The Task 7 commit subject above is retained as historical plan/commit text; it does not assert that E0 collected or accepted native evidence. The approved scope and E1 obligation above govern completion.
 
 ### Task 8: Orchestrate reports, preserve activation, and document serialized native execution
 
@@ -502,43 +519,42 @@ Define `fn nearest_rank_p99(values: &[u64]) -> Result<u64, Reason>` in `resource
 
 **Interfaces:** `pub async fn run_native(config: NativeConfig) -> Result<QualificationReport, Reason>`; `pub fn blocked_report(identity: RunIdentity, reason: Reason) -> QualificationReport`. `blocked_report` emits one result for every required case, all Blocked, with cleanup false when any target resource may exist. No external driver is consulted by portable fixture tests.
 
-- [ ] **Step 1: Add orchestrator tests.** Missing driver emits complete blocked report and nonzero outcome. Mismatched build commit or fixture handshake rejects native mode. Failed cleanup stops further driver calls, keeps the watchdog/lock and active marker after report fsync, and marks remaining cases Blocked/CleanupUnconfirmed. Kill the orchestrator while a fixture driver is alive and prove a second orchestrator cannot issue a driver request until watchdog cleanup and `recover_unfinished` succeed. A portable test invokes the built production `chimera start` with sandboxed profile and verifies its unchanged unavailable diagnostic; no feature/env setting used by the harness changes that result.
+- [ ] **Step 1: Add orchestrator tests.** Missing driver emits a complete blocked report and nonzero outcome. Even a present fixture driver cannot be invoked in NativeDebian mode because E0 has no authenticated run-cgroup authority; all required cases remain Blocked/BackendUnavailable. A failed report write leaves the active marker and blocks another invocation. Kill the orchestrator after marker fsync and prove a second orchestrator cannot issue any driver request: it receives UnfinishedRun until E1's exact-resource recovery exists. A portable test invokes the built production `chimera start` with sandboxed profile and verifies its unchanged unavailable diagnostic; no feature/env setting used by the harness changes that result. Do not simulate a successful native cleanup or fabricate a passing report.
 
 ```rust
 #[cfg(feature = "acceptance-tests")]
 #[tokio::test]
 #[ignore = "native Debian, exclusive host qualification and configured runtime driver required"]
 async fn native_sandboxed_release_qualification() {
-    let path = std::env::var_os("CHIMERA_QUALIFICATION_CONFIG")
-        .expect("explicit native qualification config required");
-    let bytes = std::fs::read(path).unwrap();
-    let config: qualification::host::NativeConfig = serde_json::from_slice(&bytes).unwrap();
-    let report = qualification::run_native(config).await.unwrap();
-    assert!(qualification::report::qualifies(&report), "native qualification incomplete");
-    assert!(!report.activation_available);
+    use qualification::catalog::Reason;
+    let outcome = async {
+        let path = std::env::var_os("CHIMERA_QUALIFICATION_CONFIG")
+            .ok_or(Reason::InvalidConfig)?;
+        let config = qualification::read_native_config(std::path::Path::new(&path))?;
+        qualification::run_native(config).await
+    }.await;
+    match outcome {
+        Ok(report) => {
+            assert!(!report.activation_available);
+            assert!(qualification::report::qualifies(&report), "BackendUnavailable");
+        }
+        Err(reason) => panic!("{reason:?}"),
+    }
 }
 ```
 
-`run_native` always persists reports before returning a negative qualification result; parsing failures write a safe preflight report if the output directory can be safely opened, otherwise print only the safe error category.
+Once `NativeLease` is acquired, `run_native` persists the complete blocked report before returning a negative qualification result. Malformed/unvalidated config, commit identity failure or lease-acquisition failure prints only the safe `Reason` category and exits nonzero: without a validated config and held lease, there is no trusted report destination and no ad hoc preflight report is written. Failed publication retains the unfinished marker. Portable tests exercise this publication core with `acquire_fixture` and retain Fixture provenance; they do not claim native execution. The production CLI regression preprovisions its existing root lock, then verifies no additional changes after sandboxed rejection; creation of that lock on a fresh root remains existing `Daemon::load` behavior.
 - [ ] **Step 2: RED.** `cargo test --test sandboxed_qualification_test orchestrator > /tmp/chimera-e0-orchestrator.log 2>&1` — new orchestration tests fail. The production-gate regression must remain green throughout.
-- [ ] **Step 3: Implement orchestration and script.** Native entrypoint requires exactly one absolute config path, verifies it is a regular no-follow file, sets TMPDIR inside checkout target, and invokes the single target serially:
+- [ ] **Step 3: Implement orchestration and script.** Native entrypoint requires exactly one absolute config path and verifies it is a regular no-follow file. Before creating directories, validate each ancestry component from `/` to the checkout: no symlinks, owner root/service UID, no group/other write bits except root-owned sticky ancestors above the checkout. Require protected non-writable checkout, `target` and `target/chimera-tests`; create missing directories only below an already checked protected parent, never via unchecked `mkdir -p` or permission repair. Root and the service UID must honor the lock and not mutate checked ancestry. Create an exclusive service-owned `0700` invocation directory below `target/chimera-tests`, use it as TMPDIR, and exclusively open a `0600` log with noclobber on retained FD 3. Cargo output goes to that FD, never a reopened pathname. Invoke the single target serially:
 
 ```bash
-#!/usr/bin/env bash
-set -euo pipefail
-test "$#" -eq 1
-case "$1" in /*) ;; *) exit 2 ;; esac
-test -f "$1"
-test ! -L "$1"
-mkdir -p "$PWD/target/chimera-tests"
-export TMPDIR="$PWD/target/chimera-tests"
-export CHIMERA_QUALIFICATION_CONFIG="$1"
+# After the protected-directory checks and exclusive FD setup above:
 cargo test --features acceptance-tests --test sandboxed_qualification_test \
   native_sandboxed_release_qualification -- --ignored --exact --test-threads=1 \
-  > /tmp/chimera-sandboxed-native.log 2>&1
+  >&3 2>&1
 ```
 
-The Rust harness, not the Bash process, holds `/run/lock/chimera-qualification.lock` throughout. Script exit reflects cargo exit; review captured log and JSON report afterward. The runbook explains dedicated qualification roots on the single host, operator provisioning of the lock and bounded filesystem, target service stop/restart sequencing, positive sentinel controls outside its cgroup, mandatory reserve/SLO config, synthetic credentials, no production deploy, watchdog and manual quarantine recovery using exact owned resources. E0 cannot execute B–D native scenarios without their driver; this is expected blocked evidence and must be visible in the runbook/report.
+Reject LF/CR in the checkout path before component traversal so line-based shell reads cannot skip a later unsafe ancestor. The Rust harness, not the Bash process, holds `/run/lock/chimera-qualification.lock` throughout. Script exit reflects cargo exit; review captured log and JSON report afterward. The runbook explains dedicated qualification roots on the single host, operator preprovisioning of the exact lock file, bounded filesystem, target service stop/restart sequencing, positive sentinel controls outside its cgroup, mandatory reserve/SLO config, synthetic credentials and no production deploy. It must state that E0 has no watchdog or automatic orphan recovery: a crash leaves an active marker and manual quarantine is required, never `rm` on guessed paths. E1 must add exact run-owned cgroup/driver identity, watchdog, authenticated cleanup and operator-approved storage/benchmark inventory before S-01…S-16 can run. E0's correct native result is a complete blocked report, even if a driver executable happens to exist.
 
 Do not run native stress concurrently with any other native qualification or daemon migration. The shared machine lock, not an instruction to obtain separate VMs, serializes S-01…S-16. One scenario may create 20/40 concurrent attempts internally; this is the behavior under test, not parallel test scheduling.
 - [ ] **Step 4: GREEN and completion checks.** Run:
@@ -552,11 +568,11 @@ cargo test -- --ignored > /tmp/chimera-e0-docker.log 2>&1
 git diff --check
 ```
 
-Run the ignored Docker command using the existing Linux/macOS Docker runbook as appropriate; the native test is absent unless `acceptance-tests` is explicitly enabled. Native script execution on the single Debian host is a separate serialized operation; during E0 its correct result with no B–D driver is a complete blocked report, not a release pass. Check each exit code and captured failure section. Also compile native target with `cargo test --features acceptance-tests --test sandboxed_qualification_test --no-run > /tmp/chimera-e0-native-compile.log 2>&1` so feature-gated code cannot rot.
+Run the ignored Docker command using the existing Linux/macOS Docker runbook as appropriate; the native test is absent unless `acceptance-tests` is explicitly enabled. Native script execution on the single Debian host is a separate serialized operation; during E0 its correct result, regardless of a driver path, is a complete blocked report, not a release pass. Check each exit code and captured failure section. Also compile native target with `cargo test --features acceptance-tests --test sandboxed_qualification_test --no-run > /tmp/chimera-e0-native-compile.log 2>&1` so feature-gated code cannot rot.
 - [ ] **Step 5: Commit.** `git add tests/sandboxed_qualification_test.rs tests/qualification scripts/qualification/native.sh docs/testing-sandboxed-native.md && git commit -m "test: add serialized native sandbox qualification entrypoint"`
 
 ## E0 completion and E1 release boundary
 
-E0 completion means all catalogue, fixture, protocol, report, lock and evaluator tests pass, native target compiles, and the production activation rejection remains unchanged. Its fixture reports are useful to review harness behavior but cannot satisfy S-01…S-16.
+E0 completion means all catalogue, fixture, protocol, report, lock and evaluator tests pass, native target compiles, and the production activation rejection remains unchanged. Its fixture reports are useful to review harness behavior but cannot satisfy S-01…S-16. The E0 native entrypoint is deliberately fail-closed and does not launch destructive scenarios or claim automatic crash recovery; an unfinished marker blocks subsequent native attempts.
 
-E1 supplies the real driver using the stable B–D interfaces, executes the exact native catalogue on the single Debian host with agreed reserve/SLO limits, and publishes commit/config-bound evidence for every case including cold/warm/failure/cancel/restart followed by next tenant and idle checks. External runtime/image/log/lease/artifact issue gaps remain blocked cases instead of being erased from the report. Only the final activation change can remove the unavailable gate after the complete native evidence is accepted; no task here grants that permission or makes that change.
+E1 supplies the real driver using the stable B–D interfaces, the operator-approved production-root/CIDR/storage/benchmark manifest, pinned run-owned cgroup/process identity, unprivileged watchdog and authenticated crash recovery. Only then does it execute the exact native catalogue on the single Debian host with agreed reserve/SLO limits and publish commit/config-bound evidence for every case including cold/warm/failure/cancel/restart followed by next tenant and idle checks. External runtime/image/log/lease/artifact issue gaps remain blocked cases instead of being erased from the report. Only the final activation change can remove the unavailable gate after the complete native evidence is accepted; no task here grants that permission or makes that change.
