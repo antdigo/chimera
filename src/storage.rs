@@ -6,7 +6,7 @@ use std::mem::MaybeUninit;
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Component, Path, PathBuf};
-#[cfg(any(target_os = "linux", test))]
+#[cfg(test)]
 use std::sync::{Arc, Mutex, MutexGuard};
 
 const MAX_SYMLINKS: usize = 40;
@@ -18,7 +18,7 @@ pub(crate) struct RootLock {
     #[cfg(any(target_os = "linux", test))]
     root_path: PathBuf,
     _file: File,
-    #[cfg(any(target_os = "linux", test))]
+    #[cfg(test)]
     reconciliation_gate: Arc<Mutex<()>>,
 }
 
@@ -28,6 +28,7 @@ pub(crate) struct RootLockProof {
     root: File,
     root_path: PathBuf,
     _file: File,
+    #[cfg(test)]
     reconciliation_gate: Arc<Mutex<()>>,
 }
 
@@ -85,7 +86,7 @@ impl RootLock {
             #[cfg(any(target_os = "linux", test))]
             root_path,
             _file: file,
-            #[cfg(any(target_os = "linux", test))]
+            #[cfg(test)]
             reconciliation_gate: Arc::new(Mutex::new(())),
         })
     }
@@ -100,6 +101,7 @@ impl RootLock {
             root: self.root.try_clone()?,
             root_path: self.root_path.clone(),
             _file: self._file.try_clone()?,
+            #[cfg(test)]
             reconciliation_gate: Arc::clone(&self.reconciliation_gate),
         })
     }
@@ -115,6 +117,7 @@ impl RootLockProof {
         &self.root_path
     }
 
+    #[cfg(test)]
     pub(crate) fn lock_reconciliation(&self) -> MutexGuard<'_, ()> {
         self.reconciliation_gate
             .lock()

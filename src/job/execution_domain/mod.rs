@@ -5,7 +5,7 @@ use std::io::{self, Write};
 use std::num::NonZeroUsize;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", test))]
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -134,11 +134,11 @@ pub struct ExecutionDomainRoot {
     admission: Arc<Semaphore>,
     manager_tasks: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
     retained_cleanups: Arc<manager::RetainedCleanupRegistry>,
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", test))]
     linux_reconcile: Option<Arc<linux::reconcile::LinuxReconcileContext>>,
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", test))]
     reconciled: Arc<AtomicBool>,
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", test))]
     reconcile_started: Arc<AtomicBool>,
     #[cfg(test)]
     provision_pause: Arc<Mutex<Option<ProvisionPause>>>,
@@ -455,11 +455,11 @@ impl ExecutionDomainRoot {
             admission: Arc::new(Semaphore::new(capacity.get())),
             manager_tasks: Arc::new(Mutex::new(Vec::new())),
             retained_cleanups: Arc::new(manager::RetainedCleanupRegistry::default()),
-            #[cfg(target_os = "linux")]
+            #[cfg(all(target_os = "linux", test))]
             linux_reconcile: None,
-            #[cfg(target_os = "linux")]
+            #[cfg(all(target_os = "linux", test))]
             reconciled: Arc::new(AtomicBool::new(true)),
-            #[cfg(target_os = "linux")]
+            #[cfg(all(target_os = "linux", test))]
             reconcile_started: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
             provision_pause: Arc::new(Mutex::new(None)),
@@ -475,7 +475,7 @@ impl ExecutionDomainRoot {
     }
 
     pub(crate) fn ensure_reconciled(&self) -> Result<(), ExecutionDomainError> {
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", test))]
         if !self.reconciled.load(Ordering::Acquire) {
             return Err(ExecutionDomainError::AdmissionClosed {
                 path: self.canonical_path.clone(),
@@ -484,7 +484,7 @@ impl ExecutionDomainRoot {
         Ok(())
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", test))]
     pub async fn reconcile(&self) -> Result<(), ExecutionDomainError> {
         let context = self.linux_reconcile.as_ref().cloned().ok_or_else(|| {
             ExecutionDomainError::Backend {

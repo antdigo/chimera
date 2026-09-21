@@ -25,6 +25,7 @@ mod native_fixture;
 #[cfg(all(test, target_os = "linux", feature = "acceptance-tests"))]
 #[path = "native_test.rs"]
 mod native_test;
+#[cfg(test)]
 pub(super) mod reconcile;
 #[cfg(test)]
 #[path = "reconcile_test.rs"]

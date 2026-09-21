@@ -130,6 +130,7 @@ pub(in crate::job::execution_domain) trait CgroupFilesystem:
 pub(in crate::job::execution_domain) struct KernelCgroupFs;
 impl CgroupFilesystem for KernelCgroupFs {}
 
+#[cfg(test)]
 pub(in crate::job::execution_domain) struct CgroupRoot<F = KernelCgroupFs> {
     directory: Arc<CgroupDir<F>>,
     #[cfg(test)]
@@ -147,6 +148,7 @@ pub(super) struct CleanupCgroup<F = KernelCgroupFs> {
     directory: Arc<CgroupDir<F>>,
 }
 
+#[cfg(test)]
 pub(super) struct RecoveredCgroup<F = KernelCgroupFs> {
     pub attempt: AttemptIdentity,
     pub kind: super::reconcile::OwnedKind,
@@ -154,6 +156,7 @@ pub(super) struct RecoveredCgroup<F = KernelCgroupFs> {
     empty_proven: bool,
 }
 
+#[cfg(test)]
 pub(super) struct RecoveryCgroupInventory<F = KernelCgroupFs> {
     pub entries: Vec<RecoveredCgroup<F>>,
     pub first_error: Option<ExecutionDomainError>,
@@ -170,6 +173,7 @@ struct CgroupDir<F> {
     parent: Option<(Arc<CgroupDir<F>>, CString)>,
 }
 
+#[cfg(test)]
 impl CgroupRoot {
     #[cfg(test)]
     pub(super) fn open_delegated(path: &Path) -> Result<Self, ExecutionDomainError> {
@@ -177,6 +181,7 @@ impl CgroupRoot {
     }
 }
 
+#[cfg(test)]
 impl<F: CgroupFilesystem> CgroupRoot<F> {
     #[cfg(test)]
     pub(super) fn open_with_filesystem(
@@ -371,6 +376,7 @@ impl<F: CgroupFilesystem> CgroupRoot<F> {
     }
 }
 
+#[cfg(test)]
 impl<F: CgroupFilesystem> RecoveredCgroup<F> {
     pub(super) fn neutralize_until(
         &mut self,
@@ -808,6 +814,7 @@ impl<F: CgroupFilesystem> CgroupDir<F> {
         value.ok_or_else(|| failure(FailureCategory::IdentityMismatch))
     }
 
+    #[cfg(test)]
     fn has_children(&self) -> Result<bool, ExecutionDomainError> {
         self.verify()?;
         let mut budget = TraversalBudget::new();
@@ -1017,6 +1024,7 @@ fn required<T>(value: &Option<T>) -> Result<&T, ExecutionDomainError> {
         .ok_or_else(|| failure(FailureCategory::NotReady))
 }
 
+#[cfg(test)]
 fn retain_first(first: &mut Option<ExecutionDomainError>, error: ExecutionDomainError) {
     if first.is_none() {
         *first = Some(error);

@@ -149,6 +149,9 @@ jobs:
             suite-args: --test execution_domain_docker_test --test composite_test
           - name: lib
             suite-args: --lib
+            # Native Linux isolation fixtures require a dedicated delegated
+            # host, not the rootless Docker daemon used by this shard.
+            test-filters: --skip job::execution_domain::linux::
     steps:
       - uses: actions/checkout@v4
 

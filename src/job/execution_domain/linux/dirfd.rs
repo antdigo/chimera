@@ -2,6 +2,7 @@ use std::ffi::{CStr, CString};
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+#[cfg(test)]
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
@@ -132,6 +133,7 @@ impl BoundDir {
         verify_chain(&self.binding).inspect_err(|_| self.poison())
     }
 
+    #[cfg(test)]
     pub(in crate::job::execution_domain) fn verify_private_directory(
         &self,
     ) -> Result<(), ExecutionDomainError> {
@@ -146,10 +148,12 @@ impl BoundDir {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(super) fn verify_attempt_removal_tree(&self) -> Result<(), ExecutionDomainError> {
         self.inventory(RemovalPolicy::Attempt).map(drop)
     }
 
+    #[cfg(test)]
     pub(super) fn verify_empty_partial_attempt(&self) -> Result<(), ExecutionDomainError> {
         self.verify_binding()?;
         if directory_entries_stream(self.fd())?.next().is_some() {
@@ -391,6 +395,7 @@ impl BoundDir {
         self.root_path.as_path()
     }
 
+    #[cfg(test)]
     pub(in crate::job::execution_domain) fn bound_path(&self) -> PathBuf {
         let mut names = Vec::new();
         let mut binding = self.binding.as_ref();
@@ -540,6 +545,7 @@ impl BoundDir {
         result.inspect_err(|_| self.poison())
     }
 
+    #[cfg(test)]
     pub(super) fn remove_bound_tree(
         &self,
         name: &CStr,

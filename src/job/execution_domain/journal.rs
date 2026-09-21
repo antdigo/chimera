@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", test))]
 use super::AttemptIdentity;
 use super::ExecutionDomainError;
 use super::filesystem::{
@@ -54,13 +54,13 @@ struct LinuxJournalRecord {
     layout_version: u32,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", test))]
 #[derive(Debug, Deserialize)]
 struct JournalVersion {
     version: u32,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", test))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum LinuxJournalEvidence {
     Missing,
@@ -338,7 +338,7 @@ impl DomainLifecycle {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", test))]
 pub(super) fn inspect_linux_journal(
     directory: &BoundDir,
     attempt: AttemptIdentity,
@@ -373,7 +373,7 @@ pub(super) fn inspect_linux_journal(
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", test))]
 fn parse_version(path: &Path, bytes: &[u8]) -> Result<u32, ExecutionDomainError> {
     serde_json::from_slice::<JournalVersion>(bytes)
         .map(|record| record.version)
