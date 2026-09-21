@@ -115,3 +115,50 @@ fn rejects_zero_capacity() {
             .unwrap_err();
     assert!(error.to_string().contains("nonzero"));
 }
+
+#[test]
+fn optional_policy_preserves_trusted_defaults() {
+    let config: ExecutionConfig = toml::from_str("").unwrap();
+    assert_eq!(config.profile, ExecutionProfile::TrustedHost);
+    assert!(config.network.is_none());
+    assert!(config.storage.is_none());
+}
+
+#[test]
+fn sandboxed_without_policy_still_parses() {
+    let config: ExecutionConfig = toml::from_str("profile = 'sandboxed'").unwrap();
+    assert_eq!(config.profile, ExecutionProfile::Sandboxed);
+    assert!(config.network.is_none());
+    assert!(config.storage.is_none());
+}
+
+#[test]
+fn policy_tables_round_trip() {
+    let text = "[network]\nproduction_cidrs = ['10.2.0.0/16']\n[storage]\nmechanism = 'project-quota'\nmax_bytes = '64GiB'\n";
+    let config: ExecutionConfig = toml::from_str(text).unwrap();
+    assert_eq!(config.network.as_ref().unwrap().production_cidrs.len(), 1);
+    assert_eq!(
+        config.storage.as_ref().unwrap().max_bytes.get(),
+        68_719_476_736
+    );
+    let encoded = toml::to_string(&config).unwrap();
+    assert!(encoded.contains("68719476736B"));
+    assert_eq!(toml::from_str::<ExecutionConfig>(&encoded).unwrap(), config);
+    let empty: ExecutionConfig = toml::from_str("[network]\nproduction_cidrs = []").unwrap();
+    assert_eq!(empty.network.unwrap().production_cidrs.len(), 0);
+}
+
+#[test]
+fn unknown_policy_fields_fail() {
+    for text in [
+        "[network]\nproduction_cidrs = []\nunknown = true",
+        "[storage]\nmechanism = 'btrfs-quota'\nmax_bytes = '1B'\nunknown = true",
+        "[network]",
+        "[storage]",
+    ] {
+        assert!(
+            toml::from_str::<ExecutionConfig>(text).is_err(),
+            "accepted {text:?}"
+        );
+    }
+}
