@@ -88,6 +88,7 @@ impl Wave {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CaseKey {
     pub scenario: ScenarioId,
     pub case: String,
