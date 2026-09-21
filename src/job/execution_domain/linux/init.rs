@@ -53,6 +53,9 @@ pub(super) fn run(
     if unsafe { libc::getpid() } != 1 {
         return Err(failure(FailureCategory::IdentityMismatch));
     }
+    if unsafe { libc::prctl(libc::PR_SET_NAME, c"chimera-domain".as_ptr(), 0, 0, 0) } < 0 {
+        return Err(io_failure());
+    }
     if unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) } < 0 {
         return Err(io_failure());
     }

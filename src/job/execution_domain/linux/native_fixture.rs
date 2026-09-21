@@ -1,17 +1,27 @@
+use std::ffi::CString;
 use std::fs;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
-use super::super::{ExecutionDomainError, FailureCategory, Stage};
-use super::cleanup::IdMapSpec;
+use super::super::protocol::{Message, Request, Response};
+use super::super::{
+    AttemptIdentity, CommandOutcome, CommandSpec, CommandTarget, DestroyReport, DomainPath,
+    ExecutionDomainError, FailureCategory, Stage,
+};
+use super::cleanup::{CleanupWorkerConfig, IdMapSpec};
+use super::dirfd::{self, BoundDir};
+use super::launcher::{KernelDomain, LaunchSpec, NetworkLaunch};
+use super::{StrictBackendBuilder, StrictCleanupRecord, StrictPartialCleanup};
 
 pub(super) struct NativePrerequisites {
     root: PathBuf,
     cgroup: PathBuf,
     binary: PathBuf,
-    _map: IdMapSpec,
+    map: IdMapSpec,
 }
 
 impl NativePrerequisites {
@@ -63,7 +73,7 @@ impl NativePrerequisites {
             root,
             cgroup,
             binary,
-            _map: map,
+            map,
         })
     }
 
@@ -76,21 +86,442 @@ impl NativePrerequisites {
     }
 }
 
-// The existing private builder cannot yet receive a pinned cleanup-worker
-// executable/helper capability. A successful preflight is not permission to
-// start a domain that the fixture cannot safely tear down.
-pub(super) struct NativeDomainFixture;
+// Failed teardown retains the production cleanup capability AND its root lock.
+// A later selected test cannot reuse a poisoned root or overwrite its inventory.
+static QUARANTINE: Mutex<Vec<QuarantinedFixture>> = Mutex::new(Vec::new());
+
+struct QuarantinedFixture {
+    _lock: crate::storage::RootLock,
+    _cleanup: Option<StrictPartialCleanup>,
+}
+
+pub(super) struct NativeDomainFixture {
+    cleanup: Option<StrictCleanupRecord>,
+    lock: Option<crate::storage::RootLock>,
+    active: BoundDir,
+    cgroup_root: BoundDir,
+    attempt_cgroup: BoundDir,
+    attempt_path: PathBuf,
+    attempt_name: CString,
+    cgroup_name: CString,
+    cleanup_cgroup_name: CString,
+    launcher_pidfd: OwnedFd,
+    report: Option<DestroyReport>,
+    command_id: u64,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct NativeSnapshot {
+    pub live_processes: usize,
+    pub cgroups: usize,
+    pub mounts: usize,
+    pub entries: usize,
+}
 
 impl NativeDomainFixture {
     pub(super) async fn prepare() -> Result<Self, ExecutionDomainError> {
         let prerequisites = NativePrerequisites::from_environment()?;
-        let _ = (
-            prerequisites.root,
-            prerequisites.cgroup,
-            prerequisites.binary,
-        );
-        Err(not_ready())
+        super::cleanup::verify_empty_supplementary_groups()?;
+        let worker = CleanupWorkerConfig::verified(
+            &prerequisites.binary,
+            Path::new("/usr/bin/newuidmap"),
+            Path::new("/usr/bin/newgidmap"),
+        )?;
+        // Both cache mount targets need immutable inputs even for this shell-only
+        // case. Use fixed operator-owned data, never a service-writable fixture.
+        let mut rootfs =
+            super::rootfs::RootfsPlan::debian(&super::rootfs::linux::ImmutableInputs {
+                tool_cache: "/usr/share/zoneinfo/Etc".into(),
+                actions_cache: "/usr/share/zoneinfo/Etc".into(),
+                extra_tools: Vec::new(),
+            })?;
+        let limits = crate::config::resources::ResourceLimits {
+            memory_high: "256 MiB".into(),
+            memory_max: "512 MiB".into(),
+            memory_swap_max: "0".into(),
+            cpu_quota: "150%".into(),
+            cpu_weight: 100,
+            pids_max: "256".into(),
+            io_weight: 100,
+            io_max: Vec::new(),
+        }
+        .validate()
+        .map_err(|_| unavailable())?;
+        let lock =
+            crate::storage::RootLock::acquire(&prerequisites.root).map_err(|_| unavailable())?;
+        let mut retained = None;
+        let result = (|| {
+            let root = BoundDir::open_root(&prerequisites.root)?;
+            root.verify_private_directory()?;
+            let active = match dirfd::stat_at(root.fd(), c"active") {
+                Ok(_) => root.child(c"active")?,
+                Err(error) if error.raw_os_error() == Some(libc::ENOENT) => {
+                    root.create_child(c"active", 0o700)?
+                }
+                Err(error) => return Err(io_error(error)),
+            };
+            active.verify_private_directory()?;
+            if !dirfd::directory_entries(active.fd())?.is_empty() {
+                return Err(unavailable());
+            }
+            let mut cgroups = super::cgroup::CgroupRoot::open_delegated(&prerequisites.cgroup)?;
+            // The dedicated unit supplies these exact global limits. Production
+            // validates readback and evacuates this test process before launch.
+            cgroups.prepare_supervisor(&limits)?;
+            let attempt = AttemptIdentity::new();
+            let attempt_name = CString::new(attempt.component()).map_err(|_| unavailable())?;
+            let attempt_root = active.create_child(&attempt_name, 0o700)?;
+            let bound_rootfs = attempt_root.create_child(c"rootfs", 0o700)?;
+            let state = attempt_root.create_child(c"rootlesskit", 0o700)?;
+            for (name, target) in [
+                ("work", "/work"),
+                ("tmp", "/tmp"),
+                ("home", "/home/chimera"),
+                ("run", "/run/chimera"),
+                ("docker", "/home/chimera/.docker"),
+                ("docker-data", "/var/lib/chimera/docker"),
+                ("docker-exec", "/run/chimera/docker-exec"),
+            ] {
+                let name = CString::new(name).map_err(|_| unavailable())?;
+                let directory = attempt_root.create_child(&name, 0o700)?;
+                rootfs.inputs.push(super::rootfs::MountInput::writable(
+                    directory.bound_path(),
+                    target,
+                )?);
+            }
+            rootfs.staging_root = bound_rootfs.bound_path();
+            install_fd_probe(&attempt_root.child(c"work")?)?;
+            let cgroup = cgroups.create_attempt(attempt, &limits)?;
+            let cgroup_name = CString::new(format!("attempt-{}", attempt.component()))
+                .map_err(|_| unavailable())?;
+            let domain_path = prerequisites
+                .cgroup
+                .join(cgroup_name.to_str().map_err(|_| unavailable())?)
+                .join("domain");
+            let input = super::rootfs::MountInput::writable(domain_path, "/sys/fs/cgroup");
+            match input {
+                Ok(input) => rootfs.inputs.push(input),
+                Err(error) => {
+                    retained = Some(StrictPartialCleanup::Cgroup(cgroup));
+                    return Err(error);
+                }
+            }
+            let builder = StrictBackendBuilder {
+                cgroup,
+                launch: LaunchSpec {
+                    attempt,
+                    rootfs,
+                    bound_rootfs,
+                    executable: prerequisites.binary,
+                    rootlesskit: "/usr/bin/rootlesskit".into(),
+                    state_directory: state.bound_path(),
+                    hostname: "chimera-native".into(),
+                    network: NetworkLaunch::Disconnected,
+                },
+                mapped_cleanup: Some((prerequisites.map.range(), worker)),
+                runtime_socket: None,
+            };
+            let parts = match builder.build() {
+                Ok(parts) => parts,
+                Err(failure) => {
+                    let (error, cleanup) = failure.into_parts();
+                    retained = cleanup;
+                    return Err(error);
+                }
+            };
+            retained = Some(StrictPartialCleanup::Record(Box::new(parts.cleanup)));
+            let Some(StrictPartialCleanup::Record(record)) = retained.as_ref() else {
+                unreachable!()
+            };
+            let launcher_fd =
+                unsafe { libc::fcntl(record.kernel().pidfd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 3) };
+            if launcher_fd < 0 {
+                return Err(io_error(io::Error::last_os_error()));
+            }
+            let launcher_pidfd = unsafe { OwnedFd::from_raw_fd(launcher_fd) };
+            let cgroup_root = BoundDir::open_root(&prerequisites.cgroup)?;
+            let attempt_cgroup = cgroup_root.child(&cgroup_name)?;
+            let cleanup_cgroup_name = CString::new(format!("cleanup-{}", attempt.component()))
+                .map_err(|_| unavailable())?;
+            Ok((
+                active,
+                attempt_root.bound_path(),
+                attempt_name,
+                cgroup_name,
+                cleanup_cgroup_name,
+                launcher_pidfd,
+                cgroup_root,
+                attempt_cgroup,
+            ))
+        })();
+        match result {
+            Ok((
+                active,
+                attempt_path,
+                attempt_name,
+                cgroup_name,
+                cleanup_cgroup_name,
+                launcher_pidfd,
+                cgroup_root,
+                attempt_cgroup,
+            )) => {
+                let Some(StrictPartialCleanup::Record(record)) = retained.take() else {
+                    unreachable!()
+                };
+                Ok(Self {
+                    cleanup: Some(*record),
+                    lock: Some(lock),
+                    active,
+                    cgroup_root,
+                    attempt_cgroup,
+                    attempt_path,
+                    attempt_name,
+                    cgroup_name,
+                    cleanup_cgroup_name,
+                    launcher_pidfd,
+                    report: None,
+                    command_id: 0,
+                })
+            }
+            Err(error) => {
+                // If construction failed after publication, retry through the
+                // production owner. Keep the lock even on an early partial tree:
+                // a failed prepare never advertises a clean fixture.
+                if let Some(cleanup) = retained.as_mut() {
+                    let _ = cleanup.retry();
+                }
+                quarantine(lock, retained);
+                Err(error)
+            }
+        }
     }
+
+    pub(super) fn kernel(&self) -> &KernelDomain {
+        self.cleanup
+            .as_ref()
+            .expect("fixture already destroyed")
+            .kernel()
+    }
+
+    pub(super) async fn run(&mut self, script: &str) -> CommandOutcome {
+        self.run_checked(script)
+            .unwrap_or_else(|error| panic!("native command protocol failed: {error:?}"))
+    }
+
+    fn run_checked(&mut self, script: &str) -> Result<CommandOutcome, ExecutionDomainError> {
+        self.command_id += 1;
+        let command_id = self.command_id;
+        let kernel = self.cleanup.as_mut().ok_or_else(not_ready)?.kernel_mut();
+        let deadline = Instant::now() + Duration::from_secs(40);
+        let spec = CommandSpec {
+            target: CommandTarget::Sandboxed {
+                program: DomainPath::parse("/usr/bin/dash")?,
+                args: vec!["-c".into(), format!("set -eu\n{script}")],
+                cwd: DomainPath::parse("/work")?,
+            },
+            env: Default::default(),
+            timeout: Duration::from_secs(30),
+            state: None,
+        };
+        match kernel
+            .control
+            .request_until(Request::Run { command_id, spec }, deadline)?
+        {
+            Response::CommandStarted { command_id: actual } if actual == command_id => {}
+            _ => return Err(unavailable()),
+        }
+        loop {
+            match kernel.control.receive(deadline)? {
+                Message::Response(Response::Output {
+                    command_id: actual, ..
+                }) if actual == command_id => {}
+                Message::Response(Response::CommandFinished {
+                    command_id: actual,
+                    outcome,
+                }) if actual == command_id => return Ok(outcome),
+                _ => return Err(unavailable()),
+            }
+        }
+    }
+
+    pub(super) async fn probe_control_fds(&mut self) -> CommandOutcome {
+        self.run("exec /work/native-fd-probe").await
+    }
+
+    pub(super) async fn destroy(&mut self) -> Result<DestroyReport, ExecutionDomainError> {
+        if let Some(report) = &self.report {
+            return Ok(report.clone());
+        }
+        let report = self.cleanup.as_mut().ok_or_else(not_ready)?.destroy()?;
+        self.report = Some(report.clone());
+        self.cleanup.take();
+        Ok(report)
+    }
+
+    pub(super) fn snapshot(&self) -> NativeSnapshot {
+        self.inventory()
+            .expect("native resource inventory must be readable")
+    }
+
+    fn inventory(&self) -> Result<NativeSnapshot, ExecutionDomainError> {
+        self.active.verify_binding()?;
+        self.cgroup_root.verify_binding()?;
+        let mut snapshot = NativeSnapshot {
+            live_processes: 0,
+            cgroups: 0,
+            mounts: 0,
+            entries: dirfd::directory_entries(self.active.fd())?.len(),
+        };
+        for name in [&self.cgroup_name, &self.cleanup_cgroup_name] {
+            match dirfd::stat_at(self.cgroup_root.fd(), name) {
+                Ok(_) => {
+                    if name == &self.cgroup_name {
+                        self.attempt_cgroup.verify_binding()?;
+                    }
+                    inventory_cgroup(&self.cgroup_root.child(name)?, &mut snapshot, 0)?;
+                }
+                Err(error) if error.raw_os_error() == Some(libc::ENOENT) => {}
+                Err(error) => return Err(io_error(error)),
+            }
+        }
+        let mut poll = libc::pollfd {
+            fd: self.launcher_pidfd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ready = unsafe { libc::poll(&mut poll, 1, 0) };
+        if ready < 0 {
+            return Err(io_error(io::Error::last_os_error()));
+        }
+        if ready == 0 && snapshot.live_processes == 0 {
+            snapshot.live_processes += 1;
+        }
+        if poll.revents & (libc::POLLERR | libc::POLLNVAL) != 0 {
+            return Err(unavailable());
+        }
+        let mountinfo = fs::read("/proc/self/mountinfo").map_err(io_error)?;
+        for line in mountinfo.split(|byte| *byte == b'\n') {
+            let Some(field) = line.split(|byte| *byte == b' ').nth(4) else {
+                continue;
+            };
+            let point = super::unescape_mountinfo(field)?;
+            let path = self.attempt_path.as_os_str().as_encoded_bytes();
+            if point == path
+                || point
+                    .strip_prefix(path)
+                    .is_some_and(|suffix| suffix.starts_with(b"/"))
+            {
+                snapshot.mounts += 1;
+            }
+        }
+        Ok(snapshot)
+    }
+
+    pub(super) async fn assert_no_resources(&self) -> Result<(), ExecutionDomainError> {
+        if self.report.is_none() || self.cleanup.is_some() {
+            return Err(not_ready());
+        }
+        self.active.refuse_entry(&self.attempt_name)?;
+        let inventory = self.inventory()?;
+        if inventory
+            != (NativeSnapshot {
+                live_processes: 0,
+                cgroups: 0,
+                mounts: 0,
+                entries: 0,
+            })
+        {
+            return Err(unavailable());
+        }
+        Ok(())
+    }
+}
+
+impl Drop for NativeDomainFixture {
+    fn drop(&mut self) {
+        let retained = self.cleanup.take().and_then(|mut cleanup| {
+            cleanup
+                .destroy()
+                .err()
+                .map(|_| StrictPartialCleanup::Record(Box::new(cleanup)))
+        });
+        let clean = self.inventory().is_ok_and(|inventory| {
+            inventory
+                == (NativeSnapshot {
+                    live_processes: 0,
+                    cgroups: 0,
+                    mounts: 0,
+                    entries: 0,
+                })
+        });
+        if (retained.is_some() || !clean)
+            && let Some(lock) = self.lock.take()
+        {
+            quarantine(lock, retained);
+        }
+    }
+}
+
+fn quarantine(lock: crate::storage::RootLock, cleanup: Option<StrictPartialCleanup>) {
+    QUARANTINE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(QuarantinedFixture {
+            _lock: lock,
+            _cleanup: cleanup,
+        });
+}
+
+fn install_fd_probe(work: &BoundDir) -> Result<(), ExecutionDomainError> {
+    let executable = work.write_new(
+        c"native-fd-probe",
+        include_bytes!(concat!(env!("OUT_DIR"), "/chimera-native-fd-probe")),
+    )?;
+    if unsafe { libc::fchmod(executable.as_raw_fd(), 0o700) } < 0 {
+        return Err(io_error(io::Error::last_os_error()));
+    }
+    work.verify_binding()
+}
+
+fn inventory_cgroup(
+    directory: &BoundDir,
+    snapshot: &mut NativeSnapshot,
+    depth: usize,
+) -> Result<(), ExecutionDomainError> {
+    use std::io::Read;
+    if depth >= 64 || snapshot.cgroups >= 4096 {
+        return Err(unavailable());
+    }
+    directory.verify_binding()?;
+    snapshot.cgroups += 1;
+    let fd = dirfd::open_at(
+        directory.fd(),
+        c"cgroup.procs",
+        libc::O_RDONLY | libc::O_CLOEXEC,
+        0,
+        dirfd::RESOLVE_POLICY,
+    )?;
+    let mut members = String::new();
+    fs::File::from(fd)
+        .take(1024 * 1024 + 1)
+        .read_to_string(&mut members)
+        .map_err(io_error)?;
+    if members.len() > 1024 * 1024 {
+        return Err(unavailable());
+    }
+    for member in members.split_whitespace() {
+        if member.parse::<u32>().ok().is_none_or(|pid| pid == 0) {
+            return Err(unavailable());
+        }
+        snapshot.live_processes += 1;
+    }
+    for name in dirfd::directory_entries(directory.fd())? {
+        let metadata = dirfd::stat_at(directory.fd(), &name).map_err(io_error)?;
+        if u32::from(metadata.stx_mode) & libc::S_IFMT == libc::S_IFDIR {
+            inventory_cgroup(&directory.child(&name)?, snapshot, depth + 1)?;
+        }
+    }
+    directory.verify_binding()
 }
 
 fn canonical_required(path: Option<PathBuf>) -> Result<PathBuf, ExecutionDomainError> {
@@ -110,9 +541,24 @@ fn verify_private_root(path: &Path) -> Result<(), ExecutionDomainError> {
     if !metadata.is_dir()
         || metadata.uid() != unsafe { libc::geteuid() }
         || metadata.permissions().mode() & 0o7777 != 0o700
-        || fs::read_dir(path).map_err(io_error)?.next().is_some()
     {
         return Err(unavailable());
+    }
+    // Scaffolding survives a successful case; stale or quarantined attempts do
+    // not. RootLock validates the lock file again when acquiring ownership.
+    for entry in fs::read_dir(path).map_err(io_error)? {
+        let entry = entry.map_err(io_error)?;
+        match entry.file_name().to_str() {
+            Some(".chimera.lock") => {}
+            Some("active") => {
+                let active = BoundDir::open_root(&entry.path())?;
+                active.verify_private_directory()?;
+                if !dirfd::directory_entries(active.fd())?.is_empty() {
+                    return Err(unavailable());
+                }
+            }
+            _ => return Err(unavailable()),
+        }
     }
     Ok(())
 }
@@ -129,28 +575,9 @@ fn verify_delegation(path: &Path) -> Result<(), ExecutionDomainError> {
     if !path.starts_with("/sys/fs/cgroup") || path == Path::new("/sys/fs/cgroup") {
         return Err(unavailable());
     }
-    let directory = fs::File::open(path).map_err(io_error)?;
-    let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
-    if unsafe { libc::fstatfs(directory.as_raw_fd(), stat.as_mut_ptr()) } < 0 {
-        return Err(io_error(io::Error::last_os_error()));
-    }
-    if unsafe { stat.assume_init() }.f_type != libc::CGROUP2_SUPER_MAGIC {
-        return Err(unavailable());
-    }
-    let controllers = fs::read_to_string(path.join("cgroup.controllers")).map_err(io_error)?;
-    if !["cpu", "io", "memory", "pids"].iter().all(|name| {
-        controllers
-            .split_ascii_whitespace()
-            .any(|value| value == *name)
-    }) {
-        return Err(unavailable());
-    }
-    for name in ["cgroup.procs", "cgroup.subtree_control", "cgroup.kill"] {
-        fs::OpenOptions::new()
-            .write(true)
-            .open(path.join(name))
-            .map_err(io_error)?;
-    }
+    // systemd owns the unit's kill control. The production cgroup builder
+    // pins it with O_PATH and validates kill authority on each new attempt.
+    super::cgroup::CgroupRoot::open_delegated(path)?;
     Ok(())
 }
 
