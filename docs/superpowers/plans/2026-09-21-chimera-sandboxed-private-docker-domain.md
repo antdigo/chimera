@@ -39,7 +39,7 @@
 
 ## Baseline, boundaries, and evidence
 
-Planning baseline is `origin/main@0664288`, branch `codex/sandboxed-private-docker-plan`. C0 endpoint propagation and B12a's first native fixture implementation are merged. B native qualification has **not passed**. The roadmap's older statement that the whole B harness consists of named failures is superseded by the merged B12a code and `docs/testing/sandboxed-linux-domain.md`: one native case is implemented, fourteen still fail explicitly when selected. Neither status is a native pass.
+Planning baseline is `origin/main@a2f9755`, branch `codex/sandboxed-private-docker-plan`. C0 endpoint propagation, B12a's first native fixture, B12b1's detached-descendant case, and the no-downtime qualification design are merged. B native qualification has **not passed**. Two native cases are implemented but have **not run** on Debian; thirteen still fail explicitly when selected. None of these states is a native pass.
 
 At this baseline:
 
@@ -53,7 +53,7 @@ At this baseline:
 
 C1 delivers compiled runtime machinery plus daemon-free tests and explicitly selected native fixtures. Full S-05 network policy/capability service integration belongs to D; full B native qualification and S-01…S-16 release execution belong to B/D/E. Offline C1 fixtures may load verified local images and run a synthetic registry in the attempt. Registry Internet access and production-compatible capability endpoints wait for D.
 
-The conceptually accepted no-downtime qualification topology is a future release dependency. Its written spec in draft PR [#71](https://github.com/antdigo/chimera/pull/71) is pending user review and is **not merged implementation authority**. Do not incorporate it by assuming its helpers, options, or deployment paths exist. Its eventual approved implementation must provide separate qualification resources and leave live production service/data untouched; no downtime or server access is authorized by this plan.
+The user-approved [no-downtime qualification design](../specs/2026-09-21-chimera-sandboxed-live-qualification-design.md) is merged in `main`, but its facility is **not implemented**. Do not incorporate it by assuming its helpers, options, or deployment paths exist. Its later implementation must provide separate qualification resources and leave live production service/data untouched; no downtime or server access is authorized by this plan.
 
 ## Ownership and path contract
 
@@ -494,7 +494,7 @@ Two sequential tenant waves reuse the same service account and subordinate mappi
 ```
 
 Keep build.rs's static FD-probe prerequisites and native Linux compiler handling. Do not use macOS cargo success as evidence that Linux cfg branches compile.
-- [ ] **Document exact behavior and limitations.** Explain shared-kernel risk, eager cost, direct API/rootless semantics, complete private classic store, no persistent daemon pool, protected env, container socket availability, mapped binds, Docker resource-flag limitations, cleanup/quarantine, and native prerequisites. Mark C1 “implementation/tests compiled; native acceptance pending” until actual evidence exists. Update B's stale roadmap wording to B12a implemented/native not qualified without implying C1 passed B.
+- [ ] **Document exact behavior and limitations.** Explain shared-kernel risk, eager cost, direct API/rootless semantics, complete private classic store, no persistent daemon pool, protected env, container socket availability, mapped binds, Docker resource-flag limitations, cleanup/quarantine, and native prerequisites. Mark C1 “implementation/tests compiled; native acceptance pending” until actual evidence exists. Update B's stale roadmap wording to reflect the merged B12a/B12b1 implementation-only cases, with native qualification still pending; do not imply C1 passed B.
 - [ ] **Run final local and CI verification once after implementation:**
 
 ```bash
