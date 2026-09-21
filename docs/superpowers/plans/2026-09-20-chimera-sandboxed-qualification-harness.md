@@ -526,17 +526,24 @@ The Task 7 commit subject above is retained as historical plan/commit text; it d
 #[tokio::test]
 #[ignore = "native Debian, exclusive host qualification and configured runtime driver required"]
 async fn native_sandboxed_release_qualification() {
-    let path = std::env::var_os("CHIMERA_QUALIFICATION_CONFIG")
-        .expect("explicit native qualification config required");
-    let bytes = std::fs::read(path).unwrap();
-    let config: qualification::host::NativeConfig = serde_json::from_slice(&bytes).unwrap();
-    let report = qualification::run_native(config).await.unwrap();
-    assert!(qualification::report::qualifies(&report), "native qualification incomplete");
-    assert!(!report.activation_available);
+    use qualification::catalog::Reason;
+    let outcome = async {
+        let path = std::env::var_os("CHIMERA_QUALIFICATION_CONFIG")
+            .ok_or(Reason::InvalidConfig)?;
+        let config = qualification::read_native_config(std::path::Path::new(&path))?;
+        qualification::run_native(config).await
+    }.await;
+    match outcome {
+        Ok(report) => {
+            assert!(!report.activation_available);
+            assert!(qualification::report::qualifies(&report), "BackendUnavailable");
+        }
+        Err(reason) => panic!("{reason:?}"),
+    }
 }
 ```
 
-`run_native` always persists reports before returning a negative qualification result; parsing failures write a safe preflight report if the output directory can be safely opened, otherwise print only the safe error category.
+Once `NativeLease` is acquired, `run_native` persists the complete blocked report before returning a negative qualification result. Malformed/unvalidated config, commit identity failure or lease-acquisition failure prints only the safe `Reason` category and exits nonzero: without a validated config and held lease, there is no trusted report destination and no ad hoc preflight report is written. Failed publication retains the unfinished marker. Portable tests exercise this publication core with `acquire_fixture` and retain Fixture provenance; they do not claim native execution. The production CLI regression preprovisions its existing root lock, then verifies no additional changes after sandboxed rejection; creation of that lock on a fresh root remains existing `Daemon::load` behavior.
 - [ ] **Step 2: RED.** `cargo test --test sandboxed_qualification_test orchestrator > /tmp/chimera-e0-orchestrator.log 2>&1` — new orchestration tests fail. The production-gate regression must remain green throughout.
 - [ ] **Step 3: Implement orchestration and script.** Native entrypoint requires exactly one absolute config path, verifies it is a regular no-follow file, sets TMPDIR inside checkout target, and invokes the single target serially:
 

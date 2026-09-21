@@ -1,7 +1,9 @@
 //! E0 owns only preflight storage and reports. No native workload is launched.
 #![allow(dead_code)] // Native entrypoints are consumed by Task 8.
 use super::catalog::{Reason, validate_coverage};
-use super::report::{EvidenceMode, QualificationReport, Verdict, valid_identity, write_report_at};
+use super::report::{
+    EvidenceMode, QualificationReport, RunIdentity, Verdict, valid_identity, write_report_at,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -222,6 +224,15 @@ pub(super) enum PublicationStage {
     AfterClaim,
 }
 impl NativeLease {
+    pub(super) fn run_identity(&self, commit: String) -> RunIdentity {
+        RunIdentity {
+            run_id: self.run_id,
+            commit,
+            config_digest: self.config_digest.clone(),
+            host_boot_id: self.boot_id,
+            mode: self.mode,
+        }
+    }
     pub fn run_directory(&self) -> &Path {
         &self.run_directory
     }
