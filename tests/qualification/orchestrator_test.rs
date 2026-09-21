@@ -311,7 +311,7 @@ fn orchestrator_production_start_rejects_sandboxed_without_side_effects() {
 #[test]
 fn orchestrator_native_script_rejects_bad_paths_and_propagates_serial_cargo_failure() {
     let fixture = Fixture::new();
-    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/qualification/native.sh");
+    let script = copy_native_script(&fixture);
     let config = fixture.base().join("config.json");
     fs::write(&config, b"{}").unwrap();
     let link = fixture.base().join("link");
@@ -345,4 +345,163 @@ fn orchestrator_native_script_rejects_bad_paths_and_propagates_serial_cargo_fail
     let arguments = fs::read_to_string(calls).unwrap();
     assert!(arguments.starts_with("test\n--features\nacceptance-tests\n--test\nsandboxed_qualification_test\nnative_sandboxed_release_qualification\n--\n--ignored\n--exact\n--test-threads=1\n"));
     assert!(arguments.contains(config.to_str().unwrap()));
+}
+
+fn copy_native_script(fixture: &Fixture) -> PathBuf {
+    let script = fixture
+        .base()
+        .join("checkout/scripts/qualification/native.sh");
+    fs::create_dir_all(script.parent().unwrap()).unwrap();
+    fs::write(
+        &script,
+        include_bytes!("../../scripts/qualification/native.sh"),
+    )
+    .unwrap();
+    script
+}
+
+fn shell_run(
+    fixture: &Fixture,
+    script: &Path,
+    cargo: &str,
+    mktemp: Option<&str>,
+) -> std::process::Output {
+    let bin = fixture.base().join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    for (name, contents) in [("cargo", Some(cargo)), ("mktemp", mktemp)] {
+        if let Some(contents) = contents {
+            fs::write(bin.join(name), contents).unwrap();
+            fs::set_permissions(bin.join(name), fs::Permissions::from_mode(0o700)).unwrap();
+        }
+    }
+    let config = fixture.base().join("config.json");
+    fs::write(&config, b"{}").unwrap();
+    Command::new("/bin/bash")
+        .arg(script)
+        .arg(config)
+        .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+        .env("CALLS", fixture.base().join("calls"))
+        .env("VICTIM", fixture.base().join("active-marker"))
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn orchestrator_native_script_rejects_symlink_and_writable_output_ancestry() {
+    for component in [
+        "checkout",
+        "checkout/target",
+        "checkout/target/chimera-tests",
+    ] {
+        for link in [false, true] {
+            let fixture = Fixture::new();
+            let script = copy_native_script(&fixture);
+            let path = fixture.base().join(component);
+            fs::create_dir_all(&path).unwrap();
+            let retained = path.with_extension("retained");
+            if link {
+                fs::rename(&path, &retained).unwrap();
+                symlink(&retained, &path).unwrap();
+            } else {
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o777)).unwrap();
+            }
+            let output = shell_run(
+                &fixture,
+                &script,
+                "#!/bin/sh\nprintf invoked > \"$CALLS\"\n",
+                None,
+            );
+            assert!(
+                !output.status.success(),
+                "accepted {component}, symlink={link}"
+            );
+            assert!(!fixture.base().join("calls").exists());
+            let checked_directory = if link { &retained } else { &path };
+            match component {
+                "checkout" => assert!(!checked_directory.join("target").exists()),
+                "checkout/target" => assert!(!checked_directory.join("chimera-tests").exists()),
+                _ => {}
+            }
+            if component.ends_with("chimera-tests") {
+                assert_eq!(fs::read_dir(checked_directory).unwrap().count(), 0);
+            }
+        }
+    }
+}
+
+#[test]
+fn orchestrator_native_script_rejects_newline_paths_before_creating_output() {
+    let fixture = Fixture::new();
+    let source = copy_native_script(&fixture);
+    let prefix = fixture.base().join("prefix");
+    fs::create_dir(&prefix).unwrap();
+    let unsafe_parent = fixture.base().join("prefix\n/unsafe");
+    let script = unsafe_parent.join("checkout/scripts/qualification/native.sh");
+    fs::create_dir_all(script.parent().unwrap()).unwrap();
+    fs::copy(source, &script).unwrap();
+    fs::set_permissions(&unsafe_parent, fs::Permissions::from_mode(0o777)).unwrap();
+    let output = shell_run(
+        &fixture,
+        &script,
+        "#!/bin/sh\nprintf invoked > \"$CALLS\"\n",
+        None,
+    );
+    assert!(!output.status.success());
+    assert!(!fixture.base().join("calls").exists());
+    assert!(!unsafe_parent.join("checkout/target").exists());
+}
+
+#[test]
+fn orchestrator_native_script_exclusive_log_open_rejects_preplaced_link() {
+    let fixture = Fixture::new();
+    let script = copy_native_script(&fixture);
+    let victim = fixture.base().join("active-marker");
+    fs::write(&victim, b"preserve active marker").unwrap();
+    let output = shell_run(
+        &fixture,
+        &script,
+        "#!/bin/sh\nprintf invoked > \"$CALLS\"\n",
+        Some(
+            "#!/bin/sh\ncreated=$(/usr/bin/mktemp \"$@\") || exit\nif test -d \"$created\"; then\n  ln -s \"$VICTIM\" \"$created/cargo.log\"\nelse\n  mv \"$created\" \"$created.original\"\n  ln -s \"$VICTIM\" \"$created\"\nfi\nprintf '%s\\n' \"$created\"\n",
+        ),
+    );
+    assert!(!output.status.success());
+    assert_eq!(fs::read(&victim).unwrap(), b"preserve active marker");
+    assert!(!fixture.base().join("calls").exists());
+}
+
+#[test]
+fn orchestrator_native_script_retains_log_descriptor_after_path_replacement() {
+    let fixture = Fixture::new();
+    let script = copy_native_script(&fixture);
+    let victim = fixture.base().join("active-marker");
+    fs::write(&victim, b"preserve active marker").unwrap();
+    let output = shell_run(
+        &fixture,
+        &script,
+        "#!/bin/sh\ntest -d \"$TMPDIR\" || exit 90\ntest -f \"$TMPDIR/cargo.log\" || exit 91\nls -i \"$TMPDIR/cargo.log\" > \"$CALLS.inode\"\nmv \"$TMPDIR/cargo.log\" \"$TMPDIR/retained.log\"\nln -s \"$VICTIM\" \"$TMPDIR/cargo.log\"\nprintf '%s\\n' \"$TMPDIR\" > \"$CALLS\"\nprintf 'fixture stdout\\n'\nprintf 'fixture stderr\\n' >&2\nexit 23\n",
+        None,
+    );
+    assert_eq!(output.status.code(), Some(23));
+    assert_eq!(fs::read(&victim).unwrap(), b"preserve active marker");
+    let invocation = PathBuf::from(
+        fs::read_to_string(fixture.base().join("calls"))
+            .unwrap()
+            .trim(),
+    );
+    assert_eq!(fs::metadata(&invocation).unwrap().mode() & 0o777, 0o700);
+    let retained = invocation.join("retained.log");
+    let inode: u64 = fs::read_to_string(fixture.base().join("calls.inode"))
+        .unwrap()
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(fs::metadata(&retained).unwrap().ino(), inode);
+    assert_eq!(fs::metadata(&retained).unwrap().mode() & 0o777, 0o600);
+    assert_eq!(
+        fs::read(retained).unwrap(),
+        b"fixture stdout\nfixture stderr\n"
+    );
 }

@@ -30,6 +30,12 @@ Before scheduling the maintenance window:
    PATH containing Bash and Cargo; systemd does not load the login shell's setup.
    The harness reads HEAD from that checkout; keep it
    unchanged during the run. E0 reports do not establish build provenance for E1.
+   Checkout ancestry must contain no symlinks and must be root/service-owned,
+   without group/other write access (root-owned sticky directories are permitted
+   only above the checkout). The checkout, `target` and `target/chimera-tests`
+   must themselves have no group/other write bits. The script rejects unsafe
+   existing directories; it does not repair permissions or follow aliases.
+   Use a normalized checkout path without LF/CR, `.` or `..` components.
 2. Provision a dedicated qualification filesystem with an operator-approved byte
    bound. Create `/var/lib/chimera-qualification` and its `reports` child owned by
    the service UID, mode `0700`. They must be distinct from production roots and
@@ -93,16 +99,29 @@ The command executed by that unit is:
 /absolute/checkout/scripts/qualification/native.sh /etc/chimera/qualification.json
 ```
 
-The script accepts exactly one absolute regular non-symlink config path, changes
-to its own checkout, sets `TMPDIR` to `target/chimera-tests`, and invokes:
+The script accepts exactly one absolute regular non-symlink config path. It checks
+each ancestry component from `/` before traversing its child, then creates any
+missing `target`/`chimera-tests` directory only beneath the already protected
+parent. It creates an exclusive `0700` invocation directory at
+`target/chimera-tests/run.<random>` and uses that private directory as `TMPDIR`.
+Root and the service UID are trusted to honor the lock and leave checked ancestry
+unchanged during execution; untrusted workloads must not run as this UID outside
+their isolated domain or gain write access to the checkout. These pathname checks
+are not a defense against a malicious root or service-UID process.
+
+From the checked checkout it invokes:
 
 ```bash
 cargo test --features acceptance-tests --test sandboxed_qualification_test \
   native_sandboxed_release_qualification -- --ignored --exact --test-threads=1
 ```
 
-It records output in a unique `0600` log beneath that TMPDIR and prints its path
-to the service journal. Its exit status is Cargo's exit status. There is no
+It exclusively creates `cargo.log` (`0600`, shell noclobber) inside the private
+invocation directory and retains its open descriptor. Cargo writes to that
+descriptor, without reopening the log pathname; replacing the name cannot
+redirect output or truncate a marker or another service-writable file. It prints
+the log path to the service journal and preserves the private directory as an
+artifact. Its exit status is Cargo's exit status. There is no
 environment or feature override for activation, platform checks, machine lock,
 report coverage or missing driver authority. `CHIMERA_QUALIFICATION_CONFIG` only
 selects the config input. The feature compiles the ignored test; it changes no

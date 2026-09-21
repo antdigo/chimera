@@ -545,24 +545,16 @@ async fn native_sandboxed_release_qualification() {
 
 Once `NativeLease` is acquired, `run_native` persists the complete blocked report before returning a negative qualification result. Malformed/unvalidated config, commit identity failure or lease-acquisition failure prints only the safe `Reason` category and exits nonzero: without a validated config and held lease, there is no trusted report destination and no ad hoc preflight report is written. Failed publication retains the unfinished marker. Portable tests exercise this publication core with `acquire_fixture` and retain Fixture provenance; they do not claim native execution. The production CLI regression preprovisions its existing root lock, then verifies no additional changes after sandboxed rejection; creation of that lock on a fresh root remains existing `Daemon::load` behavior.
 - [ ] **Step 2: RED.** `cargo test --test sandboxed_qualification_test orchestrator > /tmp/chimera-e0-orchestrator.log 2>&1` — new orchestration tests fail. The production-gate regression must remain green throughout.
-- [ ] **Step 3: Implement orchestration and script.** Native entrypoint requires exactly one absolute config path, verifies it is a regular no-follow file, sets TMPDIR inside checkout target, and invokes the single target serially:
+- [ ] **Step 3: Implement orchestration and script.** Native entrypoint requires exactly one absolute config path and verifies it is a regular no-follow file. Before creating directories, validate each ancestry component from `/` to the checkout: no symlinks, owner root/service UID, no group/other write bits except root-owned sticky ancestors above the checkout. Require protected non-writable checkout, `target` and `target/chimera-tests`; create missing directories only below an already checked protected parent, never via unchecked `mkdir -p` or permission repair. Root and the service UID must honor the lock and not mutate checked ancestry. Create an exclusive service-owned `0700` invocation directory below `target/chimera-tests`, use it as TMPDIR, and exclusively open a `0600` log with noclobber on retained FD 3. Cargo output goes to that FD, never a reopened pathname. Invoke the single target serially:
 
 ```bash
-#!/usr/bin/env bash
-set -euo pipefail
-test "$#" -eq 1
-case "$1" in /*) ;; *) exit 2 ;; esac
-test -f "$1"
-test ! -L "$1"
-mkdir -p "$PWD/target/chimera-tests"
-export TMPDIR="$PWD/target/chimera-tests"
-export CHIMERA_QUALIFICATION_CONFIG="$1"
+# After the protected-directory checks and exclusive FD setup above:
 cargo test --features acceptance-tests --test sandboxed_qualification_test \
   native_sandboxed_release_qualification -- --ignored --exact --test-threads=1 \
-  > /tmp/chimera-sandboxed-native.log 2>&1
+  >&3 2>&1
 ```
 
-The Rust harness, not the Bash process, holds `/run/lock/chimera-qualification.lock` throughout. Script exit reflects cargo exit; review captured log and JSON report afterward. The runbook explains dedicated qualification roots on the single host, operator preprovisioning of the exact lock file, bounded filesystem, target service stop/restart sequencing, positive sentinel controls outside its cgroup, mandatory reserve/SLO config, synthetic credentials and no production deploy. It must state that E0 has no watchdog or automatic orphan recovery: a crash leaves an active marker and manual quarantine is required, never `rm` on guessed paths. E1 must add exact run-owned cgroup/driver identity, watchdog, authenticated cleanup and operator-approved storage/benchmark inventory before S-01…S-16 can run. E0's correct native result is a complete blocked report, even if a driver executable happens to exist.
+Reject LF/CR in the checkout path before component traversal so line-based shell reads cannot skip a later unsafe ancestor. The Rust harness, not the Bash process, holds `/run/lock/chimera-qualification.lock` throughout. Script exit reflects cargo exit; review captured log and JSON report afterward. The runbook explains dedicated qualification roots on the single host, operator preprovisioning of the exact lock file, bounded filesystem, target service stop/restart sequencing, positive sentinel controls outside its cgroup, mandatory reserve/SLO config, synthetic credentials and no production deploy. It must state that E0 has no watchdog or automatic orphan recovery: a crash leaves an active marker and manual quarantine is required, never `rm` on guessed paths. E1 must add exact run-owned cgroup/driver identity, watchdog, authenticated cleanup and operator-approved storage/benchmark inventory before S-01…S-16 can run. E0's correct native result is a complete blocked report, even if a driver executable happens to exist.
 
 Do not run native stress concurrently with any other native qualification or daemon migration. The shared machine lock, not an instruction to obtain separate VMs, serializes S-01…S-16. One scenario may create 20/40 concurrent attempts internally; this is the behavior under test, not parallel test scheduling.
 - [ ] **Step 4: GREEN and completion checks.** Run:
