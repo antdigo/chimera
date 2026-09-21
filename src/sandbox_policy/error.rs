@@ -4,4 +4,6 @@ pub enum PolicyError {
     InvalidCidr,
     #[error("invalid storage limit")]
     InvalidStorageLimit,
+    #[error("host address inventory is empty")]
+    EmptyHostInventory,
 }
