@@ -27,6 +27,7 @@ use crate::docker::output::{DockerErrorDiagnostic, DockerLogFramer, OutputProces
 use crate::docker::resources::JobDockerResources;
 use crate::job::execute::{
     JobExecutionContext, JobState, StepConclusion, StepResult, build_step_env,
+    complete_step_transaction, is_reserved_command_file_env, prepare_step_transaction,
 };
 use crate::job::execution_domain::DOCKER_CONFIG_ENV;
 use crate::job::expression::ExprContext;
@@ -53,6 +54,12 @@ pub async fn run_docker_image_action(
 
     let docker = execution.docker_client()?;
 
+    let state_id = prepare_step_transaction(execution.docker_config(), workspace).await?;
+    let processor = OutputProcessor::new(
+        log_sender.clone(),
+        job_state.secret_masker.clone(),
+        job_state.debug_enabled,
+    );
     let result = run_docker_container(RunDockerParams {
         docker: &docker,
         image,
@@ -61,16 +68,21 @@ pub async fn run_docker_image_action(
         entrypoint: plan.entrypoint.as_deref(),
         args: &plan.args,
         env: &plan.env,
-        job_state,
+        processor: &processor,
         workspace,
-        log_sender,
         cancel_token,
         docker_resources: execution.docker_resources(),
     })
     .await;
-
-    rekey_action_state(job_state, step);
-    result
+    complete_docker_action_transaction(
+        execution.docker_config(),
+        state_id,
+        &processor,
+        job_state,
+        step,
+        result,
+    )
+    .await
 }
 
 /// Case 2: Repo action with `runs.using: docker` — has action.yml with Docker fields.
@@ -160,6 +172,12 @@ pub(crate) async fn run_docker_metadata_action(
 
     trace_docker_metadata_action(&selected_image, entrypoint.is_some(), resolved_args.len());
 
+    let state_id = prepare_step_transaction(execution.docker_config(), workspace).await?;
+    let processor = OutputProcessor::new(
+        log_sender.clone(),
+        job_state.secret_masker.clone(),
+        job_state.debug_enabled,
+    );
     let result = run_docker_container(RunDockerParams {
         docker: &docker,
         image: selected_image.image(),
@@ -168,14 +186,33 @@ pub(crate) async fn run_docker_metadata_action(
         entrypoint: entrypoint.as_deref(),
         args: &resolved_args,
         env: &env,
-        job_state,
+        processor: &processor,
         workspace,
-        log_sender,
         cancel_token,
         docker_resources: execution.docker_resources(),
     })
     .await;
+    complete_docker_action_transaction(
+        execution.docker_config(),
+        state_id,
+        &processor,
+        job_state,
+        step,
+        result,
+    )
+    .await
+}
 
+async fn complete_docker_action_transaction<T>(
+    domain: &crate::job::execution_domain::ExecutionDomain,
+    state_id: crate::job::execution_domain::StepFilesId,
+    processor: &OutputProcessor,
+    job_state: &mut JobState,
+    step: &Step,
+    command_result: Result<T>,
+) -> Result<T> {
+    let result =
+        complete_step_transaction(domain, state_id, processor, job_state, command_result).await;
     rekey_action_state(job_state, step);
     result
 }
@@ -258,7 +295,7 @@ fn build_metadata_action_env(
     let mut env = build_docker_action_env(step, job_state, workspace, base_env)?;
     let expr_ctx = ExprContext::new(&env, job_state, false, false);
     env.extend(build_action_inputs(metadata, step, &expr_ctx));
-    merge_action_env(&mut env, metadata, job_state);
+    merge_action_env(&mut env, metadata, job_state)?;
     inject_post_state(&mut env, entry_point, step, job_state);
 
     let resolved_args = resolve_args(args, &env, job_state);
@@ -352,14 +389,18 @@ fn merge_action_env(
     env: &mut HashMap<String, String>,
     metadata: &ActionMetadata,
     job_state: &JobState,
-) {
+) -> Result<()> {
     if let Some(action_env) = &metadata.runs.env {
         for (k, v) in action_env {
+            if is_reserved_command_file_env(k) {
+                anyhow::bail!("reserved workflow command-file environment variable");
+            }
             let ctx = ExprContext::new(env, job_state, false, false);
             let resolved = crate::job::expression::resolve_expression(v, &ctx);
             env.insert(k.clone(), resolved);
         }
     }
+    Ok(())
 }
 
 fn inject_post_state(
@@ -406,9 +447,8 @@ struct RunDockerParams<'a> {
     entrypoint: Option<&'a str>,
     args: &'a [String],
     env: &'a HashMap<String, String>,
-    job_state: &'a mut JobState,
+    processor: &'a OutputProcessor,
     workspace: &'a Workspace,
-    log_sender: &'a LogSender,
     cancel_token: &'a CancellationToken,
     docker_resources: Option<&'a JobDockerResources>,
 }
@@ -557,11 +597,9 @@ async fn launch_ready_action_container(
     let result = start_and_stream_logs(
         docker,
         &container.id,
-        params.job_state,
-        params.log_sender,
+        params.processor,
         params.deadline,
         params.cancel_token,
-        params.job_state.debug_enabled,
     )
     .await;
 
@@ -814,11 +852,9 @@ fn build_bind_mounts(workspace: &Workspace) -> Result<Vec<String>> {
 async fn start_and_stream_logs(
     docker: &Docker,
     container_id: &str,
-    job_state: &mut JobState,
-    log_sender: &LogSender,
+    processor: &OutputProcessor,
     deadline: Instant,
     cancel_token: &CancellationToken,
-    debug_enabled: bool,
 ) -> Result<StepResult> {
     let start = within_lifecycle_budget(
         deadline,
@@ -837,11 +873,6 @@ async fn start_and_stream_logs(
         return Ok(interrupted);
     }
 
-    let processor = OutputProcessor::new(
-        log_sender.clone(),
-        job_state.secret_masker.clone(),
-        debug_enabled,
-    );
     let docker_for_logs = docker.clone();
     let container_id_for_logs = container_id.to_string();
     let processor_for_logs = processor.clone();
@@ -913,16 +944,6 @@ async fn start_and_stream_logs(
     };
     if let Err(error) = joined {
         warn!(error = %error, "Docker action stream task panicked");
-    }
-
-    let apply = within_lifecycle_budget(
-        deadline,
-        cancel_token,
-        processor.apply_to_job_state(job_state),
-    )
-    .await;
-    if let Err(interrupted) = lifecycle_value(apply, "applying Docker action output") {
-        return Ok(interrupted);
     }
 
     let inspect = within_lifecycle_budget(

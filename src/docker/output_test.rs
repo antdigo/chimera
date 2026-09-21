@@ -1,7 +1,4 @@
-use std::collections::HashMap;
-
 use super::{DockerErrorDiagnostic, DockerLogFramer, LineFramer, OutputProcessor};
-use crate::job::execute::JobState;
 use crate::job::logs::{LogLine, LogSender};
 use bollard::container::LogOutput;
 
@@ -11,11 +8,6 @@ fn make_processor(debug_enabled: bool) -> (OutputProcessor, tokio::sync::mpsc::R
     let sender = LogSender::new_for_test(tx, masks.clone());
     let processor = OutputProcessor::new(sender, masks, debug_enabled);
     (processor, rx)
-}
-
-fn make_job_state() -> JobState {
-    let masks = crate::job::secret_masker::shared_masker_for_test(&[]);
-    JobState::new(masks, HashMap::new(), serde_json::json!({}))
 }
 
 #[test]
@@ -124,9 +116,8 @@ async fn set_env_collected() {
     let (proc, _rx) = make_processor(false);
     proc.process_line("::set-env name=FOO::bar").await;
 
-    let mut state = make_job_state();
-    proc.apply_to_job_state(&mut state).await;
-    assert_eq!(state.env.get("FOO").unwrap(), "bar");
+    let state = proc.take_workflow_state_for_test().await;
+    assert_eq!(state.env(), &[("FOO".into(), "bar".into())]);
 }
 
 #[tokio::test]
@@ -134,9 +125,8 @@ async fn set_output_collected() {
     let (proc, _rx) = make_processor(false);
     proc.process_line("::set-output name=result::42").await;
 
-    let mut state = make_job_state();
-    proc.apply_to_job_state(&mut state).await;
-    assert_eq!(state.outputs.get("result").unwrap(), "42");
+    let state = proc.take_workflow_state_for_test().await;
+    assert_eq!(state.output(), &[("result".into(), "42".into())]);
 }
 
 #[tokio::test]
@@ -144,9 +134,8 @@ async fn add_path_collected() {
     let (proc, _rx) = make_processor(false);
     proc.process_line("::add-path::/usr/local/bin").await;
 
-    let mut state = make_job_state();
-    proc.apply_to_job_state(&mut state).await;
-    assert_eq!(state.path_prepends, vec!["/usr/local/bin"]);
+    let state = proc.take_workflow_state_for_test().await;
+    assert_eq!(state.path(), &["/usr/local/bin"]);
 }
 
 #[tokio::test]
@@ -174,10 +163,8 @@ async fn save_state_collected() {
     let (proc, _rx) = make_processor(false);
     proc.process_line("::save-state name=key::val").await;
 
-    let mut state = make_job_state();
-    proc.apply_to_job_state(&mut state).await;
-    let bucket = state.action_states.get("").unwrap();
-    assert_eq!(bucket.get("key").unwrap(), "val");
+    let state = proc.take_workflow_state_for_test().await;
+    assert_eq!(state.state(), &[("key".into(), "val".into())]);
 }
 
 #[tokio::test]
@@ -229,14 +216,10 @@ async fn apply_drains_buffers() {
     proc.process_line("::set-env name=A::1").await;
     proc.process_line("::set-output name=B::2").await;
 
-    let mut state = make_job_state();
-    proc.apply_to_job_state(&mut state).await;
-    assert_eq!(state.env.get("A").unwrap(), "1");
-    assert_eq!(state.outputs.get("B").unwrap(), "2");
+    let state = proc.take_workflow_state_for_test().await;
+    assert_eq!(state.env(), &[("A".into(), "1".into())]);
+    assert_eq!(state.output(), &[("B".into(), "2".into())]);
 
-    // Second apply should find empty buffers
-    let mut state2 = make_job_state();
-    proc.apply_to_job_state(&mut state2).await;
-    assert!(state2.env.is_empty());
-    assert!(state2.outputs.is_empty());
+    // The next drain should find all command buffers empty.
+    assert!(proc.take_workflow_state_for_test().await.is_empty());
 }

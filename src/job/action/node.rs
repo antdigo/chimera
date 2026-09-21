@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::ffi::OsStr;
 use std::path::Path;
 use std::time::Duration;
 
@@ -8,7 +7,11 @@ use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
 use super::metadata::ActionMetadata;
-use crate::job::execute::{JobExecutionContext, JobState, StepResult, build_step_env, run_process};
+use crate::docker::output::OutputProcessor;
+use crate::job::execute::{
+    JobExecutionContext, JobState, StepResult, build_step_env, complete_docker_exec_transaction,
+    prepare_step_transaction, run_process,
+};
 use crate::job::expression::ExprContext;
 use crate::job::logs::LogSender;
 use crate::job::schema::Step;
@@ -106,17 +109,29 @@ pub async fn run_node_action(
             "running node action in container"
         );
 
+        let state_id = prepare_step_transaction(execution.docker_config(), workspace).await?;
+        let processor = OutputProcessor::new(
+            log_sender.clone(),
+            job_state.secret_masker.clone(),
+            job_state.debug_enabled,
+        );
         let result = crate::docker::exec::docker_exec(
             resources.docker(),
             container_id,
             vec![resources.node_path(node_major).into(), container_script],
             &env,
             "/github/workspace",
-            job_state,
-            log_sender,
+            &processor,
             timeout,
             cancel_token,
-            job_state.debug_enabled,
+        )
+        .await;
+        let result = complete_docker_exec_transaction(
+            execution.docker_config(),
+            state_id,
+            &processor,
+            job_state,
+            result,
         )
         .await;
 
@@ -127,7 +142,10 @@ pub async fn run_node_action(
     // Host mode
     env.insert(
         "GITHUB_ACTION_PATH".into(),
-        action_dir.to_string_lossy().into_owned(),
+        action_dir
+            .to_str()
+            .context("host action path is not valid UTF-8")?
+            .to_owned(),
     );
 
     debug!(
@@ -136,16 +154,13 @@ pub async fn run_node_action(
         "running node action"
     );
 
-    let script_path_str = script_path.to_string_lossy();
-    let node_path_str = execution
-        .node_runtimes()
-        .resolve(node_major)
-        .to_string_lossy();
+    let node_path = execution.node_runtimes().resolve(node_major);
     let result = run_process(
-        &node_path_str,
-        &[OsStr::new(script_path_str.as_ref())],
+        node_path.as_os_str(),
+        &[script_path.as_os_str()],
         &env,
         workspace.workspace_dir(),
+        workspace,
         execution.docker_config(),
         job_state,
         log_sender,

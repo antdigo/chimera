@@ -14,7 +14,9 @@ use serde::{Deserialize, Serialize};
 use crate::cache::config::CacheConfig;
 
 pub mod execution;
+pub mod resources;
 pub use execution::{ExecutionConfig, ExecutionProfile};
+pub use resources::{ExecutionResources, IoMax, ResourceLimits};
 
 #[derive(Debug, Deserialize, Serialize, Default)]
 pub struct ChimeraConfig {
@@ -375,3 +377,7 @@ pub fn public_key_to_xml(key: &RsaPrivateKey) -> String {
 #[cfg(test)]
 #[path = "config_test.rs"]
 mod config_test;
+
+#[cfg(test)]
+#[path = "config/resources_test.rs"]
+mod resources_test;

@@ -4,7 +4,7 @@ use bollard::container::LogOutput;
 use bollard::errors::Error as DockerError;
 
 use crate::job::commands::{WorkflowCommand, parse_command};
-use crate::job::execute::JobState;
+use crate::job::execute::{BufferedWorkflowState, WorkflowStateDrainPermit};
 use crate::job::logs::LogSender;
 use crate::job::secret_masker::SharedSecretMasker;
 
@@ -191,21 +191,23 @@ impl OutputProcessor {
         }
     }
 
-    /// Drain collected state mutations into the job state.
-    pub async fn apply_to_job_state(&self, job_state: &mut JobState) {
-        for (k, v) in self.env_buf.lock().await.drain(..) {
-            job_state.env.insert(k, v);
-        }
-        job_state
-            .path_prepends
-            .extend(self.path_buf.lock().await.drain(..));
-        for (k, v) in self.output_buf.lock().await.drain(..) {
-            crate::utils::insert_case_insensitive(&mut job_state.outputs, k, v);
-        }
-        for (k, v) in self.state_buf.lock().await.drain(..) {
-            let entry = job_state.action_states.entry(String::new()).or_default();
-            crate::utils::insert_case_insensitive(entry, k, v);
-        }
+    pub(crate) async fn take_workflow_state(
+        &self,
+        permit: &WorkflowStateDrainPermit,
+    ) -> BufferedWorkflowState {
+        BufferedWorkflowState::new(
+            permit,
+            self.env_buf.lock().await.drain(..).collect(),
+            self.path_buf.lock().await.drain(..).collect(),
+            self.output_buf.lock().await.drain(..).collect(),
+            self.state_buf.lock().await.drain(..).collect(),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn take_workflow_state_for_test(&self) -> BufferedWorkflowState {
+        let permit = WorkflowStateDrainPermit::new_for_test();
+        self.take_workflow_state(&permit).await
     }
 }
 

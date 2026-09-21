@@ -5,6 +5,353 @@ use uuid::Uuid;
 
 use super::ExecutionDomainError;
 use super::journal::{DomainLifecycle, DomainState};
+#[cfg(target_os = "linux")]
+use super::journal::{LinuxJournalEvidence, inspect_linux_journal};
+
+#[test]
+fn quarantined_destroy_can_complete_in_memory_on_retry() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut lifecycle = DomainLifecycle::create(temp.path(), Uuid::new_v4()).unwrap();
+    lifecycle.transition(DomainState::Destroying).unwrap();
+    lifecycle.transition(DomainState::Quarantined).unwrap();
+
+    lifecycle.complete_destroyed().unwrap();
+
+    assert_eq!(lifecycle.state(), DomainState::Destroyed);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn trusted_journal_does_not_require_strict_linux_syscalls() {
+    let temp = tempfile::tempdir().unwrap();
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "job::execution_domain::journal_test::trusted_journal_without_strict_syscalls_child",
+            "--nocapture",
+        ])
+        .env("CHIMERA_JOURNAL_NO_STRICT_SYSCALLS", temp.path())
+        .status()
+        .unwrap();
+    assert!(status.success());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn trusted_journal_without_strict_syscalls_child() {
+    let Some(path) = std::env::var_os("CHIMERA_JOURNAL_NO_STRICT_SYSCALLS") else {
+        return;
+    };
+    // The filter is installed only in this subprocess's test thread.
+    let mut filter = [
+        libc::sock_filter {
+            code: (libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16,
+            jt: 0,
+            jf: 0,
+            k: 0,
+        },
+        libc::sock_filter {
+            code: (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16,
+            jt: 1,
+            jf: 0,
+            k: libc::SYS_openat2 as u32,
+        },
+        libc::sock_filter {
+            code: (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16,
+            jt: 0,
+            jf: 1,
+            k: libc::SYS_statx as u32,
+        },
+        libc::sock_filter {
+            code: (libc::BPF_RET | libc::BPF_K) as u16,
+            jt: 0,
+            jf: 0,
+            k: libc::SECCOMP_RET_ERRNO | libc::ENOSYS as u32,
+        },
+        libc::sock_filter {
+            code: (libc::BPF_RET | libc::BPF_K) as u16,
+            jt: 0,
+            jf: 0,
+            k: libc::SECCOMP_RET_ALLOW,
+        },
+    ];
+    let program = libc::sock_fprog {
+        len: filter.len() as u16,
+        filter: filter.as_mut_ptr(),
+    };
+    assert_eq!(
+        unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) },
+        0
+    );
+    assert_eq!(
+        unsafe {
+            libc::syscall(
+                libc::SYS_seccomp,
+                libc::SECCOMP_SET_MODE_FILTER,
+                0,
+                &program,
+            )
+        },
+        0
+    );
+    let path = std::path::Path::new(&path);
+    assert_eq!(
+        unsafe {
+            libc::syscall(
+                libc::SYS_openat2,
+                -1,
+                c"".as_ptr(),
+                std::ptr::null::<libc::open_how>(),
+                0,
+            )
+        },
+        -1
+    );
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::ENOSYS)
+    );
+    assert_eq!(
+        unsafe {
+            libc::syscall(
+                libc::SYS_statx,
+                -1,
+                c"".as_ptr(),
+                0,
+                0,
+                std::ptr::null::<libc::statx>(),
+            )
+        },
+        -1
+    );
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::ENOSYS)
+    );
+    let unavailable = super::linux::dirfd::BoundDir::open_root(path).unwrap_err();
+    // glibc may emulate statx after ENOSYS, but cannot supply mount IDs; both
+    // missing syscall and missing mount identity must leave strict mode unavailable.
+    assert!(
+        matches!(
+            unavailable,
+            ExecutionDomainError::Backend {
+                errno: Some(libc::ENOSYS | libc::EOPNOTSUPP),
+                ..
+            }
+        ),
+        "{unavailable:?}"
+    );
+
+    let mut journal = DomainLifecycle::create(path, Uuid::new_v4()).unwrap();
+    journal.transition(DomainState::Ready).unwrap();
+    assert_eq!(
+        DomainLifecycle::load(path).unwrap().state(),
+        DomainState::Ready
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn strict_journal_uses_bound_storage_and_preserves_invalid_records() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut journal = DomainLifecycle::create_strict(temp.path(), Uuid::new_v4()).unwrap();
+    journal.transition(DomainState::Ready).unwrap();
+    assert_eq!(
+        DomainLifecycle::load_strict(temp.path()).unwrap().state(),
+        DomainState::Ready
+    );
+    assert!(DomainLifecycle::create_strict(temp.path(), Uuid::new_v4()).is_err());
+
+    for body in [
+        b"{".as_slice(),
+        br#"{"version":2,"attempt_id":"00000000-0000-0000-0000-000000000009","state":"ready"}"#
+            .as_slice(),
+    ] {
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(outside.path().join("canary"), b"keep").unwrap();
+        fs::write(temp.path().join("journal.json"), body).unwrap();
+        assert!(DomainLifecycle::load_strict(temp.path()).is_err());
+        assert_eq!(fs::read(temp.path().join("journal.json")).unwrap(), body);
+        assert_eq!(fs::read(outside.path().join("canary")).unwrap(), b"keep");
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn strict_linux_journal_is_minimal_v2_and_authoritative_for_its_attempt() {
+    let temp = tempfile::tempdir().unwrap();
+    let attempt = super::AttemptIdentity::from_uuid(Uuid::from_u128(19)).unwrap();
+    DomainLifecycle::create_strict(temp.path(), attempt.uuid()).unwrap();
+
+    let value: serde_json::Value =
+        serde_json::from_slice(&fs::read(temp.path().join("journal.json")).unwrap()).unwrap();
+    assert_eq!(
+        value,
+        serde_json::json!({
+            "version": 2,
+            "backend": "linux",
+            "attempt_id": "00000000-0000-0000-0000-000000000013",
+            "state": "provisioning",
+            "layout_version": 1
+        })
+    );
+    let bound = super::linux::dirfd::BoundDir::open_root(temp.path()).unwrap();
+    assert_eq!(
+        inspect_linux_journal(&bound, attempt).unwrap(),
+        LinuxJournalEvidence::Recoverable(DomainState::Provisioning)
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn trusted_v1_journal_is_diagnostic_but_never_linux_cleanup_authority() {
+    let temp = tempfile::tempdir().unwrap();
+    let attempt = super::AttemptIdentity::from_uuid(Uuid::from_u128(20)).unwrap();
+    DomainLifecycle::create(temp.path(), attempt.uuid()).unwrap();
+    let bound = super::linux::dirfd::BoundDir::open_root(temp.path()).unwrap();
+
+    assert_eq!(
+        inspect_linux_journal(&bound, attempt).unwrap(),
+        LinuxJournalEvidence::TrustedV1Diagnostic
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn persisted_destroyed_linux_journal_is_inconsistent() {
+    let temp = tempfile::tempdir().unwrap();
+    let attempt = super::AttemptIdentity::from_uuid(Uuid::from_u128(21)).unwrap();
+    fs::write(
+        temp.path().join("journal.json"),
+        br#"{"version":2,"backend":"linux","attempt_id":"00000000-0000-0000-0000-000000000015","state":"destroyed","layout_version":1}"#,
+    )
+    .unwrap();
+    let bound = super::linux::dirfd::BoundDir::open_root(temp.path()).unwrap();
+
+    assert!(inspect_linux_journal(&bound, attempt).is_err());
+    assert!(temp.path().join("journal.json").exists());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn every_non_destroyed_linux_v2_state_is_recoverable() {
+    let states = [
+        ("provisioning", DomainState::Provisioning),
+        ("ready", DomainState::Ready),
+        ("running", DomainState::Running),
+        ("cleaning", DomainState::Cleaning),
+        ("destroying", DomainState::Destroying),
+        ("quarantined", DomainState::Quarantined),
+    ];
+    for (name, expected) in states {
+        let temp = tempfile::tempdir().unwrap();
+        let attempt = super::AttemptIdentity::from_uuid(Uuid::from_u128(22)).unwrap();
+        fs::write(
+            temp.path().join("journal.json"),
+            format!(
+                r#"{{"version":2,"backend":"linux","attempt_id":"00000000-0000-0000-0000-000000000016","state":"{name}","layout_version":1}}"#
+            ),
+        )
+        .unwrap();
+        let bound = super::linux::dirfd::BoundDir::open_root(temp.path()).unwrap();
+        assert_eq!(
+            inspect_linux_journal(&bound, attempt).unwrap(),
+            LinuxJournalEvidence::Recoverable(expected)
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_journal_distinguishes_missing_from_present_invalid_evidence() {
+    let attempt = super::AttemptIdentity::from_uuid(Uuid::from_u128(23)).unwrap();
+    let missing = tempfile::tempdir().unwrap();
+    let bound = super::linux::dirfd::BoundDir::open_root(missing.path()).unwrap();
+    assert_eq!(
+        inspect_linux_journal(&bound, attempt).unwrap(),
+        LinuxJournalEvidence::Missing
+    );
+
+    for body in [
+        br#"{"version":2,"backend":"other","attempt_id":"00000000-0000-0000-0000-000000000017","state":"running","layout_version":1}"#.as_slice(),
+        br#"{"version":2,"backend":"linux","attempt_id":"00000000-0000-0000-0000-000000000017","state":"running","layout_version":2}"#.as_slice(),
+        b"{".as_slice(),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("journal.json"), body).unwrap();
+        let bound = super::linux::dirfd::BoundDir::open_root(temp.path()).unwrap();
+        assert!(inspect_linux_journal(&bound, attempt).is_err());
+        assert_eq!(fs::read(temp.path().join("journal.json")).unwrap(), body);
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn diagnostic_pid_is_rejected_and_never_used_as_recovery_authority() {
+    let mut sentinel = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let attempt = super::AttemptIdentity::from_uuid(Uuid::from_u128(24)).unwrap();
+    fs::write(
+        temp.path().join("journal.json"),
+        format!(
+            r#"{{"version":2,"backend":"linux","attempt_id":"00000000-0000-0000-0000-000000000018","state":"running","layout_version":1,"pid":{}}}"#,
+            sentinel.id()
+        ),
+    )
+    .unwrap();
+    let bound = super::linux::dirfd::BoundDir::open_root(temp.path()).unwrap();
+
+    assert!(inspect_linux_journal(&bound, attempt).is_err());
+    assert!(sentinel.try_wait().unwrap().is_none());
+    sentinel.kill().unwrap();
+    sentinel.wait().unwrap();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_initial_journal_refuses_symlinked_parent() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::create_dir(temp.path().join("outside")).unwrap();
+    fs::create_dir(temp.path().join("outside/attempt")).unwrap();
+    fs::write(temp.path().join("outside/canary"), b"keep").unwrap();
+    std::os::unix::fs::symlink(temp.path().join("outside"), temp.path().join("active")).unwrap();
+
+    assert!(
+        DomainLifecycle::create_strict(&temp.path().join("active/attempt"), Uuid::new_v4())
+            .is_err()
+    );
+    assert!(!temp.path().join("outside/attempt/journal.json").exists());
+    assert_eq!(
+        fs::read(temp.path().join("outside/canary")).unwrap(),
+        b"keep"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_journal_refuses_hardlinked_or_oversized_record() {
+    for hardlink in [true, false] {
+        let temp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let canary = outside.path().join("canary");
+        let body =
+            br#"{"version":1,"attempt_id":"00000000-0000-0000-0000-000000000009","state":"ready"}"#;
+        fs::write(&canary, body).unwrap();
+        if hardlink {
+            fs::hard_link(&canary, temp.path().join("journal.json")).unwrap();
+        } else {
+            let mut oversized = body.to_vec();
+            oversized.extend(vec![b' '; 16 * 1024]);
+            fs::write(temp.path().join("journal.json"), oversized).unwrap();
+        }
+
+        assert!(DomainLifecycle::load_strict(temp.path()).is_err());
+        assert_eq!(fs::read(canary).unwrap(), body);
+    }
+}
 
 #[test]
 fn accepts_the_normal_lifecycle() {
@@ -171,6 +518,7 @@ fn enforces_every_lifecycle_edge() {
         (Running, Destroying),
         (Cleaning, Destroying),
         (Destroying, Quarantined),
+        (Quarantined, Destroying),
     ];
     for (from, name) in states.into_iter().zip(names) {
         for to in states {

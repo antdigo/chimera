@@ -10,8 +10,11 @@ use tracing::debug;
 use super::download::{ActionCache, TrustedActionDirectory};
 use super::metadata::ActionMetadata;
 use crate::docker::build::{DockerActionBuilder, DockerBuildScope, RegistryAuth};
+use crate::docker::output::OutputProcessor;
 use crate::job::execute::{
-    JobExecutionContext, JobState, StepConclusion, StepResult, build_step_env, run_process,
+    JobExecutionContext, JobState, StepConclusion, StepResult, build_step_env,
+    complete_docker_exec_transaction, is_reserved_command_file_env, prepare_step_transaction,
+    run_process,
 };
 use crate::job::execution_domain::DOCKER_CONFIG_ENV;
 use crate::job::expression::ExprContext;
@@ -224,6 +227,9 @@ async fn run_nested_script(
     if let Some(serde_yaml::Value::Mapping(env_map)) = step_map.get(ykey("env")) {
         for (k, v) in env_map {
             if let (Some(key), Some(val)) = (k.as_str(), v.as_str()) {
+                if is_reserved_command_file_env(key) {
+                    bail!("reserved workflow command-file environment variable");
+                }
                 let env_ctx = ExprContext::new(&step_env, job_state, false, false);
                 let resolved_val = crate::job::expression::resolve_template(val, &env_ctx);
                 if key == DOCKER_CONFIG_ENV
@@ -259,17 +265,29 @@ async fn run_nested_script(
             _ => "/github/workspace".into(),
         };
 
-        return crate::docker::exec::docker_exec(
+        let state_id = prepare_step_transaction(execution.docker_config(), workspace).await?;
+        let processor = OutputProcessor::new(
+            log_sender.clone(),
+            job_state.secret_masker.clone(),
+            job_state.debug_enabled,
+        );
+        let result = crate::docker::exec::docker_exec(
             resources.docker(),
             container_id,
             vec![shell.into(), "-e".into(), "-c".into(), resolved_script],
             &step_env,
             &working_dir,
-            job_state,
-            log_sender,
+            &processor,
             timeout,
             cancel_token,
-            job_state.debug_enabled,
+        )
+        .await;
+        return complete_docker_exec_transaction(
+            execution.docker_config(),
+            state_id,
+            &processor,
+            job_state,
+            result,
         )
         .await;
     }
@@ -287,10 +305,11 @@ async fn run_nested_script(
         .with_context(|| format!("writing composite script to {}", script_file.display()))?;
 
     let result = run_process(
-        shell,
+        OsStr::new(shell),
         &[OsStr::new("-e"), script_file.as_os_str()],
         &step_env,
         &working_dir,
+        workspace,
         execution.docker_config(),
         job_state,
         log_sender,

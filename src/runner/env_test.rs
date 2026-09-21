@@ -1,5 +1,7 @@
 use super::*;
-use crate::job::execution_domain::{DOCKER_CONFIG_ENV, ExecutionDomain, ExecutionDomainRoot};
+use crate::job::execution_domain::{
+    AttemptIdentity, DOCKER_CONFIG_ENV, ExecutionDomain, ExecutionDomainRoot,
+};
 use crate::job::schema::{JobManifest, JobVariable};
 use serde_json::json;
 use std::num::NonZeroUsize;
@@ -60,9 +62,13 @@ fn test_docker_config() -> (tempfile::TempDir, ExecutionDomain) {
         NonZeroUsize::new(1).unwrap(),
     )
     .unwrap();
-    let config = futures::executor::block_on(root.reserve())
-        .and_then(|permit| permit.provision())
-        .unwrap();
+    let config = futures::executor::block_on(async {
+        root.reserve()
+            .await?
+            .provision(AttemptIdentity::new())
+            .await
+    })
+    .unwrap();
     (temp, config)
 }
 

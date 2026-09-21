@@ -8,7 +8,7 @@ use crate::github::auth::TokenManager;
 use crate::job::action::ActionCache;
 use crate::job::client::JobConclusion;
 use crate::job::execution_domain::{
-    DOCKER_CONFIG_ENV, ExecutionDomain, ExecutionDomainError, ExecutionDomainRoot,
+    AttemptIdentity, DOCKER_CONFIG_ENV, ExecutionDomain, ExecutionDomainError, ExecutionDomainRoot,
 };
 use crate::job::schema::{StepReference, StepReferenceKind};
 use tokio_util::sync::CancellationToken;
@@ -203,10 +203,24 @@ fn test_docker_config() -> (tempfile::TempDir, ExecutionDomain) {
         NonZeroUsize::new(1).unwrap(),
     )
     .unwrap();
-    let config = futures::executor::block_on(root.reserve())
-        .and_then(|permit| permit.provision())
-        .unwrap();
+    let config = futures::executor::block_on(async {
+        root.reserve()
+            .await?
+            .provision(AttemptIdentity::new())
+            .await
+    })
+    .unwrap();
     (temp, config)
+}
+
+fn provision_test_domain(root: &ExecutionDomainRoot) -> ExecutionDomain {
+    futures::executor::block_on(async {
+        root.reserve()
+            .await?
+            .provision(AttemptIdentity::new())
+            .await
+    })
+    .unwrap()
 }
 
 const DOCKER_CONTEXT_CHILD_CASE: &str = "CHIMERA_DOCKER_CONTEXT_CHILD_CASE";
@@ -363,6 +377,26 @@ fn step_environment_cannot_override_docker_config() {
 }
 
 #[test]
+fn step_environment_cannot_override_runner_command_files() {
+    let (_temp, workspace) = test_workspace();
+    let (_resources, config) = test_docker_config();
+    let state = test_job_state();
+    let base = host_base_env(&config);
+
+    for key in [
+        "GITHUB_ENV",
+        "GITHUB_PATH",
+        "GITHUB_OUTPUT",
+        "GITHUB_STATE",
+        "GITHUB_STEP_SUMMARY",
+        "GITHUB_EVENT_PATH",
+    ] {
+        let step = step_with_environment(key, "/tmp/attacker");
+        assert!(build_step_env(&step, &state, &workspace, &base, Some(&config)).is_err());
+    }
+}
+
+#[test]
 fn job_environment_cannot_override_docker_config() {
     let (_temp, workspace) = test_workspace();
     let (_resources, config) = test_docker_config();
@@ -382,27 +416,279 @@ fn job_environment_cannot_override_docker_config() {
     ));
 }
 
-#[test]
-fn github_env_cannot_override_docker_config() {
+#[tokio::test]
+async fn github_env_cannot_override_docker_config() {
     let (_temp, workspace) = test_workspace();
     let (_resources, config) = test_docker_config();
+    config.bind_workspace(&workspace).await.unwrap();
+    let state_id = config.prepare_step(b"{}").await.unwrap();
     std::fs::write(workspace.env_file(), "DOCKER_CONFIG=/shared/.docker\n").unwrap();
-    let base = host_base_env(&config);
-
-    let error = build_step_env(
-        &test_step(),
-        &test_job_state(),
-        &workspace,
-        &base,
-        Some(&config),
-    )
-    .unwrap_err();
+    let mut state = test_job_state();
+    let error = finish_step_transaction(&config, state_id, &mut state)
+        .await
+        .unwrap_err();
 
     assert!(matches!(
         error.downcast_ref::<ExecutionDomainError>(),
         Some(ExecutionDomainError::ReservedEnvironmentOverride {
             source: "GITHUB_ENV"
         })
+    ));
+}
+
+#[tokio::test]
+async fn failed_spawn_still_closes_the_step_transaction() {
+    let (_temp, workspace) = test_workspace();
+    let (_resources, config) = test_docker_config();
+    let mut state = test_job_state();
+    let env = host_base_env(&config);
+    let (log_tx, _log_rx) = tokio::sync::mpsc::channel(8);
+    let log_sender = LogSender::new_for_test(
+        log_tx,
+        crate::job::secret_masker::shared_masker_for_test(&[]),
+    );
+
+    let result = run_process(
+        OsStr::new("/definitely-missing-chimera-command"),
+        &[],
+        &env,
+        workspace.workspace_dir(),
+        &workspace,
+        &config,
+        &mut state,
+        &log_sender,
+        Duration::from_secs(1),
+        &CancellationToken::new(),
+    )
+    .await;
+    assert!(result.is_err());
+
+    let next = config.prepare_step(b"{}").await.unwrap();
+    config.read_step(next).await.unwrap();
+}
+
+#[tokio::test]
+async fn shell_malformed_state_discards_all_mutations_and_closes_transaction() {
+    let (_temp, workspace) = test_workspace();
+    let (_resources, domain) = test_docker_config();
+    let mut state = test_job_state();
+    let env = host_base_env(&domain);
+    let (log_tx, _log_rx) = tokio::sync::mpsc::channel(8);
+    let log_sender = LogSender::new_for_test(
+        log_tx,
+        crate::job::secret_masker::shared_masker_for_test(&[]),
+    );
+    let step = make_step(
+        "malformed-shell",
+        "printf '%s\\n' '::set-env name=STDOUT_ENV::leak' \
+         '::set-output name=stdout_output::leak' \
+         '::add-path::/stdout/leak' \
+         '::save-state name=stdout_state::leak'; \
+         printf 'FILE_ENV=leak\\n' > \"$GITHUB_ENV\"; \
+         printf '\\377' >> \"$GITHUB_ENV\"; \
+         printf 'file_output=leak\\n' > \"$GITHUB_OUTPUT\"",
+    );
+
+    let error = run_host_step(
+        &step,
+        &mut state,
+        &workspace,
+        &env,
+        &log_sender,
+        &CancellationToken::new(),
+        &domain,
+    )
+    .await
+    .unwrap_err();
+
+    assert!(error.downcast_ref::<ExecutionDomainError>().is_some());
+    assert!(state.env.is_empty());
+    assert!(state.outputs.is_empty());
+    assert!(state.path_prepends.is_empty());
+    assert!(state.action_states.is_empty());
+    assert!(state.step_summaries.is_empty());
+    let next = domain.prepare_step(b"{}").await.unwrap();
+    domain.read_step(next).await.unwrap();
+}
+
+#[tokio::test]
+async fn command_files_win_collisions_with_buffered_stdout_commands() {
+    let (_temp, workspace) = test_workspace();
+    let (_resources, domain) = test_docker_config();
+    let mut state = test_job_state();
+    let env = host_base_env(&domain);
+    let (log_tx, _log_rx) = tokio::sync::mpsc::channel(8);
+    let log_sender = LogSender::new_for_test(
+        log_tx,
+        crate::job::secret_masker::shared_masker_for_test(&[]),
+    );
+    let step = make_step(
+        "state-order",
+        "printf '%s\\n' '::set-env name=COLLISION::stdout' \
+         '::set-output name=collision::stdout' \
+         '::add-path::/stdout/path' \
+         '::save-state name=collision::stdout'; \
+         printf 'COLLISION=file\\n' > \"$GITHUB_ENV\"; \
+         printf 'collision=file\\n' > \"$GITHUB_OUTPUT\"; \
+         printf '/file/path\\n' > \"$GITHUB_PATH\"; \
+         printf 'collision=file\\n' > \"$GITHUB_STATE\"",
+    );
+
+    let result = run_host_step(
+        &step,
+        &mut state,
+        &workspace,
+        &env,
+        &log_sender,
+        &CancellationToken::new(),
+        &domain,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(result.conclusion, StepConclusion::Succeeded);
+    assert_eq!(state.env.get("COLLISION").map(String::as_str), Some("file"));
+    assert_eq!(
+        state.outputs.get("collision").map(String::as_str),
+        Some("file")
+    );
+    assert_eq!(state.path_prepends, ["/stdout/path", "/file/path"]);
+    assert_eq!(
+        state
+            .action_states
+            .get("state-order")
+            .and_then(|values| values.get("collision"))
+            .map(String::as_str),
+        Some("file")
+    );
+}
+
+#[tokio::test]
+async fn valid_step_transaction_applies_each_workflow_command_once() {
+    let (_temp, workspace) = test_workspace();
+    let (_resources, domain) = test_docker_config();
+    let mut state = test_job_state();
+    let mut env = host_base_env(&domain);
+    env.insert("PATH".into(), "/usr/bin:/bin".into());
+    let (log_tx, _log_rx) = tokio::sync::mpsc::channel(8);
+    let log_sender = LogSender::new_for_test(
+        log_tx,
+        crate::job::secret_masker::shared_masker_for_test(&[]),
+    );
+    let first = make_step(
+        "first",
+        "printf '%s\\n' '::add-path::/stdout/once'; \
+         printf '/file/once\\n' > \"$GITHUB_PATH\"",
+    );
+
+    run_host_step(
+        &first,
+        &mut state,
+        &workspace,
+        &env,
+        &log_sender,
+        &CancellationToken::new(),
+        &domain,
+    )
+    .await
+    .unwrap();
+    run_host_step(
+        &make_step("second", "true"),
+        &mut state,
+        &workspace,
+        &env,
+        &log_sender,
+        &CancellationToken::new(),
+        &domain,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(state.path_prepends, ["/stdout/once", "/file/once"]);
+}
+
+#[tokio::test]
+async fn snapshot_failure_has_priority_over_command_failure_without_partial_mutation() {
+    let (_temp, workspace) = test_workspace();
+    let (_resources, domain) = test_docker_config();
+    domain.bind_workspace(&workspace).await.unwrap();
+    let state_id = domain.prepare_step(b"{}").await.unwrap();
+    std::fs::remove_file(workspace.env_file()).unwrap();
+    std::fs::write(workspace.env_file(), "FILE_ENV=leak\n").unwrap();
+
+    let (log_tx, _log_rx) = tokio::sync::mpsc::channel(8);
+    let processor = OutputProcessor::new(
+        LogSender::new_for_test(
+            log_tx,
+            crate::job::secret_masker::shared_masker_for_test(&[]),
+        ),
+        crate::job::secret_masker::shared_masker_for_test(&[]),
+        false,
+    );
+    processor
+        .process_line("::set-env name=STDOUT_ENV::leak")
+        .await;
+    let mut state = test_job_state();
+    let command_result: Result<StepResult> = Err(anyhow::anyhow!("spawn canary"));
+
+    let error =
+        complete_step_transaction(&domain, state_id, &processor, &mut state, command_result)
+            .await
+            .unwrap_err();
+
+    assert!(
+        matches!(
+            error.downcast_ref::<ExecutionDomainError>(),
+            Some(ExecutionDomainError::Backend {
+                category: crate::job::execution_domain::FailureCategory::IdentityMismatch,
+                ..
+            })
+        ),
+        "snapshot failure must win: {error}"
+    );
+    assert!(state.env.is_empty());
+    let next_error = domain.prepare_step(b"{}").await.unwrap_err();
+    assert!(matches!(
+        next_error,
+        ExecutionDomainError::Backend {
+            category: crate::job::execution_domain::FailureCategory::IdentityMismatch,
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
+async fn unterminated_docker_exec_failure_does_not_consume_or_apply_state() {
+    let (_temp, workspace) = test_workspace();
+    let (_resources, domain) = test_docker_config();
+    domain.bind_workspace(&workspace).await.unwrap();
+    let state_id = domain.prepare_step(b"{}").await.unwrap();
+    std::fs::write(workspace.path_file(), "/file/leak\n").unwrap();
+    let masks = crate::job::secret_masker::shared_masker_for_test(&[]);
+    let processor = OutputProcessor::new(
+        LogSender::new_for_test(tokio::sync::mpsc::channel(8).0, masks.clone()),
+        masks,
+        false,
+    );
+    processor.process_line("::add-path::/stdout/leak").await;
+    let mut state = test_job_state();
+    let command_result: Result<StepResult> =
+        Err(crate::docker::exec::DockerExecRecoveryError::ContainerStillRunning.into());
+
+    let error =
+        complete_docker_exec_transaction(&domain, state_id, &processor, &mut state, command_result)
+            .await
+            .unwrap_err();
+
+    assert!(
+        error
+            .downcast_ref::<crate::docker::exec::DockerExecRecoveryError>()
+            .is_some()
+    );
+    assert!(state.path_prepends.is_empty());
+    assert!(matches!(
+        domain.prepare_step(b"{}").await.unwrap_err(),
+        ExecutionDomainError::Backend { .. }
     ));
 }
 
@@ -438,6 +724,87 @@ fn make_action_step(id: &str, context_name: &str) -> Step {
         environment: None,
         context_name: Some(context_name.into()),
     }
+}
+
+#[tokio::test]
+async fn execute_job_runs_two_node_posts_in_reverse_without_state_replay() {
+    let (tmp, workspace, client, _mock) = setup_execute().await;
+    let marker = workspace.workspace_dir().join("post-order");
+    for label in ["first", "second"] {
+        let action_dir = workspace.workspace_dir().join(label);
+        std::fs::create_dir_all(&action_dir).unwrap();
+        std::fs::write(
+            action_dir.join("action.yml"),
+            "name: post-order\nruns:\n  using: node20\n  main: main.sh\n  post: post.sh\n",
+        )
+        .unwrap();
+        std::fs::write(action_dir.join("main.sh"), "true\n").unwrap();
+    }
+    std::fs::write(
+        workspace.workspace_dir().join("second/post.sh"),
+        "set -eu\nprintf 'second\\n' >> \"$GITHUB_WORKSPACE/post-order\"\nprintf '%s\\n' '::add-path::/stdout/second'\nprintf '/file/second\\n' > \"$GITHUB_PATH\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        workspace.workspace_dir().join("first/post.sh"),
+        "set -eu\ntest \"$(printf '%s' \"$PATH\" | awk -v RS=: '$0 == \"/stdout/second\" { count++ } END { print count + 0 }')\" = 1\ntest \"$(printf '%s' \"$PATH\" | awk -v RS=: '$0 == \"/file/second\" { count++ } END { print count + 0 }')\" = 1\nprintf 'first\\n' >> \"$GITHUB_WORKSPACE/post-order\"\nprintf '%s\\n' '::add-path::/stdout/first'\nprintf '/file/first\\n' > \"$GITHUB_PATH\"\n",
+    )
+    .unwrap();
+    let manifest: JobManifest = serde_json::from_value(serde_json::json!({
+        "plan": { "planId": "p", "jobId": "j", "timelineId": "t" },
+        "steps": [
+            {
+                "id": "first", "displayName": "First", "contextName": "first",
+                "reference": { "name": "first", "type": "repository", "repositoryType": "self", "path": "first" },
+                "inputs": {}, "condition": null, "timeoutInMinutes": null,
+                "continueOnError": false, "order": 1, "environment": null
+            },
+            {
+                "id": "second", "displayName": "Second", "contextName": "second",
+                "reference": { "name": "second", "type": "repository", "repositoryType": "self", "path": "second" },
+                "inputs": {}, "condition": null, "timeoutInMinutes": null,
+                "continueOnError": false, "order": 2, "environment": null
+            }
+        ],
+        "variables": {}, "resources": { "endpoints": [] }, "contextData": {},
+        "jobContainer": null, "serviceContainers": null
+    }))
+    .unwrap();
+    let (_resources, domain) = test_docker_config();
+    let mut base_env = host_base_env(&domain);
+    base_env.insert(
+        "GITHUB_WORKSPACE".into(),
+        workspace.workspace_dir().to_string_lossy().into_owned(),
+    );
+    base_env.insert(
+        "PATH".into(),
+        std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".into()),
+    );
+    let action_cache = ActionCache::new(tmp.path().join("actions"), reqwest::Client::new());
+    let docker_action_builder = crate::docker::build::DockerActionBuilder::new();
+    let node_runtimes = crate::node::NodeRuntimes::single("/bin/sh".into());
+    let execution = JobExecutionContext::new(&domain, None, &node_runtimes);
+
+    let result = run_all_steps(
+        &manifest,
+        &client,
+        &workspace,
+        &base_env,
+        "test-runner",
+        &action_cache,
+        &docker_action_builder,
+        None,
+        "fake-token",
+        CancellationToken::new(),
+        &execution,
+        None,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(result.0, JobConclusion::Succeeded);
+    let marker = std::fs::read_to_string(marker).unwrap();
+    assert_eq!(marker, "second\nfirst\n");
 }
 
 #[tokio::test]
@@ -1019,9 +1386,13 @@ fn host_command_rejects_default_docker_credential_helpers_on_effective_path() {
             NonZeroUsize::new(1).unwrap(),
         )
         .unwrap();
-        let config = futures::executor::block_on(root.reserve())
-            .and_then(|permit| permit.provision())
-            .unwrap();
+        let config = futures::executor::block_on(async {
+            root.reserve()
+                .await?
+                .provision(AttemptIdentity::new())
+                .await
+        })
+        .unwrap();
         let bin = temp.path().join("bin");
         std::fs::create_dir(&bin).unwrap();
         write_executable(&bin.join(helper));
@@ -1043,9 +1414,7 @@ fn host_command_allows_non_executable_default_credential_helper() {
         NonZeroUsize::new(1).unwrap(),
     )
     .unwrap();
-    let config = futures::executor::block_on(root.reserve())
-        .and_then(|permit| permit.provision())
-        .unwrap();
+    let config = provision_test_domain(&root);
     let bin = temp.path().join("bin");
     std::fs::create_dir(&bin).unwrap();
     let helper = bin.join("docker-credential-pass");
@@ -1093,9 +1462,7 @@ fn host_command_path_precedence_child() {
         NonZeroUsize::new(1).unwrap(),
     )
     .unwrap();
-    let config = futures::executor::block_on(root.reserve())
-        .and_then(|permit| permit.provision())
-        .unwrap();
+    let config = provision_test_domain(&root);
     let mut explicit = host_base_env(&config);
     explicit.insert("PATH".into(), safe_dir.to_string_lossy().into_owned());
 
@@ -1114,9 +1481,7 @@ fn host_command_rejects_missing_runner_owned_docker_config() {
         NonZeroUsize::new(1).unwrap(),
     )
     .unwrap();
-    let config = futures::executor::block_on(root.reserve())
-        .and_then(|permit| permit.provision())
-        .unwrap();
+    let config = provision_test_domain(&root);
 
     let error =
         host_command("/usr/bin/true", &[], &HashMap::new(), temp.path(), &config).unwrap_err();
@@ -1136,9 +1501,7 @@ fn host_command_explicitly_overrides_inherited_docker_config() {
         NonZeroUsize::new(1).unwrap(),
     )
     .unwrap();
-    let config = futures::executor::block_on(root.reserve())
-        .and_then(|permit| permit.provision())
-        .unwrap();
+    let config = provision_test_domain(&root);
     let env = host_base_env(&config);
 
     let command = host_command("/usr/bin/true", &[], &env, temp.path(), &config).unwrap();
@@ -1165,9 +1528,7 @@ fn host_command_rejects_credential_helper_from_private_tmp_path() {
         NonZeroUsize::new(1).unwrap(),
     )
     .unwrap();
-    let config = futures::executor::block_on(root.reserve())
-        .and_then(|permit| permit.provision())
-        .unwrap();
+    let config = provision_test_domain(&root);
     let directory_name = format!("chimera-helper-{}", uuid::Uuid::new_v4().simple());
     let private_bin = config.private_tmp().join(&directory_name);
     std::fs::create_dir(&private_bin).unwrap();
@@ -1198,9 +1559,7 @@ fn host_command_rejects_credential_helper_from_relative_private_tmp_path() {
         NonZeroUsize::new(1).unwrap(),
     )
     .unwrap();
-    let config = futures::executor::block_on(root.reserve())
-        .and_then(|permit| permit.provision())
-        .unwrap();
+    let config = provision_test_domain(&root);
     let directory_name = format!("chimera-helper-{}", uuid::Uuid::new_v4().simple());
     let private_bin = config.private_tmp().join(&directory_name);
     std::fs::create_dir(&private_bin).unwrap();
@@ -1232,9 +1591,7 @@ fn host_command_rejects_credential_helper_through_symlink_into_private_tmp() {
         NonZeroUsize::new(1).unwrap(),
     )
     .unwrap();
-    let config = futures::executor::block_on(root.reserve())
-        .and_then(|permit| permit.provision())
-        .unwrap();
+    let config = provision_test_domain(&root);
     let directory_name = format!("chimera-helper-{}", uuid::Uuid::new_v4().simple());
     let private_bin = config.private_tmp().join(&directory_name);
     std::fs::create_dir(&private_bin).unwrap();
@@ -1267,9 +1624,7 @@ fn host_command_rejects_credential_helper_through_symlink_within_private_tmp() {
         NonZeroUsize::new(1).unwrap(),
     )
     .unwrap();
-    let config = futures::executor::block_on(root.reserve())
-        .and_then(|permit| permit.provision())
-        .unwrap();
+    let config = provision_test_domain(&root);
     let real_name = format!("chimera-helper-real-{}", uuid::Uuid::new_v4().simple());
     let link_name = format!("chimera-helper-link-{}", uuid::Uuid::new_v4().simple());
     let private_bin = config.private_tmp().join(&real_name);
@@ -1306,9 +1661,7 @@ fn host_command_skips_inaccessible_path_entry() {
         NonZeroUsize::new(1).unwrap(),
     )
     .unwrap();
-    let config = futures::executor::block_on(root.reserve())
-        .and_then(|permit| permit.provision())
-        .unwrap();
+    let config = provision_test_domain(&root);
     let inaccessible = temp.path().join("inaccessible");
     std::fs::create_dir(&inaccessible).unwrap();
     std::fs::set_permissions(&inaccessible, std::fs::Permissions::from_mode(0o000)).unwrap();
@@ -1337,9 +1690,7 @@ fn host_command_resets_symlink_budget_after_working_directory_lookup() {
         NonZeroUsize::new(1).unwrap(),
     )
     .unwrap();
-    let config = futures::executor::block_on(root.reserve())
-        .and_then(|permit| permit.provision())
-        .unwrap();
+    let config = provision_test_domain(&root);
     let final_directory = temp.path().join("resolved-working-directory");
     let real_bin = final_directory.join("real-bin");
     std::fs::create_dir_all(&real_bin).unwrap();
@@ -1437,7 +1788,13 @@ async fn concurrent_webhook_flows_get_private_absolute_tmp() {
     );
     let mut runs = Vec::new();
     for index in 0..JOBS {
-        let config = root.reserve().await.unwrap().provision().unwrap();
+        let config = root
+            .reserve()
+            .await
+            .unwrap()
+            .provision(AttemptIdentity::new())
+            .await
+            .unwrap();
         let workspace_root = temp.path().join(format!("workspace-{index}"));
         let workspace = Workspace::create(
             &workspace_root.join("work"),
@@ -1537,7 +1894,7 @@ async fn concurrent_webhook_flows_get_private_absolute_tmp() {
         .into_iter()
         .map(Result::unwrap)
         .collect::<Vec<_>>();
-    for (index, (result, outputs, config)) in completed.into_iter().enumerate() {
+    for (index, (result, outputs, mut config)) in completed.into_iter().enumerate() {
         assert_eq!(
             result.as_ref().unwrap().conclusion,
             StepConclusion::Succeeded
@@ -1553,7 +1910,7 @@ async fn concurrent_webhook_flows_get_private_absolute_tmp() {
             config.private_tmp().display()
         );
         let attempt_dir = config.attempt_dir().to_path_buf();
-        config.destroy().unwrap();
+        config.destroy().await.unwrap();
         assert!(!attempt_dir.exists(), "job {index} cleanup");
     }
 
@@ -1580,8 +1937,8 @@ async fn concurrent_webhook_flows_get_private_absolute_tmp() {
 }
 
 #[cfg(target_os = "linux")]
-#[test]
-fn host_command_fails_closed_when_private_tmp_is_missing() {
+#[tokio::test]
+async fn host_command_fails_closed_when_private_tmp_is_missing() {
     let test_root = std::env::var_os("CARGO_TARGET_DIR")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| std::path::PathBuf::from("target"));
@@ -1592,9 +1949,7 @@ fn host_command_fails_closed_when_private_tmp_is_missing() {
         NonZeroUsize::new(1).unwrap(),
     )
     .unwrap();
-    let config = futures::executor::block_on(root.reserve())
-        .and_then(|permit| permit.provision())
-        .unwrap();
+    let mut config = provision_test_domain(&root);
     let sentinel = temp.path().join("command-ran");
     let script = format!("touch '{}'", sentinel.display());
     let env = host_base_env(&config);
@@ -1612,14 +1967,19 @@ fn host_command_fails_closed_when_private_tmp_is_missing() {
 
     assert_eq!(error.raw_os_error(), Some(libc::ENOENT));
     assert!(!sentinel.exists());
-    config.destroy().unwrap();
+    config.destroy().await.unwrap();
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn host_spawn_error_explains_denied_private_namespace_setup() {
-    let source = std::io::Error::from_raw_os_error(libc::EPERM);
-
-    let context = host_spawn_error_context("/opt/chimera/externals/node", &source, true);
+    let context = ExecutionDomainError::Backend {
+        attempt: None,
+        stage: crate::job::execution_domain::Stage::Command,
+        category: crate::job::execution_domain::FailureCategory::Io,
+        errno: Some(libc::EPERM),
+    }
+    .to_string();
 
     assert!(
         context.contains("private user/mount namespace setup"),
@@ -1644,7 +2004,13 @@ async fn private_tmp_mount_precedes_working_directory_lookup() {
         NonZeroUsize::new(1).unwrap(),
     )
     .unwrap();
-    let config = root.reserve().await.unwrap().provision().unwrap();
+    let mut config = root
+        .reserve()
+        .await
+        .unwrap()
+        .provision(AttemptIdentity::new())
+        .await
+        .unwrap();
     let env = host_base_env(&config);
     let directory_name = format!("chimera-cwd-{}", uuid::Uuid::new_v4().simple());
     let private_working_directory = std::path::PathBuf::from("/tmp").join(&directory_name);
@@ -1691,7 +2057,7 @@ async fn private_tmp_mount_precedes_working_directory_lookup() {
         .unwrap(),
         "private"
     );
-    config.destroy().unwrap();
+    config.destroy().await.unwrap();
 }
 
 #[cfg(target_os = "linux")]
@@ -1707,7 +2073,13 @@ async fn working_directory_tmp_does_not_write_to_host_tmp() {
         NonZeroUsize::new(1).unwrap(),
     )
     .unwrap();
-    let config = root.reserve().await.unwrap().provision().unwrap();
+    let mut config = root
+        .reserve()
+        .await
+        .unwrap()
+        .provision(AttemptIdentity::new())
+        .await
+        .unwrap();
     let env = host_base_env(&config);
     let file_name = format!("chimera-cwd-{}", uuid::Uuid::new_v4().simple());
     let host_path = std::path::Path::new("/tmp").join(&file_name);
@@ -1733,7 +2105,7 @@ async fn working_directory_tmp_does_not_write_to_host_tmp() {
     assert!(status.success());
     assert!(!host_file_existed, "relative write escaped to host /tmp");
     assert_eq!(std::fs::read_to_string(private_path).unwrap(), "private");
-    config.destroy().unwrap();
+    config.destroy().await.unwrap();
 }
 
 #[test]
@@ -1768,7 +2140,13 @@ async fn host_command_inheritance_child() {
         NonZeroUsize::new(1).unwrap(),
     )
     .unwrap();
-    let config = root.reserve().await.unwrap().provision().unwrap();
+    let config = root
+        .reserve()
+        .await
+        .unwrap()
+        .provision(AttemptIdentity::new())
+        .await
+        .unwrap();
     let job_config = config.docker_config_dir().to_path_buf();
     let env = HashMap::from([(
         DOCKER_CONFIG_ENV.to_string(),

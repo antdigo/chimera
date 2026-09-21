@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use chimera::job::client::JobConclusion;
-use chimera::job::execution_domain::ExecutionDomainRoot;
+use chimera::job::execution_domain::{AttemptIdentity, ExecutionDomainRoot};
 use chimera::job::workspace::Workspace;
 use common::*;
 use tokio_util::sync::CancellationToken;
@@ -405,11 +405,12 @@ async fn cleanup_runs_for_all_job_outcomes() {
         NonZeroUsize::new(2).unwrap(),
     )
     .unwrap();
-    let neighbor = execution_domains
+    let mut neighbor = execution_domains
         .reserve()
         .await
         .unwrap()
-        .provision()
+        .provision(AttemptIdentity::new())
+        .await
         .unwrap();
     let neighbor_dir = neighbor.attempt_dir().to_path_buf();
 
@@ -488,7 +489,7 @@ async fn cleanup_runs_for_all_job_outcomes() {
         }
     }
 
-    neighbor.destroy().unwrap();
+    neighbor.destroy().await.unwrap();
 }
 
 #[tokio::test]

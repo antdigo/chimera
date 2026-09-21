@@ -439,6 +439,13 @@ fn eval_function(name: &str, args: &[Expr], ctx: &ExprContext) -> Result<Value, 
                 patterns.push(eval(arg, ctx)?.to_display());
             }
 
+            if let Some(reader) = &ctx.workspace_reader {
+                return reader
+                    .hash_files(&patterns)
+                    .map(Value::String)
+                    .map_err(|error| format!("hashFiles() domain read failed: {error}"));
+            }
+
             hash_files(workspace, &patterns)
         }
 

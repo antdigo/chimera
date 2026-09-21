@@ -33,6 +33,11 @@ Status: implemented and verified at commit `b65da30`.
 
 ## Plan B — Linux launcher, rootfs и cgroup
 
+Status: kernel backend implemented; native Debian gate pending / NOT QUALIFIED.
+The Task 12 harness currently provides strict preflight and named fail-on-selection
+cases only; it does not yet construct or qualify a native domain. Production
+`sandboxed` remains unavailable.
+
 Результат:
 
 - RootlessKit/domain-init control protocol;

@@ -1,25 +1,20 @@
 use std::collections::HashMap;
-#[cfg(target_os = "linux")]
-use std::collections::VecDeque;
 use std::ffi::OsStr;
-#[cfg(target_os = "linux")]
-use std::ffi::{CStr, CString, OsString};
-#[cfg(target_os = "linux")]
+#[cfg(all(test, target_os = "linux"))]
+use std::ffi::{CStr, CString};
+#[cfg(all(test, target_os = "linux"))]
 use std::io;
-#[cfg(target_os = "linux")]
+#[cfg(all(test, target_os = "linux"))]
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::PermissionsExt;
-#[cfg(target_os = "linux")]
+#[cfg(all(test, target_os = "linux"))]
 use std::os::unix::process::CommandExt;
-#[cfg(target_os = "linux")]
-use std::path::Component;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use chrono::Utc;
-use tokio::io::{AsyncBufReadExt, BufReader};
+#[cfg(test)]
 use tokio::process::Command;
 use tokio::sync::{RwLock, mpsc};
 use tokio_util::sync::CancellationToken;
@@ -38,7 +33,10 @@ use super::workspace::Workspace;
 use crate::docker::build::{BuiltDockerImage, DockerActionBuilder, DockerBuildScope, RegistryAuth};
 use crate::docker::output::OutputProcessor;
 use crate::docker::resources::JobDockerResources;
-use crate::job::execution_domain::{DOCKER_CONFIG_ENV, ExecutionDomain, ExecutionDomainError};
+use crate::job::execution_domain::ExecutionDomainError;
+use crate::job::execution_domain::{
+    CommandEvent, CommandOutcome, CommandSpec, DOCKER_CONFIG_ENV, ExecutionDomain,
+};
 use crate::node::NodeRuntimes;
 use crate::utils::{
     find_case_insensitive, format_results_timestamp, format_timeline_timestamp,
@@ -150,12 +148,99 @@ pub struct JobState {
     /// Host filesystem workspace path for hashFiles(). In container mode, GITHUB_WORKSPACE
     /// points to the container path (/github/workspace) but file operations need the real path.
     pub host_workspace: Option<String>,
+    /// Opaque workspace reader owned and revoked by the execution-domain manager.
+    pub workspace_reader: Option<crate::job::execution_domain::DomainWorkspaceReader>,
+    /// Validated step summaries, retained in execution order for the result uploader.
+    pub step_summaries: Vec<String>,
     /// `defaults.run.working-directory` for the job, used by any `run:` step that
     /// does not set its own.
     pub default_working_directory: Option<String>,
     /// Whether `::debug::` workflow commands should be emitted to the log stream.
     /// Only true when the `ACTIONS_STEP_DEBUG` secret is set to `"true"`.
     pub debug_enabled: bool,
+}
+
+#[derive(Default)]
+pub(crate) struct BufferedWorkflowState {
+    env: Vec<(String, String)>,
+    path: Vec<String>,
+    output: Vec<(String, String)>,
+    state: Vec<(String, String)>,
+}
+
+pub(crate) struct WorkflowStateDrainPermit(());
+
+impl WorkflowStateDrainPermit {
+    fn new() -> Self {
+        Self(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_test() -> Self {
+        Self::new()
+    }
+}
+
+impl BufferedWorkflowState {
+    pub(crate) fn new(
+        _permit: &WorkflowStateDrainPermit,
+        env: Vec<(String, String)>,
+        path: Vec<String>,
+        output: Vec<(String, String)>,
+        state: Vec<(String, String)>,
+    ) -> Self {
+        Self {
+            env,
+            path,
+            output,
+            state,
+        }
+    }
+
+    fn apply(self, job_state: &mut JobState) {
+        for (key, value) in self.env {
+            job_state.env.insert(key, value);
+        }
+        job_state.path_prepends.extend(self.path);
+        for (key, value) in self.output {
+            insert_case_insensitive(&mut job_state.outputs, key, value);
+        }
+        for (key, value) in self.state {
+            insert_case_insensitive(
+                job_state.action_states.entry(String::new()).or_default(),
+                key,
+                value,
+            );
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn env(&self) -> &[(String, String)] {
+        &self.env
+    }
+
+    #[cfg(test)]
+    pub(crate) fn path(&self) -> &[String] {
+        &self.path
+    }
+
+    #[cfg(test)]
+    pub(crate) fn output(&self) -> &[(String, String)] {
+        &self.output
+    }
+
+    #[cfg(test)]
+    pub(crate) fn state(&self) -> &[(String, String)] {
+        &self.state
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.env.is_empty()
+            && self.path.is_empty()
+            && self.output.is_empty()
+            && self.state.is_empty()
+    }
 }
 
 impl JobState {
@@ -180,6 +265,8 @@ impl JobState {
             secrets,
             context_data,
             host_workspace: None,
+            workspace_reader: None,
+            step_summaries: Vec::new(),
             default_working_directory: None,
             debug_enabled,
         }
@@ -422,10 +509,11 @@ pub async fn run_host_step(
     };
 
     let result = run_process(
-        "bash",
+        OsStr::new("bash"),
         &[OsStr::new("-e"), script_file.as_os_str()],
         &env,
         &working_dir,
+        workspace,
         domain,
         job_state,
         log_sender,
@@ -449,6 +537,10 @@ pub async fn run_host_step(
 }
 
 /// Execute a single run: step inside a Docker container via `docker exec`.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "step execution keeps domain transaction and Docker context explicit"
+)]
 pub async fn run_container_step(
     step: &Step,
     job_state: &mut JobState,
@@ -457,6 +549,7 @@ pub async fn run_container_step(
     log_sender: &LogSender,
     docker_resources: &JobDockerResources,
     cancel_token: &CancellationToken,
+    domain: &ExecutionDomain,
 ) -> Result<StepResult> {
     let script_raw = step
         .inputs
@@ -484,20 +577,25 @@ pub async fn run_container_step(
         None => "/github/workspace".into(),
     };
 
-    let debug_enabled = job_state.debug_enabled;
+    let state_id = prepare_step_transaction(domain, workspace).await?;
+    let processor = OutputProcessor::new(
+        log_sender.clone(),
+        job_state.secret_masker.clone(),
+        job_state.debug_enabled,
+    );
     let result = crate::docker::exec::docker_exec(
         docker_resources.docker(),
         container_id,
         vec!["bash".into(), "-e".into(), "-c".into(), script],
         &env,
         &working_dir,
-        job_state,
-        log_sender,
+        &processor,
         timeout,
         cancel_token,
-        debug_enabled,
     )
     .await;
+    let result =
+        complete_docker_exec_transaction(domain, state_id, &processor, job_state, result).await;
 
     // Re-key saved state from the empty-key bucket into the correct action-keyed bucket
     if let Some(unnamed_state) = job_state.action_states.remove("") {
@@ -512,217 +610,33 @@ pub async fn run_container_step(
     result
 }
 
-const IMPLICIT_DOCKER_CREDENTIAL_HELPERS: [&str; 2] =
-    ["docker-credential-pass", "docker-credential-secretservice"];
-
+#[cfg(test)]
 fn validate_host_docker_capabilities(
     env: &HashMap<String, String>,
     working_dir: &Path,
     private_tmp: &Path,
 ) -> Result<(), ExecutionDomainError> {
-    let inherited_path = env
-        .get("PATH")
-        .is_none()
-        .then(|| std::env::var_os("PATH"))
-        .flatten();
-    let effective_path = env
-        .get("PATH")
-        .map(|path| OsStr::new(path.as_str()))
-        .or(inherited_path.as_deref());
-    let Some(effective_path) = effective_path else {
-        return Ok(());
-    };
-
-    for helper in IMPLICIT_DOCKER_CREDENTIAL_HELPERS {
-        for entry in std::env::split_paths(effective_path) {
-            let candidate =
-                match host_credential_helper_path(&entry, helper, working_dir, private_tmp) {
-                    Ok(candidate) => candidate,
-                    Err(error) if host_capability_path_is_unavailable(&error) => continue,
-                    Err(error) => return Err(error),
-                };
-            let Ok(metadata) = std::fs::metadata(candidate) else {
-                continue;
-            };
-            if !metadata.is_dir() && metadata.permissions().mode() & 0o111 != 0 {
-                return Err(ExecutionDomainError::ImplicitCredentialStore { helper });
-            }
-        }
-    }
-    Ok(())
+    crate::job::execution_domain::validate_host_docker_capabilities(env, working_dir, private_tmp)
 }
 
-#[cfg(target_os = "linux")]
-fn host_credential_helper_path(
-    path_entry: &Path,
-    helper: &str,
-    working_dir: &Path,
-    private_tmp: &Path,
-) -> Result<PathBuf, ExecutionDomainError> {
-    let child_candidate = if path_entry.is_absolute() {
-        path_entry.join(helper)
-    } else {
-        let resolved_working_dir = resolve_child_path(working_dir, private_tmp)?;
-        resolved_working_dir.join(path_entry).join(helper)
-    };
-    host_path_for_private_tmp(&child_candidate, private_tmp)
-}
-
-#[cfg(not(target_os = "linux"))]
-fn host_credential_helper_path(
-    path_entry: &Path,
-    helper: &str,
-    working_dir: &Path,
-    _private_tmp: &Path,
-) -> Result<PathBuf, ExecutionDomainError> {
-    let directory = if path_entry.as_os_str().is_empty() {
-        working_dir.to_path_buf()
-    } else if path_entry.is_absolute() {
-        path_entry.to_path_buf()
-    } else {
-        working_dir.join(path_entry)
-    };
-    Ok(directory.join(helper))
-}
-
-#[cfg(target_os = "linux")]
-fn host_capability_path_is_unavailable(error: &ExecutionDomainError) -> bool {
-    matches!(
-        error,
-        ExecutionDomainError::Io { source, .. }
-            if source.kind() == io::ErrorKind::PermissionDenied
-                || source.raw_os_error() == Some(libc::ELOOP)
-    )
-}
-
-#[cfg(not(target_os = "linux"))]
-fn host_capability_path_is_unavailable(_error: &ExecutionDomainError) -> bool {
-    false
-}
-
-#[cfg(target_os = "linux")]
-fn host_path_for_private_tmp(
-    child_path: &Path,
-    private_tmp: &Path,
-) -> Result<PathBuf, ExecutionDomainError> {
-    let resolved = resolve_child_path(child_path, private_tmp)?;
-    Ok(project_private_tmp_path(&resolved, private_tmp))
-}
-
-#[cfg(target_os = "linux")]
-fn resolve_child_path(
-    child_path: &Path,
-    private_tmp: &Path,
-) -> Result<PathBuf, ExecutionDomainError> {
-    let absolute = if child_path.is_absolute() {
-        child_path.to_path_buf()
-    } else {
-        std::env::current_dir()
-            .map_err(|source| ExecutionDomainError::Io {
-                operation: "resolving host capability path",
-                path: child_path.to_path_buf(),
-                source,
-            })?
-            .join(child_path)
-    };
-    let mut pending = child_path_components(&absolute);
-    let mut resolved = PathBuf::from("/");
-    let mut symlink_hops = 0;
-
-    while let Some(component) = pending.pop_front() {
-        if component == OsStr::new("..") {
-            resolved.pop();
-            continue;
-        }
-
-        let child_candidate = resolved.join(&component);
-        let host_candidate = project_private_tmp_path(&child_candidate, private_tmp);
-        match std::fs::symlink_metadata(&host_candidate) {
-            Ok(metadata) if metadata.file_type().is_symlink() => {
-                symlink_hops += 1;
-                if symlink_hops > 40 {
-                    return Err(ExecutionDomainError::Io {
-                        operation: "resolving host capability symlink",
-                        path: child_path.to_path_buf(),
-                        source: io::Error::from_raw_os_error(libc::ELOOP),
-                    });
-                }
-                let target = std::fs::read_link(&host_candidate).map_err(|source| {
-                    ExecutionDomainError::Io {
-                        operation: "reading host capability symlink",
-                        path: host_candidate,
-                        source,
-                    }
-                })?;
-                let target = if target.is_absolute() {
-                    target
-                } else {
-                    resolved.join(target)
-                };
-                let mut target_components = child_path_components(&target);
-                target_components.append(&mut pending);
-                pending = target_components;
-                resolved = PathBuf::from("/");
-            }
-            Ok(_) => resolved.push(component),
-            Err(source)
-                if matches!(
-                    source.kind(),
-                    io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
-                ) =>
-            {
-                resolved.push(component);
-            }
-            Err(source) => {
-                return Err(ExecutionDomainError::Io {
-                    operation: "resolving host capability path",
-                    path: host_candidate,
-                    source,
-                });
-            }
-        }
-    }
-
-    Ok(resolved)
-}
-
-#[cfg(target_os = "linux")]
-fn child_path_components(path: &Path) -> VecDeque<OsString> {
-    path.components()
-        .filter_map(|component| match component {
-            Component::RootDir | Component::CurDir => None,
-            Component::ParentDir => Some(OsString::from("..")),
-            Component::Normal(part) => Some(part.to_os_string()),
-            Component::Prefix(_) => unreachable!("Unix paths do not have prefixes"),
-        })
-        .collect()
-}
-
-#[cfg(target_os = "linux")]
-fn project_private_tmp_path(child_path: &Path, private_tmp: &Path) -> PathBuf {
-    match child_path.strip_prefix("/tmp") {
-        Ok(relative) => private_tmp.join(relative),
-        Err(_) => child_path.to_path_buf(),
-    }
-}
-
-fn build_host_command(
+#[cfg(test)]
+fn build_host_command<D: TestHostDomain + ?Sized>(
     program: &str,
     args: &[&OsStr],
     env: &HashMap<String, String>,
     working_dir: &Path,
-    domain: &ExecutionDomain,
+    domain: &D,
 ) -> Result<Command> {
     let configured = env
         .get(DOCKER_CONFIG_ENV)
         .context("host step is missing runner-owned DOCKER_CONFIG")?;
-    domain.validate_override(configured, "host spawn")?;
+    domain.test_validate_override(configured, "host spawn")?;
 
     let mut command = Command::new(program);
     command.args(args);
 
     #[cfg(target_os = "linux")]
-    configure_private_tmp(&mut command, domain.private_tmp(), working_dir)?;
+    configure_private_tmp(&mut command, domain.test_private_tmp(), working_dir)?;
 
     #[cfg(not(target_os = "linux"))]
     command.current_dir(working_dir);
@@ -736,41 +650,57 @@ fn build_host_command(
 }
 
 #[cfg(test)]
-fn host_command(
+fn host_command<D: TestHostDomain + ?Sized>(
     program: &str,
     args: &[&OsStr],
     env: &HashMap<String, String>,
     working_dir: &Path,
-    domain: &ExecutionDomain,
+    domain: &D,
 ) -> Result<Command> {
-    validate_host_docker_capabilities(env, working_dir, domain.private_tmp())?;
+    validate_host_docker_capabilities(env, working_dir, domain.test_private_tmp())?;
     build_host_command(program, args, env, working_dir, domain)
 }
 
-async fn host_command_for_process(
-    program: &str,
-    args: &[&OsStr],
-    env: &HashMap<String, String>,
-    working_dir: &Path,
-    domain: &ExecutionDomain,
-) -> Result<Command> {
-    let validation_env = env.clone();
-    let validation_working_dir = working_dir.to_path_buf();
-    let validation_private_tmp = domain.private_tmp().to_path_buf();
-    tokio::task::spawn_blocking(move || {
-        validate_host_docker_capabilities(
-            &validation_env,
-            &validation_working_dir,
-            &validation_private_tmp,
-        )
-    })
-    .await
-    .context("joining host capability validation task")??;
+#[cfg(test)]
+trait TestHostDomain {
+    fn test_private_tmp(&self) -> &Path;
+    fn test_validate_override(
+        &self,
+        value: &str,
+        source: &'static str,
+    ) -> Result<(), ExecutionDomainError>;
+}
 
-    build_host_command(program, args, env, working_dir, domain)
+#[cfg(test)]
+impl TestHostDomain for ExecutionDomain {
+    fn test_private_tmp(&self) -> &Path {
+        self.private_tmp()
+    }
+    fn test_validate_override(
+        &self,
+        value: &str,
+        source: &'static str,
+    ) -> Result<(), ExecutionDomainError> {
+        self.validate_override(value, source)
+    }
+}
+
+#[cfg(test)]
+impl TestHostDomain for crate::job::execution_domain::TrustedBackend {
+    fn test_private_tmp(&self) -> &Path {
+        self.private_tmp()
+    }
+    fn test_validate_override(
+        &self,
+        value: &str,
+        source: &'static str,
+    ) -> Result<(), ExecutionDomainError> {
+        self.validate_override(value, source)
+    }
 }
 
 #[cfg(target_os = "linux")]
+#[cfg(test)]
 fn configure_private_tmp(
     command: &mut Command,
     private_tmp: &Path,
@@ -827,6 +757,7 @@ fn configure_private_tmp(
 }
 
 #[cfg(target_os = "linux")]
+#[cfg(test)]
 unsafe fn write_proc_file(path: &CStr, value: &[u8]) -> io::Result<()> {
     let file = unsafe { libc::open(path.as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC) };
     if file == -1 {
@@ -863,107 +794,244 @@ unsafe fn write_proc_file(path: &CStr, value: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
-fn host_spawn_error_context(
-    program: &str,
-    source: &std::io::Error,
-    uses_private_namespace: bool,
-) -> String {
-    if uses_private_namespace && source.raw_os_error() == Some(libc::EPERM) {
-        return format!(
-            "spawning {program}: private user/mount namespace setup failed with EPERM; on Ubuntu 24.04 this is commonly the unprivileged-userns AppArmor restriction, while containers may also deny it through seccomp/AppArmor (see README.md#private-tmp-for-linux-host-jobs)"
-        );
-    }
-
-    format!("spawning {program}")
-}
-
 /// Shared process runner used by host steps, node actions, and composite steps.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_process(
-    program: &str,
+    program: &OsStr,
     args: &[&OsStr],
     env: &HashMap<String, String>,
     working_dir: &Path,
+    workspace: &Workspace,
     domain: &ExecutionDomain,
     job_state: &mut JobState,
     log_sender: &LogSender,
     timeout: Duration,
     cancel_token: &CancellationToken,
 ) -> Result<StepResult> {
-    let mut child = host_command_for_process(program, args, env, working_dir, domain)
-        .await?
-        .spawn()
-        .map_err(|source| {
-            let context = host_spawn_error_context(program, &source, cfg!(target_os = "linux"));
-            anyhow::Error::new(source).context(context)
-        })?;
-
-    let stdout = child.stdout.take().context("no stdout")?;
-    let stderr = child.stderr.take().context("no stderr")?;
-
+    // All fallible host-to-domain mapping must complete before opening the
+    // single outstanding command-file transaction.
+    let env = domain.command_environment(env)?;
+    let target = domain.command_target(program, args, working_dir, &env)?;
+    let state_id = prepare_step_transaction(domain, workspace).await?;
     let processor = OutputProcessor::new(
         log_sender.clone(),
         job_state.secret_masker.clone(),
         job_state.debug_enabled,
     );
-
-    let stdout_task = spawn_stdout_reader(stdout, processor.clone());
-
-    let stderr_sender = log_sender.clone();
-    let stderr_task = tokio::spawn(async move {
-        let reader = BufReader::new(stderr);
-        let mut lines = reader.lines();
-        while let Ok(Some(line)) = lines.next_line().await {
-            stderr_sender.send(line).await;
-        }
-    });
-
-    let timed_wait = async {
-        let (stdout_result, stderr_result, wait_result) =
-            tokio::join!(stdout_task, stderr_task, child.wait());
-        stdout_result.context("stdout task panicked")?;
-        stderr_result.context("stderr task panicked")?;
-        wait_result.context("waiting for child process")
+    let (output, mut events) = mpsc::channel(32);
+    let spec = CommandSpec {
+        target,
+        env,
+        timeout,
+        state: Some(state_id.clone()),
     };
+    let consume = consume_command_events(&mut events, &processor, log_sender);
+    let run = domain.run(spec, output, cancel_token.clone());
+    let (outcome, ()) = tokio::join!(run, consume);
+    let outcome = complete_step_transaction(
+        domain,
+        state_id,
+        &processor,
+        job_state,
+        outcome.map_err(anyhow::Error::from),
+    )
+    .await?;
+    let conclusion = match outcome {
+        CommandOutcome::Exited(0) => StepConclusion::Succeeded,
+        CommandOutcome::Cancelled => StepConclusion::Cancelled,
+        CommandOutcome::Exited(_) | CommandOutcome::Signalled(_) | CommandOutcome::TimedOut => {
+            StepConclusion::Failed
+        }
+    };
+    Ok(StepResult { conclusion })
+}
 
-    let status = tokio::select! {
-        result = tokio::time::timeout(timeout, timed_wait) => {
-            match result {
-                Ok(result) => result?,
-                Err(_) => {
-                    warn!("process timed out, killing");
-                    let _ = child.kill().await;
-                    return Ok(StepResult {
-                        conclusion: StepConclusion::Failed,
-                    });
-                }
+pub(crate) async fn prepare_step_transaction(
+    domain: &ExecutionDomain,
+    workspace: &Workspace,
+) -> Result<crate::job::execution_domain::StepFilesId> {
+    domain.bind_workspace(workspace).await?;
+    let event = workspace.read_event_file_bounded()?;
+    Ok(domain.prepare_step(&event).await?)
+}
+
+#[cfg(test)]
+pub(crate) async fn finish_step_transaction(
+    domain: &ExecutionDomain,
+    state_id: crate::job::execution_domain::StepFilesId,
+    job_state: &mut JobState,
+) -> Result<()> {
+    let snapshot = domain.read_step(state_id).await?;
+    apply_step_snapshot(
+        snapshot,
+        BufferedWorkflowState::default(),
+        domain,
+        job_state,
+    )
+}
+
+pub(crate) async fn complete_step_transaction<T>(
+    domain: &ExecutionDomain,
+    state_id: crate::job::execution_domain::StepFilesId,
+    processor: &OutputProcessor,
+    job_state: &mut JobState,
+    command_result: Result<T>,
+) -> Result<T> {
+    // Terminal state validation has deterministic priority over a command error:
+    // a corrupted bridge must never be hidden by a simultaneous spawn/transport failure.
+    let snapshot = domain.read_step(state_id).await?;
+    let permit = WorkflowStateDrainPermit::new();
+    let commands = processor.take_workflow_state(&permit).await;
+    apply_step_snapshot(snapshot, commands, domain, job_state)?;
+    command_result
+}
+
+pub(crate) async fn complete_docker_exec_transaction<T>(
+    domain: &ExecutionDomain,
+    state_id: crate::job::execution_domain::StepFilesId,
+    processor: &OutputProcessor,
+    job_state: &mut JobState,
+    command_result: Result<T>,
+) -> Result<T> {
+    if command_result
+        .as_ref()
+        .err()
+        .is_some_and(crate::docker::exec::state_may_still_change)
+    {
+        return command_result;
+    }
+    complete_step_transaction(domain, state_id, processor, job_state, command_result).await
+}
+
+async fn consume_command_events(
+    events: &mut mpsc::Receiver<CommandEvent>,
+    processor: &OutputProcessor,
+    log_sender: &LogSender,
+) {
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    while let Some(event) = events.recv().await {
+        match event {
+            CommandEvent::Stdout(bytes) => {
+                stdout.extend_from_slice(&bytes);
+                drain_processor_lines(&mut stdout, processor).await;
+                drain_bounded_processor_chunk(&mut stdout, processor).await;
+            }
+            CommandEvent::Stderr(bytes) => {
+                stderr.extend_from_slice(&bytes);
+                drain_log_lines(&mut stderr, log_sender).await;
+                drain_bounded_log_chunk(&mut stderr, log_sender).await;
             }
         }
-        _ = cancel_token.cancelled() => {
-            warn!("job cancelled, killing process");
-            let _ = child.kill().await;
-            return Ok(StepResult {
-                conclusion: StepConclusion::Cancelled,
-            });
+    }
+    if !stdout.is_empty() {
+        processor
+            .process_line(&String::from_utf8_lossy(&stdout))
+            .await;
+    }
+    if !stderr.is_empty() {
+        log_sender
+            .send(String::from_utf8_lossy(&stderr).into_owned())
+            .await;
+    }
+}
+
+const MAX_PARTIAL_OUTPUT_BYTES: usize = 64 * 1024;
+
+async fn drain_bounded_processor_chunk(buffer: &mut Vec<u8>, processor: &OutputProcessor) {
+    while buffer.len() > MAX_PARTIAL_OUTPUT_BYTES {
+        let chunk = buffer.drain(..MAX_PARTIAL_OUTPUT_BYTES).collect::<Vec<_>>();
+        processor
+            .process_line(&String::from_utf8_lossy(&chunk))
+            .await;
+    }
+}
+
+async fn drain_bounded_log_chunk(buffer: &mut Vec<u8>, sender: &LogSender) {
+    while buffer.len() > MAX_PARTIAL_OUTPUT_BYTES {
+        let chunk = buffer.drain(..MAX_PARTIAL_OUTPUT_BYTES).collect::<Vec<_>>();
+        sender
+            .send(String::from_utf8_lossy(&chunk).into_owned())
+            .await;
+    }
+}
+
+async fn drain_processor_lines(buffer: &mut Vec<u8>, processor: &OutputProcessor) {
+    while let Some(index) = buffer.iter().position(|byte| *byte == b'\n') {
+        let line = buffer.drain(..=index).collect::<Vec<_>>();
+        let line = String::from_utf8_lossy(&line[..line.len().saturating_sub(1)]);
+        processor.process_line(&line).await;
+    }
+}
+
+async fn drain_log_lines(buffer: &mut Vec<u8>, sender: &LogSender) {
+    while let Some(index) = buffer.iter().position(|byte| *byte == b'\n') {
+        let line = buffer.drain(..=index).collect::<Vec<_>>();
+        sender
+            .send(String::from_utf8_lossy(&line[..line.len().saturating_sub(1)]).into_owned())
+            .await;
+    }
+}
+
+fn apply_step_snapshot(
+    snapshot: crate::job::execution_domain::StepStateSnapshot,
+    commands: BufferedWorkflowState,
+    domain: &ExecutionDomain,
+    job_state: &mut JobState,
+) -> Result<()> {
+    let parsed = snapshot.parse()?;
+    validate_step_environment(
+        parsed
+            .env
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str())),
+        domain,
+    )?;
+    validate_step_environment(
+        commands
+            .env
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str())),
+        domain,
+    )?;
+
+    commands.apply(job_state);
+    merge_case_insensitive(&mut job_state.outputs, parsed.output);
+    job_state.env.extend(parsed.env);
+    job_state.path_prepends.extend(parsed.path);
+    merge_case_insensitive(
+        job_state.action_states.entry(String::new()).or_default(),
+        parsed.state,
+    );
+    if !parsed.summary.is_empty() {
+        job_state.step_summaries.push(parsed.summary);
+    }
+    Ok(())
+}
+
+fn validate_step_environment<'a>(
+    entries: impl IntoIterator<Item = (&'a str, &'a str)>,
+    domain: &ExecutionDomain,
+) -> Result<()> {
+    for (key, value) in entries {
+        if is_reserved_command_file_env(key) {
+            return Err(ExecutionDomainError::ReservedEnvironmentOverride {
+                source: "GITHUB_ENV",
+            }
+            .into());
         }
-    };
-
-    processor.apply_to_job_state(job_state).await;
-
-    let conclusion = if status.success() {
-        StepConclusion::Succeeded
-    } else {
-        StepConclusion::Failed
-    };
-
-    Ok(StepResult { conclusion })
+        if key == DOCKER_CONFIG_ENV {
+            domain.validate_override(value, "GITHUB_ENV")?;
+        }
+    }
+    Ok(())
 }
 
 /// Build the full environment for a step execution.
 pub fn build_step_env(
     step: &Step,
     job_state: &JobState,
-    workspace: &Workspace,
+    _workspace: &Workspace,
     base_env: &HashMap<String, String>,
     domain: Option<&ExecutionDomain>,
 ) -> Result<HashMap<String, String>> {
@@ -989,21 +1057,13 @@ pub fn build_step_env(
         }
     }
 
-    if let Ok(file_env) = workspace.read_env_file() {
-        merge_checked(&mut env, &file_env, domain, "GITHUB_ENV")?;
-    }
-
-    if let Ok(extra_paths) = workspace.read_path_file() {
-        let mut all_paths = job_state.path_prepends.clone();
-        all_paths.extend(extra_paths);
-        if !all_paths.is_empty() {
-            let prepend = all_paths.join(":");
-            let path = match env.get("PATH") {
-                Some(existing) if !existing.is_empty() => format!("{prepend}:{existing}"),
-                _ => prepend,
-            };
-            env.insert("PATH".into(), path);
-        }
+    if !job_state.path_prepends.is_empty() {
+        let prepend = job_state.path_prepends.join(":");
+        let path = match env.get("PATH") {
+            Some(existing) if !existing.is_empty() => format!("{prepend}:{existing}"),
+            _ => prepend,
+        };
+        env.insert("PATH".into(), path);
     }
 
     Ok(env)
@@ -1016,6 +1076,9 @@ fn insert_checked(
     domain: Option<&ExecutionDomain>,
     source: &'static str,
 ) -> Result<()> {
+    if is_reserved_command_file_env(&key) {
+        return Err(ExecutionDomainError::ReservedEnvironmentOverride { source }.into());
+    }
     if key == DOCKER_CONFIG_ENV
         && let Some(config) = domain
     {
@@ -1023,6 +1086,18 @@ fn insert_checked(
     }
     env.insert(key, value);
     Ok(())
+}
+
+pub(crate) fn is_reserved_command_file_env(key: &str) -> bool {
+    matches!(
+        key,
+        "GITHUB_ENV"
+            | "GITHUB_PATH"
+            | "GITHUB_OUTPUT"
+            | "GITHUB_STATE"
+            | "GITHUB_STEP_SUMMARY"
+            | "GITHUB_EVENT_PATH"
+    )
 }
 
 fn merge_checked(
@@ -1035,20 +1110,6 @@ fn merge_checked(
         insert_checked(env, key.clone(), value.clone(), domain, source)?;
     }
     Ok(())
-}
-
-/// Spawn a task that reads stdout, parses workflow commands, and forwards log lines.
-fn spawn_stdout_reader(
-    stdout: tokio::process::ChildStdout,
-    processor: OutputProcessor,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        let reader = BufReader::new(stdout);
-        let mut lines = reader.lines();
-        while let Ok(Some(line)) = lines.next_line().await {
-            processor.process_line(&line).await;
-        }
-    })
 }
 
 /// Run all steps in a job manifest.
@@ -1124,6 +1185,7 @@ pub(crate) async fn run_all_steps_with_masker(
         secrets,
         manifest.context_data.clone(),
     );
+    job_state.workspace_reader = execution.docker_config().workspace_reader();
 
     // Populate the `job` context for expression evaluation
     if let serde_json::Value::Object(ref mut map) = job_state.context_data {
@@ -1312,26 +1374,6 @@ pub(crate) async fn run_all_steps_with_masker(
             )
             .await;
 
-            // Read file-based outputs/env/path/state after pre steps
-            if let Ok(file_outputs) = workspace.read_output_file() {
-                merge_case_insensitive(&mut job_state.outputs, file_outputs);
-            }
-            if let Ok(file_env) = workspace.read_env_file() {
-                job_state.env.extend(file_env);
-            }
-            if let Ok(extra_paths) = workspace.read_path_file() {
-                job_state.path_prepends.extend(extra_paths);
-            }
-            if let Ok(file_state) = workspace.read_state_file() {
-                let key = pre_step.context_name.as_deref().unwrap_or(&pre_step.id);
-                job_state
-                    .action_states
-                    .entry(key.to_string())
-                    .or_default()
-                    .extend(file_state);
-            }
-            workspace.clear_step_files();
-
             // Pre steps DO affect job conclusion (unlike post steps)
             if conclusion == StepConclusion::Cancelled {
                 job_cancelled = true;
@@ -1458,26 +1500,6 @@ pub(crate) async fn run_all_steps_with_masker(
             legacy_log_id,
         )
         .await;
-
-        // Read file-based outputs/env/path/state after each step.
-        // Modern actions use these files instead of legacy :: workflow commands.
-        if let Ok(file_outputs) = workspace.read_output_file() {
-            merge_case_insensitive(&mut job_state.outputs, file_outputs);
-        }
-        if let Ok(file_env) = workspace.read_env_file() {
-            job_state.env.extend(file_env);
-        }
-        if let Ok(extra_paths) = workspace.read_path_file() {
-            job_state.path_prepends.extend(extra_paths);
-        }
-        // Read GITHUB_STATE file (used by @actions/core saveState)
-        if let Ok(file_state) = workspace.read_state_file() {
-            let key = step.context_name.as_deref().unwrap_or(&step.id);
-            let entry = job_state.action_states.entry(key.to_string()).or_default();
-            merge_case_insensitive(entry, file_state);
-        }
-        // Clear the files so the next step starts fresh
-        workspace.clear_step_files();
 
         // If this action has a `post` entry point, schedule it for later.
         let action_key = job_state.action_instance_key(step).to_string();
@@ -1650,26 +1672,6 @@ pub(crate) async fn run_all_steps_with_masker(
                 legacy_log_id,
             )
             .await;
-
-            // Read file-based outputs/env/path/state after post steps too
-            if let Ok(file_outputs) = workspace.read_output_file() {
-                merge_case_insensitive(&mut job_state.outputs, file_outputs);
-            }
-            if let Ok(file_env) = workspace.read_env_file() {
-                job_state.env.extend(file_env);
-            }
-            if let Ok(extra_paths) = workspace.read_path_file() {
-                job_state.path_prepends.extend(extra_paths);
-            }
-            if let Ok(file_state) = workspace.read_state_file() {
-                let key = post_step.context_name.as_deref().unwrap_or(&post_step.id);
-                job_state
-                    .action_states
-                    .entry(key.to_string())
-                    .or_default()
-                    .extend(file_state);
-            }
-            workspace.clear_step_files();
 
             // Post steps don't affect job conclusion
             if conclusion == StepConclusion::Failed {
@@ -1844,6 +1846,7 @@ async fn execute_step(
                 log_sender,
                 resources,
                 cancel_token,
+                execution.docker_config(),
             )
             .await
         } else {
@@ -1876,6 +1879,15 @@ async fn execute_step(
         )
         .await
     };
+
+    if let Some(unnamed_state) = job_state.action_states.remove("") {
+        let key = step.context_name.as_deref().unwrap_or(&step.id);
+        job_state
+            .action_states
+            .entry(key.to_string())
+            .or_default()
+            .extend(unnamed_state);
+    }
 
     match result {
         Ok(result) => {

@@ -1,21 +1,65 @@
 use std::collections::HashMap;
+use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::num::NonZeroUsize;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+#[cfg(all(target_os = "linux", test))]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
+use tokio::sync::{Semaphore, watch};
 use uuid::Uuid;
 
 use crate::docker::endpoint::DockerEndpoint;
 
 mod admission;
+mod contracts;
 mod docker_paths;
 mod error;
 mod filesystem;
 mod journal;
+#[cfg(any(target_os = "linux", test))]
+mod linux;
+mod manager;
+#[cfg(any(target_os = "linux", test))]
+mod protocol;
+#[cfg(test)]
+#[path = "protocol_test.rs"]
+mod protocol_test;
+mod state_bridge;
+#[cfg(test)]
+#[path = "state_bridge_test.rs"]
+mod state_bridge_test;
+mod trusted;
+mod workspace_reader;
+
+#[cfg(test)]
+pub(crate) use trusted::validate_host_docker_capabilities;
+
+/// Dispatch reserved bootstrap modes before constructing any async runtime.
+pub fn internal_entry() -> Option<i32> {
+    #[cfg(target_os = "linux")]
+    {
+        linux::internal_entry()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        std::env::args_os()
+            .nth(1)
+            .filter(|arg| {
+                arg == "--internal-domain-launch"
+                    || arg == "--internal-domain-bootstrap"
+                    || arg == "--internal-mapped-cleanup"
+            })
+            .map(|_| 78)
+    }
+}
+
+#[cfg(test)]
+#[path = "contracts_test.rs"]
+mod contracts_test;
 
 use journal::{DomainLifecycle, DomainState};
 
@@ -26,8 +70,15 @@ mod journal_test;
 mod admission_test;
 
 pub use admission::DomainPermit;
+pub use contracts::{
+    AttemptIdentity, CancelReason, CommandEvent, CommandOutcome, CommandSpec, CommandTarget,
+    DestroyReport, DomainEnvironment, DomainPath, DomainPaths, FailureCategory, Stage, StepFilesId,
+    StepStateSnapshot,
+};
 pub use docker_paths::DockerPaths;
 pub use error::{ExecutionDomainCleanupFatalError, ExecutionDomainError};
+pub use state_bridge::ParsedStepState;
+pub use workspace_reader::DomainWorkspaceReader;
 
 use filesystem::{
     DirectoryIdentity, create_private_dir, directory_identity, io_error, sync_bound_directory,
@@ -81,13 +132,31 @@ pub struct ExecutionDomainRoot {
     identity: DirectoryIdentity,
     state: Arc<ExecutionDomainState>,
     admission: Arc<Semaphore>,
+    manager_tasks: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+    retained_cleanups: Arc<manager::RetainedCleanupRegistry>,
+    #[cfg(all(target_os = "linux", test))]
+    linux_reconcile: Option<Arc<linux::reconcile::LinuxReconcileContext>>,
+    #[cfg(all(target_os = "linux", test))]
+    reconciled: Arc<AtomicBool>,
+    #[cfg(all(target_os = "linux", test))]
+    reconcile_started: Arc<AtomicBool>,
+    #[cfg(test)]
+    provision_pause: Arc<Mutex<Option<ProvisionPause>>>,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct ProvisionPause {
+    started: tokio::sync::oneshot::Sender<()>,
+    proceed: tokio::sync::oneshot::Receiver<()>,
 }
 
 #[derive(Debug)]
-pub struct ExecutionDomain {
+pub(crate) struct TrustedBackend {
     root: PathBuf,
     root_identity: DirectoryIdentity,
     state: Arc<ExecutionDomainState>,
+    #[cfg(test)]
     attempt_id: Uuid,
     attempt_dir: PathBuf,
     attempt_identity: DirectoryIdentity,
@@ -101,10 +170,252 @@ pub struct ExecutionDomain {
     work_dir_identity: DirectoryIdentity,
     destroyed: bool,
     lifecycle: DomainLifecycle,
-    admission_permit: Option<OwnedSemaphorePermit>,
+    workspace: Option<trusted::TrustedStateStore>,
+    prepared_step: Option<StepFilesId>,
+}
+
+pub struct ExecutionDomain {
+    request: Option<tokio::sync::mpsc::Sender<manager::ManagerRequest>>,
+    state: Arc<ExecutionDomainState>,
+    root: PathBuf,
+    attempt_id: AttemptIdentity,
+    docker_endpoint: DockerEndpoint,
+    docker_paths: DockerPaths,
+    docker_config_dir_env: String,
+    docker_config_file: PathBuf,
+    private_tmp: PathBuf,
+    work_dir: PathBuf,
+    attempt_dir: PathBuf,
+    paths: DomainPaths,
+    environment: DomainEnvironment,
+    command_mapping: DomainCommandMapping,
+    workspace_reader: DomainWorkspaceReader,
+    explicit_destroy: bool,
+}
+
+#[derive(Clone)]
+enum DomainCommandMapping {
+    Trusted,
+    #[cfg(target_os = "linux")]
+    Sandboxed(Vec<(PathBuf, DomainPath)>),
+}
+
+impl DomainCommandMapping {
+    #[cfg(target_os = "linux")]
+    fn map_path(&self, path: &Path) -> Result<DomainPath, ExecutionDomainError> {
+        match self {
+            Self::Trusted => path
+                .to_str()
+                .ok_or(ExecutionDomainError::InvalidDomainPath)
+                .and_then(DomainPath::parse),
+            #[cfg(target_os = "linux")]
+            Self::Sandboxed(mappings) => {
+                let canonical = canonical_sandbox_path(path);
+                let path = canonical.as_path();
+                if mappings
+                    .iter()
+                    .any(|(_, target)| path.starts_with(target.as_str()))
+                {
+                    return path
+                        .to_str()
+                        .ok_or(ExecutionDomainError::InvalidDomainPath)
+                        .and_then(DomainPath::parse);
+                }
+                let (source, mut target) = mappings
+                    .iter()
+                    .filter(|(source, _)| path.starts_with(source))
+                    .max_by_key(|(source, _)| source.components().count())
+                    .map(|(source, target)| (source, target.clone()))
+                    .ok_or(ExecutionDomainError::InvalidDomainPath)?;
+                let relative = path
+                    .strip_prefix(source)
+                    .map_err(|_| ExecutionDomainError::InvalidDomainPath)?;
+                for component in relative.components() {
+                    let std::path::Component::Normal(component) = component else {
+                        return Err(ExecutionDomainError::InvalidDomainPath);
+                    };
+                    target = target.join(
+                        component
+                            .to_str()
+                            .ok_or(ExecutionDomainError::InvalidDomainPath)?,
+                    )?;
+                }
+                Ok(target)
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn executable_exists(&self, path: &DomainPath) -> bool {
+        let Self::Sandboxed(mappings) = self else {
+            return false;
+        };
+        let domain_path = Path::new(path.as_str());
+        let Some((source, target)) = mappings
+            .iter()
+            .filter(|(_, target)| domain_path.starts_with(target.as_str()))
+            .max_by_key(|(_, target)| Path::new(target.as_str()).components().count())
+        else {
+            return false;
+        };
+        let Ok(relative) = domain_path.strip_prefix(target.as_str()) else {
+            return false;
+        };
+        let Ok(metadata) = fs::metadata(source.join(relative)) else {
+            return false;
+        };
+        metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+    }
+
+    fn target(
+        &self,
+        program: &OsStr,
+        args: &[&OsStr],
+        cwd: &Path,
+        env: &HashMap<String, String>,
+    ) -> Result<CommandTarget, ExecutionDomainError> {
+        #[cfg(not(target_os = "linux"))]
+        let _ = env;
+        match self {
+            Self::Trusted => Ok(CommandTarget::Trusted {
+                program: program.to_os_string(),
+                args: args.iter().map(|arg| (*arg).to_os_string()).collect(),
+                cwd: cwd.to_path_buf(),
+            }),
+            #[cfg(target_os = "linux")]
+            Self::Sandboxed(_) => {
+                let program_path = Path::new(program);
+                let program = if program_path.is_absolute() {
+                    self.map_path(program_path)?
+                } else {
+                    let program = program
+                        .to_str()
+                        .ok_or(ExecutionDomainError::InvalidDomainPath)?;
+                    env.get("PATH")
+                        .into_iter()
+                        .flat_map(|path| path.split(':'))
+                        .filter(|path| !path.is_empty())
+                        .filter_map(|directory| {
+                            self.map_path(Path::new(directory).join(program).as_path())
+                                .ok()
+                        })
+                        .find(|candidate| self.executable_exists(candidate))
+                        .ok_or(ExecutionDomainError::InvalidDomainPath)?
+                };
+                let args = args
+                    .iter()
+                    .map(|arg| {
+                        let value = arg
+                            .to_str()
+                            .ok_or(ExecutionDomainError::InvalidDomainPath)?;
+                        let path = Path::new(arg);
+                        if path.is_absolute() {
+                            self.map_path(path).map(|path| path.as_str().to_owned())
+                        } else {
+                            Ok(value.to_owned())
+                        }
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(CommandTarget::Sandboxed {
+                    program,
+                    args,
+                    cwd: self.map_path(cwd)?,
+                })
+            }
+        }
+    }
+
+    fn environment(
+        &self,
+        supplied: &HashMap<String, String>,
+        owned: &DomainEnvironment,
+    ) -> Result<HashMap<String, String>, ExecutionDomainError> {
+        #[cfg(not(target_os = "linux"))]
+        let _ = owned;
+        match self {
+            Self::Trusted => Ok(supplied.clone()),
+            #[cfg(target_os = "linux")]
+            Self::Sandboxed(_) => {
+                let mut mapped = supplied.clone();
+                for reserved in [
+                    "GITHUB_ENV",
+                    "GITHUB_PATH",
+                    "GITHUB_OUTPUT",
+                    "GITHUB_STATE",
+                    "GITHUB_STEP_SUMMARY",
+                    "GITHUB_EVENT_PATH",
+                ] {
+                    mapped.remove(reserved);
+                }
+                for key in [
+                    "GITHUB_WORKSPACE",
+                    "RUNNER_TEMP",
+                    "RUNNER_TOOL_CACHE",
+                    "GITHUB_ACTION_PATH",
+                ] {
+                    if let Some(value) = mapped.get(key).cloned() {
+                        mapped.insert(
+                            key.into(),
+                            self.map_path(Path::new(&value))?.as_str().into(),
+                        );
+                    }
+                }
+                if let Some(path) = mapped.get("PATH").cloned() {
+                    let mut seen = std::collections::HashSet::new();
+                    let path = path
+                        .split(':')
+                        .filter(|part| !part.is_empty())
+                        .filter_map(|part| self.map_path(Path::new(part)).ok())
+                        .map(|part| part.as_str().to_owned())
+                        .filter(|part| seen.insert(part.clone()))
+                        .collect::<Vec<_>>()
+                        .join(":");
+                    mapped.insert("PATH".into(), path);
+                }
+                owned.merge(&mapped, "sandbox command")
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn canonical_sandbox_path(path: &Path) -> PathBuf {
+    for (alias, canonical) in [("/bin", "/usr/bin"), ("/sbin", "/usr/sbin")] {
+        if let Ok(relative) = path.strip_prefix(alias) {
+            return Path::new(canonical).join(relative);
+        }
+    }
+    path.to_path_buf()
+}
+
+impl std::fmt::Debug for ExecutionDomain {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ExecutionDomain")
+            .field("attempt_id", &self.attempt_id)
+            .finish_non_exhaustive()
+    }
 }
 
 impl ExecutionDomainRoot {
+    #[cfg(target_os = "linux")]
+    pub(crate) fn validate_reconciliation_proof(
+        proof: &crate::storage::RootLockProof,
+    ) -> Result<(), ExecutionDomainError> {
+        linux::dirfd::BoundDir::from_pinned_root(
+            proof
+                .try_clone_root()
+                .map_err(|error| ExecutionDomainError::Backend {
+                    attempt: None,
+                    stage: Stage::Filesystem,
+                    category: FailureCategory::Io,
+                    errno: error.raw_os_error(),
+                })?,
+            proof.root_path().to_owned(),
+        )?
+        .verify_binding()
+    }
+
     pub fn prepare(path: &Path, capacity: NonZeroUsize) -> Result<Self, ExecutionDomainError> {
         // Reject before any mutation: creating the directory first would leave
         // behind a non-UTF-8 path that fails every later start until removed
@@ -142,6 +453,16 @@ impl ExecutionDomainRoot {
             identity,
             state: Arc::new(ExecutionDomainState::new()),
             admission: Arc::new(Semaphore::new(capacity.get())),
+            manager_tasks: Arc::new(Mutex::new(Vec::new())),
+            retained_cleanups: Arc::new(manager::RetainedCleanupRegistry::default()),
+            #[cfg(all(target_os = "linux", test))]
+            linux_reconcile: None,
+            #[cfg(all(target_os = "linux", test))]
+            reconciled: Arc::new(AtomicBool::new(true)),
+            #[cfg(all(target_os = "linux", test))]
+            reconcile_started: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            provision_pause: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -153,8 +474,138 @@ impl ExecutionDomainRoot {
         self.state.ensure_healthy(&self.canonical_path)
     }
 
+    pub(crate) fn ensure_reconciled(&self) -> Result<(), ExecutionDomainError> {
+        #[cfg(all(target_os = "linux", test))]
+        if !self.reconciled.load(Ordering::Acquire) {
+            return Err(ExecutionDomainError::AdmissionClosed {
+                path: self.canonical_path.clone(),
+            });
+        }
+        Ok(())
+    }
+
+    #[cfg(all(target_os = "linux", test))]
+    pub async fn reconcile(&self) -> Result<(), ExecutionDomainError> {
+        let context = self.linux_reconcile.as_ref().cloned().ok_or_else(|| {
+            ExecutionDomainError::Backend {
+                attempt: None,
+                stage: Stage::Filesystem,
+                category: FailureCategory::NotReady,
+                errno: None,
+            }
+        })?;
+        if self.reconcile_started.swap(true, Ordering::AcqRel) {
+            return Err(ExecutionDomainError::AdmissionClosed {
+                path: self.canonical_path.clone(),
+            });
+        }
+        let result = tokio::task::spawn_blocking(move || context.reconcile())
+            .await
+            .map_err(|_| {
+                self.state.poison();
+                ExecutionDomainError::Backend {
+                    attempt: None,
+                    stage: Stage::Filesystem,
+                    category: FailureCategory::Unavailable,
+                    errno: None,
+                }
+            })?;
+        match result {
+            Ok(()) => {
+                self.reconciled.store(true, Ordering::Release);
+                Ok(())
+            }
+            Err(error) => {
+                self.state.poison();
+                Err(error)
+            }
+        }
+    }
+
+    #[cfg(all(target_os = "linux", test))]
+    pub(in crate::job::execution_domain) fn prepare_linux_recovery_for_test<
+        F: linux::cgroup::CgroupFilesystem,
+    >(
+        lock: crate::storage::RootLockProof,
+        cgroups: linux::cgroup::CgroupRoot<F>,
+        capacity: NonZeroUsize,
+    ) -> Result<Self, ExecutionDomainError> {
+        let context = Arc::new(linux::reconcile::LinuxReconcileContext::from_root_lock(
+            lock, cgroups,
+        )?);
+        let canonical_path = context.active_path();
+        let identity = directory_identity(&canonical_path, "reading job resource root identity")?;
+        Ok(Self {
+            canonical_path,
+            identity,
+            state: Arc::new(ExecutionDomainState::new()),
+            admission: Arc::new(Semaphore::new(capacity.get())),
+            manager_tasks: Arc::new(Mutex::new(Vec::new())),
+            retained_cleanups: Arc::new(manager::RetainedCleanupRegistry::default()),
+            linux_reconcile: Some(context),
+            reconciled: Arc::new(AtomicBool::new(false)),
+            reconcile_started: Arc::new(AtomicBool::new(false)),
+            provision_pause: Arc::new(Mutex::new(None)),
+        })
+    }
+
     pub(crate) fn poisoned_receiver(&self) -> watch::Receiver<bool> {
         self.state.poisoned.subscribe()
+    }
+
+    pub(crate) fn register_manager(&self, handle: tokio::task::JoinHandle<()>) {
+        let mut handles = self
+            .manager_tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        handles.retain(|handle| !handle.is_finished());
+        handles.push(handle);
+    }
+
+    pub(crate) async fn drain_managers(&self) {
+        let handles = {
+            let mut handles = self
+                .manager_tasks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            std::mem::take(&mut *handles)
+        };
+        for handle in handles {
+            let _ = handle.await;
+        }
+        self.retained_cleanups.retry_all();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retained_cleanup_count_for_test(&self) -> usize {
+        self.retained_cleanups.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pause_after_provision_for_test(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (started, started_rx) = tokio::sync::oneshot::channel();
+        let (proceed, proceed_rx) = tokio::sync::oneshot::channel();
+        *self
+            .provision_pause
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(ProvisionPause {
+            started,
+            proceed: proceed_rx,
+        });
+        (started_rx, proceed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn take_provision_pause_for_test(&self) -> Option<ProvisionPause> {
+        self.provision_pause
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
     }
 
     #[cfg(test)]
@@ -165,7 +616,7 @@ impl ExecutionDomainRoot {
     fn create_domain_with_id(
         &self,
         attempt_id: Uuid,
-    ) -> Result<ExecutionDomain, ExecutionDomainError> {
+    ) -> Result<TrustedBackend, ExecutionDomainError> {
         self.create_with_id_and_sync(attempt_id, File::sync_all)
     }
 
@@ -173,7 +624,7 @@ impl ExecutionDomainRoot {
         &self,
         attempt_id: Uuid,
         sync_root: F,
-    ) -> Result<ExecutionDomain, ExecutionDomainError>
+    ) -> Result<TrustedBackend, ExecutionDomainError>
     where
         F: FnOnce(&File) -> io::Result<()>,
     {
@@ -263,10 +714,11 @@ impl ExecutionDomainRoot {
         sync_bound_directory(&self.canonical_path, self.identity, sync_root)
             .inspect_err(|_| self.state.poison())?;
 
-        Ok(ExecutionDomain {
+        Ok(TrustedBackend {
             root: self.canonical_path.clone(),
             root_identity: self.identity,
             state: Arc::clone(&self.state),
+            #[cfg(test)]
             attempt_id,
             attempt_dir,
             attempt_identity,
@@ -280,12 +732,13 @@ impl ExecutionDomainRoot {
             work_dir_identity,
             destroyed: false,
             lifecycle,
-            admission_permit: None,
+            workspace: None,
+            prepared_step: None,
         })
     }
 }
 
-impl ExecutionDomain {
+impl TrustedBackend {
     pub(crate) fn mark_running(&mut self) -> Result<(), ExecutionDomainError> {
         self.lifecycle.transition(DomainState::Running)
     }
@@ -294,50 +747,52 @@ impl ExecutionDomain {
         self.lifecycle.transition(DomainState::Cleaning)
     }
 
-    pub fn docker_config_dir(&self) -> &Path {
+    #[cfg(test)]
+    pub(crate) fn docker_config_dir(&self) -> &Path {
         self.docker_paths.config_dir()
     }
-
-    pub fn docker_endpoint(&self) -> &DockerEndpoint {
+    #[cfg(test)]
+    pub(crate) fn docker_endpoint(&self) -> &DockerEndpoint {
         &self.docker_endpoint
     }
-
-    pub fn docker_paths(&self) -> &DockerPaths {
+    #[cfg(test)]
+    pub(crate) fn docker_paths(&self) -> &DockerPaths {
         &self.docker_paths
     }
-
-    pub fn config_file(&self) -> &Path {
+    #[cfg(test)]
+    pub(crate) fn config_file(&self) -> &Path {
         &self.docker_config_file
     }
-
-    pub fn private_tmp(&self) -> &Path {
+    #[cfg(test)]
+    pub(crate) fn private_tmp(&self) -> &Path {
         &self.private_tmp
     }
-
-    pub fn work_dir(&self) -> &Path {
+    #[cfg(test)]
+    pub(crate) fn work_dir(&self) -> &Path {
         &self.work_dir
     }
-
-    pub fn attempt_dir(&self) -> &Path {
+    #[cfg(test)]
+    pub(crate) fn attempt_dir(&self) -> &Path {
         &self.attempt_dir
     }
-
-    pub fn attempt_id(&self) -> Uuid {
+    #[cfg(test)]
+    pub(crate) fn attempt_id(&self) -> Uuid {
         self.attempt_id
     }
-
-    pub fn validate_override(
+    #[cfg(test)]
+    pub(crate) fn validate_override(
         &self,
         value: &str,
         source: &'static str,
     ) -> Result<(), ExecutionDomainError> {
-        if value == self.docker_config_dir_env.as_str() {
-            return Ok(());
+        if value == self.docker_config_dir_env {
+            Ok(())
+        } else {
+            Err(ExecutionDomainError::ReservedEnvironmentOverride { source })
         }
-        Err(ExecutionDomainError::ReservedEnvironmentOverride { source })
     }
-
-    pub fn insert_into_host_env(
+    #[cfg(test)]
+    pub(crate) fn insert_into_host_env(
         &self,
         env: &mut HashMap<String, String>,
         source: &'static str,
@@ -346,13 +801,18 @@ impl ExecutionDomain {
             self.validate_override(existing, source)?;
         }
         env.insert(
-            DOCKER_CONFIG_ENV.to_string(),
+            DOCKER_CONFIG_ENV.to_owned(),
             self.docker_config_dir_env.clone(),
         );
         Ok(())
     }
 
-    pub fn destroy(mut self) -> Result<(), ExecutionDomainError> {
+    #[cfg(test)]
+    fn destroy(mut self) -> Result<(), ExecutionDomainError> {
+        self.destroy_with_remover(|path| fs::remove_dir_all(path))
+    }
+
+    fn destroy_in_place(&mut self) -> Result<(), ExecutionDomainError> {
         self.destroy_with_remover(|path| fs::remove_dir_all(path))
     }
 
@@ -451,7 +911,285 @@ impl ExecutionDomain {
     }
 }
 
+impl ExecutionDomain {
+    fn sender(
+        &self,
+    ) -> Result<&tokio::sync::mpsc::Sender<manager::ManagerRequest>, ExecutionDomainError> {
+        self.request
+            .as_ref()
+            .ok_or_else(|| ExecutionDomainError::AdmissionClosed {
+                path: self.root.clone(),
+            })
+    }
+
+    pub async fn bind_workspace(
+        &self,
+        workspace: &crate::job::workspace::Workspace,
+    ) -> Result<(), ExecutionDomainError> {
+        let (reply, response) = tokio::sync::oneshot::channel();
+        self.sender()?
+            .send(manager::ManagerRequest::BindWorkspace {
+                paths: workspace.state_paths(),
+                work: workspace.workspace_dir().to_path_buf(),
+                reply,
+            })
+            .await
+            .map_err(|_| ExecutionDomainError::PoisonedRoot {
+                path: self.root.clone(),
+            })?;
+        response
+            .await
+            .map_err(|_| ExecutionDomainError::PoisonedRoot {
+                path: self.root.clone(),
+            })?
+    }
+
+    pub(crate) async fn mark_running(&self) -> Result<(), ExecutionDomainError> {
+        let (reply, response) = tokio::sync::oneshot::channel();
+        self.sender()?
+            .send(manager::ManagerRequest::MarkRunning { reply })
+            .await
+            .map_err(|_| ExecutionDomainError::PoisonedRoot {
+                path: self.root.clone(),
+            })?;
+        response
+            .await
+            .map_err(|_| ExecutionDomainError::PoisonedRoot {
+                path: self.root.clone(),
+            })?
+    }
+
+    pub(crate) async fn mark_cleaning(&self) -> Result<(), ExecutionDomainError> {
+        let (reply, response) = tokio::sync::oneshot::channel();
+        self.sender()?
+            .send(manager::ManagerRequest::MarkCleaning { reply })
+            .await
+            .map_err(|_| ExecutionDomainError::PoisonedRoot {
+                path: self.root.clone(),
+            })?;
+        response
+            .await
+            .map_err(|_| ExecutionDomainError::PoisonedRoot {
+                path: self.root.clone(),
+            })?
+    }
+
+    pub async fn run(
+        &self,
+        spec: CommandSpec,
+        output: tokio::sync::mpsc::Sender<CommandEvent>,
+        cancelled: tokio_util::sync::CancellationToken,
+    ) -> Result<CommandOutcome, ExecutionDomainError> {
+        let (reply, response) = tokio::sync::oneshot::channel();
+        self.sender()?
+            .send(manager::ManagerRequest::Run {
+                spec,
+                output,
+                cancelled,
+                reply,
+            })
+            .await
+            .map_err(|_| ExecutionDomainError::PoisonedRoot {
+                path: self.root.clone(),
+            })?;
+        response
+            .await
+            .map_err(|_| ExecutionDomainError::PoisonedRoot {
+                path: self.root.clone(),
+            })?
+    }
+
+    pub(crate) fn command_target(
+        &self,
+        program: &OsStr,
+        args: &[&OsStr],
+        cwd: &Path,
+        env: &HashMap<String, String>,
+    ) -> Result<CommandTarget, ExecutionDomainError> {
+        self.command_mapping.target(program, args, cwd, env)
+    }
+
+    pub(crate) fn command_environment(
+        &self,
+        supplied: &HashMap<String, String>,
+    ) -> Result<HashMap<String, String>, ExecutionDomainError> {
+        self.command_mapping
+            .environment(supplied, &self.environment)
+    }
+
+    pub async fn prepare_step(&self, event: &[u8]) -> Result<StepFilesId, ExecutionDomainError> {
+        let (reply, response) = tokio::sync::oneshot::channel();
+        self.sender()?
+            .send(manager::ManagerRequest::PrepareStep {
+                event: event.to_vec(),
+                reply,
+            })
+            .await
+            .map_err(|_| ExecutionDomainError::PoisonedRoot {
+                path: self.root.clone(),
+            })?;
+        response
+            .await
+            .map_err(|_| ExecutionDomainError::PoisonedRoot {
+                path: self.root.clone(),
+            })?
+    }
+
+    pub async fn read_step(
+        &self,
+        id: StepFilesId,
+    ) -> Result<StepStateSnapshot, ExecutionDomainError> {
+        let (reply, response) = tokio::sync::oneshot::channel();
+        self.sender()?
+            .send(manager::ManagerRequest::ReadStep { id, reply })
+            .await
+            .map_err(|_| ExecutionDomainError::PoisonedRoot {
+                path: self.root.clone(),
+            })?;
+        response
+            .await
+            .map_err(|_| ExecutionDomainError::PoisonedRoot {
+                path: self.root.clone(),
+            })?
+    }
+
+    pub async fn cancel(&self, reason: CancelReason) -> Result<(), ExecutionDomainError> {
+        let (reply, response) = tokio::sync::oneshot::channel();
+        self.sender()?
+            .send(manager::ManagerRequest::Cancel { reason, reply })
+            .await
+            .map_err(|_| ExecutionDomainError::PoisonedRoot {
+                path: self.root.clone(),
+            })?;
+        response
+            .await
+            .map_err(|_| ExecutionDomainError::PoisonedRoot {
+                path: self.root.clone(),
+            })?
+    }
+
+    pub(crate) async fn authorize_external_revocation(&self) -> Result<(), ExecutionDomainError> {
+        let (reply, response) = tokio::sync::oneshot::channel();
+        self.sender()?
+            .send(manager::ManagerRequest::AuthorizeExternalRevocation { reply })
+            .await
+            .map_err(|_| ExecutionDomainError::PoisonedRoot {
+                path: self.root.clone(),
+            })?;
+        response
+            .await
+            .map_err(|_| ExecutionDomainError::PoisonedRoot {
+                path: self.root.clone(),
+            })?
+    }
+
+    #[cfg(test)]
+    async fn panic_manager_for_test(&self) -> Result<(), ExecutionDomainError> {
+        self.sender()?
+            .send(manager::ManagerRequest::Panic)
+            .await
+            .map_err(|_| ExecutionDomainError::PoisonedRoot {
+                path: self.root.clone(),
+            })
+    }
+
+    pub async fn destroy(&mut self) -> Result<DestroyReport, ExecutionDomainError> {
+        let (reply, response) = tokio::sync::oneshot::channel();
+        let sender = self.request.as_ref().cloned().ok_or_else(|| {
+            ExecutionDomainError::AdmissionClosed {
+                path: self.root.clone(),
+            }
+        })?;
+        sender
+            .send(manager::ManagerRequest::Destroy { reply })
+            .await
+            .map_err(|_| ExecutionDomainError::PoisonedRoot {
+                path: self.root.clone(),
+            })?;
+        let result = response
+            .await
+            .map_err(|_| ExecutionDomainError::PoisonedRoot {
+                path: self.root.clone(),
+            })?;
+        if result.is_ok() {
+            self.explicit_destroy = true;
+            self.request.take();
+        }
+        result
+    }
+
+    pub fn paths(&self) -> &DomainPaths {
+        &self.paths
+    }
+    pub fn environment(&self) -> &DomainEnvironment {
+        &self.environment
+    }
+    pub fn workspace_reader(&self) -> Option<DomainWorkspaceReader> {
+        (self.paths == DomainPaths::sandboxed()).then(|| self.workspace_reader.clone())
+    }
+    pub fn docker_config_dir(&self) -> &Path {
+        self.docker_paths.config_dir()
+    }
+    pub fn docker_endpoint(&self) -> &DockerEndpoint {
+        &self.docker_endpoint
+    }
+    pub fn docker_paths(&self) -> &DockerPaths {
+        &self.docker_paths
+    }
+    pub fn config_file(&self) -> &Path {
+        &self.docker_config_file
+    }
+    pub fn private_tmp(&self) -> &Path {
+        &self.private_tmp
+    }
+    pub fn work_dir(&self) -> &Path {
+        &self.work_dir
+    }
+    pub fn attempt_dir(&self) -> &Path {
+        &self.attempt_dir
+    }
+    pub fn attempt_id(&self) -> Uuid {
+        self.attempt_id.uuid()
+    }
+
+    pub fn validate_override(
+        &self,
+        value: &str,
+        source: &'static str,
+    ) -> Result<(), ExecutionDomainError> {
+        if value == self.docker_config_dir_env {
+            Ok(())
+        } else {
+            Err(ExecutionDomainError::ReservedEnvironmentOverride { source })
+        }
+    }
+
+    pub fn insert_into_host_env(
+        &self,
+        env: &mut HashMap<String, String>,
+        source: &'static str,
+    ) -> Result<(), ExecutionDomainError> {
+        if let Some(existing) = env.get(DOCKER_CONFIG_ENV) {
+            self.validate_override(existing, source)?;
+        }
+        env.insert(
+            DOCKER_CONFIG_ENV.to_owned(),
+            self.docker_config_dir_env.clone(),
+        );
+        Ok(())
+    }
+}
+
 impl Drop for ExecutionDomain {
+    fn drop(&mut self) {
+        if !self.explicit_destroy {
+            self.state.poison();
+            self.request.take();
+        }
+    }
+}
+
+impl Drop for TrustedBackend {
     fn drop(&mut self) {
         if !self.destroyed {
             self.state.poison();

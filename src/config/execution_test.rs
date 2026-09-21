@@ -1,12 +1,95 @@
 use std::num::NonZeroUsize;
 
 use super::{ExecutionConfig, ExecutionProfile};
+use crate::config::resources::{ExecutionResources, ResourceLimits};
 
 #[test]
 fn defaults_to_trusted_host_with_one_reserved_slot() {
     let config = ExecutionConfig::default();
     assert_eq!(config.profile, ExecutionProfile::TrustedHost);
     assert_eq!(config.max_active_domains, NonZeroUsize::new(1).unwrap());
+    assert!(config.resources.is_none());
+}
+
+#[test]
+fn absent_resources_preserve_trusted_host_configuration() {
+    let config: ExecutionConfig =
+        toml::from_str("profile = 'trusted-host'\nmax_active_domains = 2\n").unwrap();
+
+    assert_eq!(config.profile, ExecutionProfile::TrustedHost);
+    assert!(config.resources.is_none());
+    assert!(!toml::to_string(&config).unwrap().contains("resources"));
+}
+
+#[test]
+fn parses_explicit_global_and_attempt_resources() {
+    let text = r#"
+profile = "sandboxed"
+max_active_domains = 20
+
+[resources.global]
+memory_high = "256 MiB"
+memory_max = "512 MiB"
+memory_swap_max = "0"
+cpu_quota = "150%"
+cpu_weight = 100
+pids_max = "256"
+io_weight = 100
+
+[resources.attempt]
+memory_high = "256 MiB"
+memory_max = "512 MiB"
+memory_swap_max = "0"
+cpu_quota = "150%"
+cpu_weight = 100
+pids_max = "256"
+io_weight = 100
+"#;
+
+    let config: ExecutionConfig = toml::from_str(text).unwrap();
+
+    assert!(config.resources.is_some());
+    assert!(config.resources.unwrap().attempt.validate().is_ok());
+}
+
+#[test]
+fn incomplete_resources_are_not_filled_with_defaults() {
+    let error = toml::from_str::<ExecutionConfig>(
+        "profile = 'trusted-host'\n[resources]\n[resources.global]\nmemory_high = '1 MiB'\n",
+    )
+    .unwrap_err();
+
+    assert!(error.to_string().contains("missing field"));
+}
+
+fn invalid_limits() -> ResourceLimits {
+    ResourceLimits {
+        memory_high: "2 MiB".into(),
+        memory_max: "1 MiB".into(),
+        memory_swap_max: "0".into(),
+        cpu_quota: "100%".into(),
+        cpu_weight: 100,
+        pids_max: "10".into(),
+        io_weight: 100,
+        io_max: Vec::new(),
+    }
+}
+
+#[test]
+fn explicit_resource_types_round_trip_through_execution_config() {
+    let limits = invalid_limits();
+    let config = ExecutionConfig {
+        resources: Some(ExecutionResources {
+            global: limits.clone(),
+            attempt: limits,
+        }),
+        ..Default::default()
+    };
+
+    let serialized = toml::to_string(&config).unwrap();
+    let reparsed: ExecutionConfig = toml::from_str(&serialized).unwrap();
+
+    assert_eq!(reparsed, config);
 }
 
 #[test]

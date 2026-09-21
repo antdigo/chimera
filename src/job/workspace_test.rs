@@ -28,6 +28,26 @@ fn creates_all_directories() {
 }
 
 #[test]
+fn typed_step_adapter_retains_host_paths_and_parsing() {
+    let (_tmp, workspace) = make_workspace();
+    std::fs::write(workspace.env_file(), "STALE=value").unwrap();
+    workspace.prepare_step_state(b"{\"event\":true}").unwrap();
+    assert_eq!(
+        std::fs::read(workspace.event_file()).unwrap(),
+        b"{\"event\":true}"
+    );
+    assert_eq!(workspace.read_env_file().unwrap().len(), 0);
+    std::fs::write(workspace.env_file(), "DOCKER_HOST=unix:///host.sock\n").unwrap();
+    std::fs::write(workspace.output_file(), "Answer=old\nanswer=new\n").unwrap();
+    std::fs::write(workspace.step_summary_file(), "summary\n").unwrap();
+    let parsed = workspace.step_state_snapshot().unwrap().parse().unwrap();
+    assert_eq!(parsed.env["DOCKER_HOST"], "unix:///host.sock");
+    assert_eq!(parsed.output["Answer"], "new");
+    assert_eq!(parsed.summary, "summary\n");
+    assert!(!workspace.env_file().starts_with("/run/chimera"));
+}
+
+#[test]
 fn cleanup_removes_dirs() {
     let (_tmp, ws) = make_workspace();
     assert!(ws.workspace_dir().exists());

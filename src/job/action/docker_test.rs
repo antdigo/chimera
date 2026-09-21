@@ -142,7 +142,7 @@ async fn run_engine_test_container(
     let masks = crate::job::secret_masker::shared_masker_for_test(&[]);
     let (log_tx, _log_rx) = tokio::sync::mpsc::channel(32);
     let log_sender = LogSender::new_for_test(log_tx, Arc::clone(&masks));
-    let mut job_state = JobState::new(masks, HashMap::new(), serde_json::json!({}));
+    let processor = OutputProcessor::new(log_sender, masks, false);
     let env = HashMap::new();
     let args = vec!["-c".to_string(), "sleep 30".to_string()];
     let params = RunDockerParams {
@@ -153,9 +153,8 @@ async fn run_engine_test_container(
         entrypoint: Some("/bin/sh"),
         args: &args,
         env: &env,
-        job_state: &mut job_state,
+        processor: &processor,
         workspace: &workspace,
-        log_sender: &log_sender,
         cancel_token,
         docker_resources: None,
     };
@@ -550,9 +549,133 @@ fn test_docker_config(tmp: &tempfile::TempDir) -> crate::job::execution_domain::
         NonZeroUsize::new(1).unwrap(),
     )
     .unwrap();
-    futures::executor::block_on(root.reserve())
-        .and_then(|permit| permit.provision())
-        .unwrap()
+    futures::executor::block_on(async {
+        root.reserve()
+            .await?
+            .provision(crate::job::execution_domain::AttemptIdentity::new())
+            .await
+    })
+    .unwrap()
+}
+
+#[tokio::test]
+async fn docker_action_rekeys_saved_state_before_returning_command_error() {
+    let (temp, workspace) = action_workspace();
+    let domain = test_docker_config(&temp);
+    domain.bind_workspace(&workspace).await.unwrap();
+    let state_id = domain.prepare_step(b"{}").await.unwrap();
+    let masks = crate::job::secret_masker::shared_masker_for_test(&[]);
+    let (log_tx, _log_rx) = tokio::sync::mpsc::channel(8);
+    let processor = OutputProcessor::new(
+        LogSender::new_for_test(log_tx, Arc::clone(&masks)),
+        masks,
+        false,
+    );
+    processor
+        .process_line("::save-state name=cleanup::ready")
+        .await;
+    let mut state = action_job_state();
+    let step = docker_action_step(None);
+    let command_result: Result<StepResult> = Err(anyhow::anyhow!("command canary"));
+
+    let error = complete_docker_action_transaction(
+        &domain,
+        state_id,
+        &processor,
+        &mut state,
+        &step,
+        command_result,
+    )
+    .await
+    .unwrap_err();
+
+    assert!(format!("{error:#}").contains("command canary"));
+    assert!(!state.action_states.contains_key(""));
+    assert_eq!(
+        state
+            .action_states
+            .get("step")
+            .and_then(|values| values.get("cleanup"))
+            .map(String::as_str),
+        Some("ready")
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn docker_action_transactions_apply_each_workflow_command_once() {
+    let docker =
+        crate::docker::client::connect(&crate::docker::endpoint::DockerEndpoint::trusted_host())
+            .unwrap();
+    crate::docker::client::ping(&docker).await.unwrap();
+    crate::docker::client::ensure_image(&docker, "alpine:3.19", None)
+        .await
+        .unwrap();
+    let (temp, workspace) = action_workspace();
+    let action_root = temp.path().join("action");
+    std::fs::create_dir(&action_root).unwrap();
+    let action_dir = TrustedActionDirectory::resolve(&action_root, Path::new(".")).unwrap();
+    let domain = test_docker_config(&temp);
+    let masks = crate::job::secret_masker::shared_masker_for_test(&[]);
+    let log_sender = LogSender::new_for_test(tokio::sync::mpsc::channel(32).0, masks);
+    let mut state = action_job_state();
+    let step = docker_action_step(None);
+    let node_runtimes = crate::node::NodeRuntimes::single("node".into());
+    let execution = JobExecutionContext::new(&domain, None, &node_runtimes);
+    let mut metadata = make_metadata_with_entrypoints(
+        Some("/bin/sh"),
+        None,
+        None,
+        Some(vec![
+            "-c".into(),
+            "printf '%s\\n' '::add-path::/stdout/docker-action'; printf '/file/docker-action\\n' > \"$GITHUB_PATH\"".into(),
+        ]),
+    );
+    metadata.runs.image = Some("docker://alpine:3.19".into());
+
+    run_docker_metadata_action(
+        &action_dir,
+        &metadata,
+        "main",
+        &step,
+        &mut state,
+        &workspace,
+        &HashMap::new(),
+        &log_sender,
+        &DockerActionBuilder::new(),
+        &DockerBuildScope::new("test-runner", "test/exactly-once"),
+        None,
+        Instant::now() + Duration::from_secs(30),
+        &CancellationToken::new(),
+        &execution,
+    )
+    .await
+    .unwrap();
+
+    metadata.runs.args = Some(vec!["-c".into(), "true".into()]);
+    run_docker_metadata_action(
+        &action_dir,
+        &metadata,
+        "main",
+        &step,
+        &mut state,
+        &workspace,
+        &HashMap::new(),
+        &log_sender,
+        &DockerActionBuilder::new(),
+        &DockerBuildScope::new("test-runner", "test/exactly-once"),
+        None,
+        Instant::now() + Duration::from_secs(30),
+        &CancellationToken::new(),
+        &execution,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        state.path_prepends,
+        ["/stdout/docker-action", "/file/docker-action"]
+    );
 }
 
 const DOCKER_ACTION_ENDPOINT_CHILD_CASE: &str = "CHIMERA_DOCKER_ACTION_ENDPOINT_CHILD_CASE";
@@ -702,6 +825,83 @@ async fn docker_action_metadata_routes_image_operation_to_domain_endpoint() {
             .iter()
             .any(|request| request.contains("/images/fixture-image/"))
     );
+}
+
+#[tokio::test]
+#[ignore]
+async fn docker_action_replaced_state_discards_buffered_log_commands() {
+    let docker =
+        crate::docker::client::connect(&crate::docker::endpoint::DockerEndpoint::trusted_host())
+            .unwrap();
+    crate::docker::client::ping(&docker).await.unwrap();
+    crate::docker::client::ensure_image(&docker, "alpine:3.19", None)
+        .await
+        .unwrap();
+    let (temp, workspace) = action_workspace();
+    let action_root = temp.path().join("action");
+    std::fs::create_dir(&action_root).unwrap();
+    let action_dir = TrustedActionDirectory::resolve(&action_root, Path::new(".")).unwrap();
+    let mut metadata = make_metadata_with_entrypoints(
+        Some("/bin/sh"),
+        None,
+        None,
+        Some(vec![
+            "-c".into(),
+            "printf '%s\\n' '::set-env name=STDOUT_ENV::leak' '::set-output name=stdout_output::leak'; printf 'FILE_ENV=leak\\n' > \"$GITHUB_ENV\"; rm \"$GITHUB_OUTPUT\"; printf 'file_output=leak\\n' > \"$GITHUB_OUTPUT\"".into(),
+        ]),
+    );
+    metadata.runs.image = Some("docker://alpine:3.19".into());
+    let mut state = action_job_state();
+    let masks = crate::job::secret_masker::shared_masker_for_test(&[]);
+    let (log_tx, _log_rx) = tokio::sync::mpsc::channel(32);
+    let log_sender = LogSender::new_for_test(log_tx, masks);
+    let domain = test_docker_config(&temp);
+    let node_runtimes = crate::node::NodeRuntimes::single("node".into());
+    let execution = JobExecutionContext::new(&domain, None, &node_runtimes);
+
+    let error = run_docker_metadata_action(
+        &action_dir,
+        &metadata,
+        "main",
+        &docker_action_step(None),
+        &mut state,
+        &workspace,
+        &HashMap::new(),
+        &log_sender,
+        &DockerActionBuilder::new(),
+        &DockerBuildScope::new("test-runner", "test/atomic-state"),
+        None,
+        Instant::now() + Duration::from_secs(30),
+        &CancellationToken::new(),
+        &execution,
+    )
+    .await
+    .unwrap_err();
+
+    assert!(
+        matches!(
+            error.downcast_ref::<crate::job::execution_domain::ExecutionDomainError>(),
+            Some(
+                crate::job::execution_domain::ExecutionDomainError::Backend {
+                    category: crate::job::execution_domain::FailureCategory::IdentityMismatch,
+                    ..
+                }
+            )
+        ),
+        "{error}"
+    );
+    assert!(state.env.is_empty());
+    assert!(state.outputs.is_empty());
+    assert!(state.path_prepends.is_empty());
+    assert!(state.action_states.is_empty());
+    let next_error = domain.prepare_step(b"{}").await.unwrap_err();
+    assert!(matches!(
+        next_error,
+        crate::job::execution_domain::ExecutionDomainError::Backend {
+            category: crate::job::execution_domain::FailureCategory::IdentityMismatch,
+            ..
+        }
+    ));
 }
 
 #[tokio::test]
@@ -1127,7 +1327,7 @@ async fn engine_action_contents_come_from_pinned_context_after_root_replacement(
     let masks = crate::job::secret_masker::shared_masker_for_test(&[]);
     let (log_tx, _log_rx) = tokio::sync::mpsc::channel(32);
     let log_sender = LogSender::new_for_test(log_tx, Arc::clone(&masks));
-    let mut job_state = JobState::new(masks, HashMap::new(), serde_json::json!({}));
+    let job_state = JobState::new(masks, HashMap::new(), serde_json::json!({}));
 
     let builder = DockerActionBuilder::new();
     let scope = DockerBuildScope::new(
@@ -1159,6 +1359,11 @@ async fn engine_action_contents_come_from_pinned_context_after_root_replacement(
         "-c".to_string(),
         "test \"$(cat /baked/sentinel)\" = original".to_string(),
     ];
+    let processor = OutputProcessor::new(
+        log_sender.clone(),
+        job_state.secret_masker.clone(),
+        job_state.debug_enabled,
+    );
     let result = run_docker_container(RunDockerParams {
         docker: &docker,
         image: &built.image_id,
@@ -1167,9 +1372,8 @@ async fn engine_action_contents_come_from_pinned_context_after_root_replacement(
         entrypoint: Some("/bin/sh"),
         args: &args,
         env: &env,
-        job_state: &mut job_state,
+        processor: &processor,
         workspace: &workspace,
-        log_sender: &log_sender,
         cancel_token: &CancellationToken::new(),
         docker_resources: None,
     })
@@ -1236,7 +1440,7 @@ async fn engine_action_contents_come_from_pinned_context_after_symlink_root_repl
     let masks = crate::job::secret_masker::shared_masker_for_test(&[]);
     let (log_tx, _log_rx) = tokio::sync::mpsc::channel(32);
     let log_sender = LogSender::new_for_test(log_tx, Arc::clone(&masks));
-    let mut job_state = JobState::new(masks, HashMap::new(), serde_json::json!({}));
+    let job_state = JobState::new(masks, HashMap::new(), serde_json::json!({}));
 
     let builder = DockerActionBuilder::new();
     let scope = DockerBuildScope::new(
@@ -1266,6 +1470,11 @@ async fn engine_action_contents_come_from_pinned_context_after_symlink_root_repl
         "-c".to_string(),
         "test \"$(cat /baked/sentinel)\" = original".to_string(),
     ];
+    let processor = OutputProcessor::new(
+        log_sender.clone(),
+        job_state.secret_masker.clone(),
+        job_state.debug_enabled,
+    );
     let result = run_docker_container(RunDockerParams {
         docker: &docker,
         image: &built.image_id,
@@ -1274,9 +1483,8 @@ async fn engine_action_contents_come_from_pinned_context_after_symlink_root_repl
         entrypoint: Some("/bin/sh"),
         args: &args,
         env: &env,
-        job_state: &mut job_state,
+        processor: &processor,
         workspace: &workspace,
-        log_sender: &log_sender,
         cancel_token: &CancellationToken::new(),
         docker_resources: None,
     })

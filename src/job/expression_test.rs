@@ -21,6 +21,7 @@ fn empty_ctx() -> ExprContext<'static> {
         job_failed: false,
         job_cancelled: false,
         workspace_path: None,
+        workspace_reader: None,
     }
 }
 
@@ -43,6 +44,7 @@ fn ctx_with_env(env: &HashMap<String, String>) -> ExprContext<'_> {
         job_failed: false,
         job_cancelled: false,
         workspace_path: None,
+        workspace_reader: None,
     }
 }
 
@@ -465,6 +467,7 @@ fn secrets_lookup() {
         job_failed: false,
         job_cancelled: false,
         workspace_path: None,
+        workspace_reader: None,
     };
 
     assert_eq!(
@@ -502,6 +505,7 @@ fn secrets_lookup_is_case_insensitive() {
         job_failed: false,
         job_cancelled: false,
         workspace_path: None,
+        workspace_reader: None,
     };
 
     assert_eq!(
@@ -539,6 +543,7 @@ fn secrets_root_context_name_is_case_insensitive() {
         job_failed: false,
         job_cancelled: false,
         workspace_path: None,
+        workspace_reader: None,
     };
 
     assert_eq!(
@@ -568,6 +573,7 @@ fn secrets_root_serializes_the_allowed_secret_map() {
         job_failed: false,
         job_cancelled: false,
         workspace_path: None,
+        workspace_reader: None,
     };
 
     let serialized = resolve_expression("${{ toJSON(secrets) }}", &ctx);
@@ -607,6 +613,7 @@ fn steps_output_lookup() {
         job_failed: false,
         job_cancelled: false,
         workspace_path: None,
+        workspace_reader: None,
     };
 
     assert_eq!(
@@ -648,6 +655,7 @@ fn steps_outcome_success() {
         job_failed: false,
         job_cancelled: false,
         workspace_path: None,
+        workspace_reader: None,
     };
 
     assert_eq!(
@@ -686,6 +694,7 @@ fn steps_outcome_with_continue_on_error() {
         job_failed: false,
         job_cancelled: false,
         workspace_path: None,
+        workspace_reader: None,
     };
 
     assert_eq!(
@@ -728,6 +737,7 @@ fn steps_lookup_is_case_insensitive() {
         job_failed: false,
         job_cancelled: false,
         workspace_path: None,
+        workspace_reader: None,
     };
 
     assert_eq!(
@@ -766,6 +776,7 @@ fn steps_field_names_are_case_insensitive() {
         job_failed: false,
         job_cancelled: false,
         workspace_path: None,
+        workspace_reader: None,
     };
 
     assert_eq!(
@@ -808,6 +819,7 @@ fn needs_output_lookup() {
         job_failed: false,
         job_cancelled: false,
         workspace_path: None,
+        workspace_reader: None,
     };
 
     assert_eq!(
@@ -879,6 +891,7 @@ fn needs_condition_check() {
         job_failed: false,
         job_cancelled: false,
         workspace_path: None,
+        workspace_reader: None,
     };
 
     assert!(evaluate_condition(
@@ -1337,6 +1350,7 @@ fn ctx_with_json(data: &serde_json::Value) -> ExprContext<'_> {
         job_failed: false,
         job_cancelled: false,
         workspace_path: None,
+        workspace_reader: None,
     }
 }
 
@@ -1475,6 +1489,7 @@ fn bracket_notation_steps() {
         job_failed: false,
         job_cancelled: false,
         workspace_path: None,
+        workspace_reader: None,
     };
 
     assert_eq!(
@@ -1828,6 +1843,7 @@ fn workflow_pattern_condition_with_wildcard() {
         job_failed: false,
         job_cancelled: false,
         workspace_path: None,
+        workspace_reader: None,
     };
 
     assert!(evaluate_condition(
@@ -2111,4 +2127,56 @@ fn original_runner_labels_condition_survives_failure_and_cancellation() {
         Some("always() && contains(runner.labels, 'self-hosted')"),
         &ctx,
     ));
+}
+
+#[test]
+fn hashfiles_prefers_domain_reader_over_host_workspace_fallback() {
+    use sha2::{Digest, Sha256};
+
+    use crate::job::execution_domain::DomainWorkspaceReader;
+
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = temp.path().join("work");
+    std::fs::create_dir(&workspace).unwrap();
+    std::fs::write(workspace.join("domain.txt"), b"domain").unwrap();
+    let fallback = temp.path().join("fallback");
+    std::fs::create_dir(&fallback).unwrap();
+    std::fs::write(fallback.join("host.txt"), b"host").unwrap();
+
+    let mut ctx = empty_ctx();
+    ctx.workspace_path = Some(fallback.to_string_lossy().into_owned());
+    ctx.workspace_reader = Some(DomainWorkspaceReader::new(workspace).unwrap());
+    let digest = parse_and_eval("hashFiles('*.txt')", &ctx)
+        .unwrap()
+        .to_display();
+
+    let mut expected = Sha256::new();
+    expected.update(b"domain");
+    assert_eq!(digest, format!("{:x}", expected.finalize()));
+}
+
+#[test]
+fn domain_reader_matches_trusted_hashfiles_for_empty_files() {
+    use crate::job::execution_domain::DomainWorkspaceReader;
+
+    let workspace = tempfile::tempdir().unwrap();
+    std::fs::write(workspace.path().join("a.empty"), []).unwrap();
+    std::fs::write(workspace.path().join("b.empty"), []).unwrap();
+
+    let mut trusted = empty_ctx();
+    trusted.workspace_path = Some(workspace.path().to_string_lossy().into_owned());
+    let trusted_digest = parse_and_eval("hashFiles('*.empty', 'a.*')", &trusted)
+        .unwrap()
+        .to_display();
+
+    let mut sandboxed = empty_ctx();
+    sandboxed.workspace_path = Some(workspace.path().to_string_lossy().into_owned());
+    sandboxed.workspace_reader =
+        Some(DomainWorkspaceReader::new(workspace.path().to_path_buf()).unwrap());
+    let sandboxed_digest = parse_and_eval("hashFiles('*.empty', 'a.*')", &sandboxed)
+        .unwrap()
+        .to_display();
+
+    assert_ne!(trusted_digest, "");
+    assert_eq!(sandboxed_digest, trusted_digest);
 }

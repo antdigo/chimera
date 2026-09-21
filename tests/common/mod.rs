@@ -16,7 +16,7 @@ use chimera::github::auth::TokenManager;
 use chimera::job::action::ActionCache;
 use chimera::job::client::{JobClient, JobConclusion};
 use chimera::job::execute::{JobExecutionContext, run_all_steps};
-use chimera::job::execution_domain::ExecutionDomainRoot;
+use chimera::job::execution_domain::{AttemptIdentity, ExecutionDomainRoot};
 use chimera::job::schema::JobManifest;
 use chimera::job::workspace::Workspace;
 use chimera::runner::env::{build_base_env, build_container_env};
@@ -132,11 +132,33 @@ impl TestEnv {
         access_token: &str,
         registry_auth: Option<&RegistryAuth>,
     ) -> anyhow::Result<ObservedRun> {
-        let domain = self.execution_domains.reserve().await?.provision()?;
+        let mut domain = self
+            .execution_domains
+            .reserve()
+            .await?
+            .provision(AttemptIdentity::new())
+            .await?;
+        domain.bind_workspace(&self.workspace).await?;
         let docker_config_dir = domain.docker_config_dir().to_path_buf();
         let attempt_dir = domain.attempt_dir().to_path_buf();
         let run_result = match build_base_env(manifest, &self.workspace, "test-runner", &domain) {
-            Ok(base_env) => {
+            Ok(mut base_env) => {
+                // Some integration probes intentionally seed the legacy PATH
+                // command file before execution to interpose a shell wrapper.
+                // Preserve that test fixture without reintroducing production
+                // Workspace reads after the domain transaction migration.
+                if let Ok(paths) = self.workspace.read_path_file()
+                    && !paths.is_empty()
+                {
+                    let prepend = paths.join(":");
+                    let path = match base_env.get("PATH") {
+                        Some(existing) if !existing.is_empty() => {
+                            format!("{prepend}:{existing}")
+                        }
+                        _ => prepend,
+                    };
+                    base_env.insert("PATH".into(), path);
+                }
                 let action_cache =
                     ActionCache::new(self.actions_dir.clone(), reqwest::Client::new());
                 let execution = JobExecutionContext::new(&domain, None, node_runtimes);
@@ -158,7 +180,7 @@ impl TestEnv {
             }
             Err(error) => Err(error),
         };
-        let cleanup_result = domain.destroy();
+        let cleanup_result = domain.destroy().await.map(|_| ());
 
         let (conclusion, outputs) = match (run_result, cleanup_result) {
             (Ok(value), Ok(())) => value,
@@ -275,7 +297,13 @@ impl TestEnv {
         manifest: &JobManifest,
         docker_resources: &JobDockerResources,
     ) -> anyhow::Result<(JobConclusion, HashMap<String, String>)> {
-        let domain = self.execution_domains.reserve().await?.provision()?;
+        let mut domain = self
+            .execution_domains
+            .reserve()
+            .await?
+            .provision(AttemptIdentity::new())
+            .await?;
+        domain.bind_workspace(&self.workspace).await?;
         let base_env = build_container_env(manifest, &self.workspace, "test-runner");
         let action_cache = ActionCache::new(self.actions_dir.clone(), reqwest::Client::new());
         let node_runtimes =
@@ -296,7 +324,7 @@ impl TestEnv {
             None,
         )
         .await;
-        let cleanup_result = domain.destroy();
+        let cleanup_result = domain.destroy().await.map(|_| ());
 
         match (run_result, cleanup_result) {
             (Ok(value), Ok(())) => Ok(value),

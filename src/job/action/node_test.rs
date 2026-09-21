@@ -3,7 +3,7 @@ use std::num::NonZeroUsize;
 
 use super::*;
 use crate::job::execute::{JobExecutionContext, JobState, StepConclusion};
-use crate::job::execution_domain::{DOCKER_CONFIG_ENV, ExecutionDomainRoot};
+use crate::job::execution_domain::{AttemptIdentity, DOCKER_CONFIG_ENV, ExecutionDomainRoot};
 use crate::job::logs::StepLogger;
 use crate::job::schema::{Step, StepReference};
 use crate::job::workspace::Workspace;
@@ -15,9 +15,13 @@ fn test_docker_config(tmp: &tempfile::TempDir) -> crate::job::execution_domain::
         NonZeroUsize::new(1).unwrap(),
     )
     .unwrap();
-    futures::executor::block_on(root.reserve())
-        .and_then(|permit| permit.provision())
-        .unwrap()
+    futures::executor::block_on(async {
+        root.reserve()
+            .await?
+            .provision(AttemptIdentity::new())
+            .await
+    })
+    .unwrap()
 }
 
 fn make_test_workspace(tmp: &tempfile::TempDir) -> Workspace {
@@ -176,6 +180,141 @@ async fn node_action_diagnostics_omit_action_paths_and_script_names() {
     assert_eq!(result.conclusion, StepConclusion::Succeeded);
     assert!(trace.contains("running node action"), "{trace}");
     assert!(!trace.contains(canary), "{trace}");
+}
+
+#[tokio::test]
+async fn node_action_malformed_state_discards_stdout_and_file_mutations() {
+    let tmp = tempfile::tempdir().unwrap();
+    let workspace = make_test_workspace(&tmp);
+    let action_dir = tmp.path().join("action");
+    std::fs::create_dir_all(&action_dir).unwrap();
+    std::fs::write(
+        action_dir.join("main.sh"),
+        "printf '%s\\n' '::set-env name=STDOUT_ENV::leak' \
+         '::set-output name=stdout_output::leak' \
+         '::add-path::/stdout/leak' \
+         '::save-state name=stdout_state::leak'; \
+         printf 'FILE_ENV=leak\\n' > \"$GITHUB_ENV\"; \
+         printf '\\377' >> \"$GITHUB_ENV\"; \
+         printf 'file_output=leak\\n' > \"$GITHUB_OUTPUT\"\n",
+    )
+    .unwrap();
+    let domain = test_docker_config(&tmp);
+    let base_env = HashMap::from([(
+        DOCKER_CONFIG_ENV.to_string(),
+        domain.docker_config_dir().to_string_lossy().into_owned(),
+    )]);
+    let node_runtimes = crate::node::NodeRuntimes::single("/bin/sh".into());
+    let execution = JobExecutionContext::new(&domain, None, &node_runtimes);
+    let masks = crate::job::secret_masker::shared_masker_for_test(&[]);
+    let logger = StepLogger::results_for_test(masks.clone());
+    let mut state = JobState::new(masks, HashMap::new(), serde_json::json!({}));
+
+    let error = run_node_action(
+        &action_dir,
+        &make_node_metadata("main.sh"),
+        "main",
+        &make_action_step("Malformed"),
+        &mut state,
+        &workspace,
+        &base_env,
+        logger.sender(),
+        &CancellationToken::new(),
+        &execution,
+    )
+    .await
+    .unwrap_err();
+
+    assert!(
+        error
+            .downcast_ref::<crate::job::execution_domain::ExecutionDomainError>()
+            .is_some()
+    );
+    assert!(state.env.is_empty());
+    assert!(state.outputs.is_empty());
+    assert!(state.path_prepends.is_empty());
+    assert!(state.action_states.is_empty());
+    let next = domain.prepare_step(b"{}").await.unwrap();
+    domain.read_step(next).await.unwrap();
+}
+
+#[tokio::test]
+async fn node_post_replaced_state_discards_mutations_and_terminates_transaction() {
+    let tmp = tempfile::tempdir().unwrap();
+    let workspace = make_test_workspace(&tmp);
+    let action_dir = tmp.path().join("action");
+    std::fs::create_dir_all(&action_dir).unwrap();
+    std::fs::write(
+        action_dir.join("post.sh"),
+        "test \"$STATE_existing\" = kept || exit 42; \
+         printf '%s\\n' '::set-env name=POST_STDOUT_ENV::leak' \
+         '::save-state name=post_stdout_state::leak'; \
+         rm \"$GITHUB_STATE\"; \
+         printf 'post_file_state=leak\\n' > \"$GITHUB_STATE\"\n",
+    )
+    .unwrap();
+    let mut metadata = make_node_metadata("main.sh");
+    metadata.runs.post = Some("post.sh".into());
+    let mut step = make_action_step("Post");
+    step.context_name = Some("action_post".into());
+    let domain = test_docker_config(&tmp);
+    let base_env = HashMap::from([(
+        DOCKER_CONFIG_ENV.to_string(),
+        domain.docker_config_dir().to_string_lossy().into_owned(),
+    )]);
+    let node_runtimes = crate::node::NodeRuntimes::single("/bin/sh".into());
+    let execution = JobExecutionContext::new(&domain, None, &node_runtimes);
+    let masks = crate::job::secret_masker::shared_masker_for_test(&[]);
+    let logger = StepLogger::results_for_test(masks.clone());
+    let mut state = JobState::new(masks, HashMap::new(), serde_json::json!({}));
+    state.action_states.insert(
+        "action".into(),
+        HashMap::from([("existing".into(), "kept".into())]),
+    );
+
+    let error = run_node_action(
+        &action_dir,
+        &metadata,
+        "post",
+        &step,
+        &mut state,
+        &workspace,
+        &base_env,
+        logger.sender(),
+        &CancellationToken::new(),
+        &execution,
+    )
+    .await
+    .unwrap_err();
+
+    assert!(
+        matches!(
+            error.downcast_ref::<crate::job::execution_domain::ExecutionDomainError>(),
+            Some(
+                crate::job::execution_domain::ExecutionDomainError::Backend {
+                    category: crate::job::execution_domain::FailureCategory::IdentityMismatch,
+                    ..
+                }
+            )
+        ),
+        "{error}"
+    );
+    assert!(state.env.is_empty());
+    assert_eq!(
+        state.action_states,
+        HashMap::from([(
+            "action".into(),
+            HashMap::from([("existing".into(), "kept".into())])
+        )])
+    );
+    let next_error = domain.prepare_step(b"{}").await.unwrap_err();
+    assert!(matches!(
+        next_error,
+        crate::job::execution_domain::ExecutionDomainError::Backend {
+            category: crate::job::execution_domain::FailureCategory::IdentityMismatch,
+            ..
+        }
+    ));
 }
 
 #[tokio::test]

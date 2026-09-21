@@ -58,7 +58,14 @@ jobs:
             sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           fi
 
+      - name: Prepare immutable root-owned test input
+        run: |
+          sudo install -d -o root -g root -m 0755 "$RUNNER_TEMP/chimera-immutable-input"
+          sudo install -o root -g root -m 0644 /dev/null "$RUNNER_TEMP/chimera-immutable-input/tool"
+
       - name: Run unit tests
+        env:
+          CHIMERA_TEST_IMMUTABLE_INPUT: ${{ runner.temp }}/chimera-immutable-input
         run: |
           mkdir -p "$RUNNER_TEMP/chimera-tests"
           TMPDIR="$RUNNER_TEMP/chimera-tests" cargo test --lib
@@ -149,6 +156,9 @@ jobs:
             suite-args: --test execution_domain_docker_test --test composite_test
           - name: lib
             suite-args: --lib
+            # Native Linux isolation fixtures require a dedicated delegated
+            # host, not the rootless Docker daemon used by this shard.
+            test-filters: "--skip job::execution_domain::linux::"
     steps:
       - uses: actions/checkout@v4
 

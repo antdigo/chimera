@@ -10,7 +10,7 @@ use chrono::Utc;
 use tempfile::TempDir;
 
 use super::*;
-use crate::config::{ExecutionConfig, ExecutionProfile};
+use crate::config::{ExecutionConfig, ExecutionProfile, ExecutionResources, ResourceLimits};
 use crate::storage::{RootLock, RootLockError};
 
 #[test]
@@ -19,6 +19,7 @@ fn sandboxed_profile_is_rejected_before_runtime_start() {
         execution: ExecutionConfig {
             profile: ExecutionProfile::Sandboxed,
             max_active_domains: NonZeroUsize::new(20).unwrap(),
+            resources: None,
         },
         ..Default::default()
     };
@@ -36,16 +37,21 @@ async fn sandboxed_run_rejects_before_daemon_owned_side_effects() {
     let root = TempDir::new().unwrap();
     let paths = ChimeraPaths::new(root.path().to_path_buf());
     let root_lock = RootLock::acquire(root.path()).unwrap();
+    #[cfg(target_os = "linux")]
+    let root_lock_proof = root_lock.reconciliation_proof().unwrap();
     let daemon = Daemon {
         paths: paths.clone(),
         config: ChimeraConfig {
             execution: ExecutionConfig {
                 profile: ExecutionProfile::Sandboxed,
                 max_active_domains: NonZeroUsize::new(20).unwrap(),
+                resources: None,
             },
             ..Default::default()
         },
         _root_lock: root_lock,
+        #[cfg(target_os = "linux")]
+        _root_lock_proof: root_lock_proof,
     };
     let before = std::fs::read_dir(root.path())
         .unwrap()
@@ -69,6 +75,38 @@ async fn sandboxed_run_rejects_before_daemon_owned_side_effects() {
     assert!(!paths.pid_file().exists());
     assert!(!paths.job_resources_dir().exists());
     assert!(!paths.cache_entries_dir().exists());
+}
+
+#[test]
+fn sandboxed_gate_precedes_resource_validation() {
+    let invalid = ResourceLimits {
+        memory_high: "2 MiB".into(),
+        memory_max: "1 MiB".into(),
+        memory_swap_max: "0".into(),
+        cpu_quota: "0%".into(),
+        cpu_weight: 0,
+        pids_max: "0".into(),
+        io_weight: 0,
+        io_max: Vec::new(),
+    };
+    let config = ChimeraConfig {
+        execution: ExecutionConfig {
+            profile: ExecutionProfile::Sandboxed,
+            max_active_domains: NonZeroUsize::new(20).unwrap(),
+            resources: Some(ExecutionResources {
+                global: invalid.clone(),
+                attempt: invalid,
+            }),
+        },
+        ..Default::default()
+    };
+
+    let error = validate_execution_profile(&config).unwrap_err();
+
+    assert_eq!(
+        error.to_string(),
+        "sandboxed execution profile is not available in this build"
+    );
 }
 
 #[test]
@@ -115,6 +153,48 @@ fn daemon_holds_root_lock_for_its_lifetime() {
             Err(error) => panic!("root lock not acquirable after daemon drop: {error:?}"),
         }
     }
+}
+
+#[test]
+fn reconciliation_proof_keeps_the_exclusive_root_lock_live() {
+    let root = TempDir::new().unwrap();
+    let lock = RootLock::acquire(root.path()).unwrap();
+    let proof = lock.reconciliation_proof().unwrap();
+    let _pinned_root = proof.try_clone_root().unwrap();
+    assert_eq!(proof.root_path(), root.path());
+    drop(proof.lock_reconciliation());
+    drop(lock);
+
+    assert!(matches!(
+        RootLock::acquire(root.path()),
+        Err(RootLockError::Busy)
+    ));
+    drop(proof);
+    assert!(RootLock::acquire(root.path()).is_ok());
+}
+
+#[test]
+fn reconciliation_proof_serializes_same_process_recovery() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let root = TempDir::new().unwrap();
+    let lock = RootLock::acquire(root.path()).unwrap();
+    let first = lock.reconciliation_proof().unwrap();
+    let second = lock.reconciliation_proof().unwrap();
+    let entered = Arc::new(AtomicBool::new(false));
+    let held = first.lock_reconciliation();
+
+    std::thread::scope(|scope| {
+        let thread_entered = Arc::clone(&entered);
+        scope.spawn(move || {
+            let _guard = second.lock_reconciliation();
+            thread_entered.store(true, Ordering::Release);
+        });
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(!entered.load(Ordering::Acquire));
+        drop(held);
+    });
+    assert!(entered.load(Ordering::Acquire));
 }
 
 const LOCK_TEST_TIMEOUT: Duration = Duration::from_secs(5);
@@ -489,9 +569,13 @@ fn startup_preparation_rejects_stale_job_resources_without_deleting_them() {
         NonZeroUsize::new(1).unwrap(),
     )
     .unwrap();
-    let stale = futures::executor::block_on(root.reserve())
-        .and_then(|permit| permit.provision())
-        .unwrap();
+    let stale = futures::executor::block_on(async {
+        root.reserve()
+            .await?
+            .provision(crate::job::execution_domain::AttemptIdentity::new())
+            .await
+    })
+    .unwrap();
     let stale_dir = stale.attempt_dir().to_path_buf();
 
     let error = prepare_daemon_root(&paths, NonZeroUsize::new(1).unwrap()).unwrap_err();

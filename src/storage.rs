@@ -6,6 +6,8 @@ use std::mem::MaybeUninit;
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Component, Path, PathBuf};
+#[cfg(test)]
+use std::sync::{Arc, Mutex, MutexGuard};
 
 const MAX_SYMLINKS: usize = 40;
 const MAX_SYMLINK_BYTES: usize = 1024 * 1024;
@@ -13,7 +15,21 @@ const MAX_SYMLINK_BYTES: usize = 1024 * 1024;
 #[derive(Debug)]
 pub(crate) struct RootLock {
     root: File,
+    #[cfg(any(target_os = "linux", test))]
+    root_path: PathBuf,
     _file: File,
+    #[cfg(test)]
+    reconciliation_gate: Arc<Mutex<()>>,
+}
+
+#[cfg(any(target_os = "linux", test))]
+#[derive(Debug)]
+pub(crate) struct RootLockProof {
+    root: File,
+    root_path: PathBuf,
+    _file: File,
+    #[cfg(test)]
+    reconciliation_gate: Arc<Mutex<()>>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -40,6 +56,7 @@ enum PathPart {
 
 impl RootLock {
     pub(crate) fn acquire(root: &Path) -> Result<RootLock, RootLockError> {
+        let requested_root = root.to_owned();
         match validate_existing_root(root) {
             Ok(()) => {}
             Err(RootLockError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -60,11 +77,64 @@ impl RootLock {
             return Err(RootLockError::Io(error));
         }
 
-        Ok(Self { root, _file: file })
+        #[cfg(any(target_os = "linux", test))]
+        let root_path = root_path_from_fd(&root).unwrap_or(requested_root);
+        #[cfg(not(any(target_os = "linux", test)))]
+        let _ = requested_root;
+        Ok(Self {
+            root,
+            #[cfg(any(target_os = "linux", test))]
+            root_path,
+            _file: file,
+            #[cfg(test)]
+            reconciliation_gate: Arc::new(Mutex::new(())),
+        })
     }
 
     pub(crate) fn try_clone_root(&self) -> std::io::Result<File> {
         self.root.try_clone()
+    }
+
+    #[cfg(any(target_os = "linux", test))]
+    pub(crate) fn reconciliation_proof(&self) -> std::io::Result<RootLockProof> {
+        Ok(RootLockProof {
+            root: self.root.try_clone()?,
+            root_path: self.root_path.clone(),
+            _file: self._file.try_clone()?,
+            #[cfg(test)]
+            reconciliation_gate: Arc::clone(&self.reconciliation_gate),
+        })
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+impl RootLockProof {
+    pub(crate) fn try_clone_root(&self) -> std::io::Result<File> {
+        self.root.try_clone()
+    }
+
+    pub(crate) fn root_path(&self) -> &Path {
+        &self.root_path
+    }
+
+    #[cfg(test)]
+    pub(crate) fn lock_reconciliation(&self) -> MutexGuard<'_, ()> {
+        self.reconciliation_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn root_path_from_fd(file: &File) -> io::Result<PathBuf> {
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd()))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = file;
+        Err(io::Error::from(io::ErrorKind::Unsupported))
     }
 }
 
