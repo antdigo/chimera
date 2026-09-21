@@ -40,11 +40,13 @@ fn descriptor_rejects_wrong_attempt_and_noncanonical_or_expired_metadata() {
     let now = Utc::now();
     let attempt_id = Uuid::new_v4();
     let grant_id = Uuid::new_v4();
+    let different_grant_id = Uuid::new_v4();
+    assert_ne!(grant_id, different_grant_id);
     let valid_descriptor = descriptor(attempt_id, grant_id);
 
     assert_eq!(
         validate_descriptor(&valid_descriptor, Uuid::new_v4(), now),
-        Err(PolicyError::InvalidCapabilityDescriptor)
+        Err(PolicyError::CapabilityMismatch)
     );
 
     for local_path in [
@@ -54,12 +56,13 @@ fn descriptor_rejects_wrong_attempt_and_noncanonical_or_expired_metadata() {
         "/run/docker.sock".into(),
         "/run/chimera/capabilities/production.sock".into(),
         format!("/run/chimera/capabilities/{grant_id}.sock\0suffix"),
+        format!("/run/chimera/capabilities/{different_grant_id}.sock"),
     ] {
         let mut candidate = descriptor(attempt_id, grant_id);
         candidate.local_path = local_path;
         assert_eq!(
             validate_descriptor(&candidate, attempt_id, now),
-            Err(PolicyError::InvalidCapabilityDescriptor)
+            Err(PolicyError::CapabilityMismatch)
         );
     }
 
@@ -74,7 +77,7 @@ fn descriptor_rejects_wrong_attempt_and_noncanonical_or_expired_metadata() {
         candidate.local_path = format!("/run/chimera/capabilities/{candidate_grant}.sock");
         assert_eq!(
             validate_descriptor(&candidate, attempt_id, now),
-            Err(PolicyError::InvalidCapabilityDescriptor)
+            Err(PolicyError::CapabilityMismatch)
         );
     }
 }
@@ -144,7 +147,7 @@ async fn binding_rejects_nil_attempt_and_redacts_its_handle() {
 
     assert!(matches!(
         CacheCapabilityBinding::new(Uuid::nil(), handle.clone()),
-        Err(PolicyError::InvalidCapabilityDescriptor)
+        Err(PolicyError::CapabilityMismatch)
     ));
     let binding = CacheCapabilityBinding::new(Uuid::new_v4(), handle).unwrap();
     assert_eq!(format!("{binding:?}"), "CacheCapabilityBinding([redacted])");

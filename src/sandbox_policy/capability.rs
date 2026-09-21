@@ -35,7 +35,7 @@ pub fn validate_descriptor(
         || descriptor.local_path
             != format!("/run/chimera/capabilities/{}.sock", descriptor.grant_id)
     {
-        return Err(PolicyError::InvalidCapabilityDescriptor);
+        return Err(PolicyError::CapabilityMismatch);
     }
 
     Ok(())
@@ -49,7 +49,7 @@ pub struct CacheCapabilityBinding {
 impl CacheCapabilityBinding {
     pub fn new(attempt_id: Uuid, handle: CapabilityHandle) -> Result<Self, PolicyError> {
         if attempt_id.is_nil() {
-            return Err(PolicyError::InvalidCapabilityDescriptor);
+            return Err(PolicyError::CapabilityMismatch);
         }
 
         Ok(Self { attempt_id, handle })
