@@ -357,7 +357,7 @@ async fn assert_interrupted_exec_cannot_write_into_next_step(interruption: ExecI
         vec![
             "sh".into(),
             "-c".into(),
-            "touch /github/workflow/exec-started; sleep 1; printf 'LATE_ENV=leak\\n' > \"$GITHUB_ENV\"; printf '%s\\n' '::set-env name=LATE_STDOUT::leak'; sleep 30".into(),
+            "for control in /tmp/.chimera-exec-*.pid; do test ! -e \"$control\" || printf '1\\n' > \"$control\"; done; setsid sh -c 'sleep 1; printf \"LATE_ENV=leak\\n\" > \"$GITHUB_ENV\"' </dev/null >/dev/null 2>&1 & touch /github/workflow/exec-started; sleep 30".into(),
         ],
         &env,
         "/",
@@ -400,7 +400,7 @@ async fn assert_interrupted_exec_cannot_write_into_next_step(interruption: ExecI
         vec![
             "sh".into(),
             "-c".into(),
-            "sleep 2; printf '%s\\n' '::add-path::/stdout/docker-exec'; printf '/file/docker-exec\\n' > \"$GITHUB_PATH\"; printf 'NEXT_ENV=ok\\n' > \"$GITHUB_ENV\"".into(),
+            "sleep 2; set -- /tmp/.chimera-exec-*.pid; test ! -e \"$1\"; printf '%s\\n' '::add-path::/stdout/docker-exec'; printf '/file/docker-exec\\n' > \"$GITHUB_PATH\"; printf 'NEXT_ENV=ok\\n' > \"$GITHUB_ENV\"".into(),
         ],
         &env,
         "/",
@@ -493,26 +493,33 @@ async fn timed_out_exec_is_stopped_before_state_snapshot() {
     assert_interrupted_exec_cannot_write_into_next_step(ExecInterruption::Timeout).await;
 }
 
-struct DisconnectingDockerProxy {
+#[derive(Clone, Copy)]
+enum ProxyFault {
+    DisconnectStart,
+    DelayCreate,
+    DelayStart,
+}
+
+struct FaultingDockerProxy {
     _directory: tempfile::TempDir,
     socket: PathBuf,
     task: tokio::task::JoinHandle<()>,
 }
 
-impl DisconnectingDockerProxy {
-    async fn start(upstream: &Path) -> Self {
+impl FaultingDockerProxy {
+    async fn start(upstream: &Path, fault: ProxyFault) -> Self {
         let directory = tempfile::tempdir().unwrap();
         let socket = directory.path().join("docker.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let upstream = upstream.to_owned();
-        let disconnected = Arc::new(AtomicBool::new(false));
+        let injected = Arc::new(AtomicBool::new(false));
         let task = tokio::spawn(async move {
             loop {
                 let Ok((mut client, _)) = listener.accept().await else {
                     return;
                 };
                 let upstream = upstream.clone();
-                let disconnected = Arc::clone(&disconnected);
+                let injected = Arc::clone(&injected);
                 tokio::spawn(async move {
                     let mut daemon = UnixStream::connect(upstream).await.unwrap();
                     let mut request = Vec::with_capacity(1024);
@@ -526,8 +533,24 @@ impl DisconnectingDockerProxy {
                             break;
                         }
                     }
+                    let headers = String::from_utf8_lossy(&request).to_ascii_lowercase();
+                    let content_length = headers
+                        .lines()
+                        .find_map(|line| line.strip_prefix("content-length:"))
+                        .and_then(|value| value.trim().parse::<usize>().ok())
+                        .unwrap_or(0);
+                    let mut body = vec![0_u8; content_length];
+                    client.read_exact(&mut body).await.unwrap();
                     daemon.write_all(&request).await.unwrap();
+                    daemon.write_all(&body).await.unwrap();
                     let request_line = request.split(|byte| *byte == b'\r').next().unwrap_or(&[]);
+                    let is_exec_create = request_line.starts_with(b"POST ")
+                        && request_line
+                            .windows(b"/containers/".len())
+                            .any(|part| part == b"/containers/")
+                        && request_line
+                            .windows(b"/exec ".len())
+                            .any(|part| part == b"/exec ");
                     let is_exec_start = request_line.starts_with(b"POST ")
                         && request_line
                             .windows(b"/exec/".len())
@@ -535,18 +558,26 @@ impl DisconnectingDockerProxy {
                         && request_line
                             .windows(b"/start".len())
                             .any(|part| part == b"/start");
-                    let should_disconnect = is_exec_start
-                        && disconnected
+                    let matches_fault = match fault {
+                        ProxyFault::DisconnectStart | ProxyFault::DelayStart => is_exec_start,
+                        ProxyFault::DelayCreate => is_exec_create,
+                    };
+                    let should_inject = matches_fault
+                        && injected
                             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
                             .is_ok();
-                    if should_disconnect {
-                        tokio::select! {
-                            _ = tokio::io::copy_bidirectional(&mut client, &mut daemon) => {}
-                            () = tokio::time::sleep(Duration::from_millis(300)) => {}
+                    if should_inject {
+                        match fault {
+                            ProxyFault::DisconnectStart => {
+                                tokio::time::sleep(Duration::from_millis(300)).await;
+                                return;
+                            }
+                            ProxyFault::DelayCreate | ProxyFault::DelayStart => {
+                                tokio::time::sleep(Duration::from_millis(500)).await;
+                            }
                         }
-                    } else {
-                        let _ = tokio::io::copy_bidirectional(&mut client, &mut daemon).await;
                     }
+                    let _ = tokio::io::copy_bidirectional(&mut client, &mut daemon).await;
                 });
             }
         });
@@ -558,10 +589,152 @@ impl DisconnectingDockerProxy {
     }
 }
 
-impl Drop for DisconnectingDockerProxy {
+impl Drop for FaultingDockerProxy {
     fn drop(&mut self) {
         self.task.abort();
     }
+}
+
+#[tokio::test]
+async fn pre_cancelled_exec_does_not_contact_docker() {
+    let directory = tempfile::tempdir().unwrap();
+    let socket = directory.path().join("docker.sock");
+    let _listener = UnixListener::bind(&socket).unwrap();
+    let docker = bollard::Docker::connect_with_unix(
+        socket.to_str().unwrap(),
+        120,
+        bollard::API_DEFAULT_VERSION,
+    )
+    .unwrap();
+    let masks = crate::job::secret_masker::shared_masker_for_test(&[]);
+    let processor = OutputProcessor::new(
+        LogSender::new_for_test(tokio::sync::mpsc::channel(8).0, masks.clone()),
+        masks,
+        false,
+    );
+    let cancel = CancellationToken::new();
+    cancel.cancel();
+
+    let result = docker_exec(
+        &docker,
+        "never-contact-daemon",
+        vec!["irrelevant".into()],
+        &HashMap::new(),
+        "/",
+        &processor,
+        Duration::from_secs(30),
+        &cancel,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(result.conclusion, StepConclusion::Cancelled);
+}
+
+async fn assert_rpc_deadline_recovers_same_container(fault: ProxyFault) {
+    let docker =
+        crate::docker::client::connect(&crate::docker::endpoint::DockerEndpoint::trusted_host())
+            .unwrap();
+    crate::docker::client::ping(&docker).await.unwrap();
+    crate::docker::client::ensure_image(&docker, "alpine:latest", None)
+        .await
+        .unwrap();
+    let docker_host = std::env::var("DOCKER_HOST").expect("DinD test requires DOCKER_HOST");
+    let upstream = docker_host
+        .strip_prefix("unix://")
+        .expect("DinD test requires a Unix Docker socket");
+    let proxy = FaultingDockerProxy::start(Path::new(upstream), fault).await;
+    let proxied_docker = bollard::Docker::connect_with_unix(
+        proxy.socket.to_str().unwrap(),
+        120,
+        bollard::API_DEFAULT_VERSION,
+    )
+    .unwrap();
+    let name = format!("chimera-exec-rpc-deadline-{}", uuid::Uuid::new_v4());
+    let container = docker
+        .create_container(
+            Some(bollard::container::CreateContainerOptions {
+                name: name.as_str(),
+                ..Default::default()
+            }),
+            bollard::container::Config {
+                image: Some("alpine:latest"),
+                cmd: Some(vec!["tail", "-f", "/dev/null"]),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    docker
+        .start_container::<String>(&container.id, None)
+        .await
+        .unwrap();
+    let masks = crate::job::secret_masker::shared_masker_for_test(&[]);
+    let processor = OutputProcessor::new(
+        LogSender::new_for_test(tokio::sync::mpsc::channel(8).0, masks.clone()),
+        masks,
+        false,
+    );
+
+    let interrupted = docker_exec(
+        &proxied_docker,
+        &container.id,
+        vec!["sh".into(), "-c".into(), "sleep 30".into()],
+        &HashMap::new(),
+        "/",
+        &processor,
+        Duration::from_millis(100),
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    let next = docker_exec(
+        &proxied_docker,
+        &container.id,
+        vec!["sh".into(), "-c".into(), "exit 0".into()],
+        &HashMap::new(),
+        "/",
+        &processor,
+        Duration::from_secs(5),
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(interrupted.conclusion, StepConclusion::Failed);
+    assert_eq!(next.conclusion, StepConclusion::Succeeded);
+    assert_eq!(
+        docker
+            .inspect_container(&container.id, None)
+            .await
+            .unwrap()
+            .state
+            .and_then(|state| state.running),
+        Some(true)
+    );
+
+    let _ = docker.stop_container(&container.id, None).await;
+    let _ = docker
+        .remove_container(
+            &container.id,
+            Some(bollard::container::RemoveContainerOptions {
+                force: true,
+                ..Default::default()
+            }),
+        )
+        .await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn create_exec_deadline_recovers_same_container() {
+    assert_rpc_deadline_recovers_same_container(ProxyFault::DelayCreate).await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn start_exec_deadline_recovers_same_container() {
+    assert_rpc_deadline_recovers_same_container(ProxyFault::DelayStart).await;
 }
 
 #[tokio::test]
@@ -578,7 +751,7 @@ async fn early_exec_stream_end_is_terminalized_before_next_step() {
     let upstream = docker_host
         .strip_prefix("unix://")
         .expect("DinD test requires a Unix Docker socket");
-    let proxy = DisconnectingDockerProxy::start(Path::new(upstream)).await;
+    let proxy = FaultingDockerProxy::start(Path::new(upstream), ProxyFault::DisconnectStart).await;
     let proxied_docker = bollard::Docker::connect_with_unix(
         proxy.socket.to_str().unwrap(),
         120,

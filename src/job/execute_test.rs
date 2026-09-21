@@ -673,7 +673,7 @@ async fn unterminated_docker_exec_failure_does_not_consume_or_apply_state() {
     processor.process_line("::add-path::/stdout/leak").await;
     let mut state = test_job_state();
     let command_result: Result<StepResult> =
-        Err(crate::docker::exec::DockerExecTerminalizationError::StillRunning.into());
+        Err(crate::docker::exec::DockerExecRecoveryError::ContainerStillRunning.into());
 
     let error =
         complete_docker_exec_transaction(&domain, state_id, &processor, &mut state, command_result)
@@ -682,7 +682,7 @@ async fn unterminated_docker_exec_failure_does_not_consume_or_apply_state() {
 
     assert!(
         error
-            .downcast_ref::<crate::docker::exec::DockerExecTerminalizationError>()
+            .downcast_ref::<crate::docker::exec::DockerExecRecoveryError>()
             .is_some()
     );
     assert!(state.path_prepends.is_empty());
@@ -724,6 +724,87 @@ fn make_action_step(id: &str, context_name: &str) -> Step {
         environment: None,
         context_name: Some(context_name.into()),
     }
+}
+
+#[tokio::test]
+async fn execute_job_runs_two_node_posts_in_reverse_without_state_replay() {
+    let (tmp, workspace, client, _mock) = setup_execute().await;
+    let marker = workspace.workspace_dir().join("post-order");
+    for label in ["first", "second"] {
+        let action_dir = workspace.workspace_dir().join(label);
+        std::fs::create_dir_all(&action_dir).unwrap();
+        std::fs::write(
+            action_dir.join("action.yml"),
+            "name: post-order\nruns:\n  using: node20\n  main: main.sh\n  post: post.sh\n",
+        )
+        .unwrap();
+        std::fs::write(action_dir.join("main.sh"), "true\n").unwrap();
+    }
+    std::fs::write(
+        workspace.workspace_dir().join("second/post.sh"),
+        "set -eu\nprintf 'second\\n' >> \"$GITHUB_WORKSPACE/post-order\"\nprintf '%s\\n' '::add-path::/stdout/second'\nprintf '/file/second\\n' > \"$GITHUB_PATH\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        workspace.workspace_dir().join("first/post.sh"),
+        "set -eu\ntest \"$(printf '%s' \"$PATH\" | awk -v RS=: '$0 == \"/stdout/second\" { count++ } END { print count + 0 }')\" = 1\ntest \"$(printf '%s' \"$PATH\" | awk -v RS=: '$0 == \"/file/second\" { count++ } END { print count + 0 }')\" = 1\nprintf 'first\\n' >> \"$GITHUB_WORKSPACE/post-order\"\nprintf '%s\\n' '::add-path::/stdout/first'\nprintf '/file/first\\n' > \"$GITHUB_PATH\"\n",
+    )
+    .unwrap();
+    let manifest: JobManifest = serde_json::from_value(serde_json::json!({
+        "plan": { "planId": "p", "jobId": "j", "timelineId": "t" },
+        "steps": [
+            {
+                "id": "first", "displayName": "First", "contextName": "first",
+                "reference": { "name": "first", "type": "repository", "repositoryType": "self", "path": "first" },
+                "inputs": {}, "condition": null, "timeoutInMinutes": null,
+                "continueOnError": false, "order": 1, "environment": null
+            },
+            {
+                "id": "second", "displayName": "Second", "contextName": "second",
+                "reference": { "name": "second", "type": "repository", "repositoryType": "self", "path": "second" },
+                "inputs": {}, "condition": null, "timeoutInMinutes": null,
+                "continueOnError": false, "order": 2, "environment": null
+            }
+        ],
+        "variables": {}, "resources": { "endpoints": [] }, "contextData": {},
+        "jobContainer": null, "serviceContainers": null
+    }))
+    .unwrap();
+    let (_resources, domain) = test_docker_config();
+    let mut base_env = host_base_env(&domain);
+    base_env.insert(
+        "GITHUB_WORKSPACE".into(),
+        workspace.workspace_dir().to_string_lossy().into_owned(),
+    );
+    base_env.insert(
+        "PATH".into(),
+        std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".into()),
+    );
+    let action_cache = ActionCache::new(tmp.path().join("actions"), reqwest::Client::new());
+    let docker_action_builder = crate::docker::build::DockerActionBuilder::new();
+    let node_runtimes = crate::node::NodeRuntimes::single("/bin/sh".into());
+    let execution = JobExecutionContext::new(&domain, None, &node_runtimes);
+
+    let result = run_all_steps(
+        &manifest,
+        &client,
+        &workspace,
+        &base_env,
+        "test-runner",
+        &action_cache,
+        &docker_action_builder,
+        None,
+        "fake-token",
+        CancellationToken::new(),
+        &execution,
+        None,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(result.0, JobConclusion::Succeeded);
+    let marker = std::fs::read_to_string(marker).unwrap();
+    assert_eq!(marker, "second\nfirst\n");
 }
 
 #[tokio::test]

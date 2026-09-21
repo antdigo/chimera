@@ -602,52 +602,72 @@ async fn docker_action_rekeys_saved_state_before_returning_command_error() {
 }
 
 #[tokio::test]
+#[ignore]
 async fn docker_action_transactions_apply_each_workflow_command_once() {
+    let docker =
+        crate::docker::client::connect(&crate::docker::endpoint::DockerEndpoint::trusted_host())
+            .unwrap();
+    crate::docker::client::ping(&docker).await.unwrap();
+    crate::docker::client::ensure_image(&docker, "alpine:3.19", None)
+        .await
+        .unwrap();
     let (temp, workspace) = action_workspace();
+    let action_root = temp.path().join("action");
+    std::fs::create_dir(&action_root).unwrap();
+    let action_dir = TrustedActionDirectory::resolve(&action_root, Path::new(".")).unwrap();
     let domain = test_docker_config(&temp);
-    domain.bind_workspace(&workspace).await.unwrap();
     let masks = crate::job::secret_masker::shared_masker_for_test(&[]);
+    let log_sender = LogSender::new_for_test(tokio::sync::mpsc::channel(32).0, masks);
     let mut state = action_job_state();
     let step = docker_action_step(None);
-
-    let first_id = domain.prepare_step(b"{}").await.unwrap();
-    let first_processor = OutputProcessor::new(
-        LogSender::new_for_test(tokio::sync::mpsc::channel(8).0, Arc::clone(&masks)),
-        Arc::clone(&masks),
-        false,
+    let node_runtimes = crate::node::NodeRuntimes::single("node".into());
+    let execution = JobExecutionContext::new(&domain, None, &node_runtimes);
+    let mut metadata = make_metadata_with_entrypoints(
+        Some("/bin/sh"),
+        None,
+        None,
+        Some(vec![
+            "-c".into(),
+            "printf '%s\\n' '::add-path::/stdout/docker-action'; printf '/file/docker-action\\n' > \"$GITHUB_PATH\"".into(),
+        ]),
     );
-    first_processor
-        .process_line("::add-path::/stdout/docker-action")
-        .await;
-    std::fs::write(workspace.path_file(), "/file/docker-action\n").unwrap();
-    complete_docker_action_transaction(
-        &domain,
-        first_id,
-        &first_processor,
-        &mut state,
+    metadata.runs.image = Some("docker://alpine:3.19".into());
+
+    run_docker_metadata_action(
+        &action_dir,
+        &metadata,
+        "main",
         &step,
-        Ok(StepResult {
-            conclusion: StepConclusion::Succeeded,
-        }),
+        &mut state,
+        &workspace,
+        &HashMap::new(),
+        &log_sender,
+        &DockerActionBuilder::new(),
+        &DockerBuildScope::new("test-runner", "test/exactly-once"),
+        None,
+        Instant::now() + Duration::from_secs(30),
+        &CancellationToken::new(),
+        &execution,
     )
     .await
     .unwrap();
 
-    let second_id = domain.prepare_step(b"{}").await.unwrap();
-    let second_processor = OutputProcessor::new(
-        LogSender::new_for_test(tokio::sync::mpsc::channel(8).0, Arc::clone(&masks)),
-        masks,
-        false,
-    );
-    complete_docker_action_transaction(
-        &domain,
-        second_id,
-        &second_processor,
-        &mut state,
+    metadata.runs.args = Some(vec!["-c".into(), "true".into()]);
+    run_docker_metadata_action(
+        &action_dir,
+        &metadata,
+        "main",
         &step,
-        Ok(StepResult {
-            conclusion: StepConclusion::Succeeded,
-        }),
+        &mut state,
+        &workspace,
+        &HashMap::new(),
+        &log_sender,
+        &DockerActionBuilder::new(),
+        &DockerBuildScope::new("test-runner", "test/exactly-once"),
+        None,
+        Instant::now() + Duration::from_secs(30),
+        &CancellationToken::new(),
+        &execution,
     )
     .await
     .unwrap();
