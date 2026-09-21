@@ -31,6 +31,12 @@ inode, device, mount, size, link count and change timestamp are checked again
 before execution through the retained descriptor. Chimera must not be setuid;
 the mapping helpers must be setuid root.
 
+Drain all domains and retained cleanup records before replacing Chimera or
+either mapping helper. In-place changes and unlink/rename-over replacement can
+invalidate retained metadata or link-count proofs. Cleanup then refuses the
+executable and quarantines its resources; it never reopens the replacement as
+a fallback. Complete cleanup with the pinned installation before upgrading.
+
 The fixture holds the exclusive resource-root lock and constructs one
 `KernelDomain` through `StrictBackendBuilder`, with the production rootfs,
 hardening, command protocol and retained teardown authority. It never publishes
@@ -45,7 +51,9 @@ process exit. Crash recovery qualification is still a separate unfinished case.
 
 The first case checks PID1 comm, absent old root and host paths, early shell
 failure, and control isolation. A test-only C probe checks inherited descriptors
-before it opens files, then checks every visible `/proc/1/fd` entry (or, when
+before it opens files. The probe is the direct workflow executable in its
+protocol command, with no intervening shell that could hide leaked descriptors.
+It then checks every visible `/proc/1/fd` entry (or, when
 listing is denied, probes every descriptor pathname below the inherited hard
 FD limit), `pidfd_getfd`, and ptrace denial. The FD limit must be finite and no
 greater than 1,048,576; the command still has a 30-second deadline. Linux builds

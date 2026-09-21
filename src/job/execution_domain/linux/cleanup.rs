@@ -127,17 +127,7 @@ impl VerifiedExecutable {
             libc::RESOLVE_NO_SYMLINKS | libc::RESOLVE_NO_MAGICLINKS,
         )?;
         let metadata = dirfd::metadata(fd.as_raw_fd())?;
-        let mode = u32::from(metadata.stx_mode);
-        if mode & libc::S_IFMT != libc::S_IFREG
-            || metadata.stx_uid != 0
-            || metadata.stx_gid != 0
-            || metadata.stx_nlink != 1
-            || mode & 0o022 != 0
-            || mode & 0o111 == 0
-            || mode & 0o6000 != if setuid { 0o4000 } else { 0 }
-        {
-            return Err(failure(FailureCategory::IdentityMismatch));
-        }
+        validate_executable_metadata(&metadata, setuid)?;
         // CLOEXEC descriptors can execute ELF files through /proc/self/fd;
         // scripts would require passing the authority descriptor to an interpreter.
         let mut magic = [0u8; 4];
@@ -170,6 +160,24 @@ impl VerifiedExecutable {
             self.fd.as_raw_fd()
         )))
     }
+}
+
+fn validate_executable_metadata(
+    metadata: &libc::statx,
+    setuid: bool,
+) -> Result<(), ExecutionDomainError> {
+    let mode = u32::from(metadata.stx_mode);
+    if mode & libc::S_IFMT != libc::S_IFREG
+        || metadata.stx_uid != 0
+        || metadata.stx_gid != 0
+        || metadata.stx_nlink != 1
+        || mode & 0o022 != 0
+        || mode & 0o111 == 0
+        || mode & 0o6000 != if setuid { 0o4000 } else { 0 }
+    {
+        return Err(failure(FailureCategory::IdentityMismatch));
+    }
+    Ok(())
 }
 
 impl CleanupWorkerConfig {
@@ -1754,37 +1762,5 @@ fn failure(category: FailureCategory) -> ExecutionDomainError {
 }
 
 #[cfg(test)]
-mod executable_test {
-    use super::*;
-
-    #[test]
-    fn pinned_root_owned_elf_executes_with_cloexec() {
-        let executable =
-            VerifiedExecutable::open(std::path::Path::new("/usr/bin/true"), false).unwrap();
-        assert_ne!(
-            unsafe { libc::fcntl(executable.fd.as_raw_fd(), libc::F_GETFD) } & libc::FD_CLOEXEC,
-            0
-        );
-        assert!(executable.command().unwrap().status().unwrap().success());
-    }
-
-    #[test]
-    fn retained_executable_refuses_in_place_content_change() {
-        use std::io::Write;
-        // Constructor ownership is checked independently. A mutable test inode
-        // models an operator changing a retained executable after verification.
-        let mut file = tempfile::NamedTempFile::new().unwrap();
-        file.write_all(b"original").unwrap();
-        let fd: OwnedFd = file.as_file().try_clone().unwrap().into();
-        let metadata = dirfd::metadata(fd.as_raw_fd()).unwrap();
-        let executable = VerifiedExecutable {
-            fd,
-            identity: identity(&metadata),
-            size: metadata.stx_size,
-            changed: (metadata.stx_ctime.tv_sec, metadata.stx_ctime.tv_nsec),
-        };
-        assert!(executable.command().is_ok());
-        file.write_all(b"changed").unwrap();
-        assert!(executable.command().is_err());
-    }
-}
+#[path = "cleanup_executable_test.rs"]
+mod executable_test;

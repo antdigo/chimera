@@ -34,23 +34,6 @@ fn cleanup_worker_constructor_rejects_symlink_and_non_setuid_helpers() {
 }
 
 #[test]
-fn cleanup_worker_constructor_rejects_service_writable_executable() {
-    use std::os::unix::fs::PermissionsExt;
-    let temporary = TempDir::new().unwrap();
-    let executable = temporary.path().join("executable");
-    std::fs::copy("/usr/bin/true", &executable).unwrap();
-    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o777)).unwrap();
-    assert!(
-        CleanupWorkerConfig::verified(
-            &executable,
-            std::path::Path::new("/usr/bin/passwd"),
-            std::path::Path::new("/usr/bin/passwd"),
-        )
-        .is_err()
-    );
-}
-
-#[test]
 fn timed_out_child_is_killed_and_reaped_within_the_same_deadline() {
     let mut child = std::process::Command::new("sleep")
         .arg("30")

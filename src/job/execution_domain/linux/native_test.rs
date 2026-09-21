@@ -1,5 +1,21 @@
-use super::super::CommandOutcome;
-use super::native_fixture::{NativeDomainFixture, NativePrerequisites, installed_rootlesskit_235};
+use super::super::{CommandOutcome, CommandTarget};
+use super::native_fixture::{
+    NativeDomainFixture, NativePrerequisites, control_fd_probe_spec, installed_rootlesskit_235,
+};
+
+#[test]
+fn native_fd_probe_is_the_direct_workflow_executable() {
+    let command = control_fd_probe_spec().unwrap();
+    let CommandTarget::Sandboxed { program, args, cwd } = command.target else {
+        panic!("probe must use production sandbox command execution");
+    };
+    assert_eq!(program.as_str(), "/work/native-fd-probe");
+    assert!(
+        args.is_empty(),
+        "probe must not be a shell command argument"
+    );
+    assert_eq!(cwd.as_str(), "/work");
+}
 
 #[tokio::test]
 #[ignore = "requires dedicated native Debian systemd delegation"]

@@ -304,25 +304,25 @@ impl NativeDomainFixture {
     }
 
     pub(super) async fn run(&mut self, script: &str) -> CommandOutcome {
-        self.run_checked(script)
-            .unwrap_or_else(|error| panic!("native command protocol failed: {error:?}"))
-    }
-
-    fn run_checked(&mut self, script: &str) -> Result<CommandOutcome, ExecutionDomainError> {
-        self.command_id += 1;
-        let command_id = self.command_id;
-        let kernel = self.cleanup.as_mut().ok_or_else(not_ready)?.kernel_mut();
-        let deadline = Instant::now() + Duration::from_secs(40);
         let spec = CommandSpec {
             target: CommandTarget::Sandboxed {
-                program: DomainPath::parse("/usr/bin/dash")?,
+                program: DomainPath::parse("/usr/bin/dash").expect("fixed shell path"),
                 args: vec!["-c".into(), format!("set -eu\n{script}")],
-                cwd: DomainPath::parse("/work")?,
+                cwd: DomainPath::parse("/work").expect("fixed work path"),
             },
             env: Default::default(),
             timeout: Duration::from_secs(30),
             state: None,
         };
+        self.run_checked(spec)
+            .unwrap_or_else(|error| panic!("native command protocol failed: {error:?}"))
+    }
+
+    fn run_checked(&mut self, spec: CommandSpec) -> Result<CommandOutcome, ExecutionDomainError> {
+        self.command_id += 1;
+        let command_id = self.command_id;
+        let kernel = self.cleanup.as_mut().ok_or_else(not_ready)?.kernel_mut();
+        let deadline = Instant::now() + Duration::from_secs(40);
         match kernel
             .control
             .request_until(Request::Run { command_id, spec }, deadline)?
@@ -345,7 +345,10 @@ impl NativeDomainFixture {
     }
 
     pub(super) async fn probe_control_fds(&mut self) -> CommandOutcome {
-        self.run("exec /work/native-fd-probe").await
+        // The probe must be the first executable after workflow hardening:
+        // a shell could close a leaked descriptor before the probe sees it.
+        self.run_checked(control_fd_probe_spec().expect("fixed probe paths"))
+            .unwrap_or_else(|error| panic!("native probe protocol failed: {error:?}"))
     }
 
     pub(super) async fn destroy(&mut self) -> Result<DestroyReport, ExecutionDomainError> {
@@ -435,6 +438,19 @@ impl NativeDomainFixture {
         }
         Ok(())
     }
+}
+
+pub(super) fn control_fd_probe_spec() -> Result<CommandSpec, ExecutionDomainError> {
+    Ok(CommandSpec {
+        target: CommandTarget::Sandboxed {
+            program: DomainPath::parse("/work/native-fd-probe")?,
+            args: Vec::new(),
+            cwd: DomainPath::parse("/work")?,
+        },
+        env: Default::default(),
+        timeout: Duration::from_secs(30),
+        state: None,
+    })
 }
 
 impl Drop for NativeDomainFixture {
