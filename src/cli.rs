@@ -87,6 +87,22 @@ pub enum Command {
         #[arg(long)]
         dry_run: bool,
     },
+
+    /// Inspect sandbox policy prerequisites without activating the profile
+    Doctor {
+        #[arg(long, default_value_os_t = default_root())]
+        root: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Render a sandbox network policy drop-in without installing it
+    InstallPolicy {
+        #[arg(long, default_value_os_t = default_root())]
+        root: PathBuf,
+        #[arg(long, required = true)]
+        render: bool,
+    },
 }
 
 pub async fn run(cli: Cli) -> Result<()> {
@@ -124,6 +140,39 @@ pub async fn run(cli: Cli) -> Result<()> {
             init_tracing(&DaemonConfig::default());
             let outcome = crate::import::import_official(&source, &name, &root, dry_run)?;
             println!("{outcome}");
+            Ok(())
+        }
+        Command::Doctor { root, json } => {
+            let report = crate::sandbox_policy::inspect_policy(&root)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!("schema_version: {}", report.schema_version);
+                println!("activation_available: {}", report.activation_available);
+                for check in &report.checks {
+                    println!("{}: {:?} ({})", check.id, check.status, check.category);
+                }
+                if let Some(digest) = &report.policy_digest {
+                    println!("policy_digest: {digest}");
+                }
+            }
+            if report
+                .checks
+                .iter()
+                .any(|check| check.status != crate::sandbox_policy::CheckStatus::Satisfied)
+            {
+                bail!("sandbox policy has failed or unverified checks")
+            }
+            Ok(())
+        }
+        Command::InstallPolicy { root, render: _ } => {
+            let plan = crate::sandbox_policy::inspect_install_plan(&root)?;
+            println!("schema_version: {}", plan.schema_version);
+            println!("relative_destination: {}", plan.relative_destination);
+            println!("policy_digest: {}", plan.policy_digest);
+            println!("requires_restart: {}", plan.requires_restart);
+            println!("activation_available: {}", plan.activation_available);
+            print!("{}", plan.drop_in);
             Ok(())
         }
     }

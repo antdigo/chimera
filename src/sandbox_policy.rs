@@ -1,4 +1,5 @@
 mod capability;
+mod doctor;
 mod error;
 mod install;
 mod network;
@@ -12,6 +13,7 @@ mod capability_test;
 pub use capability::{
     CacheCapabilityBinding, CapabilityDescriptor, CapabilityService, validate_descriptor,
 };
+pub use doctor::{CheckStatus, DoctorCheck, DoctorReport, inspect_install_plan, inspect_policy};
 pub use error::PolicyError;
 pub use install::{InstallPlan, render_install_plan};
 pub use network::{

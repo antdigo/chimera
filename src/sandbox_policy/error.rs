@@ -24,4 +24,14 @@ pub enum PolicyError {
     StorageBoundMismatch,
     #[error("storage probe is inconclusive")]
     StorageProbeInconclusive,
+    #[error("sandbox policy root is not an existing directory")]
+    MissingRoot,
+    #[error("sandbox policy config is missing")]
+    MissingConfig,
+    #[error("sandbox policy config is invalid")]
+    InvalidConfig,
+    #[error("sandbox network config is missing")]
+    MissingNetworkConfig,
+    #[error("host address inventory could not be verified")]
+    HostInventoryUnavailable,
 }

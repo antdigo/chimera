@@ -10,7 +10,10 @@ use chrono::Utc;
 use tempfile::TempDir;
 
 use super::*;
-use crate::config::{ExecutionConfig, ExecutionProfile, ExecutionResources, ResourceLimits};
+use crate::config::{
+    ExecutionConfig, ExecutionProfile, ExecutionResources, NetworkPolicyConfig, ResourceLimits,
+    StorageBoundConfig, StorageMechanism,
+};
 use crate::storage::{RootLock, RootLockError};
 
 #[test]
@@ -47,8 +50,16 @@ async fn sandboxed_run_rejects_before_daemon_owned_side_effects() {
                 profile: ExecutionProfile::Sandboxed,
                 max_active_domains: NonZeroUsize::new(20).unwrap(),
                 resources: None,
+                network: Some(NetworkPolicyConfig {
+                    production_cidrs: vec!["203.0.113.0/24".parse().unwrap()],
+                }),
+                storage: Some(StorageBoundConfig {
+                    mechanism: StorageMechanism::DedicatedFilesystem,
+                    max_bytes: "1GiB".parse().unwrap(),
+                }),
                 ..ExecutionConfig::default()
             },
+            runners: vec!["safety".into()],
             ..Default::default()
         },
         _root_lock: root_lock,
@@ -77,6 +88,8 @@ async fn sandboxed_run_rejects_before_daemon_owned_side_effects() {
     assert!(!paths.pid_file().exists());
     assert!(!paths.job_resources_dir().exists());
     assert!(!paths.cache_entries_dir().exists());
+    assert!(!paths.state_file().exists());
+    assert!(!paths.runner_dir("safety").exists());
 }
 
 #[test]
