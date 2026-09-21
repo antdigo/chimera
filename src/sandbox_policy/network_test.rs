@@ -137,6 +137,46 @@ fn incomplete_probe_set_is_inconclusive() {
 }
 
 #[test]
+fn overlapping_production_prefixes_need_distinct_sentinels() {
+    let (base_policy, mut applied, mut probes) = evidence();
+    let policy = compile_network(
+        &NetworkPolicyConfig {
+            production_cidrs: vec![
+                "198.51.100.0/24".parse().unwrap(),
+                "198.51.100.0/25".parse().unwrap(),
+            ],
+        },
+        &HostAddresses {
+            addresses: vec!["203.0.113.9".parse().unwrap()],
+        },
+    )
+    .unwrap();
+    assert_ne!(base_policy.digest(), policy.digest());
+    applied.denied = policy.denied().to_vec();
+
+    assert_eq!(
+        validate_network_evidence(&policy, &applied, &probes),
+        Err(PolicyError::ProbeInconclusive)
+    );
+
+    probes.negative.push(SentinelObservation {
+        address: "198.51.100.1:8443".parse().unwrap(),
+        control_before: true,
+        control_after: true,
+        observed: ConnectOutcome::Denied,
+    });
+    assert_eq!(
+        validate_network_evidence(&policy, &applied, &probes),
+        Err(PolicyError::ProbeInconclusive)
+    );
+    probes.negative.last_mut().unwrap().address = "198.51.100.200:443".parse().unwrap();
+    assert_eq!(
+        validate_network_evidence(&policy, &applied, &probes),
+        Ok(())
+    );
+}
+
+#[test]
 fn canonical_policy_blocks_host_and_special_networks() {
     let config = NetworkPolicyConfig {
         production_cidrs: vec!["198.51.100.0/24".parse().unwrap()],

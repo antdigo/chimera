@@ -78,13 +78,23 @@ pub fn validate_network_evidence(
             ConnectOutcome::Denied | ConnectOutcome::TimedOut => {}
         }
     }
-    if expected.required_probe_prefixes().iter().any(|prefix| {
-        !probes
-            .negative
+    let mut prefixes: Vec<&IpCidr> = expected.required_probe_prefixes().iter().collect();
+    prefixes.sort_by_key(|prefix| std::cmp::Reverse(prefix.prefix()));
+    let mut sentinel_addresses: Vec<IpAddr> = probes
+        .negative
+        .iter()
+        .map(|probe| probe.address.ip())
+        .collect();
+    sentinel_addresses.sort_unstable();
+    sentinel_addresses.dedup();
+    for prefix in prefixes {
+        let Some(index) = sentinel_addresses
             .iter()
-            .any(|probe| prefix.contains(probe.address.ip()))
-    }) {
-        return Err(PolicyError::ProbeInconclusive);
+            .position(|address| prefix.contains(*address))
+        else {
+            return Err(PolicyError::ProbeInconclusive);
+        };
+        sentinel_addresses.swap_remove(index);
     }
     Ok(())
 }
