@@ -151,7 +151,7 @@ jobs:
             suite-args: --lib
             # Native Linux isolation fixtures require a dedicated delegated
             # host, not the rootless Docker daemon used by this shard.
-            test-filters: --skip job::execution_domain::linux::
+            test-filters: "--skip job::execution_domain::linux::"
     steps:
       - uses: actions/checkout@v4
 
