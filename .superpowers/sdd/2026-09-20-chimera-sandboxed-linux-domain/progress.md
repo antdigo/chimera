@@ -66,4 +66,6 @@ Task 11: fix round 2/5 (review-fix commit recorded by this handoff; 2 addressed,
 
 Plan C consumer note: managed dockerd needs a separate policy and explicit retained-capability lifetime; never reuse the workflow child policy.
 
+Task 12: implementation-only harness and handoff; native Debian gate NOT QUALIFIED. Test-only strict preflight and 15 named fail-on-selection native cases compile under Linux acceptance feature, but the fixture cannot yet construct a safely owned `KernelDomain` because the pinned mapped-cleanup worker/helper authority lacks a production-private constructor. No isolation assertion, native zero-resource inventory, or public sandbox activation is claimed. Host build/fmt/clippy/full serial and Linux acceptance compile/filter pass; see `task-12-report.md` for evidence and exact remaining work.
+
 Deferred contract for Task 10/C: rootless Docker may leave subordinate-UID files and non-traversable directories. Cleanup must define an owned user-namespace/idmapped cleanup capability; do not solve this by globally weakening owner checks.

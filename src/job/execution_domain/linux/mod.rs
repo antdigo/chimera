@@ -20,6 +20,11 @@ pub(super) mod launcher;
 #[cfg(all(target_os = "linux", test))]
 #[path = "launcher_test.rs"]
 mod launcher_test;
+#[cfg(all(test, target_os = "linux", feature = "acceptance-tests"))]
+mod native_fixture;
+#[cfg(all(test, target_os = "linux", feature = "acceptance-tests"))]
+#[path = "native_test.rs"]
+mod native_test;
 pub(super) mod reconcile;
 #[cfg(test)]
 #[path = "reconcile_test.rs"]
