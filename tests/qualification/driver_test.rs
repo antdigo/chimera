@@ -231,3 +231,53 @@ async fn driver_deadline_also_bounds_rehashing_without_blocking_the_runtime() {
         start.elapsed()
     );
 }
+
+#[tokio::test]
+async fn driver_rejects_late_ready_result_at_absolute_deadline() {
+    // Polling Ready must not defeat expiration, including when validation or
+    // a completed recheck makes the exchange Ready after its last await.
+    let expired = tokio::time::Instant::now() - Duration::from_millis(1);
+    let result = complete_before_deadline(expired, std::future::ready(Ok(()))).await;
+    assert_eq!(result, Err(Reason::DeadlineExceeded));
+}
+
+#[tokio::test]
+async fn driver_rejects_duplicate_fact_keys_before_value_decoding() {
+    let mut accepted = Vec::new();
+    for (name, facts) in [
+        ("direct", r#"{"poll_count":1,"poll_count":0}"#),
+        ("nested", r#"{"nested":{"poll_count":1,"poll_count":0}}"#),
+        ("array", r#"{"samples":[{"allowed":false,"allowed":true}]}"#),
+        ("escaped", r#"{"same":1,"\u0073ame":2}"#),
+    ] {
+        let body = format!(
+            "print(json.dumps(response).replace('{{\"poll_count\": 0}}', {}))",
+            serde_json::to_string(facts).unwrap()
+        );
+        let (_dir, driver) = fixture(&body, "pass");
+        match run_driver(&driver, &request()).await {
+            Err(Reason::ProtocolViolation) => {}
+            other => accepted.push(format!("{name}: {other:?}")),
+        }
+    }
+    assert!(
+        accepted.is_empty(),
+        "duplicate facts accepted: {accepted:?}"
+    );
+}
+
+#[tokio::test]
+async fn driver_preserves_unique_nested_facts_and_object_local_key_scope() {
+    let (_dir, driver) = fixture(
+        "response['observations'][0]['value']={'samples':[{'count':1},{'count':2}],'fraction':0.5,'negative':-1,'label':'synthetic','empty':None,'enabled':True}; print(json.dumps(response))",
+        "pass",
+    );
+    let authenticated = run_driver(&driver, &request()).await.unwrap();
+    assert_eq!(
+        authenticated.observations()[0].value,
+        serde_json::json!({
+            "samples": [{"count": 1}, {"count": 2}], "fraction": 0.5,
+            "negative": -1, "label": "synthetic", "empty": null, "enabled": true,
+        })
+    );
+}

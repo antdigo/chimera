@@ -73,8 +73,79 @@ pub enum Operation {
 #[serde(deny_unknown_fields)]
 pub struct Observation {
     pub name: String,
+    #[serde(deserialize_with = "unique_json_value")]
     pub value: serde_json::Value,
 }
+
+// Value's normal deserializer overwrites repeated object members. Reject each
+// duplicate on the wire, including inside arrays and after unescaping key names,
+// before that lossy conversion can hide conflicting facts from typed decoders.
+fn unique_json_value<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<serde_json::Value, D::Error> {
+    struct UniqueValue(serde_json::Value);
+    impl<'de> Deserialize<'de> for UniqueValue {
+        fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            struct UniqueVisitor;
+            impl<'de> serde::de::Visitor<'de> for UniqueVisitor {
+                type Value = UniqueValue;
+
+                fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                    formatter.write_str("JSON facts with unique object members")
+                }
+
+                fn visit_map<A: serde::de::MapAccess<'de>>(
+                    self,
+                    mut map: A,
+                ) -> Result<Self::Value, A::Error> {
+                    let mut members = serde_json::Map::new();
+                    while let Some(key) = map.next_key::<String>()? {
+                        if members.contains_key(&key) {
+                            return Err(serde::de::Error::custom("duplicate observation member"));
+                        }
+                        members.insert(key, map.next_value::<UniqueValue>()?.0);
+                    }
+                    Ok(UniqueValue(serde_json::Value::Object(members)))
+                }
+
+                fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                    self,
+                    mut sequence: A,
+                ) -> Result<Self::Value, A::Error> {
+                    let mut values = Vec::new();
+                    while let Some(value) = sequence.next_element::<UniqueValue>()? {
+                        values.push(value.0);
+                    }
+                    Ok(UniqueValue(serde_json::Value::Array(values)))
+                }
+
+                fn visit_bool<E: serde::de::Error>(self, value: bool) -> Result<Self::Value, E> {
+                    Ok(UniqueValue(value.into()))
+                }
+                fn visit_i64<E: serde::de::Error>(self, value: i64) -> Result<Self::Value, E> {
+                    Ok(UniqueValue(value.into()))
+                }
+                fn visit_u64<E: serde::de::Error>(self, value: u64) -> Result<Self::Value, E> {
+                    Ok(UniqueValue(value.into()))
+                }
+                fn visit_f64<E: serde::de::Error>(self, value: f64) -> Result<Self::Value, E> {
+                    serde_json::Number::from_f64(value)
+                        .map(|number| UniqueValue(number.into()))
+                        .ok_or_else(|| E::custom("non-finite observation number"))
+                }
+                fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
+                    Ok(UniqueValue(value.into()))
+                }
+                fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+                    Ok(UniqueValue(serde_json::Value::Null))
+                }
+            }
+            deserializer.deserialize_any(UniqueVisitor)
+        }
+    }
+    UniqueValue::deserialize(deserializer).map(|value| value.0)
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DriverResponse {
@@ -374,6 +445,7 @@ pub async fn run_driver(
     if driver.fixture_path.is_some() && request.identity.mode != EvidenceMode::Fixture {
         return Err(Reason::PlatformUnsupported);
     }
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(request.recipe.deadline_ms);
     let input = serde_json::to_vec(request).map_err(|_| Reason::ProtocolViolation)?;
     if input.len() > STDOUT_CAP {
         return Err(Reason::InvalidConfig);
@@ -422,6 +494,9 @@ pub async fn run_driver(
                 return Err(Reason::ProtocolViolation);
             }
         }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(Reason::DeadlineExceeded);
+        }
         Ok(AuthenticatedResponse {
             provenance: EvidenceProvenance {
                 identity: request.identity.clone(),
@@ -432,7 +507,20 @@ pub async fn run_driver(
             observations: response.observations,
         })
     };
-    tokio::time::timeout(Duration::from_millis(request.recipe.deadline_ms), exchange)
+    complete_before_deadline(deadline, exchange).await
+}
+
+pub(super) async fn complete_before_deadline<T>(
+    deadline: tokio::time::Instant,
+    work: impl std::future::Future<Output = Result<T, Reason>>,
+) -> Result<T, Reason> {
+    let result = tokio::time::timeout_at(deadline, work)
         .await
-        .map_err(|_| Reason::DeadlineExceeded)?
+        .map_err(|_| Reason::DeadlineExceeded)?;
+    // Timeout may poll a Ready inner future before observing its elapsed timer.
+    // The absolute deadline remains authoritative at the acceptance boundary.
+    if tokio::time::Instant::now() >= deadline {
+        return Err(Reason::DeadlineExceeded);
+    }
+    result
 }
