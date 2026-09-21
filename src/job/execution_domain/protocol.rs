@@ -313,6 +313,8 @@ pub(super) struct ControlConnection {
     interrupted: Option<&'static AtomicBool>,
     received: Vec<u8>,
     sending: Option<(Vec<u8>, usize)>,
+    #[cfg(test)]
+    flush_chunk_limit: Option<usize>,
 }
 
 impl ControlConnection {
@@ -340,6 +342,8 @@ impl ControlConnection {
             interrupted: None,
             received: Vec::new(),
             sending: None,
+            #[cfg(test)]
+            flush_chunk_limit: None,
         })
     }
 
@@ -427,7 +431,13 @@ impl ControlConnection {
         let Some((bytes, sent)) = &mut self.sending else {
             return Ok(true);
         };
-        match self.stream.write(&bytes[*sent..]) {
+        #[cfg(test)]
+        let end = self
+            .flush_chunk_limit
+            .map_or(bytes.len(), |limit| (*sent + limit).min(bytes.len()));
+        #[cfg(not(test))]
+        let end = bytes.len();
+        match self.stream.write(&bytes[*sent..end]) {
             Ok(0) => {
                 self.failed = true;
                 return Err(failure(FailureCategory::Protocol));
@@ -450,6 +460,19 @@ impl ControlConnection {
             self.sending = None;
         }
         Ok(self.sending.is_none())
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn abort(&mut self) {
+        self.failed = true;
+        self.sending = None;
+        self.received.clear();
+        let _ = self.stream.shutdown(std::net::Shutdown::Both);
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
+    pub(super) fn limit_flush_chunk_for_test(&mut self, bytes: usize) {
+        self.flush_chunk_limit = Some(bytes.max(1));
     }
 
     #[cfg(target_os = "linux")]

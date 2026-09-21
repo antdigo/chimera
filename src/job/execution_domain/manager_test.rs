@@ -48,6 +48,7 @@ fn linux_backend_for_test() -> (
         cleanup: None,
         path_mappings: Vec::new(),
         next_command_id: 1,
+        control_broken: false,
     });
     let super::Backend::Linux(backend) = backend else {
         unreachable!()
@@ -56,6 +57,25 @@ fn linux_backend_for_test() -> (
         backend,
         super::super::protocol::ControlConnection::new(peer, attempt).unwrap(),
     )
+}
+
+#[cfg(target_os = "linux")]
+fn constrain_control_send_buffer(backend: &super::LinuxBackend) {
+    use std::os::fd::AsRawFd;
+
+    let send_buffer: libc::c_int = 1024;
+    assert_eq!(
+        unsafe {
+            libc::setsockopt(
+                backend.kernel.control.control_fd().as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_SNDBUF,
+                (&raw const send_buffer).cast(),
+                std::mem::size_of_val(&send_buffer) as libc::socklen_t,
+            )
+        },
+        0
+    );
 }
 
 #[cfg(target_os = "linux")]
@@ -1038,9 +1058,182 @@ async fn linux_backend_manager_cancel_sends_correlated_shutdown_reason() {
 
 #[cfg(target_os = "linux")]
 #[tokio::test]
-async fn stalled_linux_control_send_does_not_block_a_trusted_domain() {
-    use std::os::fd::AsRawFd;
+async fn linux_backend_drains_late_cancel_rejection_before_next_request() {
+    use super::super::protocol::{Message, Request, Response};
 
+    let (mut backend, mut peer) = linux_backend_for_test();
+    // Keep the cancel frame partially sent while the peer publishes the
+    // natural terminal result, exercising the exact race that used to leave
+    // the late cancel rejection queued for the next request.
+    backend.kernel.control.limit_flush_chunk_for_test(4);
+    let responder = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let Message::Request(Request::Run { command_id, .. }) = peer.receive(deadline).unwrap()
+        else {
+            panic!("expected Run request")
+        };
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        peer.send(
+            Message::Response(Response::CommandStarted { command_id }),
+            deadline,
+        )
+        .unwrap();
+        peer.send(
+            Message::Response(Response::CommandFinished {
+                command_id,
+                outcome: CommandOutcome::Exited(0),
+            }),
+            deadline,
+        )
+        .unwrap();
+        assert!(matches!(
+            peer.receive(deadline).unwrap(),
+            Message::Request(Request::CancelCommand {
+                command_id: actual,
+                reason: CancelReason::User,
+            }) if actual == command_id
+        ));
+        peer.send(
+            Message::Response(Response::CommandRejected {
+                command_id,
+                category: super::super::FailureCategory::InvalidInput,
+            }),
+            deadline,
+        )
+        .unwrap();
+        let Message::Request(Request::PrepareStepChunk { id, .. }) =
+            peer.receive(deadline).unwrap()
+        else {
+            panic!("expected PrepareStep after drained late cancel rejection")
+        };
+        peer.send(Message::Response(Response::StepPrepared { id }), deadline)
+            .unwrap();
+    });
+    let manager_cancelled = super::ManagerCancellation::new();
+    manager_cancelled.cancel(CancelReason::User);
+    let (output, _events) = tokio::sync::mpsc::channel(1);
+
+    assert_eq!(
+        backend
+            .run(
+                sandboxed_spec(),
+                output,
+                tokio_util::sync::CancellationToken::new(),
+                manager_cancelled,
+            )
+            .await
+            .unwrap(),
+        CommandOutcome::Exited(0)
+    );
+    let prepared = backend.prepare_step(b"{}").unwrap();
+    assert!(!prepared.uuid().is_nil());
+
+    responder.join().unwrap();
+    backend.destroy().unwrap();
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn linux_backend_breaks_control_on_ambiguous_late_cancel_rejection() {
+    use super::super::protocol::{Message, Request, Response};
+
+    let (mut backend, mut peer) = linux_backend_for_test();
+    let responder = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let Message::Request(Request::Run { command_id, .. }) = peer.receive(deadline).unwrap()
+        else {
+            panic!("expected Run request")
+        };
+        peer.send(
+            Message::Response(Response::CommandStarted { command_id }),
+            deadline,
+        )
+        .unwrap();
+        peer.send(
+            Message::Response(Response::CommandFinished {
+                command_id,
+                outcome: CommandOutcome::Exited(0),
+            }),
+            deadline,
+        )
+        .unwrap();
+        assert!(matches!(
+            peer.receive(deadline).unwrap(),
+            Message::Request(Request::CancelCommand {
+                command_id: actual,
+                reason: CancelReason::User,
+            }) if actual == command_id
+        ));
+        peer.send(
+            Message::Response(Response::CommandRejected {
+                command_id,
+                category: super::super::FailureCategory::Protocol,
+            }),
+            deadline,
+        )
+        .unwrap();
+    });
+    let manager_cancelled = super::ManagerCancellation::new();
+    manager_cancelled.cancel(CancelReason::User);
+    let (output, _events) = tokio::sync::mpsc::channel(1);
+
+    assert!(matches!(
+        backend
+            .run(
+                sandboxed_spec(),
+                output,
+                tokio_util::sync::CancellationToken::new(),
+                manager_cancelled,
+            )
+            .await,
+        Err(super::super::ExecutionDomainError::Backend {
+            category: super::super::FailureCategory::Protocol,
+            ..
+        })
+    ));
+    assert!(backend.control_broken);
+
+    responder.join().unwrap();
+    backend.kernel.launcher.kill().unwrap();
+    backend.kernel.launcher.wait().unwrap();
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn linux_backend_marks_a_closed_control_transport_broken() {
+    use super::super::protocol::{Message, Request};
+
+    let (mut backend, mut peer) = linux_backend_for_test();
+    let responder = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        assert!(matches!(
+            peer.receive(deadline).unwrap(),
+            Message::Request(Request::Run { .. })
+        ));
+    });
+    let (output, _events) = tokio::sync::mpsc::channel(1);
+
+    assert!(
+        backend
+            .run(
+                sandboxed_spec(),
+                output,
+                tokio_util::sync::CancellationToken::new(),
+                super::ManagerCancellation::new(),
+            )
+            .await
+            .is_err()
+    );
+    assert!(backend.control_broken);
+
+    responder.join().unwrap();
+    backend.kernel.launcher.kill().unwrap();
+    backend.kernel.launcher.wait().unwrap();
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn stalled_linux_control_send_does_not_block_a_trusted_domain() {
     use super::super::protocol::{Message, Request, Response};
 
     let temp = tempfile::tempdir().unwrap();
@@ -1055,19 +1248,7 @@ async fn stalled_linux_control_send_does_not_block_a_trusted_domain() {
         .await
         .unwrap();
     let (mut linux, mut peer) = linux_backend_for_test();
-    let send_buffer: libc::c_int = 1024;
-    assert_eq!(
-        unsafe {
-            libc::setsockopt(
-                linux.kernel.control.control_fd().as_raw_fd(),
-                libc::SOL_SOCKET,
-                libc::SO_SNDBUF,
-                (&raw const send_buffer).cast(),
-                std::mem::size_of_val(&send_buffer) as libc::socklen_t,
-            )
-        },
-        0
-    );
+    constrain_control_send_buffer(&linux);
     let mut spec = sandboxed_spec();
     spec.env
         .insert("STALL_FRAME".into(), "x".repeat(512 * 1024));
@@ -1134,6 +1315,118 @@ async fn stalled_linux_control_send_does_not_block_a_trusted_domain() {
     assert_eq!(outcome, CommandOutcome::Exited(0));
     assert!(
         matches!(event, super::super::CommandEvent::Stdout(bytes) if bytes == b"healthy-progress")
+    );
+    trusted.destroy().await.unwrap();
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn cancel_converges_when_a_large_run_frame_remains_backpressured() {
+    use super::super::protocol::{Message, Request, Response};
+
+    let temp = tempfile::tempdir().unwrap();
+    let root =
+        ExecutionDomainRoot::prepare(&temp.path().join("domains"), NonZeroUsize::new(1).unwrap())
+            .unwrap();
+    let trusted = root
+        .reserve()
+        .await
+        .unwrap()
+        .provision(AttemptIdentity::new())
+        .await
+        .unwrap();
+    let (mut linux, mut peer) = linux_backend_for_test();
+    constrain_control_send_buffer(&linux);
+    let mut spec = sandboxed_spec();
+    spec.timeout = std::time::Duration::from_secs(60 * 60);
+    spec.env
+        .insert("STALL_FRAME".into(), "x".repeat(512 * 1024));
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let run_cancel = cancel.clone();
+    let (stalled_output, _stalled_events) = tokio::sync::mpsc::channel(1);
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let mut stalled = super::manager_runtime().unwrap().spawn(async move {
+        let _ = started_tx.send(());
+        let result = linux
+            .run(
+                spec,
+                stalled_output,
+                run_cancel,
+                super::ManagerCancellation::new(),
+            )
+            .await;
+        (linux, result)
+    });
+    started_rx.await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    cancel.cancel();
+
+    let (output, mut events) = tokio::sync::mpsc::channel(4);
+    let healthy = tokio::time::timeout(std::time::Duration::from_millis(500), async {
+        trusted.cancel(CancelReason::User).await.unwrap();
+        let outcome = trusted
+            .run(
+                trusted_spec(&trusted, "printf still-healthy"),
+                output,
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let event = events.recv().await.unwrap();
+        (outcome, event)
+    })
+    .await;
+    let convergence = tokio::time::timeout(std::time::Duration::from_secs(2), &mut stalled).await;
+    let converged = convergence.is_ok();
+
+    let responder = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        if let Ok(Message::Request(Request::Run { command_id, .. })) = peer.receive(deadline) {
+            let _ = peer.send(
+                Message::Response(Response::CommandStarted { command_id }),
+                deadline,
+            );
+            if matches!(
+                peer.receive(deadline),
+                Ok(Message::Request(Request::CancelCommand {
+                    command_id: actual,
+                    reason: CancelReason::User,
+                })) if actual == command_id
+            ) {
+                let _ = peer.send(
+                    Message::Response(Response::CommandFinished {
+                        command_id,
+                        outcome: CommandOutcome::Cancelled,
+                    }),
+                    deadline,
+                );
+            }
+        }
+    });
+    let (mut linux, stalled_result) = match convergence {
+        Ok(joined) => joined.unwrap(),
+        Err(_) => stalled.await.unwrap(),
+    };
+    responder.join().unwrap();
+    linux.kernel.launcher.kill().unwrap();
+    linux.kernel.launcher.wait().unwrap();
+
+    assert!(
+        converged,
+        "cancel waited for the original one-hour command deadline"
+    );
+    assert!(matches!(
+        stalled_result,
+        Err(super::super::ExecutionDomainError::Backend {
+            category: super::super::FailureCategory::Unavailable
+                | super::super::FailureCategory::Timeout,
+            ..
+        })
+    ));
+    let (outcome, event) = healthy.expect("cancel backpressure stalled a healthy domain");
+    assert_eq!(outcome, CommandOutcome::Exited(0));
+    assert!(
+        matches!(event, super::super::CommandEvent::Stdout(bytes) if bytes == b"still-healthy")
     );
     trusted.destroy().await.unwrap();
 }
