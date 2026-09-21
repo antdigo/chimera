@@ -82,6 +82,10 @@ pub(super) enum Response {
         command_id: u64,
         category: FailureCategory,
     },
+    CommandCancelAcknowledged {
+        command_id: u64,
+        disposition: CancelDisposition,
+    },
     Output {
         command_id: u64,
         #[serde(with = "EventWire")]
@@ -127,6 +131,12 @@ pub(super) enum SnapshotField {
     Output,
     State,
     Summary,
+}
+
+#[derive(Clone, Copy, Deserialize, Eq, PartialEq, Serialize)]
+pub(super) enum CancelDisposition {
+    Applied,
+    NotRunning,
 }
 
 macro_rules! redacted_debug {
@@ -279,6 +289,7 @@ fn validate_message(message: &Message) -> Result<(), ExecutionDomainError> {
         | Message::Response(
             Response::CommandStarted { command_id }
             | Response::CommandRejected { command_id, .. }
+            | Response::CommandCancelAcknowledged { command_id, .. }
             | Response::Output { command_id, .. }
             | Response::CommandFinished { command_id, .. },
         ) => Some(*command_id),
@@ -681,7 +692,7 @@ enum ExpectedResponse {
     Bootstrap,
     Hello,
     Started(u64),
-    Finished(u64),
+    Cancelled(u64),
     Prepared(StepFilesId),
     Snapshot(StepFilesId),
     Shutdown,
@@ -693,7 +704,7 @@ impl ExpectedResponse {
             Request::Bootstrap { .. } => Self::Bootstrap,
             Request::Hello => Self::Hello,
             Request::Run { command_id, .. } => Self::Started(*command_id),
-            Request::CancelCommand { command_id, .. } => Self::Finished(*command_id),
+            Request::CancelCommand { command_id, .. } => Self::Cancelled(*command_id),
             Request::PrepareStep { id, .. } | Request::PrepareStepChunk { id, .. } => {
                 Self::Prepared(id.clone())
             }
@@ -709,8 +720,7 @@ impl ExpectedResponse {
             | (Self::Shutdown, Response::ShuttingDown) => true,
             (Self::Started(expected), Response::CommandStarted { command_id })
             | (Self::Started(expected), Response::CommandRejected { command_id, .. })
-            | (Self::Finished(expected), Response::CommandRejected { command_id, .. })
-            | (Self::Finished(expected), Response::CommandFinished { command_id, .. }) => {
+            | (Self::Cancelled(expected), Response::CommandCancelAcknowledged { command_id, .. }) => {
                 expected == command_id
             }
             (Self::Prepared(expected), Response::StepPrepared { id })
@@ -980,6 +990,7 @@ impl OutboundQueue {
         let priority = matches!(
             message,
             Message::Request(Request::CancelCommand { .. } | Request::Shutdown { .. })
+                | Message::Response(Response::CommandCancelAcknowledged { .. })
         );
         // Validate the serialized cap before taking ownership of payload memory.
         let mut bounded = BoundedWriter(Vec::new());

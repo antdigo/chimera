@@ -812,9 +812,9 @@ impl LinuxBackend {
         let mut cancel_reason = None;
         let mut cancel_delivery_deadline = None;
         let mut cancel_started = false;
+        let mut cancel_acknowledged = false;
+        let mut cancel_ack_deadline = None;
         let mut terminal = None;
-        let mut late_cancel_rejection = false;
-        let mut late_cancel_deadline = None;
         let request_cancel =
             |reason: CancelReason,
              cancel_reason: &mut Option<CancelReason>,
@@ -835,11 +835,11 @@ impl LinuxBackend {
             {
                 return Err(self.break_control(super::FailureCategory::Unavailable));
             }
-            if late_cancel_deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+            if cancel_ack_deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
                 return Err(self.break_control(super::FailureCategory::Timeout));
             }
             if pending_send.is_none()
-                && !late_cancel_rejection
+                && (!cancel_started || cancel_acknowledged)
                 && let Some(result) = terminal.take()
             {
                 return result;
@@ -880,6 +880,9 @@ impl LinuxBackend {
                     run_flushed = true;
                 } else {
                     cancel_delivery_deadline = None;
+                    let now = std::time::Instant::now();
+                    cancel_ack_deadline =
+                        Some(now.checked_add(CONTROL_CANCEL_TIMEOUT).unwrap_or(now));
                 }
                 pending_send = None;
             }
@@ -902,12 +905,12 @@ impl LinuxBackend {
                 cancel_started = true;
             }
             if pending_send.is_none()
-                && !late_cancel_rejection
+                && (!cancel_started || cancel_acknowledged)
                 && let Some(result) = terminal.take()
             {
                 return result;
             }
-            if terminal.is_some() && !late_cancel_rejection {
+            if terminal.is_some() && (!cancel_started || cancel_acknowledged) {
                 tokio::time::sleep(std::time::Duration::from_millis(5)).await;
                 continue;
             }
@@ -951,27 +954,16 @@ impl LinuxBackend {
                 {
                     started = true;
                 }
-                Response::CommandRejected {
-                    command_id: actual,
-                    category,
-                } if actual == command_id
-                    && terminal.is_some()
-                    && late_cancel_rejection
-                    && category == super::FailureCategory::InvalidInput =>
-                {
-                    late_cancel_rejection = false;
-                    late_cancel_deadline = None;
+                Response::CommandCancelAcknowledged {
+                    command_id: actual, ..
+                } if actual == command_id && cancel_started && !cancel_acknowledged => {
+                    cancel_acknowledged = true;
+                    cancel_ack_deadline = None;
                 }
                 Response::CommandRejected {
                     command_id: actual,
                     category,
                 } if actual == command_id && terminal.is_none() => {
-                    late_cancel_rejection = cancel_started;
-                    if late_cancel_rejection {
-                        let now = std::time::Instant::now();
-                        late_cancel_deadline =
-                            Some(now.checked_add(CONTROL_CANCEL_TIMEOUT).unwrap_or(now));
-                    }
                     terminal = Some(Err(backend_failure(category)));
                 }
                 Response::Output {
@@ -1012,16 +1004,6 @@ impl LinuxBackend {
                     command_id: actual,
                     outcome,
                 } if actual == command_id && started => {
-                    late_cancel_rejection = cancel_started
-                        && !matches!(
-                            &outcome,
-                            CommandOutcome::Cancelled | CommandOutcome::TimedOut
-                        );
-                    if late_cancel_rejection {
-                        let now = std::time::Instant::now();
-                        late_cancel_deadline =
-                            Some(now.checked_add(CONTROL_CANCEL_TIMEOUT).unwrap_or(now));
-                    }
                     terminal = Some(Ok(outcome));
                 }
                 _ => return Err(self.break_control(super::FailureCategory::Protocol)),

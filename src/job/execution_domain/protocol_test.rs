@@ -70,6 +70,61 @@ fn command_rejection_preserves_the_rejected_command_identity() {
     );
 }
 
+#[test]
+fn cancel_acknowledgement_is_correlated_and_overtakes_queued_output() {
+    let frame = Frame {
+        message: Message::Response(Response::CommandCancelAcknowledged {
+            command_id: 9,
+            disposition: CancelDisposition::NotRunning,
+        }),
+        ..hello(1)
+    };
+    let decoded = decode(&encode(&frame).unwrap()).unwrap();
+    assert!(matches!(
+        decoded.message,
+        Message::Response(Response::CommandCancelAcknowledged {
+            command_id: 9,
+            disposition: CancelDisposition::NotRunning,
+        })
+    ));
+    let (a, mut b) = UnixStream::pair().unwrap();
+    b.write_all(&encode(&frame).unwrap()).unwrap();
+    assert!(matches!(
+        ControlConnection::new(a, identity())
+            .unwrap()
+            .request(Request::CancelCommand {
+                command_id: 9,
+                reason: CancelReason::User,
+            })
+            .unwrap(),
+        Response::CommandCancelAcknowledged {
+            command_id: 9,
+            disposition: CancelDisposition::NotRunning,
+        }
+    ));
+
+    let mut queue = OutboundQueue::new();
+    queue
+        .push(Message::Response(Response::Output {
+            command_id: 9,
+            event: CommandEvent::Stdout(b"stale output".to_vec()),
+        }))
+        .unwrap();
+    queue
+        .push(Message::Response(Response::CommandCancelAcknowledged {
+            command_id: 9,
+            disposition: CancelDisposition::Applied,
+        }))
+        .unwrap();
+    assert!(matches!(
+        queue.pop(),
+        Some(Message::Response(Response::CommandCancelAcknowledged {
+            command_id: 9,
+            disposition: CancelDisposition::Applied,
+        }))
+    ));
+}
+
 fn hello(sequence: u64) -> Frame {
     Frame {
         version: 1,

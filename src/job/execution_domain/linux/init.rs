@@ -5,8 +5,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use super::super::protocol::{
-    ControlConnection, EventAssembler, Message, OutboundQueue, Request, Response, failure,
-    snapshot_chunks,
+    CancelDisposition, ControlConnection, EventAssembler, Message, OutboundQueue, Request,
+    Response, failure, snapshot_chunks,
 };
 use super::super::{
     AttemptIdentity, CancelReason, CommandSpec, ExecutionDomainError, FailureCategory, StepFilesId,
@@ -292,10 +292,17 @@ impl InitRuntime {
         id: u64,
         reason: CancelReason,
     ) -> Result<(), ExecutionDomainError> {
-        match &mut self.active {
-            Some(command) if command.id == id => command.cancel(reason),
-            _ => self.reject_command(id, FailureCategory::InvalidInput),
-        }
+        let disposition = match &mut self.active {
+            Some(command) if command.id == id => {
+                command.cancel(reason)?;
+                CancelDisposition::Applied
+            }
+            _ => CancelDisposition::NotRunning,
+        };
+        self.enqueue(Response::CommandCancelAcknowledged {
+            command_id: id,
+            disposition,
+        })
     }
 
     fn discard_ephemeral_step(&mut self) {

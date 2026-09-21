@@ -918,6 +918,28 @@ async fn linux_backend_uses_monotonic_ids_and_correlates_rejection() {
             deadline,
         )
         .unwrap();
+        assert!(matches!(
+            peer.receive(deadline).unwrap(),
+            Message::Request(Request::CancelCommand {
+                command_id: actual,
+                reason: CancelReason::User,
+            }) if actual == command_id
+        ));
+        peer.send(
+            Message::Response(Response::CommandCancelAcknowledged {
+                command_id,
+                disposition: super::super::protocol::CancelDisposition::NotRunning,
+            }),
+            deadline,
+        )
+        .unwrap();
+        let Message::Request(Request::PrepareStepChunk { id, .. }) =
+            peer.receive(deadline).unwrap()
+        else {
+            panic!("expected PrepareStep after rejected command cancellation")
+        };
+        peer.send(Message::Response(Response::StepPrepared { id }), deadline)
+            .unwrap();
     });
     let (output, _events) = tokio::sync::mpsc::channel(1);
     assert_eq!(
@@ -933,12 +955,14 @@ async fn linux_backend_uses_monotonic_ids_and_correlates_rejection() {
         CommandOutcome::Exited(0)
     );
     let (output, _events) = tokio::sync::mpsc::channel(1);
+    let manager_cancelled = super::ManagerCancellation::new();
+    manager_cancelled.cancel(CancelReason::User);
     let error = backend
         .run(
             sandboxed_spec(),
             output,
             tokio_util::sync::CancellationToken::new(),
-            super::ManagerCancellation::new(),
+            manager_cancelled,
         )
         .await
         .unwrap_err();
@@ -949,6 +973,7 @@ async fn linux_backend_uses_monotonic_ids_and_correlates_rejection() {
             ..
         }
     ));
+    assert!(backend.prepare_step(b"{}").is_ok());
     responder.join().unwrap();
     backend.destroy().unwrap();
 }
@@ -977,6 +1002,14 @@ async fn linux_backend_receiver_close_sends_handle_dropped_and_drains_finish() {
                 reason: super::super::CancelReason::HandleDropped,
             }) if actual == command_id
         ));
+        peer.send(
+            Message::Response(Response::CommandCancelAcknowledged {
+                command_id,
+                disposition: super::super::protocol::CancelDisposition::Applied,
+            }),
+            deadline,
+        )
+        .unwrap();
         peer.send(
             Message::Response(Response::CommandFinished {
                 command_id,
@@ -1029,6 +1062,14 @@ async fn linux_backend_manager_cancel_sends_correlated_shutdown_reason() {
         )
         .unwrap();
         peer.send(
+            Message::Response(Response::CommandCancelAcknowledged {
+                command_id,
+                disposition: super::super::protocol::CancelDisposition::Applied,
+            }),
+            deadline,
+        )
+        .unwrap();
+        peer.send(
             Message::Response(Response::CommandFinished {
                 command_id,
                 outcome: CommandOutcome::Cancelled,
@@ -1058,13 +1099,13 @@ async fn linux_backend_manager_cancel_sends_correlated_shutdown_reason() {
 
 #[cfg(target_os = "linux")]
 #[tokio::test]
-async fn linux_backend_drains_late_cancel_rejection_before_next_request() {
+async fn linux_backend_drains_late_cancel_acknowledgement_before_next_request() {
     use super::super::protocol::{Message, Request, Response};
 
     let (mut backend, mut peer) = linux_backend_for_test();
     // Keep the cancel frame partially sent while the peer publishes the
     // natural terminal result, exercising the exact race that used to leave
-    // the late cancel rejection queued for the next request.
+    // the late cancel acknowledgement queued for the next request.
     backend.kernel.control.limit_flush_chunk_for_test(4);
     let responder = std::thread::spawn(move || {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -1094,9 +1135,9 @@ async fn linux_backend_drains_late_cancel_rejection_before_next_request() {
             }) if actual == command_id
         ));
         peer.send(
-            Message::Response(Response::CommandRejected {
+            Message::Response(Response::CommandCancelAcknowledged {
                 command_id,
-                category: super::super::FailureCategory::InvalidInput,
+                disposition: super::super::protocol::CancelDisposition::NotRunning,
             }),
             deadline,
         )
@@ -1104,7 +1145,7 @@ async fn linux_backend_drains_late_cancel_rejection_before_next_request() {
         let Message::Request(Request::PrepareStepChunk { id, .. }) =
             peer.receive(deadline).unwrap()
         else {
-            panic!("expected PrepareStep after drained late cancel rejection")
+            panic!("expected PrepareStep after drained late cancel acknowledgement")
         };
         peer.send(Message::Response(Response::StepPrepared { id }), deadline)
             .unwrap();
@@ -1130,6 +1171,78 @@ async fn linux_backend_drains_late_cancel_rejection_before_next_request() {
 
     responder.join().unwrap();
     backend.destroy().unwrap();
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn linux_backend_drains_cancel_after_independent_init_timeout() {
+    use super::super::protocol::{Message, Request, Response};
+
+    let (mut backend, mut peer) = linux_backend_for_test();
+    let responder = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let Message::Request(Request::Run { command_id, .. }) = peer.receive(deadline).unwrap()
+        else {
+            panic!("expected Run request")
+        };
+        peer.send(
+            Message::Response(Response::CommandStarted { command_id }),
+            deadline,
+        )
+        .unwrap();
+        peer.send(
+            Message::Response(Response::CommandFinished {
+                command_id,
+                outcome: CommandOutcome::TimedOut,
+            }),
+            deadline,
+        )
+        .unwrap();
+        assert!(matches!(
+            peer.receive(deadline).unwrap(),
+            Message::Request(Request::CancelCommand {
+                command_id: actual,
+                reason: CancelReason::User,
+            }) if actual == command_id
+        ));
+        peer.send(
+            Message::Response(Response::CommandCancelAcknowledged {
+                command_id,
+                disposition: super::super::protocol::CancelDisposition::NotRunning,
+            }),
+            deadline,
+        )
+        .unwrap();
+        let Message::Request(Request::PrepareStepChunk { id, .. }) =
+            peer.receive(deadline).unwrap()
+        else {
+            panic!("expected PrepareStep after timed-out command cancellation")
+        };
+        peer.send(Message::Response(Response::StepPrepared { id }), deadline)
+            .unwrap();
+    });
+    let manager_cancelled = super::ManagerCancellation::new();
+    manager_cancelled.cancel(CancelReason::User);
+    let (output, _events) = tokio::sync::mpsc::channel(1);
+
+    assert_eq!(
+        backend
+            .run(
+                sandboxed_spec(),
+                output,
+                tokio_util::sync::CancellationToken::new(),
+                manager_cancelled,
+            )
+            .await
+            .unwrap(),
+        CommandOutcome::TimedOut
+    );
+    let prepared = backend.prepare_step(b"{}");
+
+    responder.join().unwrap();
+    backend.kernel.launcher.kill().unwrap();
+    backend.kernel.launcher.wait().unwrap();
+    assert!(prepared.is_ok());
 }
 
 #[cfg(target_os = "linux")]
@@ -1393,6 +1506,13 @@ async fn cancel_converges_when_a_large_run_frame_remains_backpressured() {
                     reason: CancelReason::User,
                 })) if actual == command_id
             ) {
+                let _ = peer.send(
+                    Message::Response(Response::CommandCancelAcknowledged {
+                        command_id,
+                        disposition: super::super::protocol::CancelDisposition::Applied,
+                    }),
+                    deadline,
+                );
                 let _ = peer.send(
                     Message::Response(Response::CommandFinished {
                         command_id,

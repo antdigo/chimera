@@ -211,6 +211,46 @@ impl Fixture {
             }
         }
     }
+    fn finish_cancelled(
+        &mut self,
+        id: u64,
+        expected: crate::job::execution_domain::protocol::CancelDisposition,
+    ) -> (CommandOutcome, Vec<u8>, Vec<u8>) {
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut acknowledged = false;
+        let mut outcome = None;
+        loop {
+            match self.receive() {
+                Response::Output { command_id, event } => {
+                    assert_eq!(command_id, id);
+                    match event {
+                        CommandEvent::Stdout(bytes) => stdout.extend(bytes),
+                        CommandEvent::Stderr(bytes) => stderr.extend(bytes),
+                    }
+                }
+                Response::CommandCancelAcknowledged {
+                    command_id,
+                    disposition,
+                } => {
+                    assert_eq!(command_id, id);
+                    assert!(disposition == expected);
+                    acknowledged = true;
+                }
+                Response::CommandFinished {
+                    command_id,
+                    outcome: terminal,
+                } => {
+                    assert_eq!(command_id, id);
+                    outcome = Some(terminal);
+                }
+                response => panic!("unexpected response {response:?}"),
+            }
+            if acknowledged && let Some(outcome) = outcome.take() {
+                return (outcome, stdout, stderr);
+            }
+        }
+    }
     fn shutdown(mut self) {
         self.send(Request::Shutdown {
             reason: CancelReason::Shutdown,
@@ -507,6 +547,17 @@ fn init_timeout_and_cancel_kill_term_ignoring_groups_and_bound_lingering_output(
     assert_eq!(stdout, b"ready");
     assert!(start.elapsed() >= Duration::from_secs(5));
     assert!(start.elapsed() < Duration::from_secs(8));
+    fixture.send(Request::CancelCommand {
+        command_id: 1,
+        reason: CancelReason::User,
+    });
+    assert!(matches!(
+        fixture.receive(),
+        Response::CommandCancelAcknowledged {
+            command_id: 1,
+            disposition: crate::job::execution_domain::protocol::CancelDisposition::NotRunning,
+        }
+    ));
     fixture.run(
         2,
         "trap '' TERM; printf ready; while :; do sleep 1; done",
@@ -524,7 +575,15 @@ fn init_timeout_and_cancel_kill_term_ignoring_groups_and_bound_lingering_output(
         command_id: 2,
         reason: CancelReason::User,
     });
-    assert_eq!(fixture.finish(2).0, CommandOutcome::Cancelled);
+    assert_eq!(
+        fixture
+            .finish_cancelled(
+                2,
+                crate::job::execution_domain::protocol::CancelDisposition::Applied,
+            )
+            .0,
+        CommandOutcome::Cancelled
+    );
     let start = Instant::now();
     fixture.run(
         3,
@@ -564,7 +623,15 @@ fn init_backpressure_preserves_cancel_and_disconnect_bounds_reaping() {
         command_id: 1,
         reason: CancelReason::User,
     });
-    assert_eq!(fixture.finish(1).0, CommandOutcome::Cancelled);
+    assert_eq!(
+        fixture
+            .finish_cancelled(
+                1,
+                crate::job::execution_domain::protocol::CancelDisposition::Applied,
+            )
+            .0,
+        CommandOutcome::Cancelled
+    );
     assert!(start.elapsed() < Duration::from_secs(8));
     fixture.run(
         2,
