@@ -2,9 +2,10 @@ use super::catalog::{Reason, required_cases};
 use super::host::*;
 use super::report::*;
 use std::fs;
-use std::os::unix::fs::{PermissionsExt, symlink};
+use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 struct Fixture {
     _temp: tempfile::TempDir,
@@ -37,37 +38,40 @@ impl Fixture {
         acquire_fixture(&self.config, run, self.boot, &self.lock, &self.marker)
     }
     fn report(&self, run: uuid::Uuid) -> QualificationReport {
-        let identity = RunIdentity {
-            run_id: run,
-            commit: "a".repeat(40),
-            config_digest: self.config.digest().unwrap(),
-            host_boot_id: self.boot,
-            mode: EvidenceMode::Fixture,
-        };
-        let results = required_cases()
-            .into_iter()
-            .map(|key| CaseResult {
-                provenance: EvidenceProvenance {
-                    identity: identity.clone(),
-                    key: key.clone(),
-                    driver_commit: identity.commit.clone(),
-                    driver_digest: String::new(),
-                },
-                key,
-                verdict: Verdict::Blocked,
-                reason: Some(Reason::BackendUnavailable),
-                checks: vec![],
-                duration_ms: 0,
-            })
-            .collect();
-        QualificationReport {
-            schema_version: 1,
-            identity,
-            driver_digest: String::new(),
-            activation_available: false,
-            results,
-            cleanup_confirmed: true,
-        }
+        fixture_report(&self.config, self.boot, run)
+    }
+}
+fn fixture_report(config: &NativeConfig, boot: uuid::Uuid, run: uuid::Uuid) -> QualificationReport {
+    let identity = RunIdentity {
+        run_id: run,
+        commit: "a".repeat(40),
+        config_digest: config.digest().unwrap(),
+        host_boot_id: boot,
+        mode: EvidenceMode::Fixture,
+    };
+    let results = required_cases()
+        .into_iter()
+        .map(|key| CaseResult {
+            provenance: EvidenceProvenance {
+                identity: identity.clone(),
+                key: key.clone(),
+                driver_commit: identity.commit.clone(),
+                driver_digest: String::new(),
+            },
+            key,
+            verdict: Verdict::Blocked,
+            reason: Some(Reason::BackendUnavailable),
+            checks: vec![],
+            duration_ms: 0,
+        })
+        .collect();
+    QualificationReport {
+        schema_version: 1,
+        identity,
+        driver_digest: String::new(),
+        activation_available: false,
+        results,
+        cleanup_confirmed: true,
     }
 }
 
@@ -252,6 +256,103 @@ fn host_report_directory_replacement_cannot_redirect_publication() {
 }
 
 #[test]
+fn host_report_ancestry_replacement_before_and_after_write_preserves_quarantine() {
+    for stage in [PublicationStage::BeforeWrite, PublicationStage::AfterWrite] {
+        for replace_root in [false, true] {
+            let fixture = Fixture::new();
+            let run = uuid::Uuid::new_v4();
+            let lease = fixture.acquire(run).unwrap();
+            let target = if replace_root {
+                &fixture.config.root
+            } else {
+                &fixture.config.report_root
+            };
+            let result = lease.publish_with_hook(&fixture.report(run), |point| {
+                if point == stage {
+                    fs::rename(target, target.with_extension("moved")).unwrap();
+                    fs::create_dir(target).unwrap();
+                }
+            });
+            assert_eq!(result, Err(Reason::CleanupUnconfirmed));
+            assert!(fixture.marker.exists());
+            assert_eq!(
+                recover_fixture(&fixture.lock, &fixture.marker),
+                Err(Reason::UnfinishedRun)
+            );
+        }
+    }
+}
+
+#[test]
+fn host_report_directory_becoming_shared_writable_blocks_release() {
+    let fixture = Fixture::new();
+    let run = uuid::Uuid::new_v4();
+    let lease = fixture.acquire(run).unwrap();
+    fs::set_permissions(lease.run_directory(), fs::Permissions::from_mode(0o777)).unwrap();
+    assert_eq!(
+        lease.publish_blocked_and_release(&fixture.report(run)),
+        Err(Reason::CleanupUnconfirmed)
+    );
+    assert!(fixture.marker.exists());
+}
+
+#[test]
+fn host_marker_replacement_at_claim_is_preserved_and_blocks_next_run() {
+    let fixture = Fixture::new();
+    let run = uuid::Uuid::new_v4();
+    let lease = fixture.acquire(run).unwrap();
+    let result = lease.publish_with_hook(&fixture.report(run), |stage| {
+        if stage == PublicationStage::BeforeClaim {
+            fs::rename(&fixture.marker, fixture.marker.with_extension("original")).unwrap();
+            fs::write(&fixture.marker, b"unexpected replacement").unwrap();
+        }
+    });
+    assert_eq!(result, Err(Reason::CleanupUnconfirmed));
+    assert_eq!(
+        fs::read(fixture.marker.with_extension("claim").join("marker")).unwrap(),
+        b"unexpected replacement"
+    );
+    assert!(matches!(
+        fixture.acquire(uuid::Uuid::new_v4()),
+        Err(Reason::UnfinishedRun)
+    ));
+}
+
+#[test]
+fn host_completed_claim_is_retained_without_overwriting_an_existing_archive() {
+    for collision in [false, true] {
+        let fixture = Fixture::new();
+        let run = uuid::Uuid::new_v4();
+        let lease = fixture.acquire(run).unwrap();
+        let bytes = fs::read(&fixture.marker).unwrap();
+        let archive = fixture.marker.with_extension(format!("completed.{run}"));
+        if collision {
+            fs::create_dir(&archive).unwrap();
+        }
+        let original_archive = fs::metadata(&archive).ok().map(|metadata| metadata.ino());
+        let result = lease.publish_blocked_and_release(&fixture.report(run));
+        if collision {
+            assert_eq!(result, Err(Reason::CleanupUnconfirmed));
+            // An ordinary rename would replace this empty directory. Its inode
+            // must survive, proving atomic no-replace rather than ENOTEMPTY.
+            assert_eq!(
+                Some(fs::metadata(&archive).unwrap().ino()),
+                original_archive
+            );
+            assert_eq!(fs::read_dir(&archive).unwrap().count(), 0);
+            assert_eq!(
+                recover_fixture(&fixture.lock, &fixture.marker),
+                Err(Reason::UnfinishedRun)
+            );
+        } else {
+            assert_eq!(result, Ok(()));
+            assert_eq!(fs::read(archive.join("marker")).unwrap(), bytes);
+            assert_eq!(recover_fixture(&fixture.lock, &fixture.marker), Ok(()));
+        }
+    }
+}
+
+#[test]
 fn host_rejects_unsafe_workspace_paths_without_creating_a_marker() {
     for change in 0..9 {
         let mut fixture = Fixture::new();
@@ -369,38 +470,9 @@ fn host_failed_or_untrusted_publication_preserves_marker() {
 #[test]
 fn host_killed_harness_leaves_durable_marker_and_never_recovers_by_pid() {
     let fixture = Fixture::new();
-    let mut child = Command::new(std::env::current_exe().unwrap())
-        .args([
-            "--exact",
-            "qualification::host_test::host_marker_child",
-            "--ignored",
-            "--nocapture",
-        ])
-        .env(
-            "E0_FIXTURE_CONFIG",
-            serde_json::to_string(&fixture.config).unwrap(),
-        )
-        .env("E0_LOCK", &fixture.lock)
-        .env("E0_MARKER", &fixture.marker)
-        .stdout(Stdio::piped())
-        .spawn()
-        .unwrap();
-    use std::io::BufRead;
-    let mut stdout = std::io::BufReader::new(child.stdout.take().unwrap());
-    let mut ready = false;
-    for _ in 0..8 {
-        let mut line = String::new();
-        if stdout.read_line(&mut line).unwrap() == 0 {
-            break;
-        }
-        if line.contains("E0_MARKER_SYNCED") {
-            ready = true;
-            break;
-        }
-    }
-    assert!(ready);
-    child.kill().unwrap(); // Child handle, no stored/reused PID or process group.
-    child.wait().unwrap();
+    let mut child = start_fixture_harness(&fixture, "marker", Duration::from_secs(3)).unwrap();
+    child.0.kill().unwrap(); // Child handle, no stored/reused PID or process group.
+    child.0.wait().unwrap();
     let before = fs::read(&fixture.marker).unwrap();
     assert!(matches!(
         fixture.acquire(uuid::Uuid::new_v4()),
@@ -424,24 +496,156 @@ fn host_killed_harness_leaves_durable_marker_and_never_recovers_by_pid() {
 }
 
 #[test]
+fn host_claim_crash_blocks_even_when_active_name_has_moved() {
+    let fixture = Fixture::new();
+    let mut child = start_fixture_harness(&fixture, "claim", Duration::from_secs(3)).unwrap();
+    assert!(!fixture.marker.exists());
+    assert!(
+        fixture
+            .marker
+            .with_extension("claim")
+            .join("marker")
+            .exists()
+    );
+    child.0.kill().unwrap();
+    child.0.wait().unwrap();
+    assert!(matches!(
+        fixture.acquire(uuid::Uuid::new_v4()),
+        Err(Reason::UnfinishedRun)
+    ));
+    assert_eq!(
+        recover_fixture(&fixture.lock, &fixture.marker),
+        Err(Reason::UnfinishedRun)
+    );
+}
+
+#[test]
+fn host_silent_fixture_readiness_is_bounded_and_child_reaped() {
+    let fixture = Fixture::new();
+    let start = Instant::now();
+    let result = start_fixture_harness(&fixture, "silent", Duration::from_millis(500));
+    assert_eq!(result.err().unwrap().kind(), std::io::ErrorKind::TimedOut);
+    assert!(start.elapsed() < Duration::from_millis(1500));
+    assert!(fixture.marker.exists()); // Child acquired the lock before becoming silent.
+    assert!(lock_exclusive(&fixture.lock).is_ok()); // Its guard killed and reaped it.
+}
+
+struct FixtureChild(std::process::Child);
+impl Drop for FixtureChild {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+fn start_fixture_harness(
+    fixture: &Fixture,
+    mode: &str,
+    timeout: Duration,
+) -> std::io::Result<FixtureChild> {
+    let mut child = FixtureChild(
+        Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "qualification::host_test::host_marker_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env(
+                "E0_FIXTURE_CONFIG",
+                serde_json::to_string(&fixture.config).unwrap(),
+            )
+            .env("E0_LOCK", &fixture.lock)
+            .env("E0_MARKER", &fixture.marker)
+            .env("E0_CHILD_MODE", mode)
+            .stdout(Stdio::piped())
+            .spawn()?,
+    );
+    use std::io::Read;
+    use std::os::fd::AsRawFd;
+    let mut stdout = child.0.stdout.take().unwrap();
+    let deadline = Instant::now() + timeout;
+    let mut captured = Vec::new();
+    loop {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .ok_or(std::io::ErrorKind::TimedOut)?;
+        let mut descriptor = libc::pollfd {
+            fd: stdout.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let waited = unsafe {
+            libc::poll(
+                &mut descriptor,
+                1,
+                remaining.as_millis().clamp(1, i32::MAX as u128) as i32,
+            )
+        };
+        if waited < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error);
+        }
+        if waited == 0 {
+            continue;
+        }
+        let mut bytes = [0; 1024];
+        let count = stdout.read(&mut bytes)?;
+        if count == 0 {
+            return Err(std::io::ErrorKind::UnexpectedEof.into());
+        }
+        captured.extend_from_slice(&bytes[..count]);
+        if captured.len() > 16 * 1024 {
+            return Err(std::io::ErrorKind::InvalidData.into());
+        }
+        if captured
+            .windows(b"E0_MARKER_SYNCED".len())
+            .any(|window| window == b"E0_MARKER_SYNCED")
+        {
+            return Ok(child);
+        }
+    }
+}
+
+#[test]
 #[ignore = "fixture subprocess only"]
 fn host_marker_child() {
     let Ok(json) = std::env::var("E0_FIXTURE_CONFIG") else {
         return;
     };
     let config = serde_json::from_str(&json).unwrap();
-    let _lease = acquire_fixture(
+    let run = uuid::Uuid::new_v4();
+    let boot = uuid::Uuid::new_v4();
+    let lease = acquire_fixture(
         &config,
-        uuid::Uuid::new_v4(),
-        uuid::Uuid::new_v4(),
+        run,
+        boot,
         &PathBuf::from(std::env::var_os("E0_LOCK").unwrap()),
         &PathBuf::from(std::env::var_os("E0_MARKER").unwrap()),
     )
     .unwrap();
+    match std::env::var("E0_CHILD_MODE").unwrap_or_default().as_str() {
+        "silent" => std::thread::sleep(Duration::from_secs(2)),
+        "claim" => {
+            lease
+                .publish_with_hook(&fixture_report(&config, boot, run), |stage| {
+                    if stage == PublicationStage::AfterClaim {
+                        signal_ready_and_wait();
+                    }
+                })
+                .unwrap();
+        }
+        _ => signal_ready_and_wait(),
+    }
+}
+
+fn signal_ready_and_wait() {
     println!("E0_MARKER_SYNCED");
     use std::io::Write;
     std::io::stdout().flush().unwrap();
-    std::thread::sleep(std::time::Duration::from_secs(30));
+    std::thread::sleep(Duration::from_secs(30));
 }
 
 #[cfg(not(target_os = "linux"))]

@@ -207,13 +207,19 @@ pub struct NativeLease {
     marker_name: CString,
     marker_bytes: Vec<u8>,
     report_directory: File,
-    report_parent: File,
-    run_name: CString,
     run_id: uuid::Uuid,
     boot_id: uuid::Uuid,
     config_digest: String,
     supervisor_pid: u32,
     mode: EvidenceMode,
+    report_chain: PinnedChain,
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum PublicationStage {
+    BeforeWrite,
+    AfterWrite,
+    BeforeClaim,
+    AfterClaim,
 }
 impl NativeLease {
     pub fn run_directory(&self) -> &Path {
@@ -222,6 +228,13 @@ impl NativeLease {
     /// The only E0 release path: a complete blocked report and no runtime activity.
     /// Dropping this lease, including on error, deliberately preserves the marker.
     pub fn publish_blocked_and_release(self, report: &QualificationReport) -> Result<(), Reason> {
+        self.publish_with_hook(report, |_| {})
+    }
+    pub(super) fn publish_with_hook(
+        self,
+        report: &QualificationReport,
+        mut hook: impl FnMut(PublicationStage),
+    ) -> Result<(), Reason> {
         let valid = std::process::id() == self.supervisor_pid
             && report.schema_version == 1
             && !report.activation_available
@@ -242,27 +255,76 @@ impl NativeLease {
                     && row.provenance.driver_commit == report.identity.commit
                     && row.provenance.driver_digest.is_empty()
             });
-        if !valid
-            || !self.marker_matches()
-            || !entry_matches(&self.report_parent, &self.run_name, &self.report_directory)
-        {
+        hook(PublicationStage::BeforeWrite);
+        if !valid || !self.marker_matches() || !self.report_chain.unchanged() {
             return Err(Reason::CleanupUnconfirmed);
         }
         write_report_at(&self.report_directory, report).map_err(|_| Reason::CleanupUnconfirmed)?;
-        if !self.marker_matches() {
+        hook(PublicationStage::AfterWrite);
+        if !self.marker_matches() || !self.report_chain.unchanged() {
             return Err(Reason::CleanupUnconfirmed);
         }
-        if unsafe { libc::unlinkat(self.lock_parent.as_raw_fd(), self.marker_name.as_ptr(), 0) }
-            != 0
+        hook(PublicationStage::BeforeClaim);
+        if !self.report_chain.unchanged() {
+            return Err(Reason::CleanupUnconfirmed);
+        }
+        // The durable fixed guard closes the crash gap when the active name is
+        // moved away. Never unlink by a previously checked shared pathname.
+        let claim_name = sibling_name(&self.marker_name, ".claim");
+        if unsafe { libc::mkdirat(self.lock_parent.as_raw_fd(), claim_name.as_ptr(), 0o700) } != 0 {
+            return Err(Reason::CleanupUnconfirmed);
+        }
+        let claim = open_at(
+            &self.lock_parent,
+            &claim_name,
+            libc::O_RDONLY | libc::O_DIRECTORY,
+            0,
+        )
+        .map_err(|_| Reason::CleanupUnconfirmed)?;
+        claim
+            .sync_all()
+            .and_then(|_| self.lock_parent.sync_all())
+            .map_err(|_| Reason::CleanupUnconfirmed)?;
+        let claimed_name = CString::new("marker").unwrap();
+        // Destination is in a newly created 0700 owned directory. A replacement
+        // at the active name is moved intact, then compared, never deleted.
+        if unsafe {
+            libc::renameat(
+                self.lock_parent.as_raw_fd(),
+                self.marker_name.as_ptr(),
+                claim.as_raw_fd(),
+                claimed_name.as_ptr(),
+            )
+        } != 0
         {
             return Err(Reason::CleanupUnconfirmed);
         }
+        claim
+            .sync_all()
+            .and_then(|_| self.lock_parent.sync_all())
+            .map_err(|_| Reason::CleanupUnconfirmed)?;
+        hook(PublicationStage::AfterClaim);
+        if !self.marker_matches_at(&claim, &claimed_name)
+            || !self.report_chain.unchanged()
+            || absent_entry(&self.lock_parent, &self.marker_name).is_err()
+            || !entry_matches(&self.lock_parent, &claim_name, &claim)
+        {
+            return Err(Reason::CleanupUnconfirmed);
+        }
+        let completed_name =
+            sibling_name(&self.marker_name, &format!(".completed.{}", self.run_id));
+        // Keep the claimed inode as an audit record. Atomic no-replace rename
+        // cannot overwrite an unexpected completed record, unlike precheck+rename.
+        rename_no_replace(&self.lock_parent, &claim_name, &completed_name)?;
         self.lock_parent
             .sync_all()
             .map_err(|_| Reason::CleanupUnconfirmed)
     }
     fn marker_matches(&self) -> bool {
-        if !entry_matches(&self.lock_parent, &self.marker_name, &self.marker) {
+        self.marker_matches_at(&self.lock_parent, &self.marker_name)
+    }
+    fn marker_matches_at(&self, parent: &File, name: &CString) -> bool {
+        if !entry_matches(parent, name, &self.marker) {
             return false;
         }
         let Ok(metadata) = self.marker.metadata() else {
@@ -277,6 +339,102 @@ impl NativeLease {
         }
         let mut bytes = vec![0; self.marker_bytes.len()];
         self.marker.read_exact_at(&mut bytes, 0).is_ok() && bytes == self.marker_bytes
+    }
+}
+
+fn sibling_name(name: &CString, suffix: &str) -> CString {
+    let mut bytes = name.as_bytes().to_vec();
+    bytes.extend_from_slice(suffix.as_bytes());
+    CString::new(bytes).expect("fixed suffix contains no NUL")
+}
+fn rename_no_replace(parent: &File, from: &CString, to: &CString) -> Result<(), Reason> {
+    #[cfg(target_os = "linux")]
+    let result = unsafe {
+        libc::renameat2(
+            parent.as_raw_fd(),
+            from.as_ptr(),
+            parent.as_raw_fd(),
+            to.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    #[cfg(target_os = "macos")]
+    let result = unsafe {
+        libc::renameatx_np(
+            parent.as_raw_fd(),
+            from.as_ptr(),
+            parent.as_raw_fd(),
+            to.as_ptr(),
+            libc::RENAME_EXCL,
+        )
+    };
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let result = -1;
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(Reason::CleanupUnconfirmed)
+    }
+}
+
+struct PinnedEdge {
+    parent: File,
+    name: CString,
+    child: File,
+}
+struct PinnedChain {
+    edges: Vec<PinnedEdge>,
+}
+impl PinnedChain {
+    fn capture(path: &Path) -> Result<Self, Reason> {
+        if !normalized(path) {
+            return Err(Reason::InvalidConfig);
+        }
+        let mut parent = directory(Path::new("/"))?;
+        let mut edges = Vec::new();
+        for component in path.components() {
+            if let Component::Normal(part) = component {
+                let name = CString::new(part.as_bytes()).map_err(|_| Reason::InvalidConfig)?;
+                let child = open_at(&parent, &name, libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+                let next = child.try_clone().map_err(|_| Reason::InvalidConfig)?;
+                edges.push(PinnedEdge {
+                    parent,
+                    name,
+                    child,
+                });
+                parent = next;
+            }
+        }
+        let chain = Self { edges };
+        if chain.unchanged() {
+            Ok(chain)
+        } else {
+            Err(Reason::InvalidConfig)
+        }
+    }
+    fn unchanged(&self) -> bool {
+        self.edges.iter().all(|edge| {
+            let (Ok(parent), Ok(child)) = (edge.parent.metadata(), edge.child.metadata()) else {
+                return false;
+            };
+            // POSIX provides no atomic transaction across an ancestry chain.
+            // Exclude untrusted writers; the service UID and root must honor
+            // the held qualification lock and not mutate this ancestry.
+            let protected_parent = parent.mode() & 0o022 == 0
+                || (parent.uid() == 0 && parent.mode() & u32::from(libc::S_ISVTX) != 0);
+            let protected_child = child.mode() & 0o022 == 0
+                || (child.uid() == 0 && child.mode() & u32::from(libc::S_ISVTX) != 0);
+            [0, uid()].contains(&parent.uid())
+                && [0, uid()].contains(&child.uid())
+                && protected_parent
+                && protected_child
+                && entry_matches(&edge.parent, &edge.name, &edge.child)
+        })
+    }
+    fn ends_at(&self, directory: &File) -> bool {
+        self.edges
+            .last()
+            .is_some_and(|edge| identity(&edge.child).ok() == identity(directory).ok())
     }
 }
 #[derive(Debug)]
@@ -534,6 +692,10 @@ fn entry_matches(parent: &File, name: &CString, file: &File) -> bool {
     })
 }
 fn absent_marker(parent: &File, name: &CString) -> Result<(), Reason> {
+    absent_entry(parent, name)?;
+    absent_entry(parent, &sibling_name(name, ".claim"))
+}
+fn absent_entry(parent: &File, name: &CString) -> Result<(), Reason> {
     let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
     let result = unsafe {
         libc::fstatat(
@@ -604,6 +766,10 @@ fn safe_paths(config: &NativeConfig) -> Result<(File, File), Reason> {
     }
     let root = private_directory(&config.root)?;
     let report = private_directory(&config.report_root)?;
+    let ancestry = PinnedChain::capture(&config.report_root)?;
+    if !ancestry.ends_at(&report) {
+        return Err(Reason::InvalidConfig);
+    }
     let driver_parent = directory(config.driver.parent().ok_or(Reason::InvalidConfig)?)?;
     let parent_metadata = driver_parent
         .metadata()
@@ -682,6 +848,11 @@ fn acquire(
     let run_name = CString::new(run_id.to_string()).unwrap();
     let _attempt_directory = owned_run(&root, &run_name, run_id)?;
     let report_directory = owned_run(&report_parent, &run_name, run_id)?;
+    let run_directory = config.report_root.join(run_id.to_string());
+    let report_chain = PinnedChain::capture(&run_directory)?;
+    if !report_chain.ends_at(&report_directory) {
+        return Err(Reason::CleanupUnconfirmed);
+    }
     let marker_bytes = serde_json::to_vec(&ActiveMarker {
         run_id,
         boot_id,
@@ -707,18 +878,17 @@ fn acquire(
         .map_err(|_| Reason::CleanupUnconfirmed)?;
     Ok(NativeLease {
         lock,
-        run_directory: config.report_root.join(run_id.to_string()),
+        run_directory,
         marker,
         lock_parent,
         marker_name,
         marker_bytes,
         report_directory,
-        report_parent,
-        run_name,
         run_id,
         boot_id,
         config_digest: config.digest()?,
         supervisor_pid: std::process::id(),
         mode,
+        report_chain,
     })
 }
