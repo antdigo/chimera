@@ -352,7 +352,7 @@ pub(super) fn send_namespace_handles(
     socket: BorrowedFd<'_>,
     handles: &NamespaceHandles,
 ) -> Result<(), ExecutionDomainError> {
-    let byte = [b'N'];
+    let byte = *b"N";
     let mut io = libc::iovec {
         iov_base: byte.as_ptr().cast_mut().cast(),
         iov_len: byte.len(),
@@ -425,7 +425,7 @@ fn receive_namespace_handles(
     let received =
         unsafe { libc::recvmsg(socket.as_raw_fd(), &mut message, libc::MSG_CMSG_CLOEXEC) };
     if received != 1
-        || byte != [b'N']
+        || byte != *b"N"
         || message.msg_flags & (libc::MSG_CTRUNC | libc::MSG_TRUNC) != 0
     {
         return Err(failure(FailureCategory::Protocol));

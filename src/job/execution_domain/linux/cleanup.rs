@@ -559,17 +559,16 @@ impl MappedCleanupAuthority {
         let mut ignore = |_: u8, _: RawFd| Ok(());
         for (root_index, root) in self.roots.iter().enumerate() {
             root.verify()?;
-            inventories.push(inventory(
-                root.fd.as_raw_fd(),
-                root.identity,
-                &self.map,
-                &mut budget,
-                self.limits,
-                0,
+            let mut context = InventoryContext {
+                root: root.identity,
+                map: &self.map,
+                budget: &mut budget,
+                limits: self.limits,
                 deadline,
-                root_index as u8,
-                &mut ignore,
-            )?);
+                root_index: root_index as u8,
+                notify: &mut ignore,
+            };
+            inventories.push(inventory(root.fd.as_raw_fd(), 0, &mut context)?);
         }
         after_inventory();
         for (root, entries) in self.roots.iter().zip(inventories) {
@@ -845,17 +844,16 @@ fn worker_entry() -> Result<(), ExecutionDomainError> {
     let mut notify =
         |root_index: u8, fd: RawFd| send_fds(socket, &[b'E', root_index], &[fd], deadline);
     for (root_index, root) in authority.roots.iter().enumerate() {
-        inventories.push(inventory(
-            root.fd.as_raw_fd(),
-            root.identity,
-            &authority.map,
-            &mut budget,
-            authority.limits,
-            0,
+        let mut context = InventoryContext {
+            root: root.identity,
+            map: &authority.map,
+            budget: &mut budget,
+            limits: authority.limits,
             deadline,
-            root_index as u8,
-            &mut notify,
-        )?);
+            root_index: root_index as u8,
+            notify: &mut notify,
+        };
+        inventories.push(inventory(root.fd.as_raw_fd(), 0, &mut context)?);
     }
     send_packet(socket, b"D", deadline)?;
     expect_packet(socket, b"C", deadline, Some(unsafe { libc::getppid() }))?;
@@ -1119,42 +1117,50 @@ enum Entry {
     },
 }
 
-fn inventory(
-    fd: RawFd,
+struct InventoryContext<'a> {
     root: Identity,
-    map: &MappedIdRange,
-    budget: &mut Budget,
+    map: &'a MappedIdRange,
+    budget: &'a mut Budget,
     limits: InventoryLimits,
-    depth: usize,
     deadline: Instant,
     root_index: u8,
-    notify: &mut dyn FnMut(u8, RawFd) -> Result<(), ExecutionDomainError>,
+    notify: &'a mut dyn FnMut(u8, RawFd) -> Result<(), ExecutionDomainError>,
+}
+
+fn inventory(
+    fd: RawFd,
+    depth: usize,
+    context: &mut InventoryContext<'_>,
 ) -> Result<Vec<Entry>, ExecutionDomainError> {
-    if depth > limits.depth || Instant::now() >= deadline {
+    if depth > context.limits.depth || Instant::now() >= context.deadline {
         return Err(failure(FailureCategory::Timeout));
     }
     let mut entries = Vec::new();
     for name in dirfd::directory_entries_stream(fd)? {
         let name = name?;
-        budget.entries = budget
+        context.budget.entries = context
+            .budget
             .entries
             .checked_add(1)
             .ok_or_else(|| failure(FailureCategory::InvalidInput))?;
-        budget.path_bytes = budget
+        context.budget.path_bytes = context
+            .budget
             .path_bytes
             .checked_add(name.to_bytes().len())
             .ok_or_else(|| failure(FailureCategory::InvalidInput))?;
-        if budget.entries > limits.entries || budget.path_bytes > limits.path_bytes {
+        if context.budget.entries > context.limits.entries
+            || context.budget.path_bytes > context.limits.path_bytes
+        {
             return Err(failure(FailureCategory::Unavailable));
         }
-        if Instant::now() >= deadline {
+        if Instant::now() >= context.deadline {
             return Err(failure(FailureCategory::Timeout));
         }
         let metadata = dirfd::stat_at(fd, &name).map_err(io_failure)?;
         let current = identity(&metadata);
-        if current.device != root.device
-            || current.mount_id != root.mount_id
-            || !map.owns(current.uid, current.gid)
+        if current.device != context.root.device
+            || current.mount_id != context.root.mount_id
+            || !context.map.owns(current.uid, current.gid)
         {
             return Err(failure(FailureCategory::IdentityMismatch));
         }
@@ -1168,7 +1174,7 @@ fn inventory(
         if identity(&dirfd::metadata(pinned.as_raw_fd())?) != current {
             return Err(failure(FailureCategory::IdentityMismatch));
         }
-        notify(root_index, pinned.as_raw_fd())?;
+        (context.notify)(context.root_index, pinned.as_raw_fd())?;
         match u32::from(current.mode) & libc::S_IFMT {
             libc::S_IFDIR => {
                 let child = dirfd::open_at(
@@ -1182,17 +1188,7 @@ fn inventory(
                 if opened != current {
                     return Err(failure(FailureCategory::IdentityMismatch));
                 }
-                let children = inventory(
-                    child.as_raw_fd(),
-                    root,
-                    map,
-                    budget,
-                    limits,
-                    depth + 1,
-                    deadline,
-                    root_index,
-                    notify,
-                )?;
+                let children = inventory(child.as_raw_fd(), depth + 1, context)?;
                 entries.push(Entry::Directory {
                     name,
                     fd: child,
@@ -1391,11 +1387,13 @@ fn send_fds(
     }
 }
 
+type ReceivedFds = (Vec<u8>, Vec<OwnedFd>, Option<libc::ucred>);
+
 fn receive_fds(
     socket: RawFd,
     max_fds: usize,
     deadline: Instant,
-) -> Result<(Vec<u8>, Vec<OwnedFd>, Option<libc::ucred>), ExecutionDomainError> {
+) -> Result<ReceivedFds, ExecutionDomainError> {
     wait_socket(socket, libc::POLLIN, deadline)?;
     let mut bytes = [0u8; 64];
     let mut iovec = libc::iovec {

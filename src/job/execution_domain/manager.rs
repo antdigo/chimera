@@ -64,7 +64,7 @@ enum Backend {
     // The Linux variant remains private until C1 can publish its private
     // Docker endpoint. Its protocol implementation is compiled only on Linux.
     #[cfg(target_os = "linux")]
-    Linux(LinuxBackend),
+    Linux(Box<LinuxBackend>),
 }
 
 #[derive(Default)]
@@ -299,14 +299,14 @@ impl DomainManager {
                     #[cfg(target_os = "linux")]
                     if let Some(builder) = _builder.sandboxed {
                         match builder.build() {
-                            Ok(parts) => Ok(Backend::Linux(LinuxBackend {
+                            Ok(parts) => Ok(Backend::Linux(Box::new(LinuxBackend {
                                 cleanup: Some(parts.cleanup),
                                 #[cfg(test)]
                                 test_kernel: None,
                                 path_mappings: parts.path_mappings,
                                 next_command_id: 1,
                                 control_broken: false,
-                            })),
+                            }))),
                             Err(failure) => {
                                 if failure.quarantine() {
                                     provision_state.poison();

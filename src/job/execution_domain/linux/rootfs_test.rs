@@ -86,8 +86,11 @@ fn readonly_mode_does_not_hide_a_service_owned_writable_hardlink_alias() {
 
 #[test]
 fn operator_owned_inputs_are_accepted_and_walk_budget_is_enforced() {
-    let input =
-        MountInput::readonly("/usr/share/zoneinfo/Etc", "/opt/chimera-tools/zoneinfo").unwrap();
+    let input = MountInput::readonly(
+        super::rootfs::linux::immutable_test_input(),
+        "/opt/chimera-tools/zoneinfo",
+    )
+    .unwrap();
     super::rootfs::verify_immutable(&input).unwrap();
     assert!(super::rootfs::linux::verify_immutable_with_budget(&input, 1, 128).is_err());
     assert!(super::rootfs::linux::verify_immutable_with_budget(&input, 100_000, 1).is_err());

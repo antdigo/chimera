@@ -38,7 +38,7 @@ fn linux_backend_for_test() -> (
     let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, child.id(), 0) } as i32;
     assert!(raw >= 0);
     let pidfd = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) };
-    let backend = super::Backend::Linux(super::LinuxBackend {
+    let backend = super::LinuxBackend {
         cleanup: None,
         test_kernel: Some(super::super::linux::launcher::KernelDomain {
             control: super::super::protocol::ControlConnection::new(manager, attempt).unwrap(),
@@ -51,9 +51,6 @@ fn linux_backend_for_test() -> (
         path_mappings: Vec::new(),
         next_command_id: 1,
         control_broken: false,
-    });
-    let super::Backend::Linux(backend) = backend else {
-        unreachable!()
     };
     (
         backend,
@@ -915,7 +912,7 @@ async fn sandbox_mapping_error_does_not_leave_a_prepared_step_transaction() {
 fn private_linux_layout_is_strict_but_handle_publication_stays_not_ready() {
     let (mut linux, _peer) = linux_backend_for_test();
     linux.path_mappings = sandbox_path_mappings();
-    let backend = super::Backend::Linux(linux);
+    let backend = super::Backend::Linux(Box::new(linux));
     let (paths, environment) = backend.domain_layout().unwrap();
     assert_eq!(paths, super::super::DomainPaths::sandboxed());
     assert_eq!(environment, super::super::DomainEnvironment::sandboxed());
@@ -1622,7 +1619,7 @@ fn idle_linux_command_cancel_never_sends_domain_shutdown() {
     use super::super::protocol::{Message, Request, Response};
 
     let (linux, mut peer) = linux_backend_for_test();
-    let mut backend = super::Backend::Linux(linux);
+    let mut backend = super::Backend::Linux(Box::new(linux));
     let observed_shutdown = std::sync::Arc::new(AtomicBool::new(false));
     let responder_observed = observed_shutdown.clone();
     let responder = std::thread::spawn(move || {

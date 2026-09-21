@@ -39,6 +39,13 @@ const ALIASES: &[(&str, &str)] = &[
     ("lib64", "/usr/lib64"),
 ];
 
+#[cfg(test)]
+pub(in crate::job::execution_domain::linux) fn immutable_test_input() -> PathBuf {
+    std::env::var_os("CHIMERA_TEST_IMMUTABLE_INPUT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/usr/share/zoneinfo/Etc"))
+}
+
 // The supervisor promotes this configuration builder at the activation seam.
 #[cfg(test)]
 pub(in crate::job::execution_domain::linux) struct ImmutableInputs {

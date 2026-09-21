@@ -3,30 +3,8 @@ use super::*;
 #[test]
 fn immutable_snapshot_rejects_a_changed_launch_record() {
     let mut input =
-        MountInput::readonly("/usr/share/zoneinfo/Etc", "/opt/chimera-tools/zoneinfo").unwrap();
-    let fingerprint = immutable::fingerprint(&input, false);
-    if let Err(error) = &fingerprint {
-        eprintln!("rootfs source fingerprint failed: {error:?}");
-        eprintln!("euid={}", unsafe { libc::geteuid() });
-        eprintln!("source metadata={:?}", fs::symlink_metadata(&input.source));
-        let mountinfo = fs::read_to_string("/proc/self/mountinfo").unwrap();
-        eprintln!(
-            "mountinfo parse={:?}",
-            parse_mountinfo(&mountinfo).map(|v| v.len())
-        );
-        for entry in fs::read_dir(&input.source).unwrap().flatten() {
-            let path = entry.path();
-            let metadata = fs::symlink_metadata(&path).unwrap();
-            eprintln!(
-                "entry={:?} uid={} mode={:o} link={:?}",
-                entry.file_name(),
-                metadata.uid(),
-                metadata.mode(),
-                fs::read_link(&path).ok()
-            );
-        }
-    }
-    input.immutable_fingerprint = Some(fingerprint.unwrap());
+        MountInput::readonly(immutable_test_input(), "/opt/chimera-tools/zoneinfo").unwrap();
+    input.immutable_fingerprint = Some(immutable::fingerprint(&input, false).unwrap());
     let fd = open_path(&input.source).unwrap();
     immutable::verify_snapshot(&input, &fd, false).unwrap();
     input.immutable_fingerprint.as_mut().unwrap()[0] ^= 1;
