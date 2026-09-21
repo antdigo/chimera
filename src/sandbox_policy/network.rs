@@ -1,8 +1,93 @@
 use std::collections::BTreeMap;
 use std::net::IpAddr;
+use std::net::SocketAddr;
+
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 use crate::config::{IpCidr, NetworkPolicyConfig};
+use crate::sandbox_policy::ConnectOutcome;
 use crate::sandbox_policy::PolicyError;
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServiceGeneration {
+    pub boot_id: Uuid,
+    pub invocation_id: String,
+    pub control_group: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AppliedNetworkPolicy {
+    pub generation: ServiceGeneration,
+    pub denied: Vec<IpCidr>,
+    pub allowed: Vec<IpCidr>,
+    pub bpf_attached: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SentinelObservation {
+    pub address: SocketAddr,
+    pub control_before: bool,
+    pub control_after: bool,
+    pub observed: ConnectOutcome,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ProbeBatch {
+    pub generation: ServiceGeneration,
+    pub negative: Vec<SentinelObservation>,
+    pub public_registry_ok: bool,
+}
+
+pub fn validate_network_evidence(
+    expected: &NetworkPolicy,
+    applied: &AppliedNetworkPolicy,
+    probes: &ProbeBatch,
+) -> Result<(), PolicyError> {
+    let generation = &applied.generation;
+    if generation.boot_id.is_nil()
+        || generation.invocation_id.len() != 32
+        || !generation
+            .invocation_id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        || generation.control_group != "/system.slice/chimera.service"
+        || generation != &probes.generation
+        || !applied.bpf_attached
+        || !applied.allowed.is_empty()
+        || expected.denied().iter().any(|required| {
+            !applied.denied.iter().any(|effective| {
+                effective.prefix() <= required.prefix() && effective.contains(required.address())
+            })
+        })
+    {
+        return Err(PolicyError::PolicyMismatch);
+    }
+    if !probes.public_registry_ok || probes.negative.is_empty() {
+        return Err(PolicyError::ProbeInconclusive);
+    }
+    for probe in &probes.negative {
+        if !probe.control_before || !probe.control_after || expected.permits(probe.address.ip()) {
+            return Err(PolicyError::ProbeInconclusive);
+        }
+        match probe.observed {
+            ConnectOutcome::Connected => return Err(PolicyError::ProbeAllowedForbidden),
+            ConnectOutcome::Refused | ConnectOutcome::Unreachable => {
+                return Err(PolicyError::ProbeInconclusive);
+            }
+            ConnectOutcome::Denied | ConnectOutcome::TimedOut => {}
+        }
+    }
+    if expected.required_probe_prefixes().iter().any(|prefix| {
+        !probes
+            .negative
+            .iter()
+            .any(|probe| prefix.contains(probe.address.ip()))
+    }) {
+        return Err(PolicyError::ProbeInconclusive);
+    }
+    Ok(())
+}
 
 pub struct HostAddresses {
     pub addresses: Vec<IpAddr>,

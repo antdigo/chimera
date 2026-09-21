@@ -6,4 +6,12 @@ pub enum PolicyError {
     InvalidStorageLimit,
     #[error("host address inventory is empty")]
     EmptyHostInventory,
+    #[error("network policy evidence does not match")]
+    PolicyMismatch,
+    #[error("negative probe allowed a forbidden connection")]
+    ProbeAllowedForbidden,
+    #[error("network probe was inconclusive")]
+    ProbeInconclusive,
+    #[error("network probe I/O error")]
+    Io,
 }
