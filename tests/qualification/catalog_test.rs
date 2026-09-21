@@ -183,7 +183,12 @@ fn representative_cases_pin_the_exact_required_evidence() {
             Wave::Restart,
             40,
         )),
-        &[CheckId::CapacityBounded, CheckId::CleanupConfirmed]
+        &[
+            CheckId::CapacityBounded,
+            CheckId::DistinctStateConfirmed,
+            CheckId::ExtraAdmissionBlocked,
+            CheckId::CleanupConfirmed,
+        ]
     );
     assert_eq!(
         required_checks(&key(
@@ -211,6 +216,21 @@ fn representative_cases_pin_the_exact_required_evidence() {
             CheckId::CleanupConfirmed,
         ]
     );
+}
+
+#[test]
+fn every_s13_wave_requires_distinct_state_and_rejects_an_extra_admission() {
+    for case in required_cases()
+        .into_iter()
+        .filter(|case| case.scenario == ScenarioId::S13)
+    {
+        let checks = required_checks(&case);
+        assert!(
+            checks.contains(&CheckId::DistinctStateConfirmed),
+            "{case:?}"
+        );
+        assert!(checks.contains(&CheckId::ExtraAdmissionBlocked), "{case:?}");
+    }
 }
 
 #[test]

@@ -114,6 +114,8 @@ pub enum CheckId {
     CancellationBounded,
     RestartReconciled,
     CapacityBounded,
+    DistinctStateConfirmed,
+    ExtraAdmissionBlocked,
     NextTenantClean,
     IdleZero,
     NativeMetricsComplete,
@@ -178,7 +180,12 @@ const S12_CHECKS: &[CheckId] = &[
     CheckId::PeerFilesystemDenied,
     CheckId::CleanupConfirmed,
 ];
-const S13_CHECKS: &[CheckId] = &[CheckId::CapacityBounded, CheckId::CleanupConfirmed];
+const S13_CHECKS: &[CheckId] = &[
+    CheckId::CapacityBounded,
+    CheckId::DistinctStateConfirmed,
+    CheckId::ExtraAdmissionBlocked,
+    CheckId::CleanupConfirmed,
+];
 const S14_CHECKS: &[CheckId] = &[CheckId::NextTenantClean, CheckId::CleanupConfirmed];
 const S15_CHECKS: &[CheckId] = &[CheckId::IdleZero, CheckId::CleanupConfirmed];
 const S16_CHECKS: &[CheckId] = &[
