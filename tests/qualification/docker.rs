@@ -282,10 +282,10 @@ pub fn evaluate_docker(
     if serde_json::to_value(&facts).map_err(|_| Reason::ProtocolViolation)? != *raw {
         return Err(Reason::ProtocolViolation);
     }
-    if facts.attempts != attempts {
-        return Err(Reason::StaleEvidence);
-    }
-    // Explicit failures outrank absent supporting observations.
+    // After validating the envelope and schema, preserve stop-condition priority:
+    // cleanup failure > affirmative boundary violation > stale > missing facts.
+    // In particular, foreign attempt IDs cannot hide an explicit cleanup failure,
+    // and absent command observations cannot hide an unsafe registry endpoint.
     if !facts.cleanup_confirmed
         || facts.remaining_owned_objects != 0
         || facts.registry.as_ref().is_some_and(|r| !r.logout_confirmed)
@@ -297,8 +297,19 @@ pub fn evaluate_docker(
         || facts.host_port_reached
         || facts.peer_port_reached
         || facts.operation_exit_codes.iter().any(|&code| code != 0)
+        || facts.registry.as_ref().is_some_and(|registry| {
+            registry.address != "qualification-registry:5000" || !registry.synthetic_credentials
+        })
     {
         return Err(Reason::BoundaryViolation);
+    }
+    if facts.attempts != attempts
+        || facts
+            .registry
+            .as_ref()
+            .is_some_and(|registry| registry.attempt != attempts[0])
+    {
+        return Err(Reason::StaleEvidence);
     }
     if facts.operations.is_empty() || facts.operation_exit_codes.len() != commands.len() {
         return Err(Reason::MissingEvidence);
@@ -309,12 +320,6 @@ pub fn evaluate_docker(
     let registry_case = commands.contains(&DockerCommand::RegistryStart);
     if registry_case {
         let registry = facts.registry.as_ref().ok_or(Reason::MissingEvidence)?;
-        if registry.attempt != attempts[0] {
-            return Err(Reason::StaleEvidence);
-        }
-        if registry.address != "qualification-registry:5000" || !registry.synthetic_credentials {
-            return Err(Reason::BoundaryViolation);
-        }
         if !registry.buildkit_reachable
             || !facts.pushed_digest.as_deref().is_some_and(valid_digest)
             || facts.pushed_digest != facts.pulled_digest

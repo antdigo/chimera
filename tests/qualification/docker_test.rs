@@ -359,6 +359,102 @@ async fn docker_rejects_missing_wrong_or_failed_operations_and_cleanup() {
 }
 
 #[tokio::test]
+async fn docker_failure_priority_cleanup_outranks_stale_and_incomplete_facts() {
+    let key = key("pinned-buildx-login-build-push");
+    let ids = attempts(&key);
+    for failure in ["cleanup", "owned-objects", "logout"] {
+        let mut facts = good(&key, &ids);
+        facts["attempts"] = json!([Uuid::new_v4()]);
+        facts["registry"]["attempt"] = json!(Uuid::new_v4());
+        facts["registry"]["address"] = json!("host.docker.internal:5000");
+        facts["operations"] = json!([]);
+        facts["operation_exit_codes"] = json!([1]);
+        match failure {
+            "cleanup" => facts["cleanup_confirmed"] = json!(false),
+            "owned-objects" => facts["remaining_owned_objects"] = json!(1),
+            "logout" => facts["registry"]["logout_confirmed"] = json!(false),
+            _ => unreachable!(),
+        }
+        assert_eq!(
+            result(&key, &ids, facts).await.unwrap_err(),
+            Reason::CleanupUnconfirmed,
+            "{failure}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn docker_failure_priority_boundaries_outrank_stale_and_missing_facts() {
+    for field in [
+        "host_canary_reached",
+        "peer_canary_reached",
+        "host_port_reached",
+        "peer_port_reached",
+        "operation_exit_codes",
+    ] {
+        let key = key("network-host");
+        let ids = attempts(&key);
+        for stale in [false, true] {
+            let mut facts = good(&key, &ids);
+            facts["operations"] = json!([]);
+            facts["operation_exit_codes"] = json!([]);
+            if stale {
+                facts["attempts"][0] = json!(Uuid::new_v4());
+            }
+            match field {
+                "operation_exit_codes" => facts[field] = json!([1]),
+                _ => facts[field] = json!(true),
+            }
+            assert_eq!(
+                result(&key, &ids, facts).await.unwrap_err(),
+                Reason::BoundaryViolation,
+                "{field}, stale={stale}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn docker_failure_priority_unsafe_registry_outranks_stale_and_missing_facts() {
+    let key = key("pinned-buildx-login-build-push");
+    let ids = attempts(&key);
+    for (field, value) in [
+        ("address", json!("host.docker.internal:5000")),
+        ("synthetic_credentials", json!(false)),
+    ] {
+        for stale in [false, true] {
+            let mut facts = good(&key, &ids);
+            facts["operations"] = json!([]);
+            facts["operation_exit_codes"] = json!([]);
+            facts["registry"][field] = value.clone();
+            if stale {
+                facts["attempts"][0] = json!(Uuid::new_v4());
+                facts["registry"]["attempt"] = json!(Uuid::new_v4());
+            }
+            assert_eq!(
+                result(&key, &ids, facts).await.unwrap_err(),
+                Reason::BoundaryViolation,
+                "{field}, stale={stale}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn docker_failure_priority_stale_registry_outranks_missing_operations() {
+    let key = key("pinned-buildx-login-build-push");
+    let ids = attempts(&key);
+    let mut facts = good(&key, &ids);
+    facts["registry"]["attempt"] = json!(Uuid::new_v4());
+    facts["operations"] = json!([]);
+    facts["operation_exit_codes"] = json!([]);
+    assert_eq!(
+        result(&key, &ids, facts).await.unwrap_err(),
+        Reason::StaleEvidence
+    );
+}
+
+#[tokio::test]
 async fn docker_registry_requires_same_attempt_and_matching_immutable_digest() {
     for name in ["pull-push-login-logout", "pinned-buildx-login-build-push"] {
         let key = key(name);
