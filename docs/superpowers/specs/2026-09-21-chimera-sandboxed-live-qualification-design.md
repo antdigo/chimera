@@ -1,6 +1,6 @@
 # CHM-08 — Native qualification без остановки production Chimera
 
-Дата: 2026-09-21. Статус: дизайн согласован в диалоге; требуется review этого документа перед implementation plan.
+Дата: 2026-09-21. Статус: письменный дизайн согласован оператором; implementation plan и серверные действия требуют отдельных этапов.
 
 Дополнение к [основной спецификации](2026-09-20-chimera-sandboxed-execution-domain.md),
 заменяющее только операционную схему native qualification. Изоляция attempt,
