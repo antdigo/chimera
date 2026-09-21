@@ -144,7 +144,7 @@ fn pinned_root_rejects_escaped_writable_paths() {
 #[test]
 fn pinned_child_rejects_existing_foreign_mount_without_mounting_anything() {
     let root = std::fs::File::open("/").unwrap();
-    let identity = linux::path_identity(Path::new("/")).unwrap();
+    let identity = linux::identity(&root).unwrap();
     assert!(matches!(
         linux::open_bound_child(&root, std::ffi::OsStr::new("proc"), &identity),
         Err(PolicyError::StorageUnbounded)

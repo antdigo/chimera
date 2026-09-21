@@ -212,7 +212,7 @@ mod linux {
         Ok(records)
     }
 
-    fn identity(file: &File) -> Result<StorageIdentity, PolicyError> {
+    pub(super) fn identity(file: &File) -> Result<StorageIdentity, PolicyError> {
         let mut stat = MaybeUninit::<libc::stat>::uninit();
         if unsafe { libc::fstat(file.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
             return Err(inconclusive());
@@ -227,8 +227,8 @@ mod linux {
             .parse()
             .map_err(|_| inconclusive())?;
         Ok(StorageIdentity {
-            device: stat.st_dev as u64,
-            inode: stat.st_ino as u64,
+            device: stat.st_dev,
+            inode: stat.st_ino,
             mount_id,
         })
     }
@@ -393,9 +393,10 @@ mod linux {
             return Err(inconclusive());
         }
         let vfs = unsafe { vfs.assume_init() };
-        let total_bytes = checked_capacity(vfs.f_blocks as u64, vfs.f_frsize as u64)?;
-        let available_bytes = (vfs.f_bavail as u64)
-            .checked_mul(vfs.f_frsize as u64)
+        let total_bytes = checked_capacity(vfs.f_blocks, vfs.f_frsize)?;
+        let available_bytes = vfs
+            .f_bavail
+            .checked_mul(vfs.f_frsize)
             .ok_or_else(inconclusive)?;
         let mut mount_file = File::open("/proc/self/mountinfo").map_err(|_| inconclusive())?;
         let mounts = parse_mountinfo(&read_mountinfo_limited(&mut mount_file)?)?;
