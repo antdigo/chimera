@@ -3,6 +3,7 @@ use std::num::NonZeroUsize;
 use serde::{Deserialize, Serialize};
 
 use super::resources::ExecutionResources;
+use super::{network::NetworkPolicyConfig, storage::StorageBoundConfig};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -20,6 +21,10 @@ pub struct ExecutionConfig {
     pub max_active_domains: NonZeroUsize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resources: Option<ExecutionResources>,
+    #[serde(default)]
+    pub network: Option<NetworkPolicyConfig>,
+    #[serde(default)]
+    pub storage: Option<StorageBoundConfig>,
 }
 
 impl Default for ExecutionConfig {
@@ -28,6 +33,8 @@ impl Default for ExecutionConfig {
             profile: ExecutionProfile::TrustedHost,
             max_active_domains: default_max_active_domains(),
             resources: None,
+            network: None,
+            storage: None,
         }
     }
 }

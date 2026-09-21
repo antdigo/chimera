@@ -14,9 +14,13 @@ use serde::{Deserialize, Serialize};
 use crate::cache::config::CacheConfig;
 
 pub mod execution;
+pub mod network;
 pub mod resources;
+pub mod storage;
 pub use execution::{ExecutionConfig, ExecutionProfile};
+pub use network::{IpCidr, NetworkPolicyConfig};
 pub use resources::{ExecutionResources, IoMax, ResourceLimits};
+pub use storage::{StorageBoundConfig, StorageBytes, StorageMechanism};
 
 #[derive(Debug, Deserialize, Serialize, Default)]
 pub struct ChimeraConfig {

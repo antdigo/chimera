@@ -20,6 +20,7 @@ fn sandboxed_profile_is_rejected_before_runtime_start() {
             profile: ExecutionProfile::Sandboxed,
             max_active_domains: NonZeroUsize::new(20).unwrap(),
             resources: None,
+            ..ExecutionConfig::default()
         },
         ..Default::default()
     };
@@ -46,6 +47,7 @@ async fn sandboxed_run_rejects_before_daemon_owned_side_effects() {
                 profile: ExecutionProfile::Sandboxed,
                 max_active_domains: NonZeroUsize::new(20).unwrap(),
                 resources: None,
+                ..ExecutionConfig::default()
             },
             ..Default::default()
         },
@@ -97,6 +99,7 @@ fn sandboxed_gate_precedes_resource_validation() {
                 global: invalid.clone(),
                 attempt: invalid,
             }),
+            ..ExecutionConfig::default()
         },
         ..Default::default()
     };

@@ -8,6 +8,7 @@ pub mod import;
 pub mod job;
 pub mod node;
 pub mod runner;
+pub mod sandbox_policy;
 mod storage;
 #[cfg(test)]
 mod testing;
