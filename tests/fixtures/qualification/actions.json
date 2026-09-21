@@ -1,0 +1,5 @@
+[
+  {"owner":"docker","repository":"setup-buildx-action","commit":"d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5"},
+  {"owner":"docker","repository":"login-action","commit":"650006c6eb7dba73a995cc03b0b2d7f5ca915bee"},
+  {"owner":"docker","repository":"build-push-action","commit":"f9f3042f7e2789586610d6e8b85c8f03e5195baf"}
+]
