@@ -1,5 +1,7 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum PolicyError {
+    #[error("capability descriptor is invalid")]
+    InvalidCapabilityDescriptor,
     #[error("invalid CIDR")]
     InvalidCidr,
     #[error("invalid storage limit")]

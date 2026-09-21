@@ -1,9 +1,17 @@
+mod capability;
 mod error;
 mod install;
 mod network;
 mod probe;
 mod storage;
 
+#[cfg(test)]
+#[path = "sandbox_policy/capability_test.rs"]
+mod capability_test;
+
+pub use capability::{
+    CacheCapabilityBinding, CapabilityDescriptor, CapabilityService, validate_descriptor,
+};
 pub use error::PolicyError;
 pub use install::{InstallPlan, render_install_plan};
 pub use network::{
