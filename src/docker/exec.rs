@@ -125,9 +125,6 @@ pub async fn docker_exec(
     let command_deadline = Instant::now()
         .checked_add(timeout)
         .context("Docker exec timeout exceeds monotonic clock range")?;
-    let lifecycle_deadline = command_deadline
-        .checked_add(RECOVERY_BUDGET)
-        .context("Docker exec lifecycle exceeds monotonic clock range")?;
     if Instant::now() >= command_deadline {
         return Ok(Interruption::TimedOut.result());
     }
@@ -152,7 +149,8 @@ pub async fn docker_exec(
         StageOutcome::Ready(Ok(exec)) => exec,
         StageOutcome::Ready(Err(error)) => {
             let diagnostic = DockerErrorDiagnostic::from(&error);
-            recover_container(docker, container_id, None, lifecycle_deadline).await?;
+            let recovery_deadline = recovery_deadline(command_deadline, Instant::now())?;
+            recover_container(docker, container_id, None, recovery_deadline).await?;
             return Err(DockerExecOperationError::Create {
                 kind: diagnostic.kind,
                 status_code: diagnostic.status_code,
@@ -161,15 +159,15 @@ pub async fn docker_exec(
             .into());
         }
         StageOutcome::Interrupted(interruption) => {
-            stop_container_for_recovery(docker, container_id, lifecycle_deadline).await?;
+            let recovery_deadline = recovery_deadline(command_deadline, Instant::now())?;
+            stop_container_for_recovery(docker, container_id, recovery_deadline).await?;
             let settled =
-                before_deadline(lifecycle_deadline, "settling create-exec RPC", &mut create)
-                    .await?;
+                before_deadline(recovery_deadline, "settling create-exec RPC", &mut create).await?;
             let exec_id = settled.ok().map(|exec| exec.id);
             if let Some(exec_id) = exec_id.as_deref() {
-                prove_exec_stopped(docker, exec_id, lifecycle_deadline).await?;
+                prove_exec_stopped(docker, exec_id, recovery_deadline).await?;
             }
-            restart_container(docker, container_id, lifecycle_deadline).await?;
+            restart_container(docker, container_id, recovery_deadline).await?;
             return Ok(interruption.result());
         }
     };
@@ -179,7 +177,8 @@ pub async fn docker_exec(
         StageOutcome::Ready(Ok(result)) => result,
         StageOutcome::Ready(Err(error)) => {
             let diagnostic = DockerErrorDiagnostic::from(&error);
-            recover_container(docker, container_id, Some(&exec.id), lifecycle_deadline).await?;
+            let recovery_deadline = recovery_deadline(command_deadline, Instant::now())?;
+            recover_container(docker, container_id, Some(&exec.id), recovery_deadline).await?;
             return Err(DockerExecOperationError::Start {
                 kind: diagnostic.kind,
                 status_code: diagnostic.status_code,
@@ -188,20 +187,22 @@ pub async fn docker_exec(
             .into());
         }
         StageOutcome::Interrupted(interruption) => {
-            stop_container_for_recovery(docker, container_id, lifecycle_deadline).await?;
+            let recovery_deadline = recovery_deadline(command_deadline, Instant::now())?;
+            stop_container_for_recovery(docker, container_id, recovery_deadline).await?;
             let settled =
-                before_deadline(lifecycle_deadline, "settling start-exec RPC", &mut start).await?;
+                before_deadline(recovery_deadline, "settling start-exec RPC", &mut start).await?;
             if let Ok(started) = settled {
-                drain_start_result(started, processor, lifecycle_deadline).await?;
+                drain_start_result(started, processor, recovery_deadline).await?;
             }
-            prove_exec_stopped(docker, &exec.id, lifecycle_deadline).await?;
-            restart_container(docker, container_id, lifecycle_deadline).await?;
+            prove_exec_stopped(docker, &exec.id, recovery_deadline).await?;
+            restart_container(docker, container_id, recovery_deadline).await?;
             return Ok(interruption.result());
         }
     };
 
     let StartExecResults::Attached { output, .. } = start_result else {
-        recover_container(docker, container_id, Some(&exec.id), lifecycle_deadline).await?;
+        let recovery_deadline = recovery_deadline(command_deadline, Instant::now())?;
+        recover_container(docker, container_id, Some(&exec.id), recovery_deadline).await?;
         return Err(DockerExecOperationError::Detached.into());
     };
     let mut stream_task = spawn_stream_task(output, processor.clone());
@@ -215,24 +216,26 @@ pub async fn docker_exec(
 
     match completion {
         Completion::Interrupted(interruption) => {
+            let recovery_deadline = recovery_deadline(command_deadline, Instant::now())?;
             if let Err(error) =
-                stop_container_for_recovery(docker, container_id, lifecycle_deadline).await
+                stop_container_for_recovery(docker, container_id, recovery_deadline).await
             {
                 stream_task.abort();
                 let _ = stream_task.await;
                 return Err(error);
             }
-            let _ = await_stream_task(&mut stream_task, lifecycle_deadline).await?;
-            prove_exec_stopped(docker, &exec.id, lifecycle_deadline).await?;
-            restart_container(docker, container_id, lifecycle_deadline).await?;
+            let _ = await_stream_task(&mut stream_task, recovery_deadline).await?;
+            prove_exec_stopped(docker, &exec.id, recovery_deadline).await?;
+            restart_container(docker, container_id, recovery_deadline).await?;
             Ok(interruption.result())
         }
         Completion::Stream(stream_outcome) => {
-            let terminal = inspect_exec_state(docker, &exec.id, lifecycle_deadline).await;
+            let recovery_deadline = recovery_deadline(command_deadline, Instant::now())?;
+            let terminal = inspect_exec_state(docker, &exec.id, recovery_deadline).await;
             let exit_code = match terminal {
                 Ok((false, exit_code)) => exit_code,
                 Ok((true, _)) | Err(_) => {
-                    recover_container(docker, container_id, Some(&exec.id), lifecycle_deadline)
+                    recover_container(docker, container_id, Some(&exec.id), recovery_deadline)
                         .await?;
                     return stream_completion_error(stream_outcome, true);
                 }
@@ -258,6 +261,27 @@ pub async fn docker_exec(
             }
         }
     }
+}
+
+fn recovery_deadline(command_deadline: Instant, recovery_started_at: Instant) -> Result<Instant> {
+    recovery_deadline_with_budget(command_deadline, recovery_started_at, RECOVERY_BUDGET)
+}
+
+fn recovery_deadline_with_budget(
+    command_deadline: Instant,
+    recovery_started_at: Instant,
+    recovery_budget: Duration,
+) -> Result<Instant> {
+    let fresh_deadline = recovery_started_at.checked_add(recovery_budget).ok_or(
+        DockerExecRecoveryError::Deadline {
+            stage: "computing Docker exec recovery deadline",
+        },
+    )?;
+    Ok(command_deadline
+        .checked_add(recovery_budget)
+        .map_or(fresh_deadline, |command_bound| {
+            command_bound.min(fresh_deadline)
+        }))
 }
 
 enum StageOutcome<T> {

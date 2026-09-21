@@ -631,6 +631,124 @@ async fn pre_cancelled_exec_does_not_contact_docker() {
     assert_eq!(result.conclusion, StepConclusion::Cancelled);
 }
 
+#[test]
+fn recovery_deadline_caps_far_command_deadline_at_fresh_budget() {
+    let recovery_started_at = Instant::now();
+    let command_deadline = recovery_started_at + Duration::from_secs(6 * 60 * 60);
+
+    let deadline = recovery_deadline_with_budget(
+        command_deadline,
+        recovery_started_at,
+        Duration::from_secs(10),
+    )
+    .unwrap();
+
+    assert_eq!(deadline, recovery_started_at + Duration::from_secs(10));
+}
+
+#[test]
+fn recovery_deadline_preserves_nearly_exhausted_command_bound() {
+    let recovery_started_at = Instant::now();
+    let command_deadline = recovery_started_at - Duration::from_secs(9);
+
+    let deadline = recovery_deadline_with_budget(
+        command_deadline,
+        recovery_started_at,
+        Duration::from_secs(10),
+    )
+    .unwrap();
+
+    assert_eq!(deadline, recovery_started_at + Duration::from_secs(1));
+}
+
+#[test]
+fn recovery_deadline_overflow_fails_closed() {
+    let recovery_started_at = Instant::now();
+
+    let error =
+        recovery_deadline_with_budget(recovery_started_at, recovery_started_at, Duration::MAX)
+            .unwrap_err();
+
+    assert!(error.downcast_ref::<DockerExecRecoveryError>().is_some());
+}
+
+#[tokio::test]
+async fn hung_proxy_early_cancel_bounds_recovery_independently_of_command_timeout() {
+    let directory = tempfile::tempdir().unwrap();
+    let socket = directory.path().join("docker.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let first_request_seen = Arc::new(AtomicBool::new(false));
+    let (started_tx, mut started_rx) = tokio::sync::mpsc::channel(1);
+    let listener_task = {
+        let first_request_seen = Arc::clone(&first_request_seen);
+        tokio::spawn(async move {
+            loop {
+                let (mut connection, _) = listener.accept().await.unwrap();
+                let first_request_seen = Arc::clone(&first_request_seen);
+                let started_tx = started_tx.clone();
+                tokio::spawn(async move {
+                    let mut byte = [0_u8; 1];
+                    connection.read_exact(&mut byte).await.unwrap();
+                    if first_request_seen
+                        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                        .is_ok()
+                    {
+                        started_tx.send(()).await.unwrap();
+                    }
+                    std::future::pending::<()>().await;
+                });
+            }
+        })
+    };
+    let docker = bollard::Docker::connect_with_unix(
+        socket.to_str().unwrap(),
+        120,
+        bollard::API_DEFAULT_VERSION,
+    )
+    .unwrap();
+    let masks = crate::job::secret_masker::shared_masker_for_test(&[]);
+    let processor = OutputProcessor::new(
+        LogSender::new_for_test(tokio::sync::mpsc::channel(8).0, masks.clone()),
+        masks,
+        false,
+    );
+    let cancel = CancellationToken::new();
+    let cancel_when_started = {
+        let cancel = cancel.clone();
+        async move {
+            started_rx.recv().await.unwrap();
+            cancel.cancel();
+        }
+    };
+    let env = HashMap::new();
+    let result = tokio::time::timeout(RECOVERY_BUDGET + Duration::from_secs(2), async {
+        let (result, ()) = tokio::join!(
+            docker_exec(
+                &docker,
+                "hung-daemon",
+                vec!["irrelevant".into()],
+                &env,
+                "/",
+                &processor,
+                Duration::from_secs(6 * 60 * 60),
+                &cancel,
+            ),
+            cancel_when_started,
+        );
+        result
+    })
+    .await;
+    listener_task.abort();
+
+    let result = result.expect("recovery must use its own bounded deadline");
+    assert!(
+        result
+            .unwrap_err()
+            .downcast_ref::<DockerExecRecoveryError>()
+            .is_some()
+    );
+}
+
 async fn assert_rpc_deadline_recovers_same_container(fault: ProxyFault) {
     let docker =
         crate::docker::client::connect(&crate::docker::endpoint::DockerEndpoint::trusted_host())

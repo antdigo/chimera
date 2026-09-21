@@ -2,7 +2,7 @@
 
 **Goal:** Recover a reusable job container after any interrupted or ambiguous Docker exec without trusting guest-side helpers or reading state while late writers may survive.
 
-**Architecture:** Establish a command deadline plus one fixed outer lifecycle deadline before the first Docker RPC. Normal completion requires an exec inspection proving `running != true`. Cancellation, timeout, premature stream completion, or ambiguous create/start stops the whole job container, settles any in-flight RPC/log producer while stopped, proves the container and known exec are non-running, then restarts and re-inspects the same container. Recovery failures are typed unsafe errors and bypass the workflow-state snapshot.
+**Architecture:** Establish the normal command deadline before the first Docker RPC, then derive a separate bounded recovery deadline when recovery starts. Normal completion requires an exec inspection proving `running != true`. Cancellation, timeout, premature stream completion, or ambiguous create/start stops the whole job container, settles any in-flight RPC/log producer while stopped, proves the container and known exec are non-running, then restarts and re-inspects the same container. Recovery failures are typed unsafe errors and bypass the workflow-state snapshot.
 
 **Constraints:**
 
