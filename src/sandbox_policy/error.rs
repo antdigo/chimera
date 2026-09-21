@@ -14,4 +14,12 @@ pub enum PolicyError {
     ProbeInconclusive,
     #[error("network probe I/O error")]
     Io,
+    #[error("storage probe is unsupported for this mechanism")]
+    UnsupportedStorageProbe,
+    #[error("sandbox storage probe is unsupported on this platform")]
+    UnsupportedPlatform,
+    #[error("storage bound or identity does not match")]
+    StorageBoundMismatch,
+    #[error("storage probe is inconclusive")]
+    StorageProbeInconclusive,
 }

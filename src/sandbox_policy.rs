@@ -2,6 +2,7 @@ mod error;
 mod install;
 mod network;
 mod probe;
+mod storage;
 
 pub use error::PolicyError;
 pub use install::{InstallPlan, render_install_plan};
@@ -11,3 +12,7 @@ pub use network::{
 };
 pub use network::{HostAddresses, NetworkPolicy, compile_network};
 pub use probe::{ConnectOutcome, probe_connect};
+pub use storage::{
+    StorageBoundEvidence, StorageIdentity, StorageObservation, probe_storage,
+    revalidate_storage_identity, validate_storage_bound,
+};
